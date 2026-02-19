@@ -228,3 +228,25 @@ Design and implementation plan reviewed. The layered architecture (internal/llam
    ```
 
 3. **`//go:build rocm` for integration tests** — Good call. Keeps `go test ./...` fast on machines without GPU.
+
+---
+
+## 2026-02-19: Phase 2 Robustness (Charon)
+
+### Concurrent Requests
+
+Tested 3 goroutines calling Generate() simultaneously on the same model (Gemma3-1B, llama-server with default settings). All 3 received output (~0.9s total). llama-server handles concurrency via its slot system — default is 1 slot, so requests are serialised server-side.
+
+For true parallel inference, use `--parallel N` flag in llama-server (not yet configurable via go-rocm). VRAM cost scales with number of slots and context size.
+
+### VRAM Monitoring
+
+Reading sysfs directly (`/sys/class/drm/cardN/device/mem_info_vram_*`) instead of spawning `rocm-smi`. Auto-detects dGPU by selecting the card with the largest VRAM total:
+- card0 = iGPU (2GB) — Ryzen 9 9950X integrated
+- card1 = dGPU (16GB) — RX 7800 XT
+
+Note: sysfs reads are non-atomic. Total and Used are read separately, so transient inconsistencies are possible under heavy allocation churn. Free is clamped to prevent uint64 underflow.
+
+### lastErr Design Limitation
+
+`rocmModel.lastErr` is a single mutex-protected field shared across all callers. With concurrent Generate/Chat calls, errors can be clobbered (last writer wins). `Err()` is only reliable in single-caller scenarios. This matches the go-inference interface contract (single `Err() error` method), so it's a known limitation, not a bug. Per-call error returns would require an interface change in go-inference.

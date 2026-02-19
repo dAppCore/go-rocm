@@ -25,11 +25,11 @@ The Ryzen 9 9950X iGPU shows up as ROCm Device 1, reports 100GB free (system RAM
 
 ## Phase 2: Robustness
 
-- [ ] **Server crash recovery** — If llama-server dies mid-generation, detect via process exit, return error via Err(), allow re-load.
-- [ ] **Port conflict handling** — If the random port is taken, retry with a different port.
-- [ ] **Graceful shutdown** — On context cancellation, stop the current request cleanly (close SSE stream), don't kill the server. Only Close() kills the server.
-- [ ] **Memory monitoring** — Use `rocm-smi --showmeminfo vram` or HIP API to report VRAM usage. Expose via package-level functions (like go-mlx's GetActiveMemory).
-- [ ] **Concurrent requests** — llama-server supports concurrent slots. Test with multiple goroutines calling Generate() simultaneously. Document max concurrency.
+- [x] **Server crash recovery** — `server.alive()` detects process exit; Generate/Chat return error immediately if dead. Commits `2c4966e`, `c07f37a`. (Charon, 19 Feb 2026)
+- [x] **Port conflict handling** — `startServer()` retries up to 3 times with new port on process exit. Only retries on exit, not timeout. Commits `c50a8e9`, `b7342ec`. (Charon, 19 Feb 2026)
+- [x] **Graceful shutdown** — Already worked in Phase 1. Integration test confirms server survives context cancellation and generates again. Commit `a6e647c`. (Charon, 19 Feb 2026)
+- [x] **Memory monitoring** — `GetVRAMInfo()` reads sysfs, auto-detects dGPU by largest VRAM. Uint64 underflow guard on Free. Commits `501de83`, `954c570`. (Charon, 19 Feb 2026)
+- [x] **Concurrent requests** — 3 goroutines calling Generate() simultaneously all get output. llama-server serialises via 1 slot (default). Commit `a6e647c`. (Charon, 19 Feb 2026)
 
 ## Phase 3: Model Support
 
