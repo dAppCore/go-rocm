@@ -33,9 +33,11 @@ The Ryzen 9 9950X iGPU shows up as ROCm Device 1, reports 100GB free (system RAM
 
 ## Phase 3: Model Support
 
-- [ ] **GGUF model discovery** — Implement model path scanning: find .gguf files, parse metadata (model name, params, quant level, size). Return structured inventory.
-- [ ] **Chat templates** — llama-server handles chat templates natively via `--chat-template`. Verify Gemma3, Qwen3, Llama3 templates work. If not, add template formatting in model.go.
-- [ ] **Context window sizing** — Auto-detect optimal context window from model metadata. Default to 4096 if unknown.
+- [x] **GGUF metadata parser** — `internal/gguf/` reads GGUF v2/v3 binary headers. Extracts architecture, name, file type, size label, context length, block count. String length limits for malformed input protection. Commit `c7c9389`. (Charon, 19 Feb 2026)
+- [x] **GGUF model discovery** — `DiscoverModels(dir)` scans directory for `.gguf` files, parses metadata via GGUF parser, returns `[]ModelInfo`. Commit `af23565`. (Charon, 19 Feb 2026)
+- [x] **LoadModel enrichment** — Replaced `guessModelType` with GGUF metadata for real architecture. Auto-caps context at 4096 when user doesn't specify. Commit `2c77f6f`. (Charon, 19 Feb 2026)
+- [x] **Chat templates** — llama-server reads `tokenizer.chat_template` from GGUF natively on `/v1/chat/completions`. No go-rocm code needed. Verified with Gemma3 integration test. (Charon, 19 Feb 2026)
+- [x] **Context window sizing** — Auto-detected from GGUF metadata. Default caps at `min(model_context_length, 4096)` to prevent VRAM exhaustion. (Charon, 19 Feb 2026)
 
 ## Phase 4: Performance
 

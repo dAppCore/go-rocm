@@ -250,3 +250,39 @@ Note: sysfs reads are non-atomic. Total and Used are read separately, so transie
 ### lastErr Design Limitation
 
 `rocmModel.lastErr` is a single mutex-protected field shared across all callers. With concurrent Generate/Chat calls, errors can be clobbered (last writer wins). `Err()` is only reliable in single-caller scenarios. This matches the go-inference interface contract (single `Err() error` method), so it's a known limitation, not a bug. Per-call error returns would require an interface change in go-inference.
+
+---
+
+## 2026-02-19: Phase 3 Model Support (Charon)
+
+### GGUF Metadata Parser
+
+New `internal/gguf/` package reads GGUF v2/v3 binary headers. Extracts metadata KV pairs without reading tensor data (<1ms per file). Supports all 13 GGUF value types (uint8..float64, string, array, bool). String length capped at 1 MiB to prevent memory exhaustion from malformed files. Handles uint64 values for context_length/block_count (some producers use uint64 instead of uint32).
+
+### Model Inventory
+
+Discovered models from `/data/lem/gguf/` using GGUF metadata:
+
+| Model | Architecture | Size | Quant | Context | Blocks |
+|-------|-------------|------|-------|---------|--------|
+| Gemma3-1B Q5_K_M | gemma3 | 1B | Q5_K_M | 32768 | 26 |
+| Gemma3-1B Q8_0 | gemma3 | 1B | Q8_0 | 32768 | 26 |
+| Gemma3-4B Q4_K_M | gemma3 | 4B | Q4_K_M | 131072 | 34 |
+| Gemma3-12B Q4_K_M | gemma3 | 12B | Q4_K_M | 131072 | 42 |
+| Gemma3-27B Q4_K_M | gemma3 | 27B | Q4_K_M | 131072 | 46 |
+| Llama-3.1-8B Q4_K_M | llama | 8B | Q4_K_M | 131072 | 32 |
+| Mistral-7B-v0.3 Q4_K_M | llama | 7B | Q4_K_M | 32768 | 32 |
+| Qwen-2.5-7B Q4_K_M | qwen2 | 7B | Q4_K_M | 32768 | 28 |
+
+Key observations:
+- Mistral-7B-v0.3 reports `general.architecture = "llama"` (correct — Mistral is a Llama architecture variant). Old `guessModelType` returned "mistral", GGUF metadata returns "llama".
+- Qwen-2.5-7B reports `general.architecture = "qwen2"` (not "qwen3"). Old `guessModelType` would have returned "qwen" due to filename matching.
+- Gemma3-4B/12B/27B have 131072 native context — without auto-capping at 4096, these would exhaust VRAM.
+
+### Chat Templates
+
+llama-server reads `tokenizer.chat_template` from the GGUF and applies it automatically on `/v1/chat/completions`. No go-rocm code needed. Verified working with Gemma3 integration tests.
+
+### Context Window Auto-Detection
+
+Default context capped at `min(model_context_length, 4096)` when user doesn't specify `inference.WithContextLen(N)`. Without this cap, Llama-3.1 would try to allocate 131072 context (~4GB KV cache), which combined with model weights would not fit in 16GB VRAM for larger models.

@@ -5,6 +5,7 @@ package rocm
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -197,5 +198,23 @@ func TestROCm_ConcurrentRequests(t *testing.T) {
 	for i, result := range results {
 		t.Logf("Goroutine %d: %s", i, result)
 		assert.NotEmpty(t, result, "goroutine %d produced no output", i)
+	}
+}
+
+func TestROCm_DiscoverModels(t *testing.T) {
+	dir := filepath.Dir(testModel)
+	if _, err := os.Stat(dir); err != nil {
+		t.Skip("model directory not available")
+	}
+
+	models, err := DiscoverModels(dir)
+	require.NoError(t, err)
+	require.NotEmpty(t, models, "expected at least one model in %s", dir)
+
+	for _, m := range models {
+		t.Logf("Found: %s (%s %s %s, ctx=%d)", filepath.Base(m.Path), m.Architecture, m.Parameters, m.Quantisation, m.ContextLen)
+		assert.NotEmpty(t, m.Architecture)
+		assert.NotEmpty(t, m.Name)
+		assert.Greater(t, m.FileSize, int64(0))
 	}
 }
