@@ -30,3 +30,14 @@ type VRAMInfo struct {
 	Used  uint64
 	Free  uint64
 }
+
+// ModelInfo describes a GGUF model file discovered on disk.
+type ModelInfo struct {
+	Path         string // full path to .gguf file
+	Architecture string // GGUF architecture (e.g. "gemma3", "llama", "qwen2")
+	Name         string // human-readable model name from GGUF metadata
+	Quantisation string // quantisation level (e.g. "Q4_K_M", "Q8_0")
+	Parameters   string // parameter size label (e.g. "1B", "8B")
+	FileSize     int64  // file size in bytes
+	ContextLen   uint32 // native context window length
+}
