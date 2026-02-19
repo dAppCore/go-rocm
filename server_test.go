@@ -3,10 +3,13 @@
 package rocm
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
 
+	"forge.lthn.ai/core/go-inference"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -94,4 +97,51 @@ func TestGuessModelType(t *testing.T) {
 			assert.Equal(t, tt.expected, guessModelType(tt.path))
 		})
 	}
+}
+
+func TestServerAlive_Running(t *testing.T) {
+	s := &server{exited: make(chan struct{})}
+	assert.True(t, s.alive())
+}
+
+func TestServerAlive_Exited(t *testing.T) {
+	exited := make(chan struct{})
+	close(exited)
+	s := &server{exited: exited, exitErr: fmt.Errorf("process killed")}
+	assert.False(t, s.alive())
+}
+
+func TestGenerate_ServerDead(t *testing.T) {
+	exited := make(chan struct{})
+	close(exited)
+	s := &server{
+		exited:  exited,
+		exitErr: fmt.Errorf("process killed"),
+	}
+	m := &rocmModel{srv: s}
+
+	var count int
+	for range m.Generate(context.Background(), "hello") {
+		count++
+	}
+	assert.Equal(t, 0, count)
+	assert.ErrorContains(t, m.Err(), "server has exited")
+}
+
+func TestChat_ServerDead(t *testing.T) {
+	exited := make(chan struct{})
+	close(exited)
+	s := &server{
+		exited:  exited,
+		exitErr: fmt.Errorf("process killed"),
+	}
+	m := &rocmModel{srv: s}
+
+	msgs := []inference.Message{{Role: "user", Content: "hello"}}
+	var count int
+	for range m.Chat(context.Background(), msgs) {
+		count++
+	}
+	assert.Equal(t, 0, count)
+	assert.ErrorContains(t, m.Err(), "server has exited")
 }

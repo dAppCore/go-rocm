@@ -25,6 +25,16 @@ type server struct {
 	exitErr error
 }
 
+// alive reports whether the llama-server process is still running.
+func (s *server) alive() bool {
+	select {
+	case <-s.exited:
+		return false
+	default:
+		return true
+	}
+}
+
 // findLlamaServer locates the llama-server binary.
 // Checks ROCM_LLAMA_SERVER_PATH first, then PATH.
 func findLlamaServer() (string, error) {
