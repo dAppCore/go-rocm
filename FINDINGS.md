@@ -185,6 +185,8 @@ Token IDs are available via `logprobs: true` in the request, but this adds overh
 
 **Decision needed from Virgil:** Does any consumer (go-ml, go-i18n, go-ai) rely on `Token.ID`? If only `Token.Text` is used downstream, ID=0 is acceptable for Phase 1. If ID is needed, we'll add logprobs parsing.
 
+**ANSWER (Charon, 19 Feb 2026):** Token.ID = 0 is acceptable for Phase 1. No downstream consumer uses Token.ID today — go-ml's scoring engine and go-i18n both only read Token.Text. If a consumer needs IDs later, add logprobs parsing in Phase 2. Don't over-engineer now.
+
 ### QUESTION: StopTokens type mismatch
 
 `GenerateConfig.StopTokens` is `[]int32` (token IDs), but llama-server's OpenAI-compatible API expects `"stop"` as `[]string` (text sequences). These are fundamentally different — token IDs cannot be mapped to stop strings without a tokeniser.
@@ -195,3 +197,34 @@ Options:
 3. Add `StopStrings []string` to `GenerateConfig` in go-inference alongside the existing `StopTokens []int32`, let each backend use whichever it supports
 
 **Decision needed from Virgil:** Which approach? Option 3 would be a go-inference interface change. Option 1 is simplest for now — go-rocm silently ignores StopTokens if set.
+
+**ANSWER (Charon, 19 Feb 2026):** Option 1 — ignore StopTokens in Phase 1. No consumer uses them yet. The go-inference interface change (Option 3) should come from a real need, not a hypothetical one. YAGNI.
+
+---
+
+## 2026-02-19: Phase 1 Plan Review (Charon)
+
+### Verdict: Approved
+
+Design and implementation plan reviewed. The layered architecture (internal/llamacpp → server → model → backend) is correct. 8-task TDD breakdown is solid. Tasks 1-6 unit-testable without GPU, Task 7 needs hardware.
+
+### Notes for Implementation
+
+1. **guessModelType() filename parsing** — Pragmatic but fragile. Fine for Phase 1. llama-server's `/props` endpoint returns the actual architecture. Note as a Phase 2 upgrade.
+
+2. **serverEnv() HIP_VISIBLE_DEVICES override** — Current approach appends `HIP_VISIBLE_DEVICES=0` to `os.Environ()`. If the user already has `HIP_VISIBLE_DEVICES` set, both values exist in the env slice. Last-write-wins behaviour depends on the kernel and is platform-specific. Safer to filter the existing value out first:
+
+   ```go
+   func serverEnv() []string {
+       env := os.Environ()
+       filtered := make([]string, 0, len(env)+1)
+       for _, e := range env {
+           if !strings.HasPrefix(e, "HIP_VISIBLE_DEVICES=") {
+               filtered = append(filtered, e)
+           }
+       }
+       return append(filtered, "HIP_VISIBLE_DEVICES=0")
+   }
+   ```
+
+3. **`//go:build rocm` for integration tests** — Good call. Keeps `go test ./...` fast on machines without GPU.
