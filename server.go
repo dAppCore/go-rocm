@@ -131,8 +131,17 @@ func startServer(binary, modelPath string, gpuLayers, ctxSize int) (*server, err
 			return s, nil
 		}
 
-		_ = s.stop()
-		lastErr = fmt.Errorf("attempt %d: %w", attempt+1, err)
+		// Only retry if the process actually exited (e.g. port conflict).
+		// A timeout means the server is stuck, not a port issue.
+		select {
+		case <-s.exited:
+			_ = s.stop()
+			lastErr = fmt.Errorf("attempt %d: %w", attempt+1, err)
+			continue
+		default:
+			_ = s.stop()
+			return nil, fmt.Errorf("rocm: llama-server not ready: %w", err)
+		}
 	}
 
 	return nil, fmt.Errorf("rocm: server failed after %d attempts: %w", maxAttempts, lastErr)
