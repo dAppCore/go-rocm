@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 )
@@ -39,7 +40,8 @@ func (c *Client) Health(ctx context.Context) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("llamacpp: health returned %d", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return fmt.Errorf("llamacpp: health returned %d: %s", resp.StatusCode, string(body))
 	}
 	var h healthResponse
 	if err := json.NewDecoder(resp.Body).Decode(&h); err != nil {
