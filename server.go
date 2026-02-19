@@ -22,7 +22,7 @@ type server struct {
 	port    int
 	client  *llamacpp.Client
 	exited  chan struct{}
-	exitErr error
+	exitErr error // safe to read only after <-exited
 }
 
 // alive reports whether the llama-server process is still running.

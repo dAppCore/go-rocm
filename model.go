@@ -25,7 +25,11 @@ type rocmModel struct {
 func (m *rocmModel) Generate(ctx context.Context, prompt string, opts ...inference.GenerateOption) iter.Seq[inference.Token] {
 	if !m.srv.alive() {
 		m.mu.Lock()
-		m.lastErr = fmt.Errorf("rocm: server has exited: %w", m.srv.exitErr)
+		if m.srv.exitErr != nil {
+			m.lastErr = fmt.Errorf("rocm: server has exited: %w", m.srv.exitErr)
+		} else {
+			m.lastErr = fmt.Errorf("rocm: server has exited unexpectedly")
+		}
 		m.mu.Unlock()
 		return func(yield func(inference.Token) bool) {}
 	}
@@ -61,7 +65,11 @@ func (m *rocmModel) Generate(ctx context.Context, prompt string, opts ...inferen
 func (m *rocmModel) Chat(ctx context.Context, messages []inference.Message, opts ...inference.GenerateOption) iter.Seq[inference.Token] {
 	if !m.srv.alive() {
 		m.mu.Lock()
-		m.lastErr = fmt.Errorf("rocm: server has exited: %w", m.srv.exitErr)
+		if m.srv.exitErr != nil {
+			m.lastErr = fmt.Errorf("rocm: server has exited: %w", m.srv.exitErr)
+		} else {
+			m.lastErr = fmt.Errorf("rocm: server has exited unexpectedly")
+		}
 		m.mu.Unlock()
 		return func(yield func(inference.Token) bool) {}
 	}
