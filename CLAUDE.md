@@ -8,7 +8,7 @@ Implements `inference.Backend` and `inference.TextModel` (from `core/go-inferenc
 
 ## Target Hardware
 
-- **GPU**: AMD Radeon RX 7800 XT (gfx1101, RDNA 3, 16GB VRAM)
+- **GPU**: AMD Radeon RX 7800 XT (gfx1100, RDNA 3, 16GB VRAM) — NOTE: gfx1100 not gfx1101
 - **OS**: Ubuntu 24.04 LTS (linux/amd64)
 - **ROCm**: 6.x+ (gfx1100/gfx1101 officially supported)
 - **Kernel**: 6.10+ recommended for RDNA 3 stability

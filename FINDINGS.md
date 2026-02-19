@@ -92,3 +92,83 @@ The go-mlx package uses direct CGO because MLX is a C library designed for embed
 | Chat templates | Built into model code | llama-server `--chat-template` |
 
 Both register as `inference.Backend` via build-tagged `init()`. go-ml wraps both transparently.
+
+---
+
+## 2026-02-19: Phase 0 Environment Validation (Charon)
+
+### Actual Hardware (corrected from Virgil's notes)
+
+- **GPU arch**: gfx1100 (NOT gfx1101 — `rocminfo` confirms)
+- **ROCm version**: 7.2.0 (newer than the 6.x minimum)
+- **Kernel**: 6.17.0-14-generic
+- **`/dev/kfd`**: Present, working
+- **HSA_OVERRIDE_GFX_VERSION**: Not needed — native gfx1100
+
+### llama-server Build
+
+- **Source**: llama.cpp commit `11c325c` (cloned 19 Feb 2026)
+- **Local build path**: `/home/claude/llama.cpp/build/bin/llama-server`
+- **Installed to**: `/usr/local/bin/llama-server`
+- **Build command**:
+  ```bash
+  cmake -B build \
+      -DGGML_HIP=ON \
+      -DAMDGPU_TARGETS=gfx1100 \
+      -DGGML_HIP_ROCWMMA_FATTN=ON \
+      -DCMAKE_BUILD_TYPE=Release
+  cmake --build build --parallel $(nproc) -t llama-server
+  ```
+
+### Critical: iGPU Crash
+
+**The Ryzen 9 9950X has an integrated GPU** that ROCm detects as a second device:
+- Device 0: AMD Radeon RX 7800 XT (gfx1100) — 16GB VRAM (real)
+- Device 1: AMD Radeon Graphics (gfx1100) — reports 100GB free (system RAM, misleading)
+
+llama-server's auto-fit logic tries to split the model across both devices. Loading tensors to Device 1 (iGPU) causes **`ROCm error: unspecified launch failure`** and crashes with a core dump.
+
+**Fix**: Set `HIP_VISIBLE_DEVICES=0` to mask the iGPU. The go-rocm package MUST set this env var before spawning llama-server.
+
+### Baseline Benchmarks — Gemma3-4B-Q4_K_M
+
+| Metric | Value |
+|--------|-------|
+| Model | LEK-Gemma3-4B-Q4_K_M (2.66 GiB) |
+| VRAM used | ~3.4 GiB of 16 GiB |
+| Prefill (prompt) | 396 tok/s (2.5ms/tok) |
+| Decode (generation) | 109 tok/s (9.2ms/tok) |
+| Time to first token | ~40ms (16 token prompt) |
+| Startup time | ~6s (load + warmup) |
+| Context window | 4096 (model supports 131072) |
+| Flash attention | Auto-enabled |
+| Slots | 4 concurrent |
+
+### GGUF Models Available
+
+All at `/data/lem/gguf/` (SMB mount from M3):
+
+| Model | Size | Fits 16GB? |
+|-------|------|-----------|
+| LEK-Gemma3-1B-layered-v2-Q5_K_M | ~0.9G | Yes |
+| LEK-Gemma3-1B-layered-v2-Q8_0 | ~1.4G | Yes |
+| LEK-Gemma3-4B-Q4_K_M | 2.7G | Yes |
+| LEK-Gemma3-12B-Q4_K_M | ~7.5G | Yes |
+| LEK-Gemma3-27B-Q4_K_M | ~16G | Tight |
+| LEK-Llama-3.1-8B-Q4_K_M | ~5G | Yes |
+| LEK-Mistral-7B-v0.3-Q4_K_M | ~4G | Yes |
+| LEK-Qwen-2.5-7B-Q4_K_M | ~4G | Yes |
+
+### Environment Variables for go-rocm
+
+The server.go implementation MUST set these when spawning:
+
+```go
+cmd.Env = append(os.Environ(),
+    "HIP_VISIBLE_DEVICES=0",  // Critical: mask iGPU to prevent crash
+)
+```
+
+### Model Path Note
+
+Models are on SMB mount (`/data` = `//10.69.69.108/Data`). For CI/testing, copy a small model locally or use `t.Skip()` when the mount is unavailable.

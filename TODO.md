@@ -6,10 +6,14 @@ Dispatched from core/go orchestration. Pick up tasks in order.
 
 ## Phase 0: Environment Setup (on Linux homelab)
 
-- [ ] **Install ROCm 6.x** — Follow [ROCm install guide](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/). Ubuntu 24.04 recommended. Verify with `rocm-smi` showing RX 7800 XT.
-- [ ] **Build llama-server with HIP** — Clone llama.cpp, build with `-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100 -DGGML_HIP_ROCWMMA_FATTN=ON`. Verify binary runs: `llama-server --help`.
-- [ ] **Test manual inference** — Download a GGUF model (e.g. Qwen3-8B-Q4_K_M). Run `llama-server --model /path/to/model.gguf -ngl 99`. Test with curl against the OpenAI-compatible API. Record tokens/sec.
-- [ ] **HSA_OVERRIDE_GFX_VERSION benchmark** — Test with `11.0.0` vs `11.0.1` vs unset. The RX 7800 XT is gfx1101 but gfx1100 codegen may be faster. Record results in FINDINGS.md.
+- [x] **Install ROCm 6.x** — ROCm 7.2.0 already installed. `rocm-smi` shows RX 7800 XT (gfx1100). Kernel 6.17.0. (Charon, 19 Feb 2026)
+- [x] **Build llama-server with HIP** — Built from llama.cpp `11c325c`. Installed to `/usr/local/bin/llama-server`. (Charon, 19 Feb 2026)
+- [x] **Test manual inference** — Gemma3-4B-Q4_K_M: 109 tok/s decode, 396 tok/s prefill. See FINDINGS.md for full results. (Charon, 19 Feb 2026)
+- [x] **HSA_OVERRIDE_GFX_VERSION benchmark** — N/A: GPU is actually gfx1100 (not gfx1101 as Virgil noted). No override needed. (Charon, 19 Feb 2026)
+
+### Critical Discovery: iGPU Crash
+
+The Ryzen 9 9950X iGPU shows up as ROCm Device 1, reports 100GB free (system RAM), and crashes llama-server when it tries to split tensors across devices. **`HIP_VISIBLE_DEVICES=0` is REQUIRED** when spawning llama-server. See FINDINGS.md for details.
 
 ## Phase 1: Core Implementation
 
@@ -58,7 +62,8 @@ Download to `/data/models/` (or wherever the homelab stores data):
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `ROCM_LLAMA_SERVER_PATH` | `llama-server` (PATH lookup) | Path to llama-server binary |
-| `HSA_OVERRIDE_GFX_VERSION` | unset | Override GPU arch for ROCm compiler |
+| `HIP_VISIBLE_DEVICES` | `0` (MUST set) | Mask iGPU — Ryzen 9 iGPU crashes llama-server |
+| `HSA_OVERRIDE_GFX_VERSION` | unset | Not needed (GPU is native gfx1100) |
 | `ROCM_MODEL_DIR` | none | Default directory for model discovery |
 
 ## Upstream Dependencies
