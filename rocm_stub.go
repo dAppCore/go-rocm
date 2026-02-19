@@ -2,6 +2,13 @@
 
 package rocm
 
+import "fmt"
+
 // ROCmAvailable reports whether ROCm GPU inference is available.
 // Returns false on non-Linux or non-amd64 platforms.
 func ROCmAvailable() bool { return false }
+
+// GetVRAMInfo is not available on non-Linux/non-amd64 platforms.
+func GetVRAMInfo() (VRAMInfo, error) {
+	return VRAMInfo{}, fmt.Errorf("rocm: VRAM monitoring not available on this platform")
+}

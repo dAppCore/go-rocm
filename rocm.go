@@ -23,3 +23,10 @@
 //   - ROCm 6.x+ installed
 //   - llama-server binary (from llama.cpp built with -DGGML_HIP=ON)
 package rocm
+
+// VRAMInfo reports GPU video memory usage in bytes.
+type VRAMInfo struct {
+	Total uint64
+	Used  uint64
+	Free  uint64
+}
