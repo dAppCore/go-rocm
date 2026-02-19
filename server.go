@@ -81,7 +81,7 @@ func serverEnv() []string {
 // startServer spawns llama-server and waits for it to become ready.
 // It selects a free port automatically, retrying up to 3 times if the
 // process exits during startup (e.g. port conflict).
-func startServer(binary, modelPath string, gpuLayers, ctxSize int) (*server, error) {
+func startServer(binary, modelPath string, gpuLayers, ctxSize, parallelSlots int) (*server, error) {
 	if gpuLayers < 0 {
 		gpuLayers = 999
 	}
@@ -103,6 +103,9 @@ func startServer(binary, modelPath string, gpuLayers, ctxSize int) (*server, err
 		}
 		if ctxSize > 0 {
 			args = append(args, "--ctx-size", strconv.Itoa(ctxSize))
+		}
+		if parallelSlots > 0 {
+			args = append(args, "--parallel", strconv.Itoa(parallelSlots))
 		}
 
 		cmd := exec.Command(binary, args...)

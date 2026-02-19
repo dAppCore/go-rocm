@@ -49,7 +49,7 @@ func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (infe
 		ctxLen = int(min(meta.ContextLength, 4096))
 	}
 
-	srv, err := startServer(binary, path, cfg.GPULayers, ctxLen)
+	srv, err := startServer(binary, path, cfg.GPULayers, ctxLen, cfg.ParallelSlots)
 	if err != nil {
 		return nil, err
 	}
