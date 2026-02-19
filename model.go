@@ -23,6 +23,10 @@ type rocmModel struct {
 
 // Generate streams tokens for the given prompt via llama-server's /v1/completions endpoint.
 func (m *rocmModel) Generate(ctx context.Context, prompt string, opts ...inference.GenerateOption) iter.Seq[inference.Token] {
+	m.mu.Lock()
+	m.lastErr = nil
+	m.mu.Unlock()
+
 	if !m.srv.alive() {
 		m.mu.Lock()
 		if m.srv.exitErr != nil {
@@ -63,6 +67,10 @@ func (m *rocmModel) Generate(ctx context.Context, prompt string, opts ...inferen
 
 // Chat streams tokens from a multi-turn conversation via llama-server's /v1/chat/completions endpoint.
 func (m *rocmModel) Chat(ctx context.Context, messages []inference.Message, opts ...inference.GenerateOption) iter.Seq[inference.Token] {
+	m.mu.Lock()
+	m.lastErr = nil
+	m.mu.Unlock()
+
 	if !m.srv.alive() {
 		m.mu.Lock()
 		if m.srv.exitErr != nil {
