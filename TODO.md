@@ -17,11 +17,11 @@ The Ryzen 9 9950X iGPU shows up as ROCm Device 1, reports 100GB free (system RAM
 
 ## Phase 1: Core Implementation
 
-- [ ] **GPU detection** — Implement `Available()` in backend.go. Check: `/dev/kfd` exists (ROCm kernel driver), `rocm-smi` detects GPU, llama-server binary is findable (PATH or `ROCM_LLAMA_SERVER_PATH` env).
-- [ ] **Server lifecycle** — Create `server.go`: spawn llama-server with `--model`, `--port` (random free port), `--n-gpu-layers` (from LoadConfig.GPULayers), `--ctx-size` (from LoadConfig.ContextLen). Wait for `/health` endpoint. Handle SIGTERM on Close().
-- [ ] **HTTP client** — Create `internal/llamacpp/client.go`: POST `/v1/chat/completions` with streaming (SSE). Parse `data: {"choices":[{"delta":{"content":"..."}}]}` into inference.Token stream.
-- [ ] **TextModel implementation** — Create `model.go`: implement inference.TextModel wrapping the HTTP client. Generate() sends single-turn prompt, Chat() sends multi-turn messages. Both stream via iter.Seq[Token]. Err() returns last error.
-- [ ] **Integration test** — Test end-to-end: LoadModel → Generate → tokens received → Close. Requires GGUF model on disk. Use `t.Skip()` when model/GPU unavailable.
+- [x] **GPU detection** — `Available()` checks `/dev/kfd` + `findLlamaServer()`. Commit `1d8d65f`. (19 Feb 2026)
+- [x] **Server lifecycle** — `server.go`: spawn, health poll (100ms/60s timeout), SIGTERM/SIGKILL shutdown. `serverEnv()` filters HIP_VISIBLE_DEVICES. Commit `9aa7f62`. (19 Feb 2026)
+- [x] **HTTP client** — `internal/llamacpp/`: health check, SSE parser, ChatComplete + Complete with `iter.Seq[string]`. Commits `3c75677`, `def3167`. (19 Feb 2026)
+- [x] **TextModel implementation** — `model.go`: wraps llamacpp client, maps inference types, mutex-protected Err(). Commit `a8c4947`. (19 Feb 2026)
+- [x] **Integration test** — 3 tests (Generate, Chat, ContextCancellation) with Gemma3-1B on RX 7800 XT. All pass. Commit `0e68d71`. (19 Feb 2026)
 
 ## Phase 2: Robustness
 
