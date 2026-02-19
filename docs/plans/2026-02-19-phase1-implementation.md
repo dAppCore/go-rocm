@@ -582,6 +582,7 @@ package rocm
 
 import (
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -627,26 +628,26 @@ func TestFreePort_UniquePerCall(t *testing.T) {
 
 func TestServerEnv_HIPVisibleDevices(t *testing.T) {
 	env := serverEnv()
-	found := false
-	for _, e := range env {
-		if e == "HIP_VISIBLE_DEVICES=0" {
-			found = true
-			break
-		}
-	}
-	assert.True(t, found, "HIP_VISIBLE_DEVICES=0 must be in server env")
-
-	// Also verify it overrides any existing setting
-	t.Setenv("HIP_VISIBLE_DEVICES", "1")
-	env = serverEnv()
-	// The last occurrence wins — ours must be present
 	var hipVals []string
 	for _, e := range env {
-		if len(e) > 20 && e[:20] == "HIP_VISIBLE_DEVICES=" {
+		if strings.HasPrefix(e, "HIP_VISIBLE_DEVICES=") {
 			hipVals = append(hipVals, e)
 		}
 	}
-	assert.Contains(t, hipVals, "HIP_VISIBLE_DEVICES=0")
+	assert.Equal(t, []string{"HIP_VISIBLE_DEVICES=0"}, hipVals)
+}
+
+func TestServerEnv_FiltersExistingHIP(t *testing.T) {
+	t.Setenv("HIP_VISIBLE_DEVICES", "1")
+	env := serverEnv()
+	var hipVals []string
+	for _, e := range env {
+		if strings.HasPrefix(e, "HIP_VISIBLE_DEVICES=") {
+			hipVals = append(hipVals, e)
+		}
+	}
+	// Must filter the old value and only have our override
+	assert.Equal(t, []string{"HIP_VISIBLE_DEVICES=0"}, hipVals)
 }
 ```
 
@@ -670,6 +671,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -713,9 +715,16 @@ func freePort() (int, error) {
 }
 
 // serverEnv returns the environment for the llama-server subprocess.
-// Always includes HIP_VISIBLE_DEVICES=0 to mask the iGPU.
+// Filters any existing HIP_VISIBLE_DEVICES and sets it to 0 to mask the iGPU.
 func serverEnv() []string {
-	return append(os.Environ(), "HIP_VISIBLE_DEVICES=0")
+	env := os.Environ()
+	filtered := make([]string, 0, len(env)+1)
+	for _, e := range env {
+		if !strings.HasPrefix(e, "HIP_VISIBLE_DEVICES=") {
+			filtered = append(filtered, e)
+		}
+	}
+	return append(filtered, "HIP_VISIBLE_DEVICES=0")
 }
 
 // startServer spawns llama-server and waits for it to become ready.
