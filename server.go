@@ -79,51 +79,63 @@ func serverEnv() []string {
 }
 
 // startServer spawns llama-server and waits for it to become ready.
-func startServer(binary, modelPath string, port, gpuLayers, ctxSize int) (*server, error) {
+// It selects a free port automatically, retrying up to 3 times if the
+// process exits during startup (e.g. port conflict).
+func startServer(binary, modelPath string, gpuLayers, ctxSize int) (*server, error) {
 	if gpuLayers < 0 {
 		gpuLayers = 999
 	}
 
-	args := []string{
-		"--model", modelPath,
-		"--host", "127.0.0.1",
-		"--port", strconv.Itoa(port),
-		"--n-gpu-layers", strconv.Itoa(gpuLayers),
-	}
-	if ctxSize > 0 {
-		args = append(args, "--ctx-size", strconv.Itoa(ctxSize))
-	}
+	const maxAttempts = 3
+	var lastErr error
 
-	cmd := exec.Command(binary, args...)
-	cmd.Env = serverEnv()
+	for attempt := range maxAttempts {
+		port, err := freePort()
+		if err != nil {
+			return nil, fmt.Errorf("rocm: find free port: %w", err)
+		}
 
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start llama-server: %w", err)
-	}
+		args := []string{
+			"--model", modelPath,
+			"--host", "127.0.0.1",
+			"--port", strconv.Itoa(port),
+			"--n-gpu-layers", strconv.Itoa(gpuLayers),
+		}
+		if ctxSize > 0 {
+			args = append(args, "--ctx-size", strconv.Itoa(ctxSize))
+		}
 
-	s := &server{
-		cmd:    cmd,
-		port:   port,
-		client: llamacpp.NewClient(fmt.Sprintf("http://127.0.0.1:%d", port)),
-		exited: make(chan struct{}),
-	}
+		cmd := exec.Command(binary, args...)
+		cmd.Env = serverEnv()
 
-	// Goroutine to detect process exit.
-	go func() {
-		s.exitErr = cmd.Wait()
-		close(s.exited)
-	}()
+		if err := cmd.Start(); err != nil {
+			return nil, fmt.Errorf("start llama-server: %w", err)
+		}
 
-	// Wait for the health endpoint with a 60s timeout.
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+		s := &server{
+			cmd:    cmd,
+			port:   port,
+			client: llamacpp.NewClient(fmt.Sprintf("http://127.0.0.1:%d", port)),
+			exited: make(chan struct{}),
+		}
 
-	if err := s.waitReady(ctx); err != nil {
+		go func() {
+			s.exitErr = cmd.Wait()
+			close(s.exited)
+		}()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		err = s.waitReady(ctx)
+		cancel()
+		if err == nil {
+			return s, nil
+		}
+
 		_ = s.stop()
-		return nil, fmt.Errorf("llama-server not ready: %w", err)
+		lastErr = fmt.Errorf("attempt %d: %w", attempt+1, err)
 	}
 
-	return s, nil
+	return nil, fmt.Errorf("rocm: server failed after %d attempts: %w", maxAttempts, lastErr)
 }
 
 // waitReady polls the health endpoint until the server is ready.

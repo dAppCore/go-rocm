@@ -3,7 +3,6 @@
 package rocm
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,12 +36,7 @@ func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (infe
 		return nil, err
 	}
 
-	port, err := freePort()
-	if err != nil {
-		return nil, fmt.Errorf("rocm: find free port: %w", err)
-	}
-
-	srv, err := startServer(binary, path, port, cfg.GPULayers, cfg.ContextLen)
+	srv, err := startServer(binary, path, cfg.GPULayers, cfg.ContextLen)
 	if err != nil {
 		return nil, err
 	}

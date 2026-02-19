@@ -128,6 +128,14 @@ func TestGenerate_ServerDead(t *testing.T) {
 	assert.ErrorContains(t, m.Err(), "server has exited")
 }
 
+func TestStartServer_RetriesOnProcessExit(t *testing.T) {
+	// /bin/false starts successfully but exits immediately with code 1.
+	// startServer should retry up to 3 times, then fail.
+	_, err := startServer("/bin/false", "/nonexistent/model.gguf", 999, 0)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed after 3 attempts")
+}
+
 func TestChat_ServerDead(t *testing.T) {
 	exited := make(chan struct{})
 	close(exited)
