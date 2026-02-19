@@ -3,11 +3,11 @@
 package rocm
 
 import (
+	"fmt"
 	"os"
-	"path/filepath"
-	"strings"
 
 	"forge.lthn.ai/core/go-inference"
+	"forge.lthn.ai/core/go-rocm/internal/gguf"
 )
 
 // rocmBackend implements inference.Backend for AMD ROCm GPUs.
@@ -28,6 +28,9 @@ func (b *rocmBackend) Available() bool {
 }
 
 // LoadModel loads a GGUF model onto the AMD GPU via llama-server.
+// Model architecture is read from GGUF metadata (replacing filename-based guessing).
+// If no context length is specified, defaults to min(model_context_length, 4096)
+// to prevent VRAM exhaustion on models with 128K+ native context.
 func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (inference.TextModel, error) {
 	cfg := inference.ApplyLoadOpts(opts)
 
@@ -36,26 +39,23 @@ func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (infe
 		return nil, err
 	}
 
-	srv, err := startServer(binary, path, cfg.GPULayers, cfg.ContextLen)
+	meta, err := gguf.ReadMetadata(path)
+	if err != nil {
+		return nil, fmt.Errorf("rocm: read model metadata: %w", err)
+	}
+
+	ctxLen := cfg.ContextLen
+	if ctxLen == 0 && meta.ContextLength > 0 {
+		ctxLen = int(min(meta.ContextLength, 4096))
+	}
+
+	srv, err := startServer(binary, path, cfg.GPULayers, ctxLen)
 	if err != nil {
 		return nil, err
 	}
 
 	return &rocmModel{
 		srv:       srv,
-		modelType: guessModelType(path),
+		modelType: meta.Architecture,
 	}, nil
-}
-
-// guessModelType extracts a model type hint from the filename.
-// Hyphens are stripped so that "Llama-3" matches "llama3".
-func guessModelType(path string) string {
-	name := strings.ToLower(filepath.Base(path))
-	name = strings.ReplaceAll(name, "-", "")
-	for _, arch := range []string{"gemma3", "gemma2", "gemma", "qwen3", "qwen2", "qwen", "llama3", "llama", "mistral", "phi"} {
-		if strings.Contains(name, arch) {
-			return arch
-		}
-	}
-	return "unknown"
 }

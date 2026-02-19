@@ -81,23 +81,6 @@ func TestAvailable(t *testing.T) {
 	assert.True(t, b.Available())
 }
 
-func TestGuessModelType(t *testing.T) {
-	tests := []struct {
-		path     string
-		expected string
-	}{
-		{"/data/lem/gguf/LEK-Gemma3-4B-Q4_K_M.gguf", "gemma3"},
-		{"/data/models/Qwen3-8B-Q4_K_M.gguf", "qwen3"},
-		{"/data/models/Llama-3.1-8B-Q4_K_M.gguf", "llama3"},
-		{"/data/models/Mistral-7B-v0.3-Q4_K_M.gguf", "mistral"},
-		{"/data/models/random-model.gguf", "unknown"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.expected, func(t *testing.T) {
-			assert.Equal(t, tt.expected, guessModelType(tt.path))
-		})
-	}
-}
 
 func TestServerAlive_Running(t *testing.T) {
 	s := &server{exited: make(chan struct{})}
