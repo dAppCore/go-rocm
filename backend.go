@@ -2,27 +2,66 @@
 
 package rocm
 
-import "forge.lthn.ai/core/go-inference"
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"forge.lthn.ai/core/go-inference"
+)
 
 // rocmBackend implements inference.Backend for AMD ROCm GPUs.
-// Uses llama-server (llama.cpp built with HIP) as the inference engine.
 type rocmBackend struct{}
 
 func (b *rocmBackend) Name() string { return "rocm" }
 
+// Available reports whether ROCm GPU inference can run on this machine.
+// Checks for the ROCm kernel driver (/dev/kfd) and a findable llama-server binary.
 func (b *rocmBackend) Available() bool {
-	// TODO: Check for ROCm runtime + GPU presence
-	// - /dev/kfd exists (ROCm kernel driver)
-	// - rocm-smi detects a GPU
-	// - llama-server binary is findable
-	return false // Stub until Phase 1 implementation
+	if _, err := os.Stat("/dev/kfd"); err != nil {
+		return false
+	}
+	if _, err := findLlamaServer(); err != nil {
+		return false
+	}
+	return true
 }
 
+// LoadModel loads a GGUF model onto the AMD GPU via llama-server.
 func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (inference.TextModel, error) {
-	// TODO: Phase 1 implementation
-	// 1. Find llama-server binary (PATH or configured location)
-	// 2. Spawn llama-server with --model path --port <free> --n-gpu-layers cfg.GPULayers
-	// 3. Wait for health endpoint to respond
-	// 4. Return rocmModel wrapping the HTTP client
-	return nil, nil
+	cfg := inference.ApplyLoadOpts(opts)
+
+	binary, err := findLlamaServer()
+	if err != nil {
+		return nil, err
+	}
+
+	port, err := freePort()
+	if err != nil {
+		return nil, fmt.Errorf("rocm: find free port: %w", err)
+	}
+
+	srv, err := startServer(binary, path, port, cfg.GPULayers, cfg.ContextLen)
+	if err != nil {
+		return nil, err
+	}
+
+	return &rocmModel{
+		srv:       srv,
+		modelType: guessModelType(path),
+	}, nil
+}
+
+// guessModelType extracts a model type hint from the filename.
+// Hyphens are stripped so that "Llama-3" matches "llama3".
+func guessModelType(path string) string {
+	name := strings.ToLower(filepath.Base(path))
+	name = strings.ReplaceAll(name, "-", "")
+	for _, arch := range []string{"gemma3", "gemma2", "gemma", "qwen3", "qwen2", "qwen", "llama3", "llama", "mistral", "phi"} {
+		if strings.Contains(name, arch) {
+			return arch
+		}
+	}
+	return "unknown"
 }
