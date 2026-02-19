@@ -172,3 +172,26 @@ cmd.Env = append(os.Environ(),
 ### Model Path Note
 
 Models are on SMB mount (`/data` = `//10.69.69.108/Data`). For CI/testing, copy a small model locally or use `t.Skip()` when the mount is unavailable.
+
+---
+
+## 2026-02-19: Phase 1 Plan Review — Interface Questions
+
+### QUESTION: Token.ID not populated by llama-server SSE
+
+llama-server's OpenAI-compatible streaming API (`/v1/chat/completions`, `/v1/completions`) does not include token IDs in the default SSE response. The `inference.Token` struct has `ID int32` and `Text string` — go-rocm will set `Text` but leave `ID` as 0 for all tokens.
+
+Token IDs are available via `logprobs: true` in the request, but this adds overhead and requires parsing the `logprobs.tokens` field.
+
+**Decision needed from Virgil:** Does any consumer (go-ml, go-i18n, go-ai) rely on `Token.ID`? If only `Token.Text` is used downstream, ID=0 is acceptable for Phase 1. If ID is needed, we'll add logprobs parsing.
+
+### QUESTION: StopTokens type mismatch
+
+`GenerateConfig.StopTokens` is `[]int32` (token IDs), but llama-server's OpenAI-compatible API expects `"stop"` as `[]string` (text sequences). These are fundamentally different — token IDs cannot be mapped to stop strings without a tokeniser.
+
+Options:
+1. Ignore `StopTokens` in go-rocm Phase 1 (no consumer uses it yet)
+2. Use llama-server's native `/completion` endpoint which supports `id_slot` stop tokens
+3. Add `StopStrings []string` to `GenerateConfig` in go-inference alongside the existing `StopTokens []int32`, let each backend use whichever it supports
+
+**Decision needed from Virgil:** Which approach? Option 3 would be a go-inference interface change. Option 1 is simplest for now — go-rocm silently ignores StopTokens if set.
