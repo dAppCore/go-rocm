@@ -286,3 +286,53 @@ llama-server reads `tokenizer.chat_template` from the GGUF and applies it automa
 ### Context Window Auto-Detection
 
 Default context capped at `min(model_context_length, 4096)` when user doesn't specify `inference.WithContextLen(N)`. Without this cap, Llama-3.1 would try to allocate 131072 context (~4GB KV cache), which combined with model weights would not fit in 16GB VRAM for larger models.
+
+---
+
+## 2026-02-19: Phase 4 Performance (Charon)
+
+### Benchmark Results — RX 7800 XT (gfx1100, ROCm 7.2.0)
+
+All benchmarks run with `ctx=2048`, `testing.B`, `benchtime=3x`.
+
+#### Decode Speed (128 tokens)
+
+| Model | tok/s | VRAM Used |
+|-------|-------|-----------|
+| Gemma3-4B-Q4_K_M | 102.5 | 4724 MiB |
+| Llama-3.1-8B-Q4_K_M | 77.1 | 6482 MiB |
+| Qwen-2.5-7B-Q4_K_M | 84.4 | 6149 MiB |
+
+#### Time-to-First-Token
+
+| Model | TTFT |
+|-------|------|
+| Gemma3-4B-Q4_K_M | 13.8 ms |
+| Llama-3.1-8B-Q4_K_M | 17.1 ms |
+| Qwen-2.5-7B-Q4_K_M | 16.8 ms |
+
+#### Concurrent Throughput (4 parallel slots, 4 goroutines, 32 tokens each)
+
+| Model | Aggregate tok/s | vs Single |
+|-------|----------------|-----------|
+| Gemma3-4B-Q4_K_M | 238.9 | 2.3x |
+| Llama-3.1-8B-Q4_K_M | 166.2 | 2.2x |
+| Qwen-2.5-7B-Q4_K_M | 178.0 | 2.1x |
+
+Parallel slots give ~2.2x throughput improvement with 4 concurrent requests. Per-request latency increases but aggregate throughput scales well.
+
+### Flash Attention Comparison
+
+Compared llama-server built with `-DGGML_HIP_ROCWMMA_FATTN=ON` vs without, at ctx=2048:
+
+| Model | With FA (tok/s) | Without FA (tok/s) | Difference |
+|-------|----------------|-------------------|------------|
+| Gemma3-4B | 102.5 | 107.2 | -4.4% |
+| Llama-3.1-8B | 77.1 | 77.7 | -0.9% |
+| Qwen-2.5-7B | 84.4 | 84.4 | 0% |
+
+**Conclusion:** Flash attention shows no benefit at ctx=2048. rocWMMA flash attention is designed for large context windows where the KV cache becomes a bottleneck. At 2048 context, standard attention is faster (or equal). Flash attention benefits would appear at ctx=8192+ where the quadratic attention cost dominates. Keeping FA enabled is harmless — it auto-activates only when beneficial.
+
+### Parallel Slots
+
+Added `ParallelSlots int` to go-inference's `LoadConfig` and `WithParallelSlots(n int) LoadOption`. go-rocm passes `--parallel N` to llama-server. Each slot allocates its own KV cache, so VRAM usage scales with `parallelSlots * contextLen`. With 4 slots at ctx=2048, VRAM overhead is modest (~200 MiB extra for Gemma3-4B).

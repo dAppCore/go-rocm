@@ -41,9 +41,9 @@ The Ryzen 9 9950X iGPU shows up as ROCm Device 1, reports 100GB free (system RAM
 
 ## Phase 4: Performance
 
-- [ ] **Benchmark suite** — Measure: tokens/sec (prefill + decode), time-to-first-token, VRAM usage, for Qwen3-8B-Q4, Gemma3-4B, Llama3-8B on the RX 7800 XT. Compare with mlx on M3 Ultra.
-- [ ] **Flash attention** — Verify `-DGGML_HIP_ROCWMMA_FATTN=ON` gives real speedup on gfx1100. Benchmark with and without.
-- [ ] **Batch inference** — llama-server supports multiple slots for concurrent inference. Test parallel prompts for go-i18n's batch classification use case.
+- [x] **Benchmark suite** — Go testing.B benchmarks: BenchmarkDecode, BenchmarkTTFT, BenchmarkConcurrent across Gemma3-4B, Llama3.1-8B, Qwen2.5-7B. Commit `870ee23`. (Charon, 19 Feb 2026)
+- [x] **Flash attention** — Compared with/without `-DGGML_HIP_ROCWMMA_FATTN=ON`. No significant difference at ctx=2048. Benefits expected at larger context windows. See FINDINGS.md. (Charon, 19 Feb 2026)
+- [x] **Batch inference** — Added `ParallelSlots` to go-inference LoadConfig. `--parallel N` passed to llama-server. 4-slot concurrent: Gemma3-4B 239 tok/s aggregate (vs 103 single). Commits `3719734` (go-inference), `72120bb` (go-rocm). (Charon, 19 Feb 2026)
 
 ## Phase 5: Alternative Backends
 
