@@ -13,6 +13,9 @@ import (
 // GetVRAMInfo reads VRAM usage for the discrete GPU from sysfs.
 // It identifies the dGPU by selecting the card with the largest VRAM total,
 // which avoids hardcoding card numbers (e.g. card0=iGPU, card1=dGPU on Ryzen).
+//
+// Note: total and used are read non-atomically from sysfs; transient
+// inconsistencies are possible under heavy allocation churn.
 func GetVRAMInfo() (VRAMInfo, error) {
 	cards, err := filepath.Glob("/sys/class/drm/card[0-9]*/device/mem_info_vram_total")
 	if err != nil {
@@ -45,10 +48,15 @@ func GetVRAMInfo() (VRAMInfo, error) {
 		return VRAMInfo{}, fmt.Errorf("rocm: read vram used: %w", err)
 	}
 
+	free := uint64(0)
+	if bestTotal > used {
+		free = bestTotal - used
+	}
+
 	return VRAMInfo{
 		Total: bestTotal,
 		Used:  used,
-		Free:  bestTotal - used,
+		Free:  free,
 	}, nil
 }
 
