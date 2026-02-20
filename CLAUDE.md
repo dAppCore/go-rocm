@@ -8,95 +8,80 @@ Implements `inference.Backend` and `inference.TextModel` (from `core/go-inferenc
 
 ## Target Hardware
 
-- **GPU**: AMD Radeon RX 7800 XT (gfx1100, RDNA 3, 16GB VRAM) — NOTE: gfx1100 not gfx1101
+- **GPU**: AMD Radeon RX 7800 XT (gfx1100, RDNA 3, 16 GB VRAM) — confirmed gfx1100, not gfx1101
 - **OS**: Ubuntu 24.04 LTS (linux/amd64)
-- **ROCm**: 6.x+ (gfx1100/gfx1101 officially supported)
-- **Kernel**: 6.10+ recommended for RDNA 3 stability
+- **ROCm**: 7.2.0 installed
+- **Kernel**: 6.17.0
 
 ## Commands
 
 ```bash
-go test ./...                       # Run all tests (stubs on non-Linux)
-go test -tags rocm ./...            # Run with ROCm integration tests
-
-# On the Linux homelab:
-go test -v -run TestROCm ./...      # Full GPU tests
+go test ./...                       # Unit tests (no GPU required)
+go test -tags rocm ./...            # Integration tests + benchmarks (GPU required)
+go test -tags rocm -v -run TestROCm ./...   # Full GPU tests only
+go test -tags rocm -bench=. -benchtime=3x ./...  # Benchmarks
 ```
 
 ## Architecture
 
+See `docs/architecture.md` for full detail.
+
 ```
-go-rocm (this package)
-├── rocm.go              Package doc
-├── register_rocm.go     //go:build linux && amd64 — auto-registers via init()
-├── rocm_stub.go         //go:build !linux || !amd64 — ROCmAvailable() false
-├── backend.go           inference.Backend implementation
-├── model.go             inference.TextModel implementation (TODO)
-├── server.go            llama-server lifecycle management (TODO)
+go-rocm/
+├── backend.go           inference.Backend (linux && amd64)
+├── model.go             inference.TextModel (linux && amd64)
+├── server.go            llama-server subprocess lifecycle
+├── vram.go              VRAM monitoring via sysfs
+├── discover.go          GGUF model discovery
+├── register_rocm.go     auto-registers via init() (linux && amd64)
+├── rocm_stub.go         stubs for non-linux/non-amd64
 └── internal/
-    └── llamacpp/        llama-server HTTP client (TODO)
-        ├── client.go    OpenAI-compatible API client
-        └── health.go    Health check + readiness probe
+    ├── llamacpp/        llama-server HTTP client + health check
+    └── gguf/            GGUF v2/v3 binary metadata parser
 ```
 
-### How It Works
+## Critical: iGPU Crash
 
-1. `LoadModel()` spawns `llama-server` (llama.cpp) as a subprocess
-2. llama-server loads the GGUF model onto the AMD GPU via HIP/ROCm
-3. `Generate()` / `Chat()` make HTTP requests to llama-server's OpenAI-compatible API
-4. Token streaming via SSE (Server-Sent Events) from llama-server
-5. `Close()` sends SIGTERM to llama-server, waits for clean exit
-
-This is the subprocess approach (not CGO). It's simpler, more maintainable, and llama.cpp's server mode is battle-tested.
-
-### Dependencies
-
-- `forge.lthn.ai/core/go-inference` — shared TextModel/Backend interfaces
-- llama-server binary (external, not Go dependency) built with `-DGGML_HIP=ON`
+The Ryzen 9 9950X iGPU appears as ROCm Device 1. llama-server crashes trying to split tensors across it. `serverEnv()` always sets `HIP_VISIBLE_DEVICES=0`. Do not remove or weaken this.
 
 ## Building llama-server with ROCm
 
 ```bash
-# On the Linux homelab:
-sudo apt install rocm-dev rocm-libs  # ROCm 6.x
-
-git clone https://github.com/ggml-org/llama.cpp
-cd llama.cpp
 cmake -B build \
     -DGGML_HIP=ON \
     -DAMDGPU_TARGETS=gfx1100 \
     -DGGML_HIP_ROCWMMA_FATTN=ON \
     -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel -t llama-server
-
-# Binary at build/bin/llama-server
-# Copy to /usr/local/bin/ or set ROCM_LLAMA_SERVER_PATH
+cmake --build build --parallel $(nproc) -t llama-server
+sudo cp build/bin/llama-server /usr/local/bin/llama-server
 ```
 
-### Performance Tip
+## Environment Variables
 
-The RX 7800 XT is gfx1101 but the ROCm compiler generates identical code for gfx1100. Setting:
-```bash
-export HSA_OVERRIDE_GFX_VERSION=11.0.0
-```
-...gives better performance on some ROCm versions. Benchmark both.
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `ROCM_LLAMA_SERVER_PATH` | PATH lookup | Path to llama-server binary |
+| `HIP_VISIBLE_DEVICES` | overridden to `0` | Always forced to 0 — do not rely on ambient value |
 
 ## Coding Standards
 
 - UK English
 - Tests: testify assert/require
+- Build tags: `linux && amd64` for GPU code, `rocm` for integration tests
 - Conventional commits
 - Co-Author: `Co-Authored-By: Virgil <virgil@lethean.io>`
 - Licence: EUPL-1.2
 
 ## Coordination
 
-- **Virgil** (core/go) is the orchestrator — writes tasks here
-- **go-mlx Claude** is the sibling — Metal backend on macOS, same interface contract
+- **Virgil** (core/go) is the orchestrator — writes tasks and reviews PRs
+- **go-mlx** is the sibling — Metal backend on macOS, same interface contract
 - **go-inference** defines the shared TextModel/Backend interfaces both backends implement
 - **go-ml** wraps both backends into the scoring engine
 
-## Task Queue
+## Documentation
 
-See `TODO.md` for prioritised work.
-See `FINDINGS.md` for research notes.
+- `docs/architecture.md` — component design, data flow, interface contracts
+- `docs/development.md` — prerequisites, test commands, benchmarks, coding standards
+- `docs/history.md` — completed phases, commit hashes, known limitations
+- `docs/plans/` — phase design documents (read-only reference)
