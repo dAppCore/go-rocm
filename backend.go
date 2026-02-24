@@ -5,6 +5,7 @@ package rocm
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"forge.lthn.ai/core/go-inference"
 	"forge.lthn.ai/core/go-rocm/internal/gguf"
@@ -54,8 +55,43 @@ func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (infe
 		return nil, err
 	}
 
+	// Map quantisation file type to bit width.
+	quantBits := 0
+	quantGroup := 0
+	ftName := gguf.FileTypeName(meta.FileType)
+	switch {
+	case strings.HasPrefix(ftName, "Q4_"):
+		quantBits = 4
+		quantGroup = 32
+	case strings.HasPrefix(ftName, "Q5_"):
+		quantBits = 5
+		quantGroup = 32
+	case strings.HasPrefix(ftName, "Q8_"):
+		quantBits = 8
+		quantGroup = 32
+	case strings.HasPrefix(ftName, "Q2_"):
+		quantBits = 2
+		quantGroup = 16
+	case strings.HasPrefix(ftName, "Q3_"):
+		quantBits = 3
+		quantGroup = 32
+	case strings.HasPrefix(ftName, "Q6_"):
+		quantBits = 6
+		quantGroup = 64
+	case ftName == "F16":
+		quantBits = 16
+	case ftName == "F32":
+		quantBits = 32
+	}
+
 	return &rocmModel{
 		srv:       srv,
 		modelType: meta.Architecture,
+		modelInfo: inference.ModelInfo{
+			Architecture: meta.Architecture,
+			NumLayers:    int(meta.BlockCount),
+			QuantBits:    quantBits,
+			QuantGroup:   quantGroup,
+		},
 	}, nil
 }
