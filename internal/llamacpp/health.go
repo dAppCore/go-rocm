@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	coreerr "forge.lthn.ai/core/go-log"
 )
 
 // Client communicates with a llama-server instance.
@@ -41,14 +43,14 @@ func (c *Client) Health(ctx context.Context) error {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-		return fmt.Errorf("llamacpp: health returned %d: %s", resp.StatusCode, string(body))
+		return coreerr.E("llamacpp.Health", fmt.Sprintf("health returned %d: %s", resp.StatusCode, string(body)), nil)
 	}
 	var h healthResponse
 	if err := json.NewDecoder(resp.Body).Decode(&h); err != nil {
-		return fmt.Errorf("llamacpp: health decode: %w", err)
+		return coreerr.E("llamacpp.Health", "health decode", err)
 	}
 	if h.Status != "ok" {
-		return fmt.Errorf("llamacpp: server not ready (status: %s)", h.Status)
+		return coreerr.E("llamacpp.Health", fmt.Sprintf("server not ready (status: %s)", h.Status), nil)
 	}
 	return nil
 }

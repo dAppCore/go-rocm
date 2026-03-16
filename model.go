@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	coreerr "forge.lthn.ai/core/go-log"
 	"forge.lthn.ai/core/go-inference"
 	"forge.lthn.ai/core/go-rocm/internal/llamacpp"
 )
@@ -148,7 +149,7 @@ func (m *rocmModel) Classify(ctx context.Context, prompts []string, opts ...infe
 			text.WriteString(chunk)
 		}
 		if err := errFn(); err != nil {
-			return nil, fmt.Errorf("rocm: classify prompt %d: %w", i, err)
+			return nil, coreerr.E("rocm.Classify", fmt.Sprintf("classify prompt %d", i), err)
 		}
 
 		results[i] = inference.ClassifyResult{
@@ -194,7 +195,7 @@ func (m *rocmModel) BatchGenerate(ctx context.Context, prompts []string, opts ..
 			tokens = append(tokens, inference.Token{Text: text})
 		}
 		if err := errFn(); err != nil {
-			results[i].Err = fmt.Errorf("rocm: batch prompt %d: %w", i, err)
+			results[i].Err = coreerr.E("rocm.BatchGenerate", fmt.Sprintf("batch prompt %d", i), err)
 		}
 		results[i].Tokens = tokens
 		totalGenerated += len(tokens)
@@ -234,9 +235,9 @@ func (m *rocmModel) setServerExitErr() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.srv.exitErr != nil {
-		m.lastErr = fmt.Errorf("rocm: server has exited: %w", m.srv.exitErr)
+		m.lastErr = coreerr.E("rocm.setServerExitErr", "server has exited", m.srv.exitErr)
 	} else {
-		m.lastErr = fmt.Errorf("rocm: server has exited unexpectedly")
+		m.lastErr = coreerr.E("rocm.setServerExitErr", "server has exited unexpectedly", nil)
 	}
 }
 

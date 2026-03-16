@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+
+	coreerr "forge.lthn.ai/core/go-log"
 )
 
 // ChatMessage is a single message in a conversation.
@@ -65,26 +67,26 @@ func (c *Client) ChatComplete(ctx context.Context, req ChatRequest) (iter.Seq[st
 
 	body, err := json.Marshal(req)
 	if err != nil {
-		return noChunks, func() error { return fmt.Errorf("llamacpp: marshal chat request: %w", err) }
+		return noChunks, func() error { return coreerr.E("llamacpp.ChatComplete", "marshal chat request", err) }
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return noChunks, func() error { return fmt.Errorf("llamacpp: create chat request: %w", err) }
+		return noChunks, func() error { return coreerr.E("llamacpp.ChatComplete", "create chat request", err) }
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return noChunks, func() error { return fmt.Errorf("llamacpp: chat request: %w", err) }
+		return noChunks, func() error { return coreerr.E("llamacpp.ChatComplete", "chat request", err) }
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 		return noChunks, func() error {
-			return fmt.Errorf("llamacpp: chat returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+			return coreerr.E("llamacpp.ChatComplete", fmt.Sprintf("chat returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody))), nil)
 		}
 	}
 
@@ -100,7 +102,7 @@ func (c *Client) ChatComplete(ctx context.Context, req ChatRequest) (iter.Seq[st
 		for raw := range sseData {
 			var chunk chatChunkResponse
 			if err := json.Unmarshal([]byte(raw), &chunk); err != nil {
-				streamErr = fmt.Errorf("llamacpp: decode chat chunk: %w", err)
+				streamErr = coreerr.E("llamacpp.ChatComplete", "decode chat chunk", err)
 				return
 			}
 			if len(chunk.Choices) == 0 {
@@ -130,26 +132,26 @@ func (c *Client) Complete(ctx context.Context, req CompletionRequest) (iter.Seq[
 
 	body, err := json.Marshal(req)
 	if err != nil {
-		return noChunks, func() error { return fmt.Errorf("llamacpp: marshal completion request: %w", err) }
+		return noChunks, func() error { return coreerr.E("llamacpp.Complete", "marshal completion request", err) }
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/completions", bytes.NewReader(body))
 	if err != nil {
-		return noChunks, func() error { return fmt.Errorf("llamacpp: create completion request: %w", err) }
+		return noChunks, func() error { return coreerr.E("llamacpp.Complete", "create completion request", err) }
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return noChunks, func() error { return fmt.Errorf("llamacpp: completion request: %w", err) }
+		return noChunks, func() error { return coreerr.E("llamacpp.Complete", "completion request", err) }
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 		return noChunks, func() error {
-			return fmt.Errorf("llamacpp: completion returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+			return coreerr.E("llamacpp.Complete", fmt.Sprintf("completion returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody))), nil)
 		}
 	}
 
@@ -165,7 +167,7 @@ func (c *Client) Complete(ctx context.Context, req CompletionRequest) (iter.Seq[
 		for raw := range sseData {
 			var chunk completionChunkResponse
 			if err := json.Unmarshal([]byte(raw), &chunk); err != nil {
-				streamErr = fmt.Errorf("llamacpp: decode completion chunk: %w", err)
+				streamErr = coreerr.E("llamacpp.Complete", "decode completion chunk", err)
 				return
 			}
 			if len(chunk.Choices) == 0 {
@@ -207,7 +209,7 @@ func parseSSE(r io.Reader, errOut *error) iter.Seq[string] {
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			*errOut = fmt.Errorf("llamacpp: read SSE stream: %w", err)
+			*errOut = coreerr.E("llamacpp.parseSSE", "read SSE stream", err)
 		}
 	}
 }

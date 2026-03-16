@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	coreerr "forge.lthn.ai/core/go-log"
 	"forge.lthn.ai/core/go-rocm/internal/llamacpp"
 )
 
@@ -40,13 +41,13 @@ func (s *server) alive() bool {
 func findLlamaServer() (string, error) {
 	if p := os.Getenv("ROCM_LLAMA_SERVER_PATH"); p != "" {
 		if _, err := os.Stat(p); err != nil {
-			return "", fmt.Errorf("llama-server not found at ROCM_LLAMA_SERVER_PATH=%s: %w", p, err)
+			return "", coreerr.E("rocm.findLlamaServer", "llama-server not found at ROCM_LLAMA_SERVER_PATH="+p, err)
 		}
 		return p, nil
 	}
 	p, err := exec.LookPath("llama-server")
 	if err != nil {
-		return "", fmt.Errorf("llama-server not found in PATH: %w", err)
+		return "", coreerr.E("rocm.findLlamaServer", "llama-server not found in PATH", err)
 	}
 	return p, nil
 }
@@ -55,7 +56,7 @@ func findLlamaServer() (string, error) {
 func freePort() (int, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return 0, fmt.Errorf("freePort: %w", err)
+		return 0, coreerr.E("rocm.freePort", "listen for free port", err)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()
@@ -92,7 +93,7 @@ func startServer(binary, modelPath string, gpuLayers, ctxSize, parallelSlots int
 	for attempt := range maxAttempts {
 		port, err := freePort()
 		if err != nil {
-			return nil, fmt.Errorf("rocm: find free port: %w", err)
+			return nil, coreerr.E("rocm.startServer", "find free port", err)
 		}
 
 		args := []string{
@@ -112,7 +113,7 @@ func startServer(binary, modelPath string, gpuLayers, ctxSize, parallelSlots int
 		cmd.Env = serverEnv()
 
 		if err := cmd.Start(); err != nil {
-			return nil, fmt.Errorf("start llama-server: %w", err)
+			return nil, coreerr.E("rocm.startServer", "start llama-server", err)
 		}
 
 		s := &server{
@@ -139,15 +140,15 @@ func startServer(binary, modelPath string, gpuLayers, ctxSize, parallelSlots int
 		select {
 		case <-s.exited:
 			_ = s.stop()
-			lastErr = fmt.Errorf("attempt %d: %w", attempt+1, err)
+			lastErr = coreerr.E("rocm.startServer", fmt.Sprintf("attempt %d", attempt+1), err)
 			continue
 		default:
 			_ = s.stop()
-			return nil, fmt.Errorf("rocm: llama-server not ready: %w", err)
+			return nil, coreerr.E("rocm.startServer", "llama-server not ready", err)
 		}
 	}
 
-	return nil, fmt.Errorf("rocm: server failed after %d attempts: %w", maxAttempts, lastErr)
+	return nil, coreerr.E("rocm.startServer", fmt.Sprintf("server failed after %d attempts", maxAttempts), lastErr)
 }
 
 // waitReady polls the health endpoint until the server is ready.
@@ -158,9 +159,9 @@ func (s *server) waitReady(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for llama-server: %w", ctx.Err())
+			return coreerr.E("server.waitReady", "timeout waiting for llama-server", ctx.Err())
 		case <-s.exited:
-			return fmt.Errorf("llama-server exited before becoming ready: %v", s.exitErr)
+			return coreerr.E("server.waitReady", "llama-server exited before becoming ready", s.exitErr)
 		case <-ticker.C:
 			if err := s.client.Health(ctx); err == nil {
 				return nil
@@ -184,7 +185,7 @@ func (s *server) stop() error {
 
 	// Send SIGTERM for graceful shutdown.
 	if err := s.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		return fmt.Errorf("sigterm llama-server: %w", err)
+		return coreerr.E("server.stop", "sigterm llama-server", err)
 	}
 
 	// Wait up to 5 seconds for clean exit.
@@ -194,7 +195,7 @@ func (s *server) stop() error {
 	case <-time.After(5 * time.Second):
 		// Force kill.
 		if err := s.cmd.Process.Kill(); err != nil {
-			return fmt.Errorf("kill llama-server: %w", err)
+			return coreerr.E("server.stop", "kill llama-server", err)
 		}
 		<-s.exited
 		return s.exitErr

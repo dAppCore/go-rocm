@@ -3,10 +3,10 @@
 package rocm
 
 import (
-	"fmt"
 	"os"
 	"strings"
 
+	coreerr "forge.lthn.ai/core/go-log"
 	"forge.lthn.ai/core/go-inference"
 	"forge.lthn.ai/core/go-rocm/internal/gguf"
 )
@@ -42,7 +42,7 @@ func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (infe
 
 	meta, err := gguf.ReadMetadata(path)
 	if err != nil {
-		return nil, fmt.Errorf("rocm: read model metadata: %w", err)
+		return nil, coreerr.E("rocm.LoadModel", "read model metadata", err)
 	}
 
 	ctxLen := cfg.ContextLen

@@ -15,6 +15,8 @@ import (
 	"math"
 	"os"
 	"strings"
+
+	coreerr "forge.lthn.ai/core/go-log"
 )
 
 // ggufMagic is the GGUF file magic number: "GGUF" in little-endian.
@@ -96,37 +98,37 @@ func ReadMetadata(path string) (Metadata, error) {
 	// Read and validate magic number.
 	var magic uint32
 	if err := binary.Read(r, binary.LittleEndian, &magic); err != nil {
-		return Metadata{}, fmt.Errorf("reading magic: %w", err)
+		return Metadata{}, coreerr.E("gguf.ReadMetadata", "reading magic", err)
 	}
 	if magic != ggufMagic {
-		return Metadata{}, fmt.Errorf("invalid magic: 0x%08X (expected 0x%08X)", magic, ggufMagic)
+		return Metadata{}, coreerr.E("gguf.ReadMetadata", fmt.Sprintf("invalid magic: 0x%08X (expected 0x%08X)", magic, ggufMagic), nil)
 	}
 
 	// Read version.
 	var version uint32
 	if err := binary.Read(r, binary.LittleEndian, &version); err != nil {
-		return Metadata{}, fmt.Errorf("reading version: %w", err)
+		return Metadata{}, coreerr.E("gguf.ReadMetadata", "reading version", err)
 	}
 	if version < 2 || version > 3 {
-		return Metadata{}, fmt.Errorf("unsupported GGUF version: %d", version)
+		return Metadata{}, coreerr.E("gguf.ReadMetadata", fmt.Sprintf("unsupported GGUF version: %d", version), nil)
 	}
 
 	// Read tensor count and KV count. v3 uses uint64, v2 uses uint32.
 	var tensorCount, kvCount uint64
 	if version == 3 {
 		if err := binary.Read(r, binary.LittleEndian, &tensorCount); err != nil {
-			return Metadata{}, fmt.Errorf("reading tensor count: %w", err)
+			return Metadata{}, coreerr.E("gguf.ReadMetadata", "reading tensor count", err)
 		}
 		if err := binary.Read(r, binary.LittleEndian, &kvCount); err != nil {
-			return Metadata{}, fmt.Errorf("reading kv count: %w", err)
+			return Metadata{}, coreerr.E("gguf.ReadMetadata", "reading kv count", err)
 		}
 	} else {
 		var tc, kc uint32
 		if err := binary.Read(r, binary.LittleEndian, &tc); err != nil {
-			return Metadata{}, fmt.Errorf("reading tensor count: %w", err)
+			return Metadata{}, coreerr.E("gguf.ReadMetadata", "reading tensor count", err)
 		}
 		if err := binary.Read(r, binary.LittleEndian, &kc); err != nil {
-			return Metadata{}, fmt.Errorf("reading kv count: %w", err)
+			return Metadata{}, coreerr.E("gguf.ReadMetadata", "reading kv count", err)
 		}
 		tensorCount = uint64(tc)
 		kvCount = uint64(kc)
@@ -148,12 +150,12 @@ func ReadMetadata(path string) (Metadata, error) {
 	for i := uint64(0); i < kvCount; i++ {
 		key, err := readString(r)
 		if err != nil {
-			return Metadata{}, fmt.Errorf("reading key %d: %w", i, err)
+			return Metadata{}, coreerr.E("gguf.ReadMetadata", fmt.Sprintf("reading key %d", i), err)
 		}
 
 		var valType uint32
 		if err := binary.Read(r, binary.LittleEndian, &valType); err != nil {
-			return Metadata{}, fmt.Errorf("reading value type for key %q: %w", key, err)
+			return Metadata{}, coreerr.E("gguf.ReadMetadata", fmt.Sprintf("reading value type for key %q", key), err)
 		}
 
 		// Check whether this is an interesting key before reading the value.
@@ -161,7 +163,7 @@ func ReadMetadata(path string) (Metadata, error) {
 		case key == "general.architecture":
 			v, err := readTypedValue(r, valType)
 			if err != nil {
-				return Metadata{}, fmt.Errorf("reading value for key %q: %w", key, err)
+				return Metadata{}, coreerr.E("gguf.ReadMetadata", fmt.Sprintf("reading value for key %q", key), err)
 			}
 			if s, ok := v.(string); ok {
 				meta.Architecture = s
@@ -170,7 +172,7 @@ func ReadMetadata(path string) (Metadata, error) {
 		case key == "general.name":
 			v, err := readTypedValue(r, valType)
 			if err != nil {
-				return Metadata{}, fmt.Errorf("reading value for key %q: %w", key, err)
+				return Metadata{}, coreerr.E("gguf.ReadMetadata", fmt.Sprintf("reading value for key %q", key), err)
 			}
 			if s, ok := v.(string); ok {
 				meta.Name = s
@@ -179,7 +181,7 @@ func ReadMetadata(path string) (Metadata, error) {
 		case key == "general.file_type":
 			v, err := readTypedValue(r, valType)
 			if err != nil {
-				return Metadata{}, fmt.Errorf("reading value for key %q: %w", key, err)
+				return Metadata{}, coreerr.E("gguf.ReadMetadata", fmt.Sprintf("reading value for key %q", key), err)
 			}
 			if u, ok := v.(uint32); ok {
 				meta.FileType = u
@@ -188,7 +190,7 @@ func ReadMetadata(path string) (Metadata, error) {
 		case key == "general.size_label":
 			v, err := readTypedValue(r, valType)
 			if err != nil {
-				return Metadata{}, fmt.Errorf("reading value for key %q: %w", key, err)
+				return Metadata{}, coreerr.E("gguf.ReadMetadata", fmt.Sprintf("reading value for key %q", key), err)
 			}
 			if s, ok := v.(string); ok {
 				meta.SizeLabel = s
@@ -197,7 +199,7 @@ func ReadMetadata(path string) (Metadata, error) {
 		case strings.HasSuffix(key, ".context_length"):
 			v, err := readTypedValue(r, valType)
 			if err != nil {
-				return Metadata{}, fmt.Errorf("reading value for key %q: %w", key, err)
+				return Metadata{}, coreerr.E("gguf.ReadMetadata", fmt.Sprintf("reading value for key %q", key), err)
 			}
 			if u, ok := v.(uint32); ok {
 				candidateContextLength[key] = u
@@ -206,7 +208,7 @@ func ReadMetadata(path string) (Metadata, error) {
 		case strings.HasSuffix(key, ".block_count"):
 			v, err := readTypedValue(r, valType)
 			if err != nil {
-				return Metadata{}, fmt.Errorf("reading value for key %q: %w", key, err)
+				return Metadata{}, coreerr.E("gguf.ReadMetadata", fmt.Sprintf("reading value for key %q", key), err)
 			}
 			if u, ok := v.(uint32); ok {
 				candidateBlockCount[key] = u
@@ -215,7 +217,7 @@ func ReadMetadata(path string) (Metadata, error) {
 		default:
 			// Skip uninteresting value.
 			if err := skipValue(r, valType); err != nil {
-				return Metadata{}, fmt.Errorf("skipping value for key %q: %w", key, err)
+				return Metadata{}, coreerr.E("gguf.ReadMetadata", fmt.Sprintf("skipping value for key %q", key), err)
 			}
 		}
 	}
@@ -245,7 +247,7 @@ func readString(r io.Reader) (string, error) {
 		return "", err
 	}
 	if length > maxStringLength {
-		return "", fmt.Errorf("string length %d exceeds maximum %d", length, maxStringLength)
+		return "", coreerr.E("gguf.readString", fmt.Sprintf("string length %d exceeds maximum %d", length, maxStringLength), nil)
 	}
 	buf := make([]byte, length)
 	if _, err := io.ReadFull(r, buf); err != nil {
@@ -302,7 +304,7 @@ func skipValue(r io.Reader, valType uint32) error {
 			return err
 		}
 		if length > maxStringLength {
-			return fmt.Errorf("string length %d exceeds maximum %d", length, maxStringLength)
+			return coreerr.E("gguf.skipValue", fmt.Sprintf("string length %d exceeds maximum %d", length, maxStringLength), nil)
 		}
 		_, err := readN(r, int64(length))
 		return err
@@ -322,7 +324,7 @@ func skipValue(r io.Reader, valType uint32) error {
 		}
 		return nil
 	default:
-		return fmt.Errorf("unknown GGUF value type: %d", valType)
+		return coreerr.E("gguf.skipValue", fmt.Sprintf("unknown GGUF value type: %d", valType), nil)
 	}
 }
 

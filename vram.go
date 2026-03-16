@@ -3,11 +3,12 @@
 package rocm
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	coreerr "forge.lthn.ai/core/go-log"
 )
 
 // GetVRAMInfo reads VRAM usage for the discrete GPU from sysfs.
@@ -19,10 +20,10 @@ import (
 func GetVRAMInfo() (VRAMInfo, error) {
 	cards, err := filepath.Glob("/sys/class/drm/card[0-9]*/device/mem_info_vram_total")
 	if err != nil {
-		return VRAMInfo{}, fmt.Errorf("rocm: glob vram sysfs: %w", err)
+		return VRAMInfo{}, coreerr.E("rocm.GetVRAMInfo", "glob vram sysfs", err)
 	}
 	if len(cards) == 0 {
-		return VRAMInfo{}, fmt.Errorf("rocm: no GPU VRAM info found in sysfs")
+		return VRAMInfo{}, coreerr.E("rocm.GetVRAMInfo", "no GPU VRAM info found in sysfs", nil)
 	}
 
 	var bestDir string
@@ -40,12 +41,12 @@ func GetVRAMInfo() (VRAMInfo, error) {
 	}
 
 	if bestDir == "" {
-		return VRAMInfo{}, fmt.Errorf("rocm: no readable VRAM sysfs entries")
+		return VRAMInfo{}, coreerr.E("rocm.GetVRAMInfo", "no readable VRAM sysfs entries", nil)
 	}
 
 	used, err := readSysfsUint64(filepath.Join(bestDir, "mem_info_vram_used"))
 	if err != nil {
-		return VRAMInfo{}, fmt.Errorf("rocm: read vram used: %w", err)
+		return VRAMInfo{}, coreerr.E("rocm.GetVRAMInfo", "read vram used", err)
 	}
 
 	free := uint64(0)
