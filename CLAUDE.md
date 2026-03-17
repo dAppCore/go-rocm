@@ -68,6 +68,8 @@ sudo cp build/bin/llama-server /usr/local/bin/llama-server
 - UK English
 - Tests: testify assert/require
 - Build tags: `linux && amd64` for GPU code, `rocm` for integration tests
+- Errors: `coreerr.E("pkg.Func", "what failed", err)` via `go-log`, never `fmt.Errorf` or `errors.New`
+- File I/O: `os` package used directly — `go-io` not imported (its transitive deps are too heavy for a GPU inference module)
 - Conventional commits
 - Co-Author: `Co-Authored-By: Virgil <virgil@lethean.io>`
 - Licence: EUPL-1.2

@@ -127,3 +127,23 @@ func TestDiscoverModels_NotFound(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, models)
 }
+
+func TestDiscoverModels_SkipsCorruptFile(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a valid GGUF file.
+	writeDiscoverTestGGUF(t, dir, "valid.gguf", [][2]any{
+		{"general.architecture", "llama"},
+		{"general.name", "Valid Model"},
+		{"general.file_type", uint32(15)},
+	})
+
+	// Create a corrupt .gguf file (not valid GGUF binary).
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "corrupt.gguf"), []byte("not gguf data"), 0644))
+
+	models, err := DiscoverModels(dir)
+	require.NoError(t, err)
+	// Only the valid model should be returned; corrupt one is silently skipped.
+	require.Len(t, models, 1)
+	assert.Equal(t, "Valid Model", models[0].Name)
+}

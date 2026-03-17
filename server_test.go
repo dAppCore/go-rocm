@@ -4,12 +4,12 @@ package rocm
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"strings"
 	"testing"
 
 	"forge.lthn.ai/core/go-inference"
+	coreerr "forge.lthn.ai/core/go-log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -90,7 +90,7 @@ func TestServerAlive_Running(t *testing.T) {
 func TestServerAlive_Exited(t *testing.T) {
 	exited := make(chan struct{})
 	close(exited)
-	s := &server{exited: exited, exitErr: fmt.Errorf("process killed")}
+	s := &server{exited: exited, exitErr: coreerr.E("test", "process killed", nil)}
 	assert.False(t, s.alive())
 }
 
@@ -99,7 +99,7 @@ func TestGenerate_ServerDead(t *testing.T) {
 	close(exited)
 	s := &server{
 		exited:  exited,
-		exitErr: fmt.Errorf("process killed"),
+		exitErr: coreerr.E("test", "process killed", nil),
 	}
 	m := &rocmModel{srv: s}
 
@@ -124,7 +124,7 @@ func TestChat_ServerDead(t *testing.T) {
 	close(exited)
 	s := &server{
 		exited:  exited,
-		exitErr: fmt.Errorf("process killed"),
+		exitErr: coreerr.E("test", "process killed", nil),
 	}
 	m := &rocmModel{srv: s}
 

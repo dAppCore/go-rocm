@@ -26,6 +26,24 @@ func TestReadSysfsUint64_NotFound(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestReadSysfsUint64_InvalidContent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bad_value")
+	require.NoError(t, os.WriteFile(path, []byte("not-a-number\n"), 0644))
+
+	_, err := readSysfsUint64(path)
+	assert.Error(t, err)
+}
+
+func TestReadSysfsUint64_EmptyFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "empty_value")
+	require.NoError(t, os.WriteFile(path, []byte(""), 0644))
+
+	_, err := readSysfsUint64(path)
+	assert.Error(t, err)
+}
+
 func TestGetVRAMInfo(t *testing.T) {
 	info, err := GetVRAMInfo()
 	if err != nil {
