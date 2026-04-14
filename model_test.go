@@ -19,7 +19,7 @@ import (
 
 func newHTTPBackedModel(ts *httptest.Server) *rocmModel {
 	return &rocmModel{
-		srv: &server{
+		server: &server{
 			client: llamacpp.NewClient(ts.URL),
 			exited: make(chan struct{}),
 		},
@@ -142,4 +142,64 @@ func TestBatchGenerate_MetricsAggregatePrefillAndDecode(t *testing.T) {
 	assert.GreaterOrEqual(t, met.TotalDuration, 50*time.Millisecond)
 	assert.Greater(t, met.PrefillTokensPerSec, 0.0)
 	assert.Greater(t, met.DecodeTokensPerSec, 0.0)
+}
+
+func TestClassify_ContextCancelledRecordsMetricsAndWrapsError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var requestCount int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		writeSSEEvent(w, `{"choices":[{"text":"label","finish_reason":null}]}`)
+		writeSSEEvent(w, "[DONE]")
+		if requestCount == 1 {
+			cancel()
+		}
+	}))
+	defer ts.Close()
+
+	m := newHTTPBackedModel(ts)
+
+	results, err := m.Classify(ctx, []string{"hello world", "goodbye world"})
+	require.Error(t, err)
+	assert.Nil(t, results)
+	assert.Equal(t, 1, requestCount)
+	assert.ErrorContains(t, err, "rocm.Classify")
+	assert.ErrorContains(t, err, "cancelled before prompt 1")
+
+	metrics := m.Metrics()
+	assert.Equal(t, 2, metrics.PromptTokens)
+	assert.Equal(t, 1, metrics.GeneratedTokens)
+}
+
+func TestBatchGenerate_ContextCancelledWrapsPerPromptError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var requestCount int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		writeSSEEvent(w, `{"choices":[{"text":"token","finish_reason":null}]}`)
+		writeSSEEvent(w, "[DONE]")
+		if requestCount == 1 {
+			cancel()
+		}
+	}))
+	defer ts.Close()
+
+	m := newHTTPBackedModel(ts)
+
+	results, err := m.BatchGenerate(ctx, []string{"hello world", "goodbye world"}, inference.WithMaxTokens(1))
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+	assert.Equal(t, 1, requestCount)
+	require.Len(t, results[0].Tokens, 1)
+	require.Error(t, results[1].Err)
+	assert.ErrorContains(t, results[1].Err, "rocm.BatchGenerate")
+	assert.ErrorContains(t, results[1].Err, "cancelled before start")
+
+	metrics := m.Metrics()
+	assert.Equal(t, 2, metrics.PromptTokens)
+	assert.Equal(t, 1, metrics.GeneratedTokens)
 }

@@ -17,7 +17,7 @@ import (
 
 // rocmModel implements inference.TextModel using a llama-server subprocess.
 type rocmModel struct {
-	srv       *server
+	server    *server
 	modelType string
 	modelInfo inference.ModelInfo
 
@@ -32,17 +32,17 @@ func (m *rocmModel) Generate(ctx context.Context, prompt string, opts ...inferen
 	m.lastErr = nil
 	m.mu.Unlock()
 
-	if !m.srv.alive() {
+	if !m.server.alive() {
 		m.setServerExitErr()
 		return func(yield func(inference.Token) bool) {}
 	}
 
-	cfg := inference.ApplyGenerateOpts(opts)
-	req := completionRequest(prompt, cfg)
+	generateConfig := inference.ApplyGenerateOpts(opts)
+	request := completionRequest(prompt, generateConfig)
 	promptTokens := approximatePromptTokens(prompt)
 
 	start := time.Now()
-	chunks, errFn := m.srv.client.Complete(ctx, req)
+	chunks, errFn := m.server.client.Complete(ctx, request)
 
 	return func(yield func(inference.Token) bool) {
 		var count int
@@ -71,12 +71,12 @@ func (m *rocmModel) Chat(ctx context.Context, messages []inference.Message, opts
 	m.lastErr = nil
 	m.mu.Unlock()
 
-	if !m.srv.alive() {
+	if !m.server.alive() {
 		m.setServerExitErr()
 		return func(yield func(inference.Token) bool) {}
 	}
 
-	cfg := inference.ApplyGenerateOpts(opts)
+	generateConfig := inference.ApplyGenerateOpts(opts)
 	promptTokens := approximateMessageTokens(messages)
 
 	chatMsgs := make([]llamacpp.ChatMessage, len(messages))
@@ -86,10 +86,10 @@ func (m *rocmModel) Chat(ctx context.Context, messages []inference.Message, opts
 			Content: msg.Content,
 		}
 	}
-	req := chatRequest(chatMsgs, cfg)
+	request := chatRequest(chatMsgs, generateConfig)
 
 	start := time.Now()
-	chunks, errFn := m.srv.client.ChatComplete(ctx, req)
+	chunks, errFn := m.server.client.ChatComplete(ctx, request)
 
 	return func(yield func(inference.Token) bool) {
 		var count int
@@ -117,29 +117,30 @@ func (m *rocmModel) Chat(ctx context.Context, messages []inference.Message, opts
 // the sampling settings from opts. llama-server has no native classify
 // endpoint, so this simulates it.
 func (m *rocmModel) Classify(ctx context.Context, prompts []string, opts ...inference.GenerateOption) ([]inference.ClassifyResult, error) {
-	if !m.srv.alive() {
+	if !m.server.alive() {
 		m.setServerExitErr()
 		return nil, m.Err()
 	}
 
-	cfg := inference.ApplyGenerateOpts(opts)
+	generateConfig := inference.ApplyGenerateOpts(opts)
 	results := make([]inference.ClassifyResult, len(prompts))
 	totalPromptTokens := 0
 	totalGenerated := 0
 	var totalPrefill time.Duration
 	var totalDecode time.Duration
 
-	for i, prompt := range prompts {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+	for promptIndex, prompt := range prompts {
+		if contextError := ctx.Err(); contextError != nil {
+			m.recordMetricsDurations(totalPromptTokens, totalGenerated, totalPrefill, totalDecode)
+			return nil, coreerr.E("rocm.Classify", fmt.Sprintf("classify cancelled before prompt %d", promptIndex), contextError)
 		}
 
 		totalPromptTokens += approximatePromptTokens(prompt)
-		req := completionRequest(prompt, cfg)
-		req.MaxTokens = 1
+		request := completionRequest(prompt, generateConfig)
+		request.MaxTokens = 1
 
 		requestStart := time.Now()
-		chunks, errFn := m.srv.client.Complete(ctx, req)
+		chunks, errFn := m.server.client.Complete(ctx, request)
 		var text strings.Builder
 		var firstTokenAt time.Time
 		var generated int
@@ -150,15 +151,18 @@ func (m *rocmModel) Classify(ctx context.Context, prompts []string, opts ...infe
 			generated++
 			text.WriteString(chunk)
 		}
-		if err := errFn(); err != nil {
-			return nil, coreerr.E("rocm.Classify", fmt.Sprintf("classify prompt %d", i), err)
-		}
-		prefill, decode := splitDurations(requestStart, firstTokenAt, time.Now())
+		requestEnd := time.Now()
+		prefill, decode := splitDurations(requestStart, firstTokenAt, requestEnd)
 		totalPrefill += prefill
 		totalDecode += decode
 		totalGenerated += generated
 
-		results[i] = inference.ClassifyResult{
+		if err := errFn(); err != nil {
+			m.recordMetricsDurations(totalPromptTokens, totalGenerated, totalPrefill, totalDecode)
+			return nil, coreerr.E("rocm.Classify", fmt.Sprintf("classify prompt %d", promptIndex), err)
+		}
+
+		results[promptIndex] = inference.ClassifyResult{
 			Token: inference.Token{Text: text.String()},
 		}
 	}
@@ -170,29 +174,29 @@ func (m *rocmModel) Classify(ctx context.Context, prompts []string, opts ...infe
 // BatchGenerate runs batched autoregressive generation via llama-server.
 // Each prompt is decoded sequentially up to MaxTokens.
 func (m *rocmModel) BatchGenerate(ctx context.Context, prompts []string, opts ...inference.GenerateOption) ([]inference.BatchResult, error) {
-	if !m.srv.alive() {
+	if !m.server.alive() {
 		m.setServerExitErr()
 		return nil, m.Err()
 	}
 
-	cfg := inference.ApplyGenerateOpts(opts)
+	generateConfig := inference.ApplyGenerateOpts(opts)
 	results := make([]inference.BatchResult, len(prompts))
 	totalPromptTokens := 0
 	var totalGenerated int
 	var totalPrefill time.Duration
 	var totalDecode time.Duration
 
-	for i, prompt := range prompts {
-		if ctx.Err() != nil {
-			results[i].Err = ctx.Err()
+	for promptIndex, prompt := range prompts {
+		if contextError := ctx.Err(); contextError != nil {
+			results[promptIndex].Err = coreerr.E("rocm.BatchGenerate", fmt.Sprintf("batch prompt %d cancelled before start", promptIndex), contextError)
 			continue
 		}
 
 		totalPromptTokens += approximatePromptTokens(prompt)
-		req := completionRequest(prompt, cfg)
+		request := completionRequest(prompt, generateConfig)
 
 		requestStart := time.Now()
-		chunks, errFn := m.srv.client.Complete(ctx, req)
+		chunks, errFn := m.server.client.Complete(ctx, request)
 		var tokens []inference.Token
 		var firstTokenAt time.Time
 		for text := range chunks {
@@ -201,14 +205,16 @@ func (m *rocmModel) BatchGenerate(ctx context.Context, prompts []string, opts ..
 			}
 			tokens = append(tokens, inference.Token{Text: text})
 		}
-		if err := errFn(); err != nil {
-			results[i].Err = coreerr.E("rocm.BatchGenerate", fmt.Sprintf("batch prompt %d", i), err)
-		}
-		prefill, decode := splitDurations(requestStart, firstTokenAt, time.Now())
+		requestEnd := time.Now()
+		prefill, decode := splitDurations(requestStart, firstTokenAt, requestEnd)
 		totalPrefill += prefill
 		totalDecode += decode
-		results[i].Tokens = tokens
+		results[promptIndex].Tokens = tokens
 		totalGenerated += len(tokens)
+
+		if err := errFn(); err != nil {
+			results[promptIndex].Err = coreerr.E("rocm.BatchGenerate", fmt.Sprintf("batch prompt %d", promptIndex), err)
+		}
 	}
 
 	m.recordMetricsDurations(totalPromptTokens, totalGenerated, totalPrefill, totalDecode)
@@ -237,17 +243,17 @@ func (m *rocmModel) Err() error {
 
 // Close releases the llama-server subprocess and all associated resources.
 func (m *rocmModel) Close() error {
-	return m.srv.stop()
+	return m.server.stop()
 }
 
 // setServerExitErr stores an appropriate error when the server is dead.
 func (m *rocmModel) setServerExitErr() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.srv.exitErr != nil {
-		m.lastErr = m.srv.wrapProcessError("rocm.setServerExitErr", "server has exited", m.srv.exitErr)
+	if m.server.exitErr != nil {
+		m.lastErr = m.server.wrapProcessError("rocm.setServerExitErr", "server has exited", m.server.exitErr)
 	} else {
-		m.lastErr = coreerr.E("rocm.setServerExitErr", m.srv.messageWithProcessOutput("server has exited unexpectedly"), nil)
+		m.lastErr = coreerr.E("rocm.setServerExitErr", m.server.messageWithProcessOutput("server has exited unexpectedly"), nil)
 	}
 }
 

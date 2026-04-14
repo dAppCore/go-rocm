@@ -39,6 +39,15 @@ type server struct {
 	processOutput *processOutputCapture
 }
 
+// serverStartConfig keeps llama-server startup settings named instead of positional.
+type serverStartConfig struct {
+	BinaryPath        string
+	ModelPath         string
+	GPULayerCount     int
+	ContextSize       int
+	ParallelSlotCount int
+}
+
 // alive reports whether the llama-server process is still running.
 func (s *server) alive() bool {
 	select {
@@ -107,9 +116,10 @@ func serverEnv() []string {
 // startServer spawns llama-server and waits for it to become ready.
 // It selects a free port automatically, retrying up to 3 times if startup
 // fails before the health endpoint becomes ready.
-func startServer(binary, modelPath string, gpuLayers, ctxSize, parallelSlots int) (*server, error) {
-	if gpuLayers < 0 {
-		gpuLayers = 999
+func startServer(startConfig serverStartConfig) (*server, error) {
+	gpuLayerCount := startConfig.GPULayerCount
+	if gpuLayerCount < 0 {
+		gpuLayerCount = 999
 	}
 
 	const maxAttempts = 3
@@ -122,20 +132,20 @@ func startServer(binary, modelPath string, gpuLayers, ctxSize, parallelSlots int
 		}
 
 		args := []string{
-			"--model", modelPath,
+			"--model", startConfig.ModelPath,
 			"--host", "127.0.0.1",
 			"--port", strconv.Itoa(port),
-			"--n-gpu-layers", strconv.Itoa(gpuLayers),
+			"--n-gpu-layers", strconv.Itoa(gpuLayerCount),
 		}
-		if ctxSize > 0 {
-			args = append(args, "--ctx-size", strconv.Itoa(ctxSize))
+		if startConfig.ContextSize > 0 {
+			args = append(args, "--ctx-size", strconv.Itoa(startConfig.ContextSize))
 		}
-		if parallelSlots > 0 {
-			args = append(args, "--parallel", strconv.Itoa(parallelSlots))
+		if startConfig.ParallelSlotCount > 0 {
+			args = append(args, "--parallel", strconv.Itoa(startConfig.ParallelSlotCount))
 		}
 
 		processOutput := newProcessOutputCapture(serverProcessOutputLimit)
-		cmd := exec.Command(binary, args...)
+		cmd := exec.Command(startConfig.BinaryPath, args...)
 		cmd.Env = serverEnv()
 		cmd.Stdout = processOutput
 		cmd.Stderr = processOutput

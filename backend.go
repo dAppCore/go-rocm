@@ -33,7 +33,7 @@ func (b *rocmBackend) Available() bool {
 // If no context length is specified, defaults to min(model_context_length, 4096)
 // to prevent VRAM exhaustion on models with 128K+ native context.
 func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (inference.TextModel, error) {
-	cfg := inference.ApplyLoadOpts(opts)
+	loadConfig := inference.ApplyLoadOpts(opts)
 
 	binary, err := findLlamaServer()
 	if err != nil {
@@ -45,12 +45,18 @@ func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (infe
 		return nil, coreerr.E("rocm.LoadModel", "read model metadata", err)
 	}
 
-	ctxLen := cfg.ContextLen
-	if ctxLen == 0 && meta.ContextLength > 0 {
-		ctxLen = int(min(meta.ContextLength, 4096))
+	contextLength := loadConfig.ContextLen
+	if contextLength == 0 && meta.ContextLength > 0 {
+		contextLength = int(min(meta.ContextLength, 4096))
 	}
 
-	srv, err := startServer(binary, path, cfg.GPULayers, ctxLen, cfg.ParallelSlots)
+	server, err := startServer(serverStartConfig{
+		BinaryPath:        binary,
+		ModelPath:         path,
+		GPULayerCount:     loadConfig.GPULayers,
+		ContextSize:       contextLength,
+		ParallelSlotCount: loadConfig.ParallelSlots,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -85,7 +91,7 @@ func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (infe
 	}
 
 	return &rocmModel{
-		srv:       srv,
+		server:    server,
 		modelType: meta.Architecture,
 		modelInfo: inference.ModelInfo{
 			Architecture: meta.Architecture,

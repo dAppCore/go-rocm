@@ -120,7 +120,7 @@ func TestGenerate_ServerDead(t *testing.T) {
 		exitErr:       coreerr.E("test", "process killed", nil),
 		processOutput: processOutput,
 	}
-	m := &rocmModel{srv: s}
+	m := &rocmModel{server: s}
 
 	var count int
 	for range m.Generate(context.Background(), "hello") {
@@ -134,7 +134,11 @@ func TestGenerate_ServerDead(t *testing.T) {
 func TestStartServer_RetriesOnProcessExit(t *testing.T) {
 	// /bin/false starts successfully but exits immediately with code 1.
 	// startServer should retry up to 3 times, then fail.
-	_, err := startServer("/bin/false", "/nonexistent/model.gguf", 999, 0, 0)
+	_, err := startServer(serverStartConfig{
+		BinaryPath:    "/bin/false",
+		ModelPath:     "/nonexistent/model.gguf",
+		GPULayerCount: 999,
+	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed after 3 attempts")
 }
@@ -153,7 +157,11 @@ func TestStartServer_RetriesOnStartupTimeout(t *testing.T) {
 		serverReadyPollInterval = oldInterval
 	})
 
-	_, err := startServer(binary, "/nonexistent/model.gguf", 999, 0, 0)
+	_, err := startServer(serverStartConfig{
+		BinaryPath:    binary,
+		ModelPath:     "/nonexistent/model.gguf",
+		GPULayerCount: 999,
+	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed after 3 attempts")
 	assert.Contains(t, err.Error(), "timeout waiting for llama-server")
@@ -195,7 +203,7 @@ func TestChat_ServerDead(t *testing.T) {
 		exited:  exited,
 		exitErr: coreerr.E("test", "process killed", nil),
 	}
-	m := &rocmModel{srv: s}
+	m := &rocmModel{server: s}
 
 	msgs := []inference.Message{{Role: "user", Content: "hello"}}
 	var count int
