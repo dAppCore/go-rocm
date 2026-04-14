@@ -13,8 +13,13 @@ import (
 	"syscall"
 	"time"
 
-	coreerr "forge.lthn.ai/core/go-log"
 	"dappco.re/go/core/rocm/internal/llamacpp"
+	coreerr "forge.lthn.ai/core/go-log"
+)
+
+var (
+	serverStartupTimeout    = 60 * time.Second
+	serverReadyPollInterval = 100 * time.Millisecond
 )
 
 // server manages a llama-server subprocess.
@@ -64,13 +69,14 @@ func freePort() (int, error) {
 }
 
 // serverEnv returns the environment for the llama-server subprocess.
-// Filters any existing HIP_VISIBLE_DEVICES and sets it to 0 to mask the iGPU.
-// This is critical — the Ryzen 9 iGPU crashes llama-server if not masked.
+// Filters any existing HIP_* settings and sets HIP_VISIBLE_DEVICES=0 to mask
+// the iGPU. This is critical — the Ryzen 9 iGPU crashes llama-server if not
+// masked, and inherited HIP variables can re-expose multi-GPU state.
 func serverEnv() []string {
 	environ := os.Environ()
 	env := make([]string, 0, len(environ)+1)
 	for _, e := range environ {
-		if strings.HasPrefix(e, "HIP_VISIBLE_DEVICES=") {
+		if strings.HasPrefix(e, "HIP_") {
 			continue
 		}
 		env = append(env, e)
@@ -80,8 +86,8 @@ func serverEnv() []string {
 }
 
 // startServer spawns llama-server and waits for it to become ready.
-// It selects a free port automatically, retrying up to 3 times if the
-// process exits during startup (e.g. port conflict).
+// It selects a free port automatically, retrying up to 3 times if startup
+// fails before the health endpoint becomes ready.
 func startServer(binary, modelPath string, gpuLayers, ctxSize, parallelSlots int) (*server, error) {
 	if gpuLayers < 0 {
 		gpuLayers = 999
@@ -90,7 +96,7 @@ func startServer(binary, modelPath string, gpuLayers, ctxSize, parallelSlots int
 	const maxAttempts = 3
 	var lastErr error
 
-	for attempt := range maxAttempts {
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		port, err := freePort()
 		if err != nil {
 			return nil, coreerr.E("rocm.startServer", "find free port", err)
@@ -128,24 +134,15 @@ func startServer(binary, modelPath string, gpuLayers, ctxSize, parallelSlots int
 			close(s.exited)
 		}()
 
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), serverStartupTimeout)
 		err = s.waitReady(ctx)
 		cancel()
 		if err == nil {
 			return s, nil
 		}
 
-		// Only retry if the process actually exited (e.g. port conflict).
-		// A timeout means the server is stuck, not a port issue.
-		select {
-		case <-s.exited:
-			_ = s.stop()
-			lastErr = coreerr.E("rocm.startServer", fmt.Sprintf("attempt %d", attempt+1), err)
-			continue
-		default:
-			_ = s.stop()
-			return nil, coreerr.E("rocm.startServer", "llama-server not ready", err)
-		}
+		_ = s.stop()
+		lastErr = coreerr.E("rocm.startServer", fmt.Sprintf("attempt %d", attempt+1), err)
 	}
 
 	return nil, coreerr.E("rocm.startServer", fmt.Sprintf("server failed after %d attempts", maxAttempts), lastErr)
@@ -153,18 +150,25 @@ func startServer(binary, modelPath string, gpuLayers, ctxSize, parallelSlots int
 
 // waitReady polls the health endpoint until the server is ready.
 func (s *server) waitReady(ctx context.Context) error {
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(serverReadyPollInterval)
 	defer ticker.Stop()
+
+	var lastHealthErr error
 
 	for {
 		select {
 		case <-ctx.Done():
+			if lastHealthErr != nil {
+				return coreerr.E("server.waitReady", "timeout waiting for llama-server", lastHealthErr)
+			}
 			return coreerr.E("server.waitReady", "timeout waiting for llama-server", ctx.Err())
 		case <-s.exited:
 			return coreerr.E("server.waitReady", "llama-server exited before becoming ready", s.exitErr)
 		case <-ticker.C:
 			if err := s.client.Health(ctx); err == nil {
 				return nil
+			} else {
+				lastHealthErr = err
 			}
 		}
 	}

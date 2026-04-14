@@ -189,6 +189,7 @@ func TestReadMetadata_InvalidMagic(t *testing.T) {
 func TestReadMetadata_FileNotFound(t *testing.T) {
 	_, err := ReadMetadata("/nonexistent/path/model.gguf")
 	require.Error(t, err)
+	assert.ErrorContains(t, err, "open file")
 }
 
 func TestFileTypeName(t *testing.T) {
@@ -227,7 +228,7 @@ func TestReadMetadata_UnsupportedVersion(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, binary.Write(f, binary.LittleEndian, uint32(0x46554747))) // magic
-	require.NoError(t, binary.Write(f, binary.LittleEndian, uint32(99)))          // invalid version
+	require.NoError(t, binary.Write(f, binary.LittleEndian, uint32(99)))         // invalid version
 	f.Close()
 
 	_, err = ReadMetadata(path)
@@ -283,7 +284,7 @@ func TestReadMetadata_SkipsUnknownValueTypes(t *testing.T) {
 	b8 := make([]byte, 8)
 	binary.LittleEndian.PutUint64(b8, 3) // count: 3
 	arrBuf = append(arrBuf, b8...)
-	arrBuf = append(arrBuf, 10, 20, 30)  // 3 uint8 values
+	arrBuf = append(arrBuf, 10, 20, 30) // 3 uint8 values
 	writeRawKV(t, f, "custom.array_val", 9, arrBuf)
 
 	// 7-8. Interesting keys to verify parsing continued correctly.

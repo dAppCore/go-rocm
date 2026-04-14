@@ -33,11 +33,11 @@ type healthResponse struct {
 func (c *Client) Health(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/health", nil)
 	if err != nil {
-		return err
+		return coreerr.E("llamacpp.Health", "create health request", err)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		return coreerr.E("llamacpp.Health", "health request", err)
 	}
 	defer resp.Body.Close()
 

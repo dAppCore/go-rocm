@@ -84,13 +84,13 @@ func FileTypeName(ft uint32) string {
 func ReadMetadata(path string) (Metadata, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return Metadata{}, err
+		return Metadata{}, coreerr.E("gguf.ReadMetadata", "open file", err)
 	}
 	defer f.Close()
 
 	info, err := f.Stat()
 	if err != nil {
-		return Metadata{}, err
+		return Metadata{}, coreerr.E("gguf.ReadMetadata", "stat file", err)
 	}
 
 	r := bufio.NewReader(f)

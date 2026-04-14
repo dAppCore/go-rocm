@@ -128,6 +128,14 @@ func TestDiscoverModels_NotFound(t *testing.T) {
 	assert.Empty(t, models)
 }
 
+func TestDiscoverModels_BadPattern(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "bad[")
+
+	_, err := DiscoverModels(dir)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "glob gguf files")
+}
+
 func TestDiscoverModels_SkipsCorruptFile(t *testing.T) {
 	dir := t.TempDir()
 

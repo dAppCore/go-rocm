@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 
 	"dappco.re/go/core/rocm/internal/gguf"
+	coreerr "forge.lthn.ai/core/go-log"
 )
 
 // DiscoverModels scans a directory for GGUF model files and returns
@@ -11,7 +12,7 @@ import (
 func DiscoverModels(dir string) ([]ModelInfo, error) {
 	matches, err := filepath.Glob(filepath.Join(dir, "*.gguf"))
 	if err != nil {
-		return nil, err
+		return nil, coreerr.E("rocm.DiscoverModels", "glob gguf files", err)
 	}
 
 	var models []ModelInfo

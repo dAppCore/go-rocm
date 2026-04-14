@@ -5,8 +5,10 @@ package rocm
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"forge.lthn.ai/core/go-inference"
 	coreerr "forge.lthn.ai/core/go-log"
@@ -63,10 +65,12 @@ func TestServerEnv_HIPVisibleDevices(t *testing.T) {
 
 func TestServerEnv_FiltersExistingHIP(t *testing.T) {
 	t.Setenv("HIP_VISIBLE_DEVICES", "1")
+	t.Setenv("HIP_DEVICE_ORDER", "PCI_BUS_ID")
+	t.Setenv("HIP_TRACE_API", "1")
 	env := serverEnv()
 	var hipVals []string
 	for _, e := range env {
-		if strings.HasPrefix(e, "HIP_VISIBLE_DEVICES=") {
+		if strings.HasPrefix(e, "HIP_") {
 			hipVals = append(hipVals, e)
 		}
 	}
@@ -80,7 +84,6 @@ func TestAvailable(t *testing.T) {
 	}
 	assert.True(t, b.Available())
 }
-
 
 func TestServerAlive_Running(t *testing.T) {
 	s := &server{exited: make(chan struct{})}
@@ -117,6 +120,26 @@ func TestStartServer_RetriesOnProcessExit(t *testing.T) {
 	_, err := startServer("/bin/false", "/nonexistent/model.gguf", 999, 0, 0)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed after 3 attempts")
+}
+
+func TestStartServer_RetriesOnStartupTimeout(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "fake-llama-server")
+	require.NoError(t, os.WriteFile(binary, []byte("#!/bin/sh\nsleep 1\n"), 0755))
+
+	oldTimeout := serverStartupTimeout
+	oldInterval := serverReadyPollInterval
+	serverStartupTimeout = 50 * time.Millisecond
+	serverReadyPollInterval = 10 * time.Millisecond
+	t.Cleanup(func() {
+		serverStartupTimeout = oldTimeout
+		serverReadyPollInterval = oldInterval
+	})
+
+	_, err := startServer(binary, "/nonexistent/model.gguf", 999, 0, 0)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed after 3 attempts")
+	assert.Contains(t, err.Error(), "timeout waiting for llama-server")
 }
 
 func TestChat_ServerDead(t *testing.T) {

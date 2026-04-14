@@ -51,5 +51,11 @@ func TestHealth_Loading(t *testing.T) {
 func TestHealth_ServerDown(t *testing.T) {
 	c := NewClient("http://127.0.0.1:1") // nothing listening
 	err := c.Health(context.Background())
-	assert.Error(t, err)
+	assert.ErrorContains(t, err, "health request")
+}
+
+func TestHealth_InvalidBaseURL(t *testing.T) {
+	c := NewClient("http://%zz")
+	err := c.Health(context.Background())
+	assert.ErrorContains(t, err, "create health request")
 }
