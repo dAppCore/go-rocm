@@ -37,12 +37,12 @@ const (
 
 // server manages a llama-server subprocess.
 type server struct {
-	cmd           *exec.Cmd
-	port          int
-	client        *llamacpp.Client
-	exited        chan struct{}
-	exitErr       error // safe to read only after <-exited
-	processOutput *processOutputCapture
+	processCommand   *exec.Cmd
+	port             int
+	llamaClient      *llamacpp.Client
+	processExited    chan struct{}
+	processExitError error // safe to read only after <-processExited
+	processOutput    *processOutputCapture
 }
 
 // serverStartConfig keeps llama-server startup settings named instead of positional.
@@ -57,7 +57,7 @@ type serverStartConfig struct {
 // alive reports whether the llama-server process is still running.
 func (s *server) alive() bool {
 	select {
-	case <-s.exited:
+	case <-s.processExited:
 		return false
 	default:
 		return true
@@ -124,7 +124,7 @@ func startServer(startConfig serverStartConfig) (*server, error) {
 	}
 
 	const maxAttempts = 3
-	var lastErr error
+	var lastStartupError error
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		port, err := freePort()
@@ -135,26 +135,26 @@ func startServer(startConfig serverStartConfig) (*server, error) {
 		commandArguments := llamaServerArguments(startConfig, port, gpuLayerCount)
 
 		outputCapture := newProcessOutputCapture(serverProcessOutputLimit)
-		cmd := exec.Command(startConfig.BinaryPath, commandArguments...)
-		cmd.Env = serverEnv()
-		cmd.Stdout = outputCapture
-		cmd.Stderr = outputCapture
+		processCommand := exec.Command(startConfig.BinaryPath, commandArguments...)
+		processCommand.Env = serverEnv()
+		processCommand.Stdout = outputCapture
+		processCommand.Stderr = outputCapture
 
-		if err := cmd.Start(); err != nil {
+		if err := processCommand.Start(); err != nil {
 			return nil, coreerr.E("rocm.startServer", "start llama-server", err)
 		}
 
 		s := &server{
-			cmd:           cmd,
-			port:          port,
-			client:        llamacpp.NewClient(fmt.Sprintf("http://127.0.0.1:%d", port)),
-			exited:        make(chan struct{}),
-			processOutput: outputCapture,
+			processCommand: processCommand,
+			port:           port,
+			llamaClient:    llamacpp.NewClient(fmt.Sprintf("http://127.0.0.1:%d", port)),
+			processExited:  make(chan struct{}),
+			processOutput:  outputCapture,
 		}
 
 		go func() {
-			s.exitErr = cmd.Wait()
-			close(s.exited)
+			s.processExitError = processCommand.Wait()
+			close(s.processExited)
 		}()
 
 		ctx, cancel := context.WithTimeout(context.Background(), serverStartupTimeout)
@@ -167,13 +167,13 @@ func startServer(startConfig serverStartConfig) (*server, error) {
 		if stopErr := s.stop(); stopErr != nil {
 			coreerr.Warn("llama-server cleanup after failed startup returned error", "attempt", attempt+1, "err", stopErr)
 		}
-		lastErr = coreerr.E("rocm.startServer", fmt.Sprintf("attempt %d", attempt+1), err)
+		lastStartupError = coreerr.E("rocm.startServer", fmt.Sprintf("attempt %d", attempt+1), err)
 		if attempt < maxAttempts-1 {
-			coreerr.Warn("llama-server startup failed; retrying", "attempt", attempt+1, "max_attempts", maxAttempts, "err", lastErr)
+			coreerr.Warn("llama-server startup failed; retrying", "attempt", attempt+1, "max_attempts", maxAttempts, "err", lastStartupError)
 		}
 	}
 
-	return nil, coreerr.E("rocm.startServer", fmt.Sprintf("server failed after %d attempts", maxAttempts), lastErr)
+	return nil, coreerr.E("rocm.startServer", fmt.Sprintf("server failed after %d attempts", maxAttempts), lastStartupError)
 }
 
 func llamaServerArguments(startConfig serverStartConfig, port, gpuLayerCount int) []string {
@@ -197,22 +197,22 @@ func (s *server) waitReady(ctx context.Context) error {
 	ticker := time.NewTicker(serverReadyPollInterval)
 	defer ticker.Stop()
 
-	var lastHealthErr error
+	var lastHealthError error
 
 	for {
 		select {
 		case <-ctx.Done():
-			if lastHealthErr != nil {
-				return coreerr.E("server.waitReady", s.messageWithProcessOutput("timeout waiting for llama-server"), lastHealthErr)
+			if lastHealthError != nil {
+				return coreerr.E("server.waitReady", s.messageWithProcessOutput("timeout waiting for llama-server"), lastHealthError)
 			}
 			return coreerr.E("server.waitReady", s.messageWithProcessOutput("timeout waiting for llama-server"), ctx.Err())
-		case <-s.exited:
-			return s.wrapProcessError("server.waitReady", "llama-server exited before becoming ready", s.exitErr)
+		case <-s.processExited:
+			return s.wrapProcessError("server.waitReady", "llama-server exited before becoming ready", s.processExitError)
 		case <-ticker.C:
-			if err := s.client.Health(ctx); err == nil {
+			if err := s.llamaClient.Health(ctx); err == nil {
 				return nil
 			} else {
-				lastHealthErr = err
+				lastHealthError = err
 			}
 		}
 	}
@@ -221,42 +221,42 @@ func (s *server) waitReady(ctx context.Context) error {
 // stop sends SIGTERM and waits up to 5s, then SIGKILL. Exit caused by those
 // signals is treated as a successful caller-initiated shutdown.
 func (s *server) stop() error {
-	if s.cmd.Process == nil {
+	if s.processCommand.Process == nil {
 		return nil
 	}
 
 	// Already exited?
 	select {
-	case <-s.exited:
-		if isExpectedStopExitErr(s.exitErr) {
+	case <-s.processExited:
+		if isExpectedStopExitErr(s.processExitError) {
 			return nil
 		}
-		return s.wrapProcessError("server.stop", "llama-server already exited", s.exitErr)
+		return s.wrapProcessError("server.stop", "llama-server already exited", s.processExitError)
 	default:
 	}
 
 	// Send SIGTERM for graceful shutdown.
-	if err := s.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+	if err := s.processCommand.Process.Signal(syscall.SIGTERM); err != nil {
 		return coreerr.E("server.stop", "sigterm llama-server", err)
 	}
 
 	// Wait up to 5 seconds for clean exit.
 	select {
-	case <-s.exited:
-		if isExpectedStopExitErr(s.exitErr) {
+	case <-s.processExited:
+		if isExpectedStopExitErr(s.processExitError) {
 			return nil
 		}
-		return s.wrapProcessError("server.stop", "llama-server exited after sigterm", s.exitErr)
+		return s.wrapProcessError("server.stop", "llama-server exited after sigterm", s.processExitError)
 	case <-time.After(5 * time.Second):
 		// Force kill.
-		if err := s.cmd.Process.Kill(); err != nil {
+		if err := s.processCommand.Process.Kill(); err != nil {
 			return coreerr.E("server.stop", "kill llama-server", err)
 		}
-		<-s.exited
-		if isExpectedStopExitErr(s.exitErr) {
+		<-s.processExited
+		if isExpectedStopExitErr(s.processExitError) {
 			return nil
 		}
-		return s.wrapProcessError("server.stop", "llama-server exited after sigkill", s.exitErr)
+		return s.wrapProcessError("server.stop", "llama-server exited after sigkill", s.processExitError)
 	}
 }
 

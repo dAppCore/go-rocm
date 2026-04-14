@@ -8,5 +8,9 @@ func init() {
 	inference.Register(&rocmBackend{})
 }
 
+//	if ROCmAvailable() {
+//	    fmt.Println("ROCm code path compiled in")
+//	}
+//
 // ROCmAvailable reports whether ROCm GPU inference is available.
 func ROCmAvailable() bool { return true }

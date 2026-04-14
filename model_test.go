@@ -20,8 +20,8 @@ import (
 func newHTTPBackedModel(ts *httptest.Server) *rocmModel {
 	return &rocmModel{
 		server: &server{
-			client: llamacpp.NewClient(ts.URL),
-			exited: make(chan struct{}),
+			llamaClient:   llamacpp.NewClient(ts.URL),
+			processExited: make(chan struct{}),
 		},
 	}
 }

@@ -21,9 +21,9 @@ type rocmModel struct {
 	modelType string
 	modelInfo inference.ModelInfo
 
-	mutex   sync.Mutex
-	lastErr error
-	metrics inference.GenerateMetrics
+	stateMutex  sync.Mutex
+	lastError   error
+	lastMetrics inference.GenerateMetrics
 }
 
 // Generate streams tokens for the given prompt via llama-server's /v1/completions endpoint.
@@ -40,7 +40,7 @@ func (m *rocmModel) Generate(ctx context.Context, prompt string, opts ...inferen
 	promptTokens := approximatePromptTokens(prompt)
 
 	start := time.Now()
-	chunks, errFn := m.server.client.Complete(ctx, request)
+	chunks, streamError := m.server.llamaClient.Complete(ctx, request)
 
 	return func(yield func(inference.Token) bool) {
 		var count int
@@ -54,7 +54,7 @@ func (m *rocmModel) Generate(ctx context.Context, prompt string, opts ...inferen
 				break
 			}
 		}
-		if err := errFn(); err != nil {
+		if err := streamError(); err != nil {
 			m.setLastError(err)
 		}
 		m.recordMetrics(promptTokens, count, start, firstTokenAt)
@@ -83,7 +83,7 @@ func (m *rocmModel) Chat(ctx context.Context, messages []inference.Message, opts
 	request := newChatRequest(chatMsgs, generateConfig)
 
 	start := time.Now()
-	chunks, errFn := m.server.client.ChatComplete(ctx, request)
+	chunks, streamError := m.server.llamaClient.ChatComplete(ctx, request)
 
 	return func(yield func(inference.Token) bool) {
 		var count int
@@ -97,7 +97,7 @@ func (m *rocmModel) Chat(ctx context.Context, messages []inference.Message, opts
 				break
 			}
 		}
-		if err := errFn(); err != nil {
+		if err := streamError(); err != nil {
 			m.setLastError(err)
 		}
 		m.recordMetrics(promptTokens, count, start, firstTokenAt)
@@ -132,7 +132,7 @@ func (m *rocmModel) Classify(ctx context.Context, prompts []string, opts ...infe
 		request.MaxTokens = 1
 
 		requestStart := time.Now()
-		chunks, errFn := m.server.client.Complete(ctx, request)
+		chunks, streamError := m.server.llamaClient.Complete(ctx, request)
 		var text strings.Builder
 		var firstTokenAt time.Time
 		var generated int
@@ -149,7 +149,7 @@ func (m *rocmModel) Classify(ctx context.Context, prompts []string, opts ...infe
 		totalDecode += decode
 		totalGenerated += generated
 
-		if err := errFn(); err != nil {
+		if err := streamError(); err != nil {
 			m.recordMetricsDurations(totalPromptTokens, totalGenerated, totalPrefill, totalDecode)
 			return nil, coreerr.E("rocm.Classify", fmt.Sprintf("classify prompt %d", promptIndex), err)
 		}
@@ -188,7 +188,7 @@ func (m *rocmModel) BatchGenerate(ctx context.Context, prompts []string, opts ..
 		request := newCompletionRequest(prompt, generateConfig)
 
 		requestStart := time.Now()
-		chunks, errFn := m.server.client.Complete(ctx, request)
+		chunks, streamError := m.server.llamaClient.Complete(ctx, request)
 		var tokens []inference.Token
 		var firstTokenAt time.Time
 		for text := range chunks {
@@ -204,7 +204,7 @@ func (m *rocmModel) BatchGenerate(ctx context.Context, prompts []string, opts ..
 		results[promptIndex].Tokens = tokens
 		totalGenerated += len(tokens)
 
-		if err := errFn(); err != nil {
+		if err := streamError(); err != nil {
 			results[promptIndex].Err = coreerr.E("rocm.BatchGenerate", fmt.Sprintf("batch prompt %d", promptIndex), err)
 		}
 	}
@@ -221,16 +221,16 @@ func (m *rocmModel) Info() inference.ModelInfo { return m.modelInfo }
 
 // Metrics returns performance metrics from the last inference operation.
 func (m *rocmModel) Metrics() inference.GenerateMetrics {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-	return m.metrics
+	m.stateMutex.Lock()
+	defer m.stateMutex.Unlock()
+	return m.lastMetrics
 }
 
 // Err returns the error from the last Generate/Chat call, if any.
 func (m *rocmModel) Err() error {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-	return m.lastErr
+	m.stateMutex.Lock()
+	defer m.stateMutex.Unlock()
+	return m.lastError
 }
 
 // Close releases the llama-server subprocess and all associated resources.
@@ -240,12 +240,12 @@ func (m *rocmModel) Close() error {
 
 // setServerExitErr stores an appropriate error when the server is dead.
 func (m *rocmModel) setServerExitErr() {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-	if m.server.exitErr != nil {
-		m.lastErr = m.server.wrapProcessError("rocm.setServerExitErr", "server has exited", m.server.exitErr)
+	m.stateMutex.Lock()
+	defer m.stateMutex.Unlock()
+	if m.server.processExitError != nil {
+		m.lastError = m.server.wrapProcessError("rocm.setServerExitErr", "server has exited", m.server.processExitError)
 	} else {
-		m.lastErr = coreerr.E("rocm.setServerExitErr", m.server.messageWithProcessOutput("server has exited unexpectedly"), nil)
+		m.lastError = coreerr.E("rocm.setServerExitErr", m.server.messageWithProcessOutput("server has exited unexpectedly"), nil)
 	}
 }
 
@@ -284,9 +284,9 @@ func (m *rocmModel) recordMetricsDurations(promptTokens, generatedTokens int, pr
 		metrics.ActiveMemoryBytes = vram.Used
 	}
 
-	m.mutex.Lock()
-	m.metrics = metrics
-	m.mutex.Unlock()
+	m.stateMutex.Lock()
+	m.lastMetrics = metrics
+	m.stateMutex.Unlock()
 }
 
 func (m *rocmModel) clearLastError() {
@@ -294,9 +294,9 @@ func (m *rocmModel) clearLastError() {
 }
 
 func (m *rocmModel) setLastError(err error) {
-	m.mutex.Lock()
-	m.lastErr = err
-	m.mutex.Unlock()
+	m.stateMutex.Lock()
+	m.lastError = err
+	m.stateMutex.Unlock()
 }
 
 func newCompletionRequest(prompt string, generateConfig inference.GenerateConfig) llamacpp.CompletionRequest {

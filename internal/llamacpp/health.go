@@ -32,25 +32,26 @@ type healthStatusResponse struct {
 }
 
 //	err := client.Health(ctx)
+//	fmt.Println(err == nil)
 //
 // Health checks whether the llama-server is ready to accept requests.
 func (c *Client) Health(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/health", nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/health", nil)
 	if err != nil {
 		return coreerr.E("llamacpp.Health", "create health request", err)
 	}
-	resp, err := c.httpClient.Do(req)
+	response, err := c.httpClient.Do(request)
 	if err != nil {
 		return coreerr.E("llamacpp.Health", "health request", err)
 	}
-	defer resp.Body.Close()
+	defer response.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-		return coreerr.E("llamacpp.Health", fmt.Sprintf("health returned %d: %s", resp.StatusCode, string(body)), nil)
+	if response.StatusCode != http.StatusOK {
+		responseBody, _ := io.ReadAll(io.LimitReader(response.Body, 256))
+		return coreerr.E("llamacpp.Health", fmt.Sprintf("health returned %d: %s", response.StatusCode, string(responseBody)), nil)
 	}
 	var healthStatus healthStatusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&healthStatus); err != nil {
+	if err := json.NewDecoder(response.Body).Decode(&healthStatus); err != nil {
 		return coreerr.E("llamacpp.Health", "health decode", err)
 	}
 	if healthStatus.Status != "ok" {

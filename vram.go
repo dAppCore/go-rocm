@@ -12,6 +12,7 @@ import (
 )
 
 //	info, err := GetVRAMInfo()
+//	fmt.Printf("%d MiB free\n", info.Free>>20)
 //
 // GetVRAMInfo reads VRAM usage for the discrete GPU from sysfs. It identifies
 // the dGPU by selecting the card with the largest VRAM total, which avoids

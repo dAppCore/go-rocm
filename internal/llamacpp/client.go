@@ -70,41 +70,41 @@ type completionStreamChunkResponse struct {
 func (c *Client) ChatComplete(ctx context.Context, req ChatRequest) (iter.Seq[string], func() error) {
 	req.Stream = true
 
-	body, err := json.Marshal(req)
+	requestBody, err := json.Marshal(req)
 	if err != nil {
 		return noStreamChunks, func() error { return coreerr.E("llamacpp.ChatComplete", "marshal chat request", err) }
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/chat/completions", bytes.NewReader(body))
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/chat/completions", bytes.NewReader(requestBody))
 	if err != nil {
 		return noStreamChunks, func() error { return coreerr.E("llamacpp.ChatComplete", "create chat request", err) }
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "text/event-stream")
+	httpRequest.Header.Set("Content-Type", "application/json")
+	httpRequest.Header.Set("Accept", "text/event-stream")
 
-	resp, err := c.httpClient.Do(httpReq)
+	response, err := c.httpClient.Do(httpRequest)
 	if err != nil {
 		return noStreamChunks, func() error { return coreerr.E("llamacpp.ChatComplete", "chat request", err) }
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		defer resp.Body.Close()
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+	if response.StatusCode != http.StatusOK {
+		defer response.Body.Close()
+		responseBody, _ := io.ReadAll(io.LimitReader(response.Body, 256))
 		return noStreamChunks, func() error {
-			return coreerr.E("llamacpp.ChatComplete", fmt.Sprintf("chat returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody))), nil)
+			return coreerr.E("llamacpp.ChatComplete", fmt.Sprintf("chat returned %d: %s", response.StatusCode, strings.TrimSpace(string(responseBody))), nil)
 		}
 	}
 
 	var (
 		streamErr error
 		closeOnce sync.Once
-		closeBody = func() { closeOnce.Do(func() { resp.Body.Close() }) }
+		closeBody = func() { closeOnce.Do(func() { response.Body.Close() }) }
 	)
-	serverSentEventData := streamSSEData(resp.Body, &streamErr)
+	eventDataStream := streamSSEData(response.Body, &streamErr)
 
-	tokens := func(yield func(string) bool) {
+	tokenStream := func(yield func(string) bool) {
 		defer closeBody()
-		for rawChunk := range serverSentEventData {
+		for rawChunk := range eventDataStream {
 			var chunk chatStreamChunkResponse
 			if err := json.Unmarshal([]byte(rawChunk), &chunk); err != nil {
 				streamErr = coreerr.E("llamacpp.ChatComplete", "decode chat chunk", err)
@@ -123,7 +123,7 @@ func (c *Client) ChatComplete(ctx context.Context, req ChatRequest) (iter.Seq[st
 		}
 	}
 
-	return tokens, func() error {
+	return tokenStream, func() error {
 		closeBody()
 		return streamErr
 	}
@@ -139,41 +139,41 @@ func (c *Client) ChatComplete(ctx context.Context, req ChatRequest) (iter.Seq[st
 func (c *Client) Complete(ctx context.Context, req CompletionRequest) (iter.Seq[string], func() error) {
 	req.Stream = true
 
-	body, err := json.Marshal(req)
+	requestBody, err := json.Marshal(req)
 	if err != nil {
 		return noStreamChunks, func() error { return coreerr.E("llamacpp.Complete", "marshal completion request", err) }
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/completions", bytes.NewReader(body))
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/completions", bytes.NewReader(requestBody))
 	if err != nil {
 		return noStreamChunks, func() error { return coreerr.E("llamacpp.Complete", "create completion request", err) }
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "text/event-stream")
+	httpRequest.Header.Set("Content-Type", "application/json")
+	httpRequest.Header.Set("Accept", "text/event-stream")
 
-	resp, err := c.httpClient.Do(httpReq)
+	response, err := c.httpClient.Do(httpRequest)
 	if err != nil {
 		return noStreamChunks, func() error { return coreerr.E("llamacpp.Complete", "completion request", err) }
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		defer resp.Body.Close()
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+	if response.StatusCode != http.StatusOK {
+		defer response.Body.Close()
+		responseBody, _ := io.ReadAll(io.LimitReader(response.Body, 256))
 		return noStreamChunks, func() error {
-			return coreerr.E("llamacpp.Complete", fmt.Sprintf("completion returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody))), nil)
+			return coreerr.E("llamacpp.Complete", fmt.Sprintf("completion returned %d: %s", response.StatusCode, strings.TrimSpace(string(responseBody))), nil)
 		}
 	}
 
 	var (
 		streamErr error
 		closeOnce sync.Once
-		closeBody = func() { closeOnce.Do(func() { resp.Body.Close() }) }
+		closeBody = func() { closeOnce.Do(func() { response.Body.Close() }) }
 	)
-	serverSentEventData := streamSSEData(resp.Body, &streamErr)
+	eventDataStream := streamSSEData(response.Body, &streamErr)
 
-	tokens := func(yield func(string) bool) {
+	tokenStream := func(yield func(string) bool) {
 		defer closeBody()
-		for rawChunk := range serverSentEventData {
+		for rawChunk := range eventDataStream {
 			var chunk completionStreamChunkResponse
 			if err := json.Unmarshal([]byte(rawChunk), &chunk); err != nil {
 				streamErr = coreerr.E("llamacpp.Complete", "decode completion chunk", err)
@@ -192,7 +192,7 @@ func (c *Client) Complete(ctx context.Context, req CompletionRequest) (iter.Seq[
 		}
 	}
 
-	return tokens, func() error {
+	return tokenStream, func() error {
 		closeBody()
 		return streamErr
 	}

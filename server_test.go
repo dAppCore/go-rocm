@@ -173,26 +173,26 @@ func TestAvailable(t *testing.T) {
 }
 
 func TestServerAlive_Running(t *testing.T) {
-	s := &server{exited: make(chan struct{})}
+	s := &server{processExited: make(chan struct{})}
 	assert.True(t, s.alive())
 }
 
 func TestServerAlive_Exited(t *testing.T) {
-	exited := make(chan struct{})
-	close(exited)
-	s := &server{exited: exited, exitErr: coreerr.E("test", "process killed", nil)}
+	processExited := make(chan struct{})
+	close(processExited)
+	s := &server{processExited: processExited, processExitError: coreerr.E("test", "process killed", nil)}
 	assert.False(t, s.alive())
 }
 
 func TestGenerate_ServerDead(t *testing.T) {
 	processOutput := newProcessOutputCapture(serverProcessOutputLimit)
 	_, _ = processOutput.Write([]byte("fatal: HIP launch failure\n"))
-	exited := make(chan struct{})
-	close(exited)
+	processExited := make(chan struct{})
+	close(processExited)
 	s := &server{
-		exited:        exited,
-		exitErr:       coreerr.E("test", "process killed", nil),
-		processOutput: processOutput,
+		processExited:    processExited,
+		processExitError: coreerr.E("test", "process killed", nil),
+		processOutput:    processOutput,
 	}
 	m := &rocmModel{server: s}
 
@@ -252,16 +252,16 @@ func TestStartServer_RetriesOnStartupTimeout(t *testing.T) {
 }
 
 func TestServerStop_GracefulSignalReturnsNil(t *testing.T) {
-	cmd := exec.Command("/bin/sleep", "60")
-	require.NoError(t, cmd.Start())
+	processCommand := exec.Command("/bin/sleep", "60")
+	require.NoError(t, processCommand.Start())
 
 	s := &server{
-		cmd:    cmd,
-		exited: make(chan struct{}),
+		processCommand: processCommand,
+		processExited:  make(chan struct{}),
 	}
 	go func() {
-		s.exitErr = cmd.Wait()
-		close(s.exited)
+		s.processExitError = processCommand.Wait()
+		close(s.processExited)
 	}()
 
 	require.NoError(t, s.stop())
@@ -281,11 +281,11 @@ func TestServerWrapProcessError_IncludesProcessOutput(t *testing.T) {
 }
 
 func TestChat_ServerDead(t *testing.T) {
-	exited := make(chan struct{})
-	close(exited)
+	processExited := make(chan struct{})
+	close(processExited)
 	s := &server{
-		exited:  exited,
-		exitErr: coreerr.E("test", "process killed", nil),
+		processExited:    processExited,
+		processExitError: coreerr.E("test", "process killed", nil),
 	}
 	m := &rocmModel{server: s}
 

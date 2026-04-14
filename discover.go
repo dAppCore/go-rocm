@@ -7,7 +7,8 @@ import (
 	"dappco.re/go/rocm/internal/gguf"
 )
 
-//	models, err := DiscoverModels("/models/gguf")
+//	models, err := DiscoverModels("/data/lem/gguf")
+//	fmt.Println(models[0].Architecture, models[0].Quantisation)
 //
 // DiscoverModels scans a directory for GGUF model files and returns structured
 // information about each. Files that cannot be parsed are skipped.
