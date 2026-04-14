@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -22,13 +23,19 @@ var (
 	serverReadyPollInterval = 100 * time.Millisecond
 )
 
+const (
+	serverProcessOutputLimit       = 32 << 10
+	serverProcessOutputSummarySize = 1024
+)
+
 // server manages a llama-server subprocess.
 type server struct {
-	cmd     *exec.Cmd
-	port    int
-	client  *llamacpp.Client
-	exited  chan struct{}
-	exitErr error // safe to read only after <-exited
+	cmd           *exec.Cmd
+	port          int
+	client        *llamacpp.Client
+	exited        chan struct{}
+	exitErr       error // safe to read only after <-exited
+	processOutput *processOutputCapture
 }
 
 // alive reports whether the llama-server process is still running.
@@ -45,16 +52,27 @@ func (s *server) alive() bool {
 // Checks ROCM_LLAMA_SERVER_PATH first, then PATH.
 func findLlamaServer() (string, error) {
 	if p := os.Getenv("ROCM_LLAMA_SERVER_PATH"); p != "" {
-		if _, err := os.Stat(p); err != nil {
-			return "", coreerr.E("rocm.findLlamaServer", "llama-server not found at ROCM_LLAMA_SERVER_PATH="+p, err)
-		}
-		return p, nil
+		return validateLlamaServerPath(p)
 	}
 	p, err := exec.LookPath("llama-server")
 	if err != nil {
 		return "", coreerr.E("rocm.findLlamaServer", "llama-server not found in PATH", err)
 	}
 	return p, nil
+}
+
+func validateLlamaServerPath(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", coreerr.E("rocm.findLlamaServer", "llama-server not found at ROCM_LLAMA_SERVER_PATH="+path, err)
+	}
+	if info.IsDir() {
+		return "", coreerr.E("rocm.findLlamaServer", "ROCM_LLAMA_SERVER_PATH must point to a file", nil)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		return "", coreerr.E("rocm.findLlamaServer", "llama-server is not executable at ROCM_LLAMA_SERVER_PATH="+path, nil)
+	}
+	return path, nil
 }
 
 // freePort asks the kernel for a free TCP port on localhost.
@@ -115,18 +133,22 @@ func startServer(binary, modelPath string, gpuLayers, ctxSize, parallelSlots int
 			args = append(args, "--parallel", strconv.Itoa(parallelSlots))
 		}
 
+		processOutput := newProcessOutputCapture(serverProcessOutputLimit)
 		cmd := exec.Command(binary, args...)
 		cmd.Env = serverEnv()
+		cmd.Stdout = processOutput
+		cmd.Stderr = processOutput
 
 		if err := cmd.Start(); err != nil {
 			return nil, coreerr.E("rocm.startServer", "start llama-server", err)
 		}
 
 		s := &server{
-			cmd:    cmd,
-			port:   port,
-			client: llamacpp.NewClient(fmt.Sprintf("http://127.0.0.1:%d", port)),
-			exited: make(chan struct{}),
+			cmd:           cmd,
+			port:          port,
+			client:        llamacpp.NewClient(fmt.Sprintf("http://127.0.0.1:%d", port)),
+			exited:        make(chan struct{}),
+			processOutput: processOutput,
 		}
 
 		go func() {
@@ -159,11 +181,11 @@ func (s *server) waitReady(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			if lastHealthErr != nil {
-				return coreerr.E("server.waitReady", "timeout waiting for llama-server", lastHealthErr)
+				return coreerr.E("server.waitReady", s.messageWithProcessOutput("timeout waiting for llama-server"), lastHealthErr)
 			}
-			return coreerr.E("server.waitReady", "timeout waiting for llama-server", ctx.Err())
+			return coreerr.E("server.waitReady", s.messageWithProcessOutput("timeout waiting for llama-server"), ctx.Err())
 		case <-s.exited:
-			return coreerr.E("server.waitReady", "llama-server exited before becoming ready", s.exitErr)
+			return s.wrapProcessError("server.waitReady", "llama-server exited before becoming ready", s.exitErr)
 		case <-ticker.C:
 			if err := s.client.Health(ctx); err == nil {
 				return nil
@@ -183,7 +205,7 @@ func (s *server) stop() error {
 	// Already exited?
 	select {
 	case <-s.exited:
-		return s.exitErr
+		return s.wrapProcessError("server.stop", "llama-server already exited", s.exitErr)
 	default:
 	}
 
@@ -195,13 +217,90 @@ func (s *server) stop() error {
 	// Wait up to 5 seconds for clean exit.
 	select {
 	case <-s.exited:
-		return s.exitErr
+		return s.wrapProcessError("server.stop", "llama-server exited after sigterm", s.exitErr)
 	case <-time.After(5 * time.Second):
 		// Force kill.
 		if err := s.cmd.Process.Kill(); err != nil {
 			return coreerr.E("server.stop", "kill llama-server", err)
 		}
 		<-s.exited
-		return s.exitErr
+		return s.wrapProcessError("server.stop", "llama-server exited after sigkill", s.exitErr)
 	}
+}
+
+func (s *server) messageWithProcessOutput(message string) string {
+	if s == nil || s.processOutput == nil {
+		return message
+	}
+	output := s.processOutput.Summary()
+	if output == "" {
+		return message
+	}
+	return message + " (llama-server output: " + output + ")"
+}
+
+func (s *server) wrapProcessError(op, message string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return coreerr.E(op, s.messageWithProcessOutput(message), err)
+}
+
+type processOutputCapture struct {
+	maxBytes int
+
+	mu        sync.Mutex
+	buffer    []byte
+	truncated bool
+}
+
+func newProcessOutputCapture(maxBytes int) *processOutputCapture {
+	return &processOutputCapture{maxBytes: maxBytes}
+}
+
+func (c *processOutputCapture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	written := len(p)
+	if c.maxBytes <= 0 || written == 0 {
+		return written, nil
+	}
+
+	c.buffer = append(c.buffer, p...)
+	if len(c.buffer) > c.maxBytes {
+		c.buffer = append([]byte(nil), c.buffer[len(c.buffer)-c.maxBytes:]...)
+		c.truncated = true
+	}
+
+	return written, nil
+}
+
+func (c *processOutputCapture) Summary() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	output := strings.TrimSpace(string(c.buffer))
+	if output == "" {
+		return ""
+	}
+
+	lines := strings.Split(output, "\n")
+	parts := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts = append(parts, line)
+	}
+
+	output = strings.Join(parts, " | ")
+	if len(output) > serverProcessOutputSummarySize {
+		output = output[:serverProcessOutputSummarySize] + "..."
+	}
+	if c.truncated {
+		return "..." + output
+	}
+	return output
 }

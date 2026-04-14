@@ -36,6 +36,18 @@ func TestFindLlamaServer_EnvNotFound(t *testing.T) {
 	assert.ErrorContains(t, err, "not found")
 }
 
+func TestFindLlamaServer_EnvNotExecutable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "llama-server")
+	require.NoError(t, os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0644))
+
+	t.Setenv("ROCM_LLAMA_SERVER_PATH", path)
+
+	_, err := findLlamaServer()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "not executable")
+}
+
 func TestFreePort(t *testing.T) {
 	port, err := freePort()
 	require.NoError(t, err)
@@ -98,11 +110,14 @@ func TestServerAlive_Exited(t *testing.T) {
 }
 
 func TestGenerate_ServerDead(t *testing.T) {
+	processOutput := newProcessOutputCapture(serverProcessOutputLimit)
+	_, _ = processOutput.Write([]byte("fatal: HIP launch failure\n"))
 	exited := make(chan struct{})
 	close(exited)
 	s := &server{
-		exited:  exited,
-		exitErr: coreerr.E("test", "process killed", nil),
+		exited:        exited,
+		exitErr:       coreerr.E("test", "process killed", nil),
+		processOutput: processOutput,
 	}
 	m := &rocmModel{srv: s}
 
@@ -112,6 +127,7 @@ func TestGenerate_ServerDead(t *testing.T) {
 	}
 	assert.Equal(t, 0, count)
 	assert.ErrorContains(t, m.Err(), "server has exited")
+	assert.ErrorContains(t, m.Err(), "HIP launch failure")
 }
 
 func TestStartServer_RetriesOnProcessExit(t *testing.T) {
@@ -140,6 +156,18 @@ func TestStartServer_RetriesOnStartupTimeout(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed after 3 attempts")
 	assert.Contains(t, err.Error(), "timeout waiting for llama-server")
+}
+
+func TestServerWrapProcessError_IncludesProcessOutput(t *testing.T) {
+	processOutput := newProcessOutputCapture(serverProcessOutputLimit)
+	_, _ = processOutput.Write([]byte("HIP runtime exploded\nsecondary detail\n"))
+
+	s := &server{processOutput: processOutput}
+
+	err := s.wrapProcessError("server.waitReady", "llama-server exited before becoming ready", coreerr.E("test", "exit 1", nil))
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "HIP runtime exploded")
+	assert.ErrorContains(t, err, "secondary detail")
 }
 
 func TestChat_ServerDead(t *testing.T) {

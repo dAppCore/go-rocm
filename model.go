@@ -235,9 +235,9 @@ func (m *rocmModel) setServerExitErr() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.srv.exitErr != nil {
-		m.lastErr = coreerr.E("rocm.setServerExitErr", "server has exited", m.srv.exitErr)
+		m.lastErr = m.srv.wrapProcessError("rocm.setServerExitErr", "server has exited", m.srv.exitErr)
 	} else {
-		m.lastErr = coreerr.E("rocm.setServerExitErr", "server has exited unexpectedly", nil)
+		m.lastErr = coreerr.E("rocm.setServerExitErr", m.srv.messageWithProcessOutput("server has exited unexpectedly"), nil)
 	}
 }
 
