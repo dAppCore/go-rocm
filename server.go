@@ -132,24 +132,13 @@ func startServer(startConfig serverStartConfig) (*server, error) {
 			return nil, coreerr.E("rocm.startServer", "find free port", err)
 		}
 
-		args := []string{
-			"--model", startConfig.ModelPath,
-			"--host", "127.0.0.1",
-			"--port", strconv.Itoa(port),
-			"--n-gpu-layers", strconv.Itoa(gpuLayerCount),
-		}
-		if startConfig.ContextSize > 0 {
-			args = append(args, "--ctx-size", strconv.Itoa(startConfig.ContextSize))
-		}
-		if startConfig.ParallelSlotCount > 0 {
-			args = append(args, "--parallel", strconv.Itoa(startConfig.ParallelSlotCount))
-		}
+		commandArguments := llamaServerArguments(startConfig, port, gpuLayerCount)
 
-		processOutput := newProcessOutputCapture(serverProcessOutputLimit)
-		cmd := exec.Command(startConfig.BinaryPath, args...)
+		outputCapture := newProcessOutputCapture(serverProcessOutputLimit)
+		cmd := exec.Command(startConfig.BinaryPath, commandArguments...)
 		cmd.Env = serverEnv()
-		cmd.Stdout = processOutput
-		cmd.Stderr = processOutput
+		cmd.Stdout = outputCapture
+		cmd.Stderr = outputCapture
 
 		if err := cmd.Start(); err != nil {
 			return nil, coreerr.E("rocm.startServer", "start llama-server", err)
@@ -160,7 +149,7 @@ func startServer(startConfig serverStartConfig) (*server, error) {
 			port:          port,
 			client:        llamacpp.NewClient(fmt.Sprintf("http://127.0.0.1:%d", port)),
 			exited:        make(chan struct{}),
-			processOutput: processOutput,
+			processOutput: outputCapture,
 		}
 
 		go func() {
@@ -185,6 +174,22 @@ func startServer(startConfig serverStartConfig) (*server, error) {
 	}
 
 	return nil, coreerr.E("rocm.startServer", fmt.Sprintf("server failed after %d attempts", maxAttempts), lastErr)
+}
+
+func llamaServerArguments(startConfig serverStartConfig, port, gpuLayerCount int) []string {
+	commandArguments := []string{
+		"--model", startConfig.ModelPath,
+		"--host", "127.0.0.1",
+		"--port", strconv.Itoa(port),
+		"--n-gpu-layers", strconv.Itoa(gpuLayerCount),
+	}
+	if startConfig.ContextSize > 0 {
+		commandArguments = append(commandArguments, "--ctx-size", strconv.Itoa(startConfig.ContextSize))
+	}
+	if startConfig.ParallelSlotCount > 0 {
+		commandArguments = append(commandArguments, "--parallel", strconv.Itoa(startConfig.ParallelSlotCount))
+	}
+	return commandArguments
 }
 
 // waitReady polls the health endpoint until the server is ready.

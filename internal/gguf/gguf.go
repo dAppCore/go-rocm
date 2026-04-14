@@ -70,8 +70,10 @@ var fileTypeNames = map[uint32]string{
 	18: "Q6_K",
 }
 
-// FileTypeName returns a human-readable name for a GGML quantisation file type.
-// Unknown types return "type_N" where N is the numeric value.
+//	name := FileTypeName(15) // "Q4_K_M"
+//
+// FileTypeName returns a human-readable name for a GGML quantisation file
+// type. Unknown types return "type_N" where N is the numeric value.
 func FileTypeName(ft uint32) string {
 	if name, ok := fileTypeNames[ft]; ok {
 		return name
@@ -79,25 +81,28 @@ func FileTypeName(ft uint32) string {
 	return fmt.Sprintf("type_%d", ft)
 }
 
+//	metadata, err := ReadMetadata("/models/gemma3-4b.gguf")
+//
 // ReadMetadata reads the GGUF header from the file at path and returns the
-// extracted metadata. Only metadata KV pairs are read; tensor data is not loaded.
+// extracted metadata. Only metadata KV pairs are read; tensor data is not
+// loaded.
 func ReadMetadata(path string) (Metadata, error) {
-	f, err := os.Open(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return Metadata{}, coreerr.E("gguf.ReadMetadata", "open file", err)
 	}
-	defer f.Close()
+	defer file.Close()
 
-	info, err := f.Stat()
+	fileInfo, err := file.Stat()
 	if err != nil {
 		return Metadata{}, coreerr.E("gguf.ReadMetadata", "stat file", err)
 	}
 
-	r := bufio.NewReader(f)
+	reader := bufio.NewReader(file)
 
 	// Read and validate magic number.
 	var magic uint32
-	if err := binary.Read(r, binary.LittleEndian, &magic); err != nil {
+	if err := binary.Read(reader, binary.LittleEndian, &magic); err != nil {
 		return Metadata{}, coreerr.E("gguf.ReadMetadata", "reading magic", err)
 	}
 	if magic != ggufMagic {
@@ -106,7 +111,7 @@ func ReadMetadata(path string) (Metadata, error) {
 
 	// Read version.
 	var version uint32
-	if err := binary.Read(r, binary.LittleEndian, &version); err != nil {
+	if err := binary.Read(reader, binary.LittleEndian, &version); err != nil {
 		return Metadata{}, coreerr.E("gguf.ReadMetadata", "reading version", err)
 	}
 	if version < 2 || version > 3 {
@@ -116,22 +121,22 @@ func ReadMetadata(path string) (Metadata, error) {
 	// Read tensor count and KV count. v3 uses uint64, v2 uses uint32.
 	var tensorCount, kvCount uint64
 	if version == 3 {
-		if err := binary.Read(r, binary.LittleEndian, &tensorCount); err != nil {
+		if err := binary.Read(reader, binary.LittleEndian, &tensorCount); err != nil {
 			return Metadata{}, coreerr.E("gguf.ReadMetadata", "reading tensor count", err)
 		}
-		if err := binary.Read(r, binary.LittleEndian, &kvCount); err != nil {
+		if err := binary.Read(reader, binary.LittleEndian, &kvCount); err != nil {
 			return Metadata{}, coreerr.E("gguf.ReadMetadata", "reading kv count", err)
 		}
 	} else {
-		var tc, kc uint32
-		if err := binary.Read(r, binary.LittleEndian, &tc); err != nil {
+		var tensorCount32, kvCount32 uint32
+		if err := binary.Read(reader, binary.LittleEndian, &tensorCount32); err != nil {
 			return Metadata{}, coreerr.E("gguf.ReadMetadata", "reading tensor count", err)
 		}
-		if err := binary.Read(r, binary.LittleEndian, &kc); err != nil {
+		if err := binary.Read(reader, binary.LittleEndian, &kvCount32); err != nil {
 			return Metadata{}, coreerr.E("gguf.ReadMetadata", "reading kv count", err)
 		}
-		tensorCount = uint64(tc)
-		kvCount = uint64(kc)
+		tensorCount = uint64(tensorCount32)
+		kvCount = uint64(kvCount32)
 	}
 	_ = tensorCount // we only read metadata KVs
 
@@ -139,7 +144,7 @@ func ReadMetadata(path string) (Metadata, error) {
 	// Architecture-specific keys (e.g. llama.context_length) may appear before
 	// the general.architecture key, so we collect all candidates and resolve after.
 	var meta Metadata
-	meta.FileSize = info.Size()
+	meta.FileSize = fileInfo.Size()
 
 	// candidateContextLength and candidateBlockCount store values keyed by
 	// their full key name (e.g. "llama.context_length") so we can match them
@@ -148,75 +153,75 @@ func ReadMetadata(path string) (Metadata, error) {
 	candidateBlockCount := make(map[string]uint32)
 
 	for i := uint64(0); i < kvCount; i++ {
-		key, err := readString(r)
+		key, err := readString(reader)
 		if err != nil {
 			return Metadata{}, coreerr.E("gguf.ReadMetadata", fmt.Sprintf("reading key %d", i), err)
 		}
 
 		var valType uint32
-		if err := binary.Read(r, binary.LittleEndian, &valType); err != nil {
+		if err := binary.Read(reader, binary.LittleEndian, &valType); err != nil {
 			return Metadata{}, coreerr.E("gguf.ReadMetadata", fmt.Sprintf("reading value type for key %q", key), err)
 		}
 
 		// Check whether this is an interesting key before reading the value.
 		switch {
 		case key == "general.architecture":
-			v, err := readTypedValue(r, valType)
+			value, err := readTypedValue(reader, valType)
 			if err != nil {
 				return Metadata{}, coreerr.E("gguf.ReadMetadata", fmt.Sprintf("reading value for key %q", key), err)
 			}
-			if s, ok := v.(string); ok {
+			if s, ok := value.(string); ok {
 				meta.Architecture = s
 			}
 
 		case key == "general.name":
-			v, err := readTypedValue(r, valType)
+			value, err := readTypedValue(reader, valType)
 			if err != nil {
 				return Metadata{}, coreerr.E("gguf.ReadMetadata", fmt.Sprintf("reading value for key %q", key), err)
 			}
-			if s, ok := v.(string); ok {
+			if s, ok := value.(string); ok {
 				meta.Name = s
 			}
 
 		case key == "general.file_type":
-			v, err := readTypedValue(r, valType)
+			value, err := readTypedValue(reader, valType)
 			if err != nil {
 				return Metadata{}, coreerr.E("gguf.ReadMetadata", fmt.Sprintf("reading value for key %q", key), err)
 			}
-			if u, ok := v.(uint32); ok {
+			if u, ok := value.(uint32); ok {
 				meta.FileType = u
 			}
 
 		case key == "general.size_label":
-			v, err := readTypedValue(r, valType)
+			value, err := readTypedValue(reader, valType)
 			if err != nil {
 				return Metadata{}, coreerr.E("gguf.ReadMetadata", fmt.Sprintf("reading value for key %q", key), err)
 			}
-			if s, ok := v.(string); ok {
+			if s, ok := value.(string); ok {
 				meta.SizeLabel = s
 			}
 
 		case strings.HasSuffix(key, ".context_length"):
-			v, err := readTypedValue(r, valType)
+			value, err := readTypedValue(reader, valType)
 			if err != nil {
 				return Metadata{}, coreerr.E("gguf.ReadMetadata", fmt.Sprintf("reading value for key %q", key), err)
 			}
-			if u, ok := v.(uint32); ok {
+			if u, ok := value.(uint32); ok {
 				candidateContextLength[key] = u
 			}
 
 		case strings.HasSuffix(key, ".block_count"):
-			v, err := readTypedValue(r, valType)
+			value, err := readTypedValue(reader, valType)
 			if err != nil {
 				return Metadata{}, coreerr.E("gguf.ReadMetadata", fmt.Sprintf("reading value for key %q", key), err)
 			}
-			if u, ok := v.(uint32); ok {
+			if u, ok := value.(uint32); ok {
 				candidateBlockCount[key] = u
 			}
 
 		default:
 			// Skip uninteresting value.
-			if err := skipValue(r, valType); err != nil {
+			if err := skipValue(reader, valType); err != nil {
 				return Metadata{}, coreerr.E("gguf.ReadMetadata", fmt.Sprintf("skipping value for key %q", key), err)
 			}
 		}
@@ -287,16 +292,16 @@ func readTypedValue(r io.Reader, valType uint32) (any, error) {
 func skipValue(r io.Reader, valType uint32) error {
 	switch valType {
 	case typeUint8, typeInt8, typeBool:
-		_, err := readN(r, 1)
+		_, err := discardBytes(r, 1)
 		return err
 	case typeUint16, typeInt16:
-		_, err := readN(r, 2)
+		_, err := discardBytes(r, 2)
 		return err
 	case typeUint32, typeInt32, typeFloat32:
-		_, err := readN(r, 4)
+		_, err := discardBytes(r, 4)
 		return err
 	case typeUint64, typeInt64, typeFloat64:
-		_, err := readN(r, 8)
+		_, err := discardBytes(r, 8)
 		return err
 	case typeString:
 		var length uint64
@@ -306,7 +311,7 @@ func skipValue(r io.Reader, valType uint32) error {
 		if length > maxStringLength {
 			return coreerr.E("gguf.skipValue", fmt.Sprintf("string length %d exceeds maximum %d", length, maxStringLength), nil)
 		}
-		_, err := readN(r, int64(length))
+		_, err := discardBytes(r, int64(length))
 		return err
 	case typeArray:
 		var elemType uint32
@@ -328,7 +333,7 @@ func skipValue(r io.Reader, valType uint32) error {
 	}
 }
 
-// readN reads and discards exactly n bytes from r.
-func readN(r io.Reader, n int64) (int64, error) {
+// discardBytes reads and discards exactly n bytes from r.
+func discardBytes(r io.Reader, n int64) (int64, error) {
 	return io.CopyN(io.Discard, r, n)
 }

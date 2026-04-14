@@ -14,6 +14,8 @@ import (
 // rocmBackend implements inference.Backend for AMD ROCm GPUs.
 type rocmBackend struct{}
 
+const defaultContextLengthCap = 4096
+
 func (b *rocmBackend) Name() string { return "rocm" }
 
 // Available reports whether ROCm GPU inference can run on this machine.
@@ -30,8 +32,9 @@ func (b *rocmBackend) Available() bool {
 
 // LoadModel loads a GGUF model onto the AMD GPU via llama-server.
 // Model architecture is read from GGUF metadata (replacing filename-based guessing).
-// If no context length is specified, defaults to min(model_context_length, 4096)
-// to prevent VRAM exhaustion on models with 128K+ native context.
+// If no context length is specified, defaults to min(model_context_length,
+// 4096). When metadata omits the native context, it falls back to 4096 to
+// keep the load path on the safe side of VRAM usage.
 func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (inference.TextModel, error) {
 	loadConfig := inference.ApplyLoadOpts(opts)
 
@@ -40,17 +43,14 @@ func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (infe
 		return nil, err
 	}
 
-	meta, err := gguf.ReadMetadata(path)
+	metadata, err := gguf.ReadMetadata(path)
 	if err != nil {
 		return nil, coreerr.E("rocm.LoadModel", "read model metadata", err)
 	}
 
-	contextLength := loadConfig.ContextLen
-	if contextLength == 0 && meta.ContextLength > 0 {
-		contextLength = int(min(meta.ContextLength, 4096))
-	}
+	contextLength := resolveContextLength(loadConfig.ContextLen, metadata)
 
-	server, err := startServer(serverStartConfig{
+	modelServer, err := startServer(serverStartConfig{
 		BinaryPath:        binary,
 		ModelPath:         path,
 		GPULayerCount:     loadConfig.GPULayers,
@@ -61,43 +61,54 @@ func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (infe
 		return nil, err
 	}
 
-	// Map quantisation file type to bit width.
-	quantBits := 0
-	quantGroup := 0
-	ftName := gguf.FileTypeName(meta.FileType)
-	switch {
-	case strings.HasPrefix(ftName, "Q4_"):
-		quantBits = 4
-		quantGroup = 32
-	case strings.HasPrefix(ftName, "Q5_"):
-		quantBits = 5
-		quantGroup = 32
-	case strings.HasPrefix(ftName, "Q8_"):
-		quantBits = 8
-		quantGroup = 32
-	case strings.HasPrefix(ftName, "Q2_"):
-		quantBits = 2
-		quantGroup = 16
-	case strings.HasPrefix(ftName, "Q3_"):
-		quantBits = 3
-		quantGroup = 32
-	case strings.HasPrefix(ftName, "Q6_"):
-		quantBits = 6
-		quantGroup = 64
-	case ftName == "F16":
-		quantBits = 16
-	case ftName == "F32":
-		quantBits = 32
-	}
-
 	return &rocmModel{
-		server:    server,
-		modelType: meta.Architecture,
-		modelInfo: inference.ModelInfo{
-			Architecture: meta.Architecture,
-			NumLayers:    int(meta.BlockCount),
-			QuantBits:    quantBits,
-			QuantGroup:   quantGroup,
-		},
+		server:    modelServer,
+		modelType: metadata.Architecture,
+		modelInfo: modelInfoFromMetadata(metadata),
 	}, nil
+}
+
+func resolveContextLength(requestedContextLength int, metadata gguf.Metadata) int {
+	if requestedContextLength > 0 {
+		return requestedContextLength
+	}
+	if metadata.ContextLength == 0 {
+		return defaultContextLengthCap
+	}
+	return min(int(metadata.ContextLength), defaultContextLengthCap)
+}
+
+func modelInfoFromMetadata(metadata gguf.Metadata) inference.ModelInfo {
+	quantBits, quantGroup := quantisationFromFileType(metadata.FileType)
+	return inference.ModelInfo{
+		Architecture: metadata.Architecture,
+		NumLayers:    int(metadata.BlockCount),
+		QuantBits:    quantBits,
+		QuantGroup:   quantGroup,
+	}
+}
+
+func quantisationFromFileType(fileType uint32) (bits, groupSize int) {
+	fileTypeName := gguf.FileTypeName(fileType)
+
+	switch {
+	case strings.HasPrefix(fileTypeName, "Q4_"):
+		return 4, 32
+	case strings.HasPrefix(fileTypeName, "Q5_"):
+		return 5, 32
+	case strings.HasPrefix(fileTypeName, "Q8_"):
+		return 8, 32
+	case strings.HasPrefix(fileTypeName, "Q2_"):
+		return 2, 16
+	case strings.HasPrefix(fileTypeName, "Q3_"):
+		return 3, 32
+	case strings.HasPrefix(fileTypeName, "Q6_"):
+		return 6, 64
+	case fileTypeName == "F16":
+		return 16, 0
+	case fileTypeName == "F32":
+		return 32, 0
+	default:
+		return 0, 0
+	}
 }

@@ -7,8 +7,10 @@ import (
 	"dappco.re/go/rocm/internal/gguf"
 )
 
-// DiscoverModels scans a directory for GGUF model files and returns
-// structured information about each. Files that cannot be parsed are skipped.
+//	models, err := DiscoverModels("/models/gguf")
+//
+// DiscoverModels scans a directory for GGUF model files and returns structured
+// information about each. Files that cannot be parsed are skipped.
 func DiscoverModels(dir string) ([]ModelInfo, error) {
 	root, err := filepath.Abs(dir)
 	if err != nil {

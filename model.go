@@ -21,16 +21,14 @@ type rocmModel struct {
 	modelType string
 	modelInfo inference.ModelInfo
 
-	mu      sync.Mutex
+	mutex   sync.Mutex
 	lastErr error
 	metrics inference.GenerateMetrics
 }
 
 // Generate streams tokens for the given prompt via llama-server's /v1/completions endpoint.
 func (m *rocmModel) Generate(ctx context.Context, prompt string, opts ...inference.GenerateOption) iter.Seq[inference.Token] {
-	m.mu.Lock()
-	m.lastErr = nil
-	m.mu.Unlock()
+	m.clearLastError()
 
 	if !m.server.alive() {
 		m.setServerExitErr()
@@ -38,7 +36,7 @@ func (m *rocmModel) Generate(ctx context.Context, prompt string, opts ...inferen
 	}
 
 	generateConfig := inference.ApplyGenerateOpts(opts)
-	request := completionRequest(prompt, generateConfig)
+	request := newCompletionRequest(prompt, generateConfig)
 	promptTokens := approximatePromptTokens(prompt)
 
 	start := time.Now()
@@ -57,9 +55,7 @@ func (m *rocmModel) Generate(ctx context.Context, prompt string, opts ...inferen
 			}
 		}
 		if err := errFn(); err != nil {
-			m.mu.Lock()
-			m.lastErr = err
-			m.mu.Unlock()
+			m.setLastError(err)
 		}
 		m.recordMetrics(promptTokens, count, start, firstTokenAt)
 	}
@@ -67,9 +63,7 @@ func (m *rocmModel) Generate(ctx context.Context, prompt string, opts ...inferen
 
 // Chat streams tokens from a multi-turn conversation via llama-server's /v1/chat/completions endpoint.
 func (m *rocmModel) Chat(ctx context.Context, messages []inference.Message, opts ...inference.GenerateOption) iter.Seq[inference.Token] {
-	m.mu.Lock()
-	m.lastErr = nil
-	m.mu.Unlock()
+	m.clearLastError()
 
 	if !m.server.alive() {
 		m.setServerExitErr()
@@ -86,7 +80,7 @@ func (m *rocmModel) Chat(ctx context.Context, messages []inference.Message, opts
 			Content: msg.Content,
 		}
 	}
-	request := chatRequest(chatMsgs, generateConfig)
+	request := newChatRequest(chatMsgs, generateConfig)
 
 	start := time.Now()
 	chunks, errFn := m.server.client.ChatComplete(ctx, request)
@@ -104,9 +98,7 @@ func (m *rocmModel) Chat(ctx context.Context, messages []inference.Message, opts
 			}
 		}
 		if err := errFn(); err != nil {
-			m.mu.Lock()
-			m.lastErr = err
-			m.mu.Unlock()
+			m.setLastError(err)
 		}
 		m.recordMetrics(promptTokens, count, start, firstTokenAt)
 	}
@@ -136,7 +128,7 @@ func (m *rocmModel) Classify(ctx context.Context, prompts []string, opts ...infe
 		}
 
 		totalPromptTokens += approximatePromptTokens(prompt)
-		request := completionRequest(prompt, generateConfig)
+		request := newCompletionRequest(prompt, generateConfig)
 		request.MaxTokens = 1
 
 		requestStart := time.Now()
@@ -193,7 +185,7 @@ func (m *rocmModel) BatchGenerate(ctx context.Context, prompts []string, opts ..
 		}
 
 		totalPromptTokens += approximatePromptTokens(prompt)
-		request := completionRequest(prompt, generateConfig)
+		request := newCompletionRequest(prompt, generateConfig)
 
 		requestStart := time.Now()
 		chunks, errFn := m.server.client.Complete(ctx, request)
@@ -229,15 +221,15 @@ func (m *rocmModel) Info() inference.ModelInfo { return m.modelInfo }
 
 // Metrics returns performance metrics from the last inference operation.
 func (m *rocmModel) Metrics() inference.GenerateMetrics {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
 	return m.metrics
 }
 
 // Err returns the error from the last Generate/Chat call, if any.
 func (m *rocmModel) Err() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
 	return m.lastErr
 }
 
@@ -248,8 +240,8 @@ func (m *rocmModel) Close() error {
 
 // setServerExitErr stores an appropriate error when the server is dead.
 func (m *rocmModel) setServerExitErr() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
 	if m.server.exitErr != nil {
 		m.lastErr = m.server.wrapProcessError("rocm.setServerExitErr", "server has exited", m.server.exitErr)
 	} else {
@@ -272,7 +264,7 @@ func (m *rocmModel) recordMetricsDurations(promptTokens, generatedTokens int, pr
 	}
 	total := prefill + decode
 
-	met := inference.GenerateMetrics{
+	metrics := inference.GenerateMetrics{
 		PromptTokens:    promptTokens,
 		GeneratedTokens: generatedTokens,
 		PrefillDuration: prefill,
@@ -280,42 +272,52 @@ func (m *rocmModel) recordMetricsDurations(promptTokens, generatedTokens int, pr
 		TotalDuration:   total,
 	}
 	if prefill > 0 && promptTokens > 0 {
-		met.PrefillTokensPerSec = float64(promptTokens) / prefill.Seconds()
+		metrics.PrefillTokensPerSec = float64(promptTokens) / prefill.Seconds()
 	}
 	if decode > 0 && generatedTokens > 0 {
-		met.DecodeTokensPerSec = float64(generatedTokens) / decode.Seconds()
+		metrics.DecodeTokensPerSec = float64(generatedTokens) / decode.Seconds()
 	}
 
 	// Try to get VRAM stats — best effort.
 	if vram, err := GetVRAMInfo(); err == nil {
-		met.PeakMemoryBytes = vram.Used
-		met.ActiveMemoryBytes = vram.Used
+		metrics.PeakMemoryBytes = vram.Used
+		metrics.ActiveMemoryBytes = vram.Used
 	}
 
-	m.mu.Lock()
-	m.metrics = met
-	m.mu.Unlock()
+	m.mutex.Lock()
+	m.metrics = metrics
+	m.mutex.Unlock()
 }
 
-func completionRequest(prompt string, cfg inference.GenerateConfig) llamacpp.CompletionRequest {
+func (m *rocmModel) clearLastError() {
+	m.setLastError(nil)
+}
+
+func (m *rocmModel) setLastError(err error) {
+	m.mutex.Lock()
+	m.lastErr = err
+	m.mutex.Unlock()
+}
+
+func newCompletionRequest(prompt string, generateConfig inference.GenerateConfig) llamacpp.CompletionRequest {
 	return llamacpp.CompletionRequest{
 		Prompt:        prompt,
-		MaxTokens:     cfg.MaxTokens,
-		Temperature:   cfg.Temperature,
-		TopK:          cfg.TopK,
-		TopP:          cfg.TopP,
-		RepeatPenalty: cfg.RepeatPenalty,
+		MaxTokens:     generateConfig.MaxTokens,
+		Temperature:   generateConfig.Temperature,
+		TopK:          generateConfig.TopK,
+		TopP:          generateConfig.TopP,
+		RepeatPenalty: generateConfig.RepeatPenalty,
 	}
 }
 
-func chatRequest(messages []llamacpp.ChatMessage, cfg inference.GenerateConfig) llamacpp.ChatRequest {
+func newChatRequest(messages []llamacpp.ChatMessage, generateConfig inference.GenerateConfig) llamacpp.ChatRequest {
 	return llamacpp.ChatRequest{
 		Messages:      messages,
-		MaxTokens:     cfg.MaxTokens,
-		Temperature:   cfg.Temperature,
-		TopK:          cfg.TopK,
-		TopP:          cfg.TopP,
-		RepeatPenalty: cfg.RepeatPenalty,
+		MaxTokens:     generateConfig.MaxTokens,
+		Temperature:   generateConfig.Temperature,
+		TopK:          generateConfig.TopK,
+		TopP:          generateConfig.TopP,
+		RepeatPenalty: generateConfig.RepeatPenalty,
 	}
 }
 

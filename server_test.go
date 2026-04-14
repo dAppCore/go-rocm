@@ -122,6 +122,23 @@ func TestDeterministicPortAllocator_ReturnsErrorWhenRangeIsExhausted(t *testing.
 	assert.ErrorContains(t, err, "no free port in deterministic range")
 }
 
+func TestLlamaServerArguments(t *testing.T) {
+	args := llamaServerArguments(serverStartConfig{
+		ModelPath:         "/models/gemma3.gguf",
+		ContextSize:       2048,
+		ParallelSlotCount: 4,
+	}, 38123, 999)
+
+	assert.Equal(t, []string{
+		"--model", "/models/gemma3.gguf",
+		"--host", "127.0.0.1",
+		"--port", "38123",
+		"--n-gpu-layers", "999",
+		"--ctx-size", "2048",
+		"--parallel", "4",
+	}, args)
+}
+
 func TestServerEnv_HIPVisibleDevices(t *testing.T) {
 	env := serverEnv()
 	var hipVals []string

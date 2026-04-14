@@ -11,9 +11,11 @@ import (
 	coreerr "dappco.re/go/core/log"
 )
 
-// GetVRAMInfo reads VRAM usage for the discrete GPU from sysfs.
-// It identifies the dGPU by selecting the card with the largest VRAM total,
-// which avoids hardcoding card numbers (e.g. card0=iGPU, card1=dGPU on Ryzen).
+//	info, err := GetVRAMInfo()
+//
+// GetVRAMInfo reads VRAM usage for the discrete GPU from sysfs. It identifies
+// the dGPU by selecting the card with the largest VRAM total, which avoids
+// hardcoding card numbers (e.g. card0=iGPU, card1=dGPU on Ryzen).
 //
 // Note: total and used are read non-atomically from sysfs; transient
 // inconsistencies are possible under heavy allocation churn.

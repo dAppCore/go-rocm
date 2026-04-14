@@ -17,6 +17,8 @@ type Client struct {
 	httpClient *http.Client
 }
 
+//	client := NewClient("http://127.0.0.1:38080")
+//
 // NewClient creates a client for the llama-server at the given base URL.
 func NewClient(baseURL string) *Client {
 	return &Client{
@@ -25,10 +27,12 @@ func NewClient(baseURL string) *Client {
 	}
 }
 
-type healthResponse struct {
+type healthStatusResponse struct {
 	Status string `json:"status"`
 }
 
+//	err := client.Health(ctx)
+//
 // Health checks whether the llama-server is ready to accept requests.
 func (c *Client) Health(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/health", nil)
@@ -45,12 +49,12 @@ func (c *Client) Health(ctx context.Context) error {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 		return coreerr.E("llamacpp.Health", fmt.Sprintf("health returned %d: %s", resp.StatusCode, string(body)), nil)
 	}
-	var h healthResponse
-	if err := json.NewDecoder(resp.Body).Decode(&h); err != nil {
+	var healthStatus healthStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&healthStatus); err != nil {
 		return coreerr.E("llamacpp.Health", "health decode", err)
 	}
-	if h.Status != "ok" {
-		return coreerr.E("llamacpp.Health", fmt.Sprintf("server not ready (status: %s)", h.Status), nil)
+	if healthStatus.Status != "ok" {
+		return coreerr.E("llamacpp.Health", fmt.Sprintf("server not ready (status: %s)", healthStatus.Status), nil)
 	}
 	return nil
 }
