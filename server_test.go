@@ -4,9 +4,12 @@ package rocm
 
 import (
 	"context"
+	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -50,6 +53,11 @@ func TestFindLlamaServer_EnvNotExecutable(t *testing.T) {
 }
 
 func TestFreePort(t *testing.T) {
+	restoreListen := stubListenLocalTCP(t, func(network, address string) (net.Listener, error) {
+		return fakeTCPListener{address: address}, nil
+	})
+	defer restoreListen()
+
 	port, err := freePort()
 	require.NoError(t, err)
 	assert.Greater(t, port, 0)
@@ -57,12 +65,61 @@ func TestFreePort(t *testing.T) {
 }
 
 func TestFreePort_UniquePerCall(t *testing.T) {
+	restoreListen := stubListenLocalTCP(t, func(network, address string) (net.Listener, error) {
+		return fakeTCPListener{address: address}, nil
+	})
+	defer restoreListen()
+
 	p1, err := freePort()
 	require.NoError(t, err)
 	p2, err := freePort()
 	require.NoError(t, err)
-	_ = p1
-	_ = p2
+	assert.NotEqual(t, p1, p2)
+}
+
+func TestDeterministicPortAllocator_AdvancesAcrossCalls(t *testing.T) {
+	restoreListen := stubListenLocalTCP(t, func(network, address string) (net.Listener, error) {
+		return fakeTCPListener{address: address}, nil
+	})
+	defer restoreListen()
+
+	allocator := newDeterministicPortAllocator(41000, 3)
+
+	firstPort, err := allocator.NextAvailablePort()
+	require.NoError(t, err)
+
+	secondPort, err := allocator.NextAvailablePort()
+	require.NoError(t, err)
+
+	assert.Equal(t, 41000, firstPort)
+	assert.Equal(t, 41001, secondPort)
+}
+
+func TestDeterministicPortAllocator_SkipsOccupiedPort(t *testing.T) {
+	restoreListen := stubListenLocalTCP(t, func(network, address string) (net.Listener, error) {
+		if address == "127.0.0.1:42000" {
+			return nil, errors.New("port already in use")
+		}
+		return fakeTCPListener{address: address}, nil
+	})
+	defer restoreListen()
+
+	allocator := newDeterministicPortAllocator(42000, 3)
+	port, err := allocator.NextAvailablePort()
+	require.NoError(t, err)
+	assert.Equal(t, 42001, port)
+}
+
+func TestDeterministicPortAllocator_ReturnsErrorWhenRangeIsExhausted(t *testing.T) {
+	restoreListen := stubListenLocalTCP(t, func(network, address string) (net.Listener, error) {
+		return nil, errors.New("port already in use")
+	})
+	defer restoreListen()
+
+	allocator := newDeterministicPortAllocator(43000, 2)
+	_, err := allocator.NextAvailablePort()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "no free port in deterministic range")
 }
 
 func TestServerEnv_HIPVisibleDevices(t *testing.T) {
@@ -132,6 +189,11 @@ func TestGenerate_ServerDead(t *testing.T) {
 }
 
 func TestStartServer_RetriesOnProcessExit(t *testing.T) {
+	restoreListen := stubListenLocalTCP(t, func(network, address string) (net.Listener, error) {
+		return fakeTCPListener{address: address}, nil
+	})
+	defer restoreListen()
+
 	// /bin/false starts successfully but exits immediately with code 1.
 	// startServer should retry up to 3 times, then fail.
 	_, err := startServer(serverStartConfig{
@@ -144,6 +206,11 @@ func TestStartServer_RetriesOnProcessExit(t *testing.T) {
 }
 
 func TestStartServer_RetriesOnStartupTimeout(t *testing.T) {
+	restoreListen := stubListenLocalTCP(t, func(network, address string) (net.Listener, error) {
+		return fakeTCPListener{address: address}, nil
+	})
+	defer restoreListen()
+
 	dir := t.TempDir()
 	binary := filepath.Join(dir, "fake-llama-server")
 	require.NoError(t, os.WriteFile(binary, []byte("#!/bin/sh\nsleep 1\n"), 0755))
@@ -212,4 +279,41 @@ func TestChat_ServerDead(t *testing.T) {
 	}
 	assert.Equal(t, 0, count)
 	assert.ErrorContains(t, m.Err(), "server has exited")
+}
+
+func stubListenLocalTCP(t *testing.T, stub func(network, address string) (net.Listener, error)) func() {
+	t.Helper()
+
+	original := listenLocalTCP
+	listenLocalTCP = stub
+	return func() {
+		listenLocalTCP = original
+	}
+}
+
+type fakeTCPListener struct {
+	address string
+}
+
+func (listener fakeTCPListener) Accept() (net.Conn, error) {
+	return nil, errors.New("not implemented in test listener")
+}
+
+func (listener fakeTCPListener) Close() error { return nil }
+
+func (listener fakeTCPListener) Addr() net.Addr {
+	host, portText, err := net.SplitHostPort(listener.address)
+	if err != nil {
+		return &net.TCPAddr{}
+	}
+
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		return &net.TCPAddr{}
+	}
+
+	return &net.TCPAddr{
+		IP:   net.ParseIP(host),
+		Port: port,
+	}
 }

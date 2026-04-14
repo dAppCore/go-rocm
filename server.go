@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -22,11 +23,16 @@ import (
 var (
 	serverStartupTimeout    = 60 * time.Second
 	serverReadyPollInterval = 100 * time.Millisecond
+	serverPortAllocator     = newDeterministicPortAllocator(serverPortRangeStart, serverPortRangeCount)
+	// listenLocalTCP lets tests stub port probing without opening real sockets.
+	listenLocalTCP = net.Listen
 )
 
 const (
 	serverProcessOutputLimit       = 32 << 10
 	serverProcessOutputSummarySize = 1024
+	serverPortRangeStart           = 38080
+	serverPortRangeCount           = 256
 )
 
 // server manages a llama-server subprocess.
@@ -85,15 +91,10 @@ func validateLlamaServerPath(path string) (string, error) {
 	return path, nil
 }
 
-// freePort asks the kernel for a free TCP port on localhost.
+// freePort walks a deterministic localhost port range and returns the first
+// currently-bindable port.
 func freePort() (int, error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, coreerr.E("rocm.freePort", "listen for free port", err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
-	return port, nil
+	return serverPortAllocator.NextAvailablePort()
 }
 
 // serverEnv returns the environment for the llama-server subprocess.
@@ -293,6 +294,60 @@ func (s *server) wrapProcessError(op, message string, err error) error {
 		return nil
 	}
 	return coreerr.E(op, s.messageWithProcessOutput(message), err)
+}
+
+type deterministicPortAllocator struct {
+	basePort  int
+	portCount int
+	nextPort  atomic.Uint64
+}
+
+func newDeterministicPortAllocator(basePort, portCount int) *deterministicPortAllocator {
+	return &deterministicPortAllocator{
+		basePort:  basePort,
+		portCount: portCount,
+	}
+}
+
+func (allocator *deterministicPortAllocator) NextAvailablePort() (int, error) {
+	if allocator == nil || allocator.portCount <= 0 {
+		return 0, coreerr.E("rocm.freePort", "port allocator is not configured", nil)
+	}
+
+	lastPort := allocator.basePort + allocator.portCount - 1
+	if allocator.basePort <= 0 || lastPort > 65535 {
+		return 0, coreerr.E("rocm.freePort", fmt.Sprintf("invalid port range %d-%d", allocator.basePort, lastPort), nil)
+	}
+
+	startIndex := allocator.nextPort.Add(1) - 1
+	for scanned := 0; scanned < allocator.portCount; scanned++ {
+		portIndex := int((startIndex + uint64(scanned)) % uint64(allocator.portCount))
+		port := allocator.basePort + portIndex
+		address := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+
+		listener, err := listenLocalTCP("tcp", address)
+		if err != nil {
+			continue
+		}
+		listener.Close()
+
+		allocator.advancePast(startIndex + uint64(scanned) + 1)
+		return port, nil
+	}
+
+	return 0, coreerr.E("rocm.freePort", fmt.Sprintf("no free port in deterministic range %d-%d", allocator.basePort, lastPort), nil)
+}
+
+func (allocator *deterministicPortAllocator) advancePast(candidate uint64) {
+	for {
+		current := allocator.nextPort.Load()
+		if current >= candidate {
+			return
+		}
+		if allocator.nextPort.CompareAndSwap(current, candidate) {
+			return
+		}
+	}
 }
 
 type processOutputCapture struct {
