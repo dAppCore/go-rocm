@@ -38,23 +38,19 @@ func (m *rocmModel) Generate(ctx context.Context, prompt string, opts ...inferen
 	}
 
 	cfg := inference.ApplyGenerateOpts(opts)
-
-	req := llamacpp.CompletionRequest{
-		Prompt:        prompt,
-		MaxTokens:     cfg.MaxTokens,
-		Temperature:   cfg.Temperature,
-		TopK:          cfg.TopK,
-		TopP:          cfg.TopP,
-		RepeatPenalty: cfg.RepeatPenalty,
-	}
+	req := completionRequest(prompt, cfg)
+	promptTokens := approximatePromptTokens(prompt)
 
 	start := time.Now()
 	chunks, errFn := m.srv.client.Complete(ctx, req)
 
 	return func(yield func(inference.Token) bool) {
 		var count int
-		decodeStart := time.Now()
+		var firstTokenAt time.Time
 		for text := range chunks {
+			if firstTokenAt.IsZero() {
+				firstTokenAt = time.Now()
+			}
 			count++
 			if !yield(inference.Token{Text: text}) {
 				break
@@ -65,7 +61,7 @@ func (m *rocmModel) Generate(ctx context.Context, prompt string, opts ...inferen
 			m.lastErr = err
 			m.mu.Unlock()
 		}
-		m.recordMetrics(0, count, start, decodeStart)
+		m.recordMetrics(promptTokens, count, start, firstTokenAt)
 	}
 }
 
@@ -81,6 +77,7 @@ func (m *rocmModel) Chat(ctx context.Context, messages []inference.Message, opts
 	}
 
 	cfg := inference.ApplyGenerateOpts(opts)
+	promptTokens := approximateMessageTokens(messages)
 
 	chatMsgs := make([]llamacpp.ChatMessage, len(messages))
 	for i, msg := range messages {
@@ -89,23 +86,18 @@ func (m *rocmModel) Chat(ctx context.Context, messages []inference.Message, opts
 			Content: msg.Content,
 		}
 	}
-
-	req := llamacpp.ChatRequest{
-		Messages:      chatMsgs,
-		MaxTokens:     cfg.MaxTokens,
-		Temperature:   cfg.Temperature,
-		TopK:          cfg.TopK,
-		TopP:          cfg.TopP,
-		RepeatPenalty: cfg.RepeatPenalty,
-	}
+	req := chatRequest(chatMsgs, cfg)
 
 	start := time.Now()
 	chunks, errFn := m.srv.client.ChatComplete(ctx, req)
 
 	return func(yield func(inference.Token) bool) {
 		var count int
-		decodeStart := time.Now()
+		var firstTokenAt time.Time
 		for text := range chunks {
+			if firstTokenAt.IsZero() {
+				firstTokenAt = time.Now()
+			}
 			count++
 			if !yield(inference.Token{Text: text}) {
 				break
@@ -116,48 +108,62 @@ func (m *rocmModel) Chat(ctx context.Context, messages []inference.Message, opts
 			m.lastErr = err
 			m.mu.Unlock()
 		}
-		m.recordMetrics(0, count, start, decodeStart)
+		m.recordMetrics(promptTokens, count, start, firstTokenAt)
 	}
 }
 
 // Classify runs batched prefill-only inference via llama-server.
-// Each prompt gets a single-token completion (max_tokens=1, temperature=0).
-// llama-server has no native classify endpoint, so this simulates it.
+// Each prompt gets a single-token completion (max_tokens=1) while honoring
+// the sampling settings from opts. llama-server has no native classify
+// endpoint, so this simulates it.
 func (m *rocmModel) Classify(ctx context.Context, prompts []string, opts ...inference.GenerateOption) ([]inference.ClassifyResult, error) {
 	if !m.srv.alive() {
 		m.setServerExitErr()
 		return nil, m.Err()
 	}
 
-	start := time.Now()
+	cfg := inference.ApplyGenerateOpts(opts)
 	results := make([]inference.ClassifyResult, len(prompts))
+	totalPromptTokens := 0
+	totalGenerated := 0
+	var totalPrefill time.Duration
+	var totalDecode time.Duration
 
 	for i, prompt := range prompts {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 
-		req := llamacpp.CompletionRequest{
-			Prompt:      prompt,
-			MaxTokens:   1,
-			Temperature: 0,
-		}
+		totalPromptTokens += approximatePromptTokens(prompt)
+		req := completionRequest(prompt, cfg)
+		req.MaxTokens = 1
 
+		requestStart := time.Now()
 		chunks, errFn := m.srv.client.Complete(ctx, req)
 		var text strings.Builder
+		var firstTokenAt time.Time
+		var generated int
 		for chunk := range chunks {
+			if firstTokenAt.IsZero() {
+				firstTokenAt = time.Now()
+			}
+			generated++
 			text.WriteString(chunk)
 		}
 		if err := errFn(); err != nil {
 			return nil, coreerr.E("rocm.Classify", fmt.Sprintf("classify prompt %d", i), err)
 		}
+		prefill, decode := splitDurations(requestStart, firstTokenAt, time.Now())
+		totalPrefill += prefill
+		totalDecode += decode
+		totalGenerated += generated
 
 		results[i] = inference.ClassifyResult{
 			Token: inference.Token{Text: text.String()},
 		}
 	}
 
-	m.recordMetrics(len(prompts), len(prompts), start, start)
+	m.recordMetricsDurations(totalPromptTokens, totalGenerated, totalPrefill, totalDecode)
 	return results, nil
 }
 
@@ -170,9 +176,11 @@ func (m *rocmModel) BatchGenerate(ctx context.Context, prompts []string, opts ..
 	}
 
 	cfg := inference.ApplyGenerateOpts(opts)
-	start := time.Now()
 	results := make([]inference.BatchResult, len(prompts))
+	totalPromptTokens := 0
 	var totalGenerated int
+	var totalPrefill time.Duration
+	var totalDecode time.Duration
 
 	for i, prompt := range prompts {
 		if ctx.Err() != nil {
@@ -180,28 +188,30 @@ func (m *rocmModel) BatchGenerate(ctx context.Context, prompts []string, opts ..
 			continue
 		}
 
-		req := llamacpp.CompletionRequest{
-			Prompt:        prompt,
-			MaxTokens:     cfg.MaxTokens,
-			Temperature:   cfg.Temperature,
-			TopK:          cfg.TopK,
-			TopP:          cfg.TopP,
-			RepeatPenalty: cfg.RepeatPenalty,
-		}
+		totalPromptTokens += approximatePromptTokens(prompt)
+		req := completionRequest(prompt, cfg)
 
+		requestStart := time.Now()
 		chunks, errFn := m.srv.client.Complete(ctx, req)
 		var tokens []inference.Token
+		var firstTokenAt time.Time
 		for text := range chunks {
+			if firstTokenAt.IsZero() {
+				firstTokenAt = time.Now()
+			}
 			tokens = append(tokens, inference.Token{Text: text})
 		}
 		if err := errFn(); err != nil {
 			results[i].Err = coreerr.E("rocm.BatchGenerate", fmt.Sprintf("batch prompt %d", i), err)
 		}
+		prefill, decode := splitDurations(requestStart, firstTokenAt, time.Now())
+		totalPrefill += prefill
+		totalDecode += decode
 		results[i].Tokens = tokens
 		totalGenerated += len(tokens)
 	}
 
-	m.recordMetrics(len(prompts), totalGenerated, start, start)
+	m.recordMetricsDurations(totalPromptTokens, totalGenerated, totalPrefill, totalDecode)
 	return results, nil
 }
 
@@ -242,11 +252,19 @@ func (m *rocmModel) setServerExitErr() {
 }
 
 // recordMetrics captures timing data from an inference operation.
-func (m *rocmModel) recordMetrics(promptTokens, generatedTokens int, start, decodeStart time.Time) {
-	now := time.Now()
-	total := now.Sub(start)
-	decode := now.Sub(decodeStart)
-	prefill := total - decode
+func (m *rocmModel) recordMetrics(promptTokens, generatedTokens int, start, firstTokenAt time.Time) {
+	prefill, decode := splitDurations(start, firstTokenAt, time.Now())
+	m.recordMetricsDurations(promptTokens, generatedTokens, prefill, decode)
+}
+
+func (m *rocmModel) recordMetricsDurations(promptTokens, generatedTokens int, prefill, decode time.Duration) {
+	if prefill < 0 {
+		prefill = 0
+	}
+	if decode < 0 {
+		decode = 0
+	}
+	total := prefill + decode
 
 	met := inference.GenerateMetrics{
 		PromptTokens:    promptTokens,
@@ -271,4 +289,50 @@ func (m *rocmModel) recordMetrics(promptTokens, generatedTokens int, start, deco
 	m.mu.Lock()
 	m.metrics = met
 	m.mu.Unlock()
+}
+
+func completionRequest(prompt string, cfg inference.GenerateConfig) llamacpp.CompletionRequest {
+	return llamacpp.CompletionRequest{
+		Prompt:        prompt,
+		MaxTokens:     cfg.MaxTokens,
+		Temperature:   cfg.Temperature,
+		TopK:          cfg.TopK,
+		TopP:          cfg.TopP,
+		RepeatPenalty: cfg.RepeatPenalty,
+	}
+}
+
+func chatRequest(messages []llamacpp.ChatMessage, cfg inference.GenerateConfig) llamacpp.ChatRequest {
+	return llamacpp.ChatRequest{
+		Messages:      messages,
+		MaxTokens:     cfg.MaxTokens,
+		Temperature:   cfg.Temperature,
+		TopK:          cfg.TopK,
+		TopP:          cfg.TopP,
+		RepeatPenalty: cfg.RepeatPenalty,
+	}
+}
+
+func splitDurations(start, firstTokenAt, end time.Time) (time.Duration, time.Duration) {
+	if start.IsZero() || end.Before(start) {
+		return 0, 0
+	}
+	if firstTokenAt.IsZero() || firstTokenAt.Before(start) || firstTokenAt.After(end) {
+		return end.Sub(start), 0
+	}
+	return firstTokenAt.Sub(start), end.Sub(firstTokenAt)
+}
+
+// llama-server's streaming API does not expose prompt token counts, so metrics
+// use a lightweight whitespace-token approximation for prefill throughput.
+func approximatePromptTokens(prompt string) int {
+	return len(strings.Fields(prompt))
+}
+
+func approximateMessageTokens(messages []inference.Message) int {
+	total := 0
+	for _, msg := range messages {
+		total += approximatePromptTokens(msg.Content)
+	}
+	return total
 }
