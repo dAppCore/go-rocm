@@ -199,11 +199,12 @@ func (c *Client) Complete(ctx context.Context, req CompletionRequest) (iter.Seq[
 }
 
 // streamSSEData reads SSE-formatted lines from r and yields the payload of
-// each "data: " line. It stops when it encounters "[DONE]" or an I/O error.
-// Any read error (other than EOF) is stored via errOut.
+// each "data: " line. llama-server terminates successful streams with a
+// "[DONE]" sentinel; EOF before that marker is treated as a truncated stream.
 func streamSSEData(r io.Reader, errOut *error) iter.Seq[string] {
 	return func(yield func(string) bool) {
 		scanner := bufio.NewScanner(r)
+		sawDone := false
 		for scanner.Scan() {
 			line := scanner.Text()
 			if !strings.HasPrefix(line, "data: ") {
@@ -211,6 +212,7 @@ func streamSSEData(r io.Reader, errOut *error) iter.Seq[string] {
 			}
 			payload := strings.TrimPrefix(line, "data: ")
 			if payload == "[DONE]" {
+				sawDone = true
 				return
 			}
 			if !yield(payload) {
@@ -219,6 +221,10 @@ func streamSSEData(r io.Reader, errOut *error) iter.Seq[string] {
 		}
 		if err := scanner.Err(); err != nil {
 			*errOut = coreerr.E("llamacpp.streamSSEData", "read SSE stream", err)
+			return
+		}
+		if !sawDone {
+			*errOut = coreerr.E("llamacpp.streamSSEData", "stream ended before [DONE]", io.ErrUnexpectedEOF)
 		}
 	}
 }

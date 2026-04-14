@@ -5,8 +5,10 @@ package rocm
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,13 +19,23 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func newHTTPBackedModel(ts *httptest.Server) *rocmModel {
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return fn(r)
+}
+
+func newClientBackedModel(client *llamacpp.Client) *rocmModel {
 	return &rocmModel{
 		server: &server{
-			llamaClient:   llamacpp.NewClient(ts.URL),
+			llamaClient:   client,
 			processExited: make(chan struct{}),
 		},
 	}
+}
+
+func newHTTPBackedModel(ts *httptest.Server) *rocmModel {
+	return newClientBackedModel(llamacpp.NewClient(ts.URL))
 }
 
 func writeSSEEvent(w http.ResponseWriter, payload string) {
@@ -202,4 +214,31 @@ func TestBatchGenerate_ContextCancelledWrapsPerPromptError(t *testing.T) {
 	metrics := m.Metrics()
 	assert.Equal(t, 2, metrics.PromptTokens)
 	assert.Equal(t, 1, metrics.GeneratedTokens)
+}
+
+func TestGenerate_TruncatedStreamSetsLastError(t *testing.T) {
+	client := llamacpp.NewClientWithHTTPClient("http://llama.test", &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			require.Equal(t, "/v1/completions", r.URL.Path)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(strings.NewReader(
+					"data: " + `{"choices":[{"text":"partial","finish_reason":null}]}` + "\n\n",
+				)),
+				Request: r,
+			}, nil
+		}),
+	})
+
+	m := newClientBackedModel(client)
+
+	var got []string
+	for tok := range m.Generate(context.Background(), "hello", inference.WithMaxTokens(1)) {
+		got = append(got, tok.Text)
+	}
+
+	assert.Equal(t, []string{"partial"}, got)
+	require.Error(t, m.Err())
+	assert.ErrorContains(t, m.Err(), "stream ended before [DONE]")
 }

@@ -3,13 +3,21 @@ package llamacpp
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return fn(r)
+}
 
 // sseLines writes SSE-formatted lines to a flushing response writer.
 func sseLines(w http.ResponseWriter, lines []string) {
@@ -191,4 +199,35 @@ func TestComplete_HTTPError(t *testing.T) {
 	err := errFn()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "400")
+}
+
+func TestComplete_TruncatedStreamReturnsError(t *testing.T) {
+	c := NewClientWithHTTPClient("http://llama.test", &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			assert.Equal(t, "/v1/completions", r.URL.Path)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(strings.NewReader(
+					"data: " + `{"choices":[{"text":"partial","finish_reason":null}]}` + "\n\n",
+				)),
+				Request: r,
+			}, nil
+		}),
+	})
+	tokens, errFn := c.Complete(context.Background(), CompletionRequest{
+		Prompt:      "Hello",
+		Temperature: 0.0,
+		Stream:      true,
+	})
+
+	var got []string
+	for tok := range tokens {
+		got = append(got, tok)
+	}
+
+	assert.Equal(t, []string{"partial"}, got)
+	err := errFn()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "stream ended before [DONE]")
 }

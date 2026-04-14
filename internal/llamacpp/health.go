@@ -21,9 +21,19 @@ type Client struct {
 //
 // NewClient creates a client for the llama-server at the given base URL.
 func NewClient(baseURL string) *Client {
+	return NewClientWithHTTPClient(baseURL, &http.Client{})
+}
+
+//	client := NewClientWithHTTPClient("http://127.0.0.1:38080", customHTTPClient)
+//
+// NewClientWithHTTPClient creates a client with an injected HTTP transport.
+func NewClientWithHTTPClient(baseURL string, httpClient *http.Client) *Client {
+	if httpClient == nil {
+		httpClient = &http.Client{}
+	}
 	return &Client{
 		baseURL:    strings.TrimRight(baseURL, "/"),
-		httpClient: &http.Client{},
+		httpClient: httpClient,
 	}
 }
 
