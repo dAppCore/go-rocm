@@ -3,7 +3,7 @@ package rocm
 import (
 	"path/filepath"
 
-	"forge.lthn.ai/core/go-rocm/internal/gguf"
+	"dappco.re/go/core/rocm/internal/gguf"
 )
 
 // DiscoverModels scans a directory for GGUF model files and returns

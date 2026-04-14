@@ -12,7 +12,7 @@ import (
 
 	coreerr "forge.lthn.ai/core/go-log"
 	"forge.lthn.ai/core/go-inference"
-	"forge.lthn.ai/core/go-rocm/internal/llamacpp"
+	"dappco.re/go/core/rocm/internal/llamacpp"
 )
 
 // rocmModel implements inference.TextModel using a llama-server subprocess.

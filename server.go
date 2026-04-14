@@ -14,7 +14,7 @@ import (
 	"time"
 
 	coreerr "forge.lthn.ai/core/go-log"
-	"forge.lthn.ai/core/go-rocm/internal/llamacpp"
+	"dappco.re/go/core/rocm/internal/llamacpp"
 )
 
 // server manages a llama-server subprocess.
