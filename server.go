@@ -4,6 +4,7 @@ package rocm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -163,8 +164,13 @@ func startServer(binary, modelPath string, gpuLayers, ctxSize, parallelSlots int
 			return s, nil
 		}
 
-		_ = s.stop()
+		if stopErr := s.stop(); stopErr != nil {
+			coreerr.Warn("llama-server cleanup after failed startup returned error", "attempt", attempt+1, "err", stopErr)
+		}
 		lastErr = coreerr.E("rocm.startServer", fmt.Sprintf("attempt %d", attempt+1), err)
+		if attempt < maxAttempts-1 {
+			coreerr.Warn("llama-server startup failed; retrying", "attempt", attempt+1, "max_attempts", maxAttempts, "err", lastErr)
+		}
 	}
 
 	return nil, coreerr.E("rocm.startServer", fmt.Sprintf("server failed after %d attempts", maxAttempts), lastErr)
@@ -196,7 +202,8 @@ func (s *server) waitReady(ctx context.Context) error {
 	}
 }
 
-// stop sends SIGTERM and waits up to 5s, then SIGKILL.
+// stop sends SIGTERM and waits up to 5s, then SIGKILL. Exit caused by those
+// signals is treated as a successful caller-initiated shutdown.
 func (s *server) stop() error {
 	if s.cmd.Process == nil {
 		return nil
@@ -205,6 +212,9 @@ func (s *server) stop() error {
 	// Already exited?
 	select {
 	case <-s.exited:
+		if isExpectedStopExitErr(s.exitErr) {
+			return nil
+		}
 		return s.wrapProcessError("server.stop", "llama-server already exited", s.exitErr)
 	default:
 	}
@@ -217,6 +227,9 @@ func (s *server) stop() error {
 	// Wait up to 5 seconds for clean exit.
 	select {
 	case <-s.exited:
+		if isExpectedStopExitErr(s.exitErr) {
+			return nil
+		}
 		return s.wrapProcessError("server.stop", "llama-server exited after sigterm", s.exitErr)
 	case <-time.After(5 * time.Second):
 		// Force kill.
@@ -224,7 +237,33 @@ func (s *server) stop() error {
 			return coreerr.E("server.stop", "kill llama-server", err)
 		}
 		<-s.exited
+		if isExpectedStopExitErr(s.exitErr) {
+			return nil
+		}
 		return s.wrapProcessError("server.stop", "llama-server exited after sigkill", s.exitErr)
+	}
+}
+
+func isExpectedStopExitErr(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return false
+	}
+
+	status, ok := exitErr.ProcessState.Sys().(syscall.WaitStatus)
+	if !ok || !status.Signaled() {
+		return false
+	}
+
+	switch status.Signal() {
+	case syscall.SIGTERM, syscall.SIGKILL:
+		return true
+	default:
+		return false
 	}
 }
 

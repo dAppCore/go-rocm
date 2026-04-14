@@ -5,6 +5,7 @@ package rocm
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -156,6 +157,23 @@ func TestStartServer_RetriesOnStartupTimeout(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed after 3 attempts")
 	assert.Contains(t, err.Error(), "timeout waiting for llama-server")
+}
+
+func TestServerStop_GracefulSignalReturnsNil(t *testing.T) {
+	cmd := exec.Command("/bin/sleep", "60")
+	require.NoError(t, cmd.Start())
+
+	s := &server{
+		cmd:    cmd,
+		exited: make(chan struct{}),
+	}
+	go func() {
+		s.exitErr = cmd.Wait()
+		close(s.exited)
+	}()
+
+	require.NoError(t, s.stop())
+	require.NoError(t, s.stop(), "stop should remain idempotent after graceful shutdown")
 }
 
 func TestServerWrapProcessError_IncludesProcessOutput(t *testing.T) {
