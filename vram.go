@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	coreerr "forge.lthn.ai/core/go-log"
+	coreerr "dappco.re/go/core/log"
 )
 
 // GetVRAMInfo reads VRAM usage for the discrete GPU from sysfs.

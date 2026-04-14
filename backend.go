@@ -6,9 +6,9 @@ import (
 	"os"
 	"strings"
 
-	coreerr "forge.lthn.ai/core/go-log"
+	coreerr "dappco.re/go/core/log"
+	"dappco.re/go/rocm/internal/gguf"
 	"forge.lthn.ai/core/go-inference"
-	"dappco.re/go/core/rocm/internal/gguf"
 )
 
 // rocmBackend implements inference.Backend for AMD ROCm GPUs.

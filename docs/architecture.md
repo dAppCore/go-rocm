@@ -4,7 +4,7 @@
 
 go-rocm provides AMD ROCm GPU inference for Linux by managing llama-server as a subprocess. It implements the `inference.Backend` and `inference.TextModel` interfaces from go-inference, making the AMD GPU available to the broader Go ML ecosystem (go-ml, go-ai, go-i18n) without any CGO in the package itself.
 
-Module path: `forge.lthn.ai/core/go-rocm`
+Module path: `dappco.re/go/rocm`
 
 ## Design Choice: Subprocess over CGO
 
@@ -53,7 +53,7 @@ The package uses build constraints to ensure correctness across platforms:
 On Linux/amd64, `register_rocm.go` calls `inference.Register(&rocmBackend{})` in an `init()` function. Any program that blank-imports go-rocm gets the backend automatically:
 
 ```go
-import _ "forge.lthn.ai/core/go-rocm"
+import _ "dappco.re/go/rocm"
 ```
 
 The backend is then available to `inference.LoadModel()` from go-inference, which iterates registered backends and calls `Available()` on each to select one.

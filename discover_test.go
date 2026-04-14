@@ -112,6 +112,30 @@ func TestDiscoverModels(t *testing.T) {
 	assert.Greater(t, llama.FileSize, int64(0))
 }
 
+func TestDiscoverModels_RelativeDirReturnsAbsolutePaths(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "models")
+	require.NoError(t, os.Mkdir(dir, 0755))
+
+	path := writeDiscoverTestGGUF(t, dir, "model.gguf", [][2]any{
+		{"general.architecture", "llama"},
+		{"general.name", "Relative Model"},
+		{"general.file_type", uint32(15)},
+	})
+
+	wd, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(parent))
+	t.Cleanup(func() {
+		require.NoError(t, os.Chdir(wd))
+	})
+
+	models, err := DiscoverModels("models")
+	require.NoError(t, err)
+	require.Len(t, models, 1)
+	assert.Equal(t, path, models[0].Path)
+}
+
 func TestDiscoverModels_EmptyDir(t *testing.T) {
 	dir := t.TempDir()
 

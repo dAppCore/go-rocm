@@ -2,7 +2,7 @@
 
 AMD ROCm GPU inference for Linux via a managed llama-server subprocess. Implements the `inference.Backend` and `inference.TextModel` interfaces from go-inference for AMD RDNA 3+ GPUs (validated on RX 7800 XT with ROCm 7.2). Uses llama-server's OpenAI-compatible streaming API rather than direct HIP CGO bindings, giving access to 50+ GGUF model architectures with GPU crash isolation. Includes a GGUF v2/v3 binary metadata parser, sysfs VRAM monitoring, and model discovery. Platform-restricted: `linux/amd64` only; a safe stub compiles everywhere else.
 
-**Module**: `forge.lthn.ai/core/go-rocm`
+**Module**: `dappco.re/go/rocm`
 **Licence**: EUPL-1.2
 **Language**: Go 1.25
 
@@ -11,7 +11,7 @@ AMD ROCm GPU inference for Linux via a managed llama-server subprocess. Implemen
 ```go
 import (
     "forge.lthn.ai/core/go-inference"
-    _ "forge.lthn.ai/core/go-rocm"  // registers "rocm" backend via init()
+    _ "dappco.re/go/rocm"  // registers "rocm" backend via init()
 )
 
 // Requires llama-server compiled with HIP/ROCm on PATH

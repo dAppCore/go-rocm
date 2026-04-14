@@ -13,8 +13,8 @@ import (
 	"syscall"
 	"time"
 
-	"dappco.re/go/core/rocm/internal/llamacpp"
-	coreerr "forge.lthn.ai/core/go-log"
+	coreerr "dappco.re/go/core/log"
+	"dappco.re/go/rocm/internal/llamacpp"
 )
 
 var (

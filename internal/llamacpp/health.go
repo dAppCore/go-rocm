@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"strings"
 
-	coreerr "forge.lthn.ai/core/go-log"
+	coreerr "dappco.re/go/core/log"
 )
 
 // Client communicates with a llama-server instance.

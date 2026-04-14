@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
+	coreerr "dappco.re/go/core/log"
 	"forge.lthn.ai/core/go-inference"
-	coreerr "forge.lthn.ai/core/go-log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

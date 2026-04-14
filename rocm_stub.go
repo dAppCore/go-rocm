@@ -2,7 +2,7 @@
 
 package rocm
 
-import coreerr "forge.lthn.ai/core/go-log"
+import coreerr "dappco.re/go/core/log"
 
 // ROCmAvailable reports whether ROCm GPU inference is available.
 // Returns false on non-Linux or non-amd64 platforms.

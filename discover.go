@@ -3,14 +3,19 @@ package rocm
 import (
 	"path/filepath"
 
-	"dappco.re/go/core/rocm/internal/gguf"
-	coreerr "forge.lthn.ai/core/go-log"
+	coreerr "dappco.re/go/core/log"
+	"dappco.re/go/rocm/internal/gguf"
 )
 
 // DiscoverModels scans a directory for GGUF model files and returns
 // structured information about each. Files that cannot be parsed are skipped.
 func DiscoverModels(dir string) ([]ModelInfo, error) {
-	matches, err := filepath.Glob(filepath.Join(dir, "*.gguf"))
+	root, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, coreerr.E("rocm.DiscoverModels", "resolve model directory", err)
+	}
+
+	matches, err := filepath.Glob(filepath.Join(root, "*.gguf"))
 	if err != nil {
 		return nil, coreerr.E("rocm.DiscoverModels", "glob gguf files", err)
 	}
