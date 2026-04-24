@@ -4,12 +4,19 @@ package rocm
 
 import (
 	"context"
+	// Note: intrinsic - errors.Is/As for stdlib error chain walks; core is downstream.
 	"errors"
+	// Note: intrinsic - fmt.Sprintf/Errorf for HTTP error responses; core.Sprintf can replace but server.go is old-style.
 	"fmt"
+	// Note: intrinsic - net.Listener for the HTTP server; no core equivalent.
 	"net"
+	// Note: intrinsic - os.Getenv/Stdout; core.Env is downstream of server.
 	"os"
+	// Note: intrinsic - rocm-smi CLI subprocess; Process primitive unavailable in bare HTTP handler.
 	"os/exec"
+	// Note: intrinsic - numeric parsing from ROCm output; core has no ParseInt/Atoi.
 	"strconv"
+	// Note: intrinsic - core helpers are not yet in scope for this repo.
 	"strings"
 	"sync"
 	"sync/atomic"
