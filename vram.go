@@ -3,9 +3,13 @@
 package rocm
 
 import (
+	// Note: os: os.ReadFile for sysfs memory files; core.Fs() does not model sysfs
 	"os"
+	// Note: path/filepath: filepath.Glob/Join for sysfs path walking; no core equivalent for sysfs paths
 	"path/filepath"
+	// Note: strconv: numeric parsing of sysfs values; no core.ParseInt
 	"strconv"
+	// Note: strings: trimming sysfs output whitespace; core.* not in scope for this repo
 	"strings"
 
 	coreerr "dappco.re/go/core/log"
