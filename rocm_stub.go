@@ -2,7 +2,7 @@
 
 package rocm
 
-import coreerr "dappco.re/go/core/log"
+import coreerr "dappco.re/go/log"
 
 //	if !ROCmAvailable() {
 //	    fmt.Println("fall back to CPU or another backend")

@@ -16,7 +16,7 @@ import (
 	"os"
 	"strings"
 
-	coreerr "dappco.re/go/core/log"
+	coreerr "dappco.re/go/log"
 )
 
 // ggufMagic is the GGUF file magic number: "GGUF" in little-endian.

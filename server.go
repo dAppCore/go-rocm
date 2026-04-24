@@ -23,7 +23,7 @@ import (
 	"syscall"
 	"time"
 
-	coreerr "dappco.re/go/core/log"
+	coreerr "dappco.re/go/log"
 	"dappco.re/go/rocm/internal/llamacpp"
 )
 

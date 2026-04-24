@@ -12,7 +12,7 @@ import (
 	// Note: strings: trimming sysfs output whitespace; core.* not in scope for this repo
 	"strings"
 
-	coreerr "dappco.re/go/core/log"
+	coreerr "dappco.re/go/log"
 )
 
 //	info, err := GetVRAMInfo()

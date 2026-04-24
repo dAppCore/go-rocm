@@ -6,7 +6,7 @@
 // # Quick Start
 //
 //	import (
-//	    "forge.lthn.ai/core/go-inference"
+//	    "dappco.re/go/inference"
 //	    _ "dappco.re/go/rocm" // auto-registers ROCm backend
 //	)
 //

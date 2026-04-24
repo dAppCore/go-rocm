@@ -2,7 +2,7 @@
 
 package rocm
 
-import "forge.lthn.ai/core/go-inference"
+import "dappco.re/go/inference"
 
 func init() {
 	inference.Register(&rocmBackend{})

@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	coreerr "dappco.re/go/core/log"
+	coreerr "dappco.re/go/log"
 	"dappco.re/go/rocm/internal/llamacpp"
-	"forge.lthn.ai/core/go-inference"
+	"dappco.re/go/inference"
 )
 
 // rocmModel implements inference.TextModel using a llama-server subprocess.

@@ -3,7 +3,7 @@ package rocm
 import (
 	"path/filepath"
 
-	coreerr "dappco.re/go/core/log"
+	coreerr "dappco.re/go/log"
 	"dappco.re/go/rocm/internal/gguf"
 )
 

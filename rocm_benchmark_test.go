@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"forge.lthn.ai/core/go-inference"
+	"dappco.re/go/inference"
 )
 
 // benchModels lists the models to benchmark.

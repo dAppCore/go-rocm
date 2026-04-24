@@ -12,7 +12,7 @@ import (
 	"strings"
 	"sync"
 
-	coreerr "dappco.re/go/core/log"
+	coreerr "dappco.re/go/log"
 )
 
 // ChatMessage is a single message in a conversation.

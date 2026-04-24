@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"forge.lthn.ai/core/go-inference"
+	"dappco.re/go/inference"
 )
 
 const testModel = "/data/lem/gguf/LEK-Gemma3-1B-layered-v2-Q5_K_M.gguf"

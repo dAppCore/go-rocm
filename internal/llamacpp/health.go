@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"strings"
 
-	coreerr "dappco.re/go/core/log"
+	coreerr "dappco.re/go/log"
 )
 
 // Client communicates with a llama-server instance.

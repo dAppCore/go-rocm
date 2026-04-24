@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"dappco.re/go/rocm/internal/llamacpp"
-	"forge.lthn.ai/core/go-inference"
+	"dappco.re/go/inference"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

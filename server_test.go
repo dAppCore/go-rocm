@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	coreerr "dappco.re/go/core/log"
-	"forge.lthn.ai/core/go-inference"
+	coreerr "dappco.re/go/log"
+	"dappco.re/go/inference"
 )
 
 func TestFindLlamaServer_InPATH(t *testing.T) {
