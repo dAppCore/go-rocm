@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -16,40 +17,54 @@ import (
 
 	coreerr "dappco.re/go/core/log"
 	"forge.lthn.ai/core/go-inference"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestFindLlamaServer_InPATH(t *testing.T) {
 	// llama-server is at /usr/local/bin/llama-server on this machine.
 	path, err := findLlamaServer()
-	require.NoError(t, err)
-	assert.Contains(t, path, "llama-server")
+	if err != nil {
+		t.Fatalf("findLlamaServer: %v", err)
+	}
+	if !strings.Contains(path, "llama-server") {
+		t.Errorf("path = %q, want contains %q", path, "llama-server")
+	}
 }
 
 func TestFindLlamaServer_EnvOverride(t *testing.T) {
 	t.Setenv("ROCM_LLAMA_SERVER_PATH", "/usr/local/bin/llama-server")
 	path, err := findLlamaServer()
-	require.NoError(t, err)
-	assert.Equal(t, "/usr/local/bin/llama-server", path)
+	if err != nil {
+		t.Fatalf("findLlamaServer: %v", err)
+	}
+	if path != "/usr/local/bin/llama-server" {
+		t.Errorf("path = %q, want %q", path, "/usr/local/bin/llama-server")
+	}
 }
 
 func TestFindLlamaServer_EnvNotFound(t *testing.T) {
 	t.Setenv("ROCM_LLAMA_SERVER_PATH", "/nonexistent/llama-server")
 	_, err := findLlamaServer()
-	assert.ErrorContains(t, err, "not found")
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("err = %v, want contains %q", err, "not found")
+	}
 }
 
 func TestFindLlamaServer_EnvNotExecutable(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "llama-server")
-	require.NoError(t, os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0644))
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
 
 	t.Setenv("ROCM_LLAMA_SERVER_PATH", path)
 
 	_, err := findLlamaServer()
-	require.Error(t, err)
-	assert.ErrorContains(t, err, "not executable")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "not executable") {
+		t.Errorf("err = %v, want contains %q", err, "not executable")
+	}
 }
 
 func TestFreePort(t *testing.T) {
@@ -59,9 +74,15 @@ func TestFreePort(t *testing.T) {
 	defer restoreListen()
 
 	port, err := freePort()
-	require.NoError(t, err)
-	assert.Greater(t, port, 0)
-	assert.Less(t, port, 65536)
+	if err != nil {
+		t.Fatalf("freePort: %v", err)
+	}
+	if port <= 0 {
+		t.Errorf("port = %d, want > 0", port)
+	}
+	if port >= 65536 {
+		t.Errorf("port = %d, want < 65536", port)
+	}
 }
 
 func TestFreePort_UniquePerCall(t *testing.T) {
@@ -71,10 +92,16 @@ func TestFreePort_UniquePerCall(t *testing.T) {
 	defer restoreListen()
 
 	p1, err := freePort()
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("freePort: %v", err)
+	}
 	p2, err := freePort()
-	require.NoError(t, err)
-	assert.NotEqual(t, p1, p2)
+	if err != nil {
+		t.Fatalf("freePort: %v", err)
+	}
+	if p1 == p2 {
+		t.Errorf("freePort returned identical ports: %d", p1)
+	}
 }
 
 func TestDeterministicPortAllocator_AdvancesAcrossCalls(t *testing.T) {
@@ -86,13 +113,21 @@ func TestDeterministicPortAllocator_AdvancesAcrossCalls(t *testing.T) {
 	allocator := newDeterministicPortAllocator(41000, 3)
 
 	firstPort, err := allocator.NextAvailablePort()
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NextAvailablePort #1: %v", err)
+	}
 
 	secondPort, err := allocator.NextAvailablePort()
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NextAvailablePort #2: %v", err)
+	}
 
-	assert.Equal(t, 41000, firstPort)
-	assert.Equal(t, 41001, secondPort)
+	if firstPort != 41000 {
+		t.Errorf("firstPort = %d, want 41000", firstPort)
+	}
+	if secondPort != 41001 {
+		t.Errorf("secondPort = %d, want 41001", secondPort)
+	}
 }
 
 func TestDeterministicPortAllocator_SkipsOccupiedPort(t *testing.T) {
@@ -106,8 +141,12 @@ func TestDeterministicPortAllocator_SkipsOccupiedPort(t *testing.T) {
 
 	allocator := newDeterministicPortAllocator(42000, 3)
 	port, err := allocator.NextAvailablePort()
-	require.NoError(t, err)
-	assert.Equal(t, 42001, port)
+	if err != nil {
+		t.Fatalf("NextAvailablePort: %v", err)
+	}
+	if port != 42001 {
+		t.Errorf("port = %d, want 42001", port)
+	}
 }
 
 func TestDeterministicPortAllocator_ReturnsErrorWhenRangeIsExhausted(t *testing.T) {
@@ -118,8 +157,12 @@ func TestDeterministicPortAllocator_ReturnsErrorWhenRangeIsExhausted(t *testing.
 
 	allocator := newDeterministicPortAllocator(43000, 2)
 	_, err := allocator.NextAvailablePort()
-	require.Error(t, err)
-	assert.ErrorContains(t, err, "no free port in deterministic range")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "no free port in deterministic range") {
+		t.Errorf("err = %v, want contains %q", err, "no free port in deterministic range")
+	}
 }
 
 func TestLlamaServerArguments(t *testing.T) {
@@ -129,14 +172,17 @@ func TestLlamaServerArguments(t *testing.T) {
 		ParallelSlotCount: 4,
 	}, 38123, 999)
 
-	assert.Equal(t, []string{
+	want := []string{
 		"--model", "/models/gemma3.gguf",
 		"--host", "127.0.0.1",
 		"--port", "38123",
 		"--n-gpu-layers", "999",
 		"--ctx-size", "2048",
 		"--parallel", "4",
-	}, args)
+	}
+	if !reflect.DeepEqual(args, want) {
+		t.Errorf("args = %v, want %v", args, want)
+	}
 }
 
 func TestServerEnv_HIPVisibleDevices(t *testing.T) {
@@ -147,7 +193,10 @@ func TestServerEnv_HIPVisibleDevices(t *testing.T) {
 			hipVals = append(hipVals, e)
 		}
 	}
-	assert.Equal(t, []string{"HIP_VISIBLE_DEVICES=0"}, hipVals)
+	want := []string{"HIP_VISIBLE_DEVICES=0"}
+	if !reflect.DeepEqual(hipVals, want) {
+		t.Errorf("hipVals = %v, want %v", hipVals, want)
+	}
 }
 
 func TestServerEnv_FiltersExistingHIP(t *testing.T) {
@@ -161,7 +210,10 @@ func TestServerEnv_FiltersExistingHIP(t *testing.T) {
 			hipVals = append(hipVals, e)
 		}
 	}
-	assert.Equal(t, []string{"HIP_VISIBLE_DEVICES=0"}, hipVals)
+	want := []string{"HIP_VISIBLE_DEVICES=0"}
+	if !reflect.DeepEqual(hipVals, want) {
+		t.Errorf("hipVals = %v, want %v", hipVals, want)
+	}
 }
 
 func TestAvailable(t *testing.T) {
@@ -169,19 +221,25 @@ func TestAvailable(t *testing.T) {
 	if _, err := os.Stat("/dev/kfd"); err != nil {
 		t.Skip("no ROCm hardware")
 	}
-	assert.True(t, b.Available())
+	if !b.Available() {
+		t.Error("b.Available() = false, want true")
+	}
 }
 
 func TestServerAlive_Running(t *testing.T) {
 	s := &server{processExited: make(chan struct{})}
-	assert.True(t, s.alive())
+	if !s.alive() {
+		t.Error("s.alive() = false, want true")
+	}
 }
 
 func TestServerAlive_Exited(t *testing.T) {
 	processExited := make(chan struct{})
 	close(processExited)
 	s := &server{processExited: processExited, processExitError: coreerr.E("test", "process killed", nil)}
-	assert.False(t, s.alive())
+	if s.alive() {
+		t.Error("s.alive() = true, want false")
+	}
 }
 
 func TestGenerate_ServerDead(t *testing.T) {
@@ -200,9 +258,19 @@ func TestGenerate_ServerDead(t *testing.T) {
 	for range m.Generate(context.Background(), "hello") {
 		count++
 	}
-	assert.Equal(t, 0, count)
-	assert.ErrorContains(t, m.Err(), "server has exited")
-	assert.ErrorContains(t, m.Err(), "HIP launch failure")
+	if count != 0 {
+		t.Errorf("count = %d, want 0", count)
+	}
+	err := m.Err()
+	if err == nil {
+		t.Fatal("m.Err() = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "server has exited") {
+		t.Errorf("err = %v, want contains %q", err, "server has exited")
+	}
+	if !strings.Contains(err.Error(), "HIP launch failure") {
+		t.Errorf("err = %v, want contains %q", err, "HIP launch failure")
+	}
 }
 
 func TestStartServer_RetriesOnProcessExit(t *testing.T) {
@@ -218,8 +286,12 @@ func TestStartServer_RetriesOnProcessExit(t *testing.T) {
 		ModelPath:     "/nonexistent/model.gguf",
 		GPULayerCount: 999,
 	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "failed after 3 attempts")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed after 3 attempts") {
+		t.Errorf("err = %v, want contains %q", err, "failed after 3 attempts")
+	}
 }
 
 func TestStartServer_RetriesOnStartupTimeout(t *testing.T) {
@@ -230,7 +302,9 @@ func TestStartServer_RetriesOnStartupTimeout(t *testing.T) {
 
 	dir := t.TempDir()
 	binary := filepath.Join(dir, "fake-llama-server")
-	require.NoError(t, os.WriteFile(binary, []byte("#!/bin/sh\nsleep 1\n"), 0755))
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nsleep 1\n"), 0755); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
 
 	oldTimeout := serverStartupTimeout
 	oldInterval := serverReadyPollInterval
@@ -246,14 +320,22 @@ func TestStartServer_RetriesOnStartupTimeout(t *testing.T) {
 		ModelPath:     "/nonexistent/model.gguf",
 		GPULayerCount: 999,
 	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "failed after 3 attempts")
-	assert.Contains(t, err.Error(), "timeout waiting for llama-server")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed after 3 attempts") {
+		t.Errorf("err = %v, want contains %q", err, "failed after 3 attempts")
+	}
+	if !strings.Contains(err.Error(), "timeout waiting for llama-server") {
+		t.Errorf("err = %v, want contains %q", err, "timeout waiting for llama-server")
+	}
 }
 
 func TestServerStop_GracefulSignalReturnsNil(t *testing.T) {
 	processCommand := exec.Command("/bin/sleep", "60")
-	require.NoError(t, processCommand.Start())
+	if err := processCommand.Start(); err != nil {
+		t.Fatalf("processCommand.Start: %v", err)
+	}
 
 	s := &server{
 		processCommand: processCommand,
@@ -264,8 +346,12 @@ func TestServerStop_GracefulSignalReturnsNil(t *testing.T) {
 		close(s.processExited)
 	}()
 
-	require.NoError(t, s.stop())
-	require.NoError(t, s.stop(), "stop should remain idempotent after graceful shutdown")
+	if err := s.stop(); err != nil {
+		t.Fatalf("s.stop(): %v", err)
+	}
+	if err := s.stop(); err != nil {
+		t.Fatalf("s.stop() second call should remain idempotent: %v", err)
+	}
 }
 
 func TestServerWrapProcessError_IncludesProcessOutput(t *testing.T) {
@@ -275,9 +361,15 @@ func TestServerWrapProcessError_IncludesProcessOutput(t *testing.T) {
 	s := &server{processOutput: processOutput}
 
 	err := s.wrapProcessError("server.waitReady", "llama-server exited before becoming ready", coreerr.E("test", "exit 1", nil))
-	require.Error(t, err)
-	assert.ErrorContains(t, err, "HIP runtime exploded")
-	assert.ErrorContains(t, err, "secondary detail")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "HIP runtime exploded") {
+		t.Errorf("err = %v, want contains %q", err, "HIP runtime exploded")
+	}
+	if !strings.Contains(err.Error(), "secondary detail") {
+		t.Errorf("err = %v, want contains %q", err, "secondary detail")
+	}
 }
 
 func TestChat_ServerDead(t *testing.T) {
@@ -294,8 +386,16 @@ func TestChat_ServerDead(t *testing.T) {
 	for range m.Chat(context.Background(), msgs) {
 		count++
 	}
-	assert.Equal(t, 0, count)
-	assert.ErrorContains(t, m.Err(), "server has exited")
+	if count != 0 {
+		t.Errorf("count = %d, want 0", count)
+	}
+	err := m.Err()
+	if err == nil {
+		t.Fatal("m.Err() = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "server has exited") {
+		t.Errorf("err = %v, want contains %q", err, "server has exited")
+	}
 }
 
 func stubListenLocalTCP(t *testing.T, stub func(network, address string) (net.Listener, error)) func() {

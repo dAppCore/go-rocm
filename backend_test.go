@@ -6,17 +6,24 @@ import (
 	"testing"
 
 	"dappco.re/go/rocm/internal/gguf"
-	"github.com/stretchr/testify/assert"
 )
 
 func TestBackend_ResolveContextLength_Good(t *testing.T) {
-	assert.Equal(t, 2048, resolveContextLength(2048, gguf.Metadata{ContextLength: 32768}))
-	assert.Equal(t, 1024, resolveContextLength(0, gguf.Metadata{ContextLength: 1024}))
-	assert.Equal(t, defaultContextLengthCap, resolveContextLength(0, gguf.Metadata{ContextLength: 131072}))
+	if got := resolveContextLength(2048, gguf.Metadata{ContextLength: 32768}); got != 2048 {
+		t.Errorf("resolveContextLength(2048, 32768) = %d, want 2048", got)
+	}
+	if got := resolveContextLength(0, gguf.Metadata{ContextLength: 1024}); got != 1024 {
+		t.Errorf("resolveContextLength(0, 1024) = %d, want 1024", got)
+	}
+	if got := resolveContextLength(0, gguf.Metadata{ContextLength: 131072}); got != defaultContextLengthCap {
+		t.Errorf("resolveContextLength(0, 131072) = %d, want %d", got, defaultContextLengthCap)
+	}
 }
 
 func TestBackend_ResolveContextLength_Ugly(t *testing.T) {
-	assert.Equal(t, defaultContextLengthCap, resolveContextLength(0, gguf.Metadata{}))
+	if got := resolveContextLength(0, gguf.Metadata{}); got != defaultContextLengthCap {
+		t.Errorf("resolveContextLength(0, empty) = %d, want %d", got, defaultContextLengthCap)
+	}
 }
 
 func TestBackend_QuantisationFromFileType_Good(t *testing.T) {
@@ -39,8 +46,12 @@ func TestBackend_QuantisationFromFileType_Good(t *testing.T) {
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			bits, groupSize := quantisationFromFileType(testCase.fileType)
-			assert.Equal(t, testCase.expectedBits, bits)
-			assert.Equal(t, testCase.expectedGroupSize, groupSize)
+			if bits != testCase.expectedBits {
+				t.Errorf("bits = %d, want %d", bits, testCase.expectedBits)
+			}
+			if groupSize != testCase.expectedGroupSize {
+				t.Errorf("groupSize = %d, want %d", groupSize, testCase.expectedGroupSize)
+			}
 		})
 	}
 }
@@ -52,8 +63,16 @@ func TestBackend_ModelInfoFromMetadata_Good(t *testing.T) {
 		FileType:     15,
 	})
 
-	assert.Equal(t, "gemma3", modelInfo.Architecture)
-	assert.Equal(t, 34, modelInfo.NumLayers)
-	assert.Equal(t, 4, modelInfo.QuantBits)
-	assert.Equal(t, 32, modelInfo.QuantGroup)
+	if modelInfo.Architecture != "gemma3" {
+		t.Errorf("Architecture = %q, want %q", modelInfo.Architecture, "gemma3")
+	}
+	if modelInfo.NumLayers != 34 {
+		t.Errorf("NumLayers = %d, want 34", modelInfo.NumLayers)
+	}
+	if modelInfo.QuantBits != 4 {
+		t.Errorf("QuantBits = %d, want 4", modelInfo.QuantBits)
+	}
+	if modelInfo.QuantGroup != 32 {
+		t.Errorf("QuantGroup = %d, want 32", modelInfo.QuantGroup)
+	}
 }
