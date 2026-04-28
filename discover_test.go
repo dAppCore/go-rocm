@@ -199,8 +199,16 @@ func TestDiscoverModels_RelativeDirReturnsAbsolutePaths(t *testing.T) {
 	if len(models) != 1 {
 		t.Fatalf("len(models) = %d, want 1", len(models))
 	}
-	if models[0].Path != path {
-		t.Errorf("models[0].Path = %q, want %q", models[0].Path, path)
+	gotPath, err := filepath.EvalSymlinks(models[0].Path)
+	if err != nil {
+		t.Fatalf("EvalSymlinks got path: %v", err)
+	}
+	wantPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatalf("EvalSymlinks want path: %v", err)
+	}
+	if gotPath != wantPath {
+		t.Errorf("models[0].Path = %q, want %q", gotPath, wantPath)
 	}
 }
 

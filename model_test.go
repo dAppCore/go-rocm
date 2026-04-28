@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"dappco.re/go/rocm/internal/llamacpp"
 	"dappco.re/go/inference"
+	"dappco.re/go/rocm/internal/llamacpp"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

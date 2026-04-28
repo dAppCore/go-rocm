@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
+	"dappco.re/go/inference"
 	coreerr "dappco.re/go/log"
 	"dappco.re/go/rocm/internal/llamacpp"
-	"dappco.re/go/inference"
 )
 
 // rocmModel implements inference.TextModel using a llama-server subprocess.
