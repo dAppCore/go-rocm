@@ -11,9 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"forge.lthn.ai/core/go-inference"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	"dappco.re/go/inference"
 )
 
 const testModel = "/data/lem/gguf/LEK-Gemma3-1B-layered-v2-Q5_K_M.gguf"
@@ -40,13 +38,19 @@ func TestROCm_LoadAndGenerate(t *testing.T) {
 	skipIfNoModel(t)
 
 	b := &rocmBackend{}
-	require.True(t, b.Available())
+	if !b.Available() {
+		t.Fatal("b.Available() = false, want true")
+	}
 
 	m, err := b.LoadModel(testModel, inference.WithContextLen(2048))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("LoadModel: %v", err)
+	}
 	defer m.Close()
 
-	assert.Equal(t, "gemma3", m.ModelType())
+	if got := m.ModelType(); got != "gemma3" {
+		t.Errorf("ModelType() = %q, want %q", got, "gemma3")
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -56,8 +60,12 @@ func TestROCm_LoadAndGenerate(t *testing.T) {
 		tokens = append(tokens, tok.Text)
 	}
 
-	require.NoError(t, m.Err())
-	require.NotEmpty(t, tokens, "expected at least one token")
+	if err := m.Err(); err != nil {
+		t.Fatalf("m.Err(): %v", err)
+	}
+	if len(tokens) == 0 {
+		t.Fatal("expected at least one token")
+	}
 
 	full := ""
 	for _, tok := range tokens {
@@ -72,7 +80,9 @@ func TestROCm_Chat(t *testing.T) {
 
 	b := &rocmBackend{}
 	m, err := b.LoadModel(testModel, inference.WithContextLen(2048))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("LoadModel: %v", err)
+	}
 	defer m.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -87,8 +97,12 @@ func TestROCm_Chat(t *testing.T) {
 		tokens = append(tokens, tok.Text)
 	}
 
-	require.NoError(t, m.Err())
-	require.NotEmpty(t, tokens, "expected at least one token")
+	if err := m.Err(); err != nil {
+		t.Fatalf("m.Err(): %v", err)
+	}
+	if len(tokens) == 0 {
+		t.Fatal("expected at least one token")
+	}
 
 	full := ""
 	for _, tok := range tokens {
@@ -103,7 +117,9 @@ func TestROCm_ContextCancellation(t *testing.T) {
 
 	b := &rocmBackend{}
 	m, err := b.LoadModel(testModel, inference.WithContextLen(2048))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("LoadModel: %v", err)
+	}
 	defer m.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -118,7 +134,9 @@ func TestROCm_ContextCancellation(t *testing.T) {
 	}
 
 	t.Logf("Got %d tokens before cancel", count)
-	assert.GreaterOrEqual(t, count, 3)
+	if count < 3 {
+		t.Errorf("count = %d, want >= 3", count)
+	}
 }
 
 func TestROCm_GracefulShutdown(t *testing.T) {
@@ -127,7 +145,9 @@ func TestROCm_GracefulShutdown(t *testing.T) {
 
 	b := &rocmBackend{}
 	m, err := b.LoadModel(testModel, inference.WithContextLen(2048))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("LoadModel: %v", err)
+	}
 	defer m.Close()
 
 	// Cancel mid-stream.
@@ -152,8 +172,12 @@ func TestROCm_GracefulShutdown(t *testing.T) {
 		count2++
 	}
 
-	require.NoError(t, m.Err())
-	assert.Greater(t, count2, 0, "expected tokens from second generation after cancel")
+	if err := m.Err(); err != nil {
+		t.Fatalf("m.Err(): %v", err)
+	}
+	if count2 == 0 {
+		t.Error("expected tokens from second generation after cancel")
+	}
 	t.Logf("Second generation: %d tokens", count2)
 }
 
@@ -163,7 +187,9 @@ func TestROCm_ConcurrentRequests(t *testing.T) {
 
 	b := &rocmBackend{}
 	m, err := b.LoadModel(testModel, inference.WithContextLen(2048))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("LoadModel: %v", err)
+	}
 	defer m.Close()
 
 	const numGoroutines = 3
@@ -197,7 +223,9 @@ func TestROCm_ConcurrentRequests(t *testing.T) {
 
 	for i, result := range results {
 		t.Logf("Goroutine %d: %s", i, result)
-		assert.NotEmpty(t, result, "goroutine %d produced no output", i)
+		if result == "" {
+			t.Errorf("goroutine %d produced no output", i)
+		}
 	}
 }
 
@@ -207,7 +235,9 @@ func TestROCm_Classify(t *testing.T) {
 
 	b := &rocmBackend{}
 	m, err := b.LoadModel(testModel, inference.WithContextLen(2048))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("LoadModel: %v", err)
+	}
 	defer m.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -219,11 +249,17 @@ func TestROCm_Classify(t *testing.T) {
 	}
 
 	results, err := m.Classify(ctx, prompts)
-	require.NoError(t, err)
-	require.Len(t, results, 2)
+	if err != nil {
+		t.Fatalf("Classify: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("len(results) = %d, want 2", len(results))
+	}
 
 	for i, r := range results {
-		assert.NotEmpty(t, r.Token.Text, "classify result %d should have a token", i)
+		if r.Token.Text == "" {
+			t.Errorf("classify result %d should have a token", i)
+		}
 		t.Logf("Classify %d: %q", i, r.Token.Text)
 	}
 }
@@ -234,7 +270,9 @@ func TestROCm_BatchGenerate(t *testing.T) {
 
 	b := &rocmBackend{}
 	m, err := b.LoadModel(testModel, inference.WithContextLen(2048))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("LoadModel: %v", err)
+	}
 	defer m.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -246,12 +284,20 @@ func TestROCm_BatchGenerate(t *testing.T) {
 	}
 
 	results, err := m.BatchGenerate(ctx, prompts, inference.WithMaxTokens(8))
-	require.NoError(t, err)
-	require.Len(t, results, 2)
+	if err != nil {
+		t.Fatalf("BatchGenerate: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("len(results) = %d, want 2", len(results))
+	}
 
 	for i, r := range results {
-		require.NoError(t, r.Err, "batch result %d error", i)
-		assert.NotEmpty(t, r.Tokens, "batch result %d should have tokens", i)
+		if r.Err != nil {
+			t.Fatalf("batch result %d error: %v", i, r.Err)
+		}
+		if len(r.Tokens) == 0 {
+			t.Errorf("batch result %d should have tokens", i)
+		}
 
 		var sb strings.Builder
 		for _, tok := range r.Tokens {
@@ -267,14 +313,22 @@ func TestROCm_InfoAndMetrics(t *testing.T) {
 
 	b := &rocmBackend{}
 	m, err := b.LoadModel(testModel, inference.WithContextLen(2048))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("LoadModel: %v", err)
+	}
 	defer m.Close()
 
 	// Info should be populated from GGUF metadata.
 	info := m.Info()
-	assert.Equal(t, "gemma3", info.Architecture)
-	assert.Greater(t, info.NumLayers, 0, "expected non-zero layer count")
-	assert.Greater(t, info.QuantBits, 0, "expected non-zero quant bits")
+	if info.Architecture != "gemma3" {
+		t.Errorf("Architecture = %q, want %q", info.Architecture, "gemma3")
+	}
+	if info.NumLayers == 0 {
+		t.Error("expected non-zero layer count")
+	}
+	if info.QuantBits == 0 {
+		t.Error("expected non-zero quant bits")
+	}
 	t.Logf("Info: arch=%s layers=%d quant=%d-bit group=%d",
 		info.Architecture, info.NumLayers, info.QuantBits, info.QuantGroup)
 
@@ -284,12 +338,20 @@ func TestROCm_InfoAndMetrics(t *testing.T) {
 
 	for range m.Generate(ctx, "Hello", inference.WithMaxTokens(4)) {
 	}
-	require.NoError(t, m.Err())
+	if err := m.Err(); err != nil {
+		t.Fatalf("m.Err(): %v", err)
+	}
 
 	met := m.Metrics()
-	assert.Greater(t, met.GeneratedTokens, 0, "expected generated tokens")
-	assert.Greater(t, met.TotalDuration, time.Duration(0), "expected non-zero duration")
-	assert.Greater(t, met.DecodeTokensPerSec, float64(0), "expected non-zero decode throughput")
+	if met.GeneratedTokens == 0 {
+		t.Error("expected generated tokens")
+	}
+	if met.TotalDuration == 0 {
+		t.Error("expected non-zero duration")
+	}
+	if met.DecodeTokensPerSec <= 0 {
+		t.Error("expected non-zero decode throughput")
+	}
 	t.Logf("Metrics: gen=%d tok, total=%s, decode=%.1f tok/s, vram=%d MiB",
 		met.GeneratedTokens, met.TotalDuration, met.DecodeTokensPerSec,
 		met.ActiveMemoryBytes/(1024*1024))
@@ -302,13 +364,23 @@ func TestROCm_DiscoverModels(t *testing.T) {
 	}
 
 	models, err := DiscoverModels(dir)
-	require.NoError(t, err)
-	require.NotEmpty(t, models, "expected at least one model in %s", dir)
+	if err != nil {
+		t.Fatalf("DiscoverModels: %v", err)
+	}
+	if len(models) == 0 {
+		t.Fatalf("expected at least one model in %s", dir)
+	}
 
 	for _, m := range models {
 		t.Logf("Found: %s (%s %s %s, ctx=%d)", filepath.Base(m.Path), m.Architecture, m.Parameters, m.Quantisation, m.ContextLen)
-		assert.NotEmpty(t, m.Architecture)
-		assert.NotEmpty(t, m.Name)
-		assert.Greater(t, m.FileSize, int64(0))
+		if m.Architecture == "" {
+			t.Errorf("empty Architecture for %s", m.Path)
+		}
+		if m.Name == "" {
+			t.Errorf("empty Name for %s", m.Path)
+		}
+		if m.FileSize <= 0 {
+			t.Errorf("FileSize = %d for %s, want > 0", m.FileSize, m.Path)
+		}
 	}
 }

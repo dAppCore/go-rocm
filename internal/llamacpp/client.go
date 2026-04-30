@@ -12,7 +12,7 @@ import (
 	"strings"
 	"sync"
 
-	coreerr "forge.lthn.ai/core/go-log"
+	coreerr "dappco.re/go/log"
 )
 
 // ChatMessage is a single message in a conversation.
@@ -43,7 +43,7 @@ type CompletionRequest struct {
 	Stream        bool    `json:"stream"`
 }
 
-type chatChunkResponse struct {
+type chatStreamChunkResponse struct {
 	Choices []struct {
 		Delta struct {
 			Content string `json:"content"`
@@ -52,56 +52,61 @@ type chatChunkResponse struct {
 	} `json:"choices"`
 }
 
-type completionChunkResponse struct {
+type completionStreamChunkResponse struct {
 	Choices []struct {
 		Text         string  `json:"text"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
 }
 
-// ChatComplete sends a streaming chat completion request to /v1/chat/completions.
-// It returns an iterator over text chunks and a function that returns any error
-// that occurred during the request or while reading the stream.
+//	chunks, streamError := client.ChatComplete(ctx, ChatRequest{
+//		Messages: []ChatMessage{{Role: "user", Content: "Hi"}},
+//	})
+//
+// ChatComplete sends a streaming chat completion request to
+// /v1/chat/completions. It returns an iterator over text chunks and a function
+// that returns any error that occurred during the request or while reading the
+// stream.
 func (c *Client) ChatComplete(ctx context.Context, req ChatRequest) (iter.Seq[string], func() error) {
 	req.Stream = true
 
-	body, err := json.Marshal(req)
+	requestBody, err := json.Marshal(req)
 	if err != nil {
-		return noChunks, func() error { return coreerr.E("llamacpp.ChatComplete", "marshal chat request", err) }
+		return noStreamChunks, func() error { return coreerr.E("llamacpp.ChatComplete", "marshal chat request", err) }
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/chat/completions", bytes.NewReader(body))
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/chat/completions", bytes.NewReader(requestBody))
 	if err != nil {
-		return noChunks, func() error { return coreerr.E("llamacpp.ChatComplete", "create chat request", err) }
+		return noStreamChunks, func() error { return coreerr.E("llamacpp.ChatComplete", "create chat request", err) }
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "text/event-stream")
+	httpRequest.Header.Set("Content-Type", "application/json")
+	httpRequest.Header.Set("Accept", "text/event-stream")
 
-	resp, err := c.httpClient.Do(httpReq)
+	response, err := c.httpClient.Do(httpRequest)
 	if err != nil {
-		return noChunks, func() error { return coreerr.E("llamacpp.ChatComplete", "chat request", err) }
+		return noStreamChunks, func() error { return coreerr.E("llamacpp.ChatComplete", "chat request", err) }
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		defer resp.Body.Close()
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-		return noChunks, func() error {
-			return coreerr.E("llamacpp.ChatComplete", fmt.Sprintf("chat returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody))), nil)
+	if response.StatusCode != http.StatusOK {
+		defer response.Body.Close()
+		responseBody, _ := io.ReadAll(io.LimitReader(response.Body, 256))
+		return noStreamChunks, func() error {
+			return coreerr.E("llamacpp.ChatComplete", fmt.Sprintf("chat returned %d: %s", response.StatusCode, strings.TrimSpace(string(responseBody))), nil)
 		}
 	}
 
 	var (
 		streamErr error
 		closeOnce sync.Once
-		closeBody = func() { closeOnce.Do(func() { resp.Body.Close() }) }
+		closeBody = func() { closeOnce.Do(func() { response.Body.Close() }) }
 	)
-	sseData := parseSSE(resp.Body, &streamErr)
+	eventDataStream := streamSSEData(response.Body, &streamErr)
 
-	tokens := func(yield func(string) bool) {
+	tokenStream := func(yield func(string) bool) {
 		defer closeBody()
-		for raw := range sseData {
-			var chunk chatChunkResponse
-			if err := json.Unmarshal([]byte(raw), &chunk); err != nil {
+		for rawChunk := range eventDataStream {
+			var chunk chatStreamChunkResponse
+			if err := json.Unmarshal([]byte(rawChunk), &chunk); err != nil {
 				streamErr = coreerr.E("llamacpp.ChatComplete", "decode chat chunk", err)
 				return
 			}
@@ -118,55 +123,59 @@ func (c *Client) ChatComplete(ctx context.Context, req ChatRequest) (iter.Seq[st
 		}
 	}
 
-	return tokens, func() error {
+	return tokenStream, func() error {
 		closeBody()
 		return streamErr
 	}
 }
 
-// Complete sends a streaming completion request to /v1/completions.
-// It returns an iterator over text chunks and a function that returns any error
+//	chunks, streamError := client.Complete(ctx, CompletionRequest{
+//		Prompt: "Hello",
+//	})
+//
+// Complete sends a streaming completion request to /v1/completions. It
+// returns an iterator over text chunks and a function that returns any error
 // that occurred during the request or while reading the stream.
 func (c *Client) Complete(ctx context.Context, req CompletionRequest) (iter.Seq[string], func() error) {
 	req.Stream = true
 
-	body, err := json.Marshal(req)
+	requestBody, err := json.Marshal(req)
 	if err != nil {
-		return noChunks, func() error { return coreerr.E("llamacpp.Complete", "marshal completion request", err) }
+		return noStreamChunks, func() error { return coreerr.E("llamacpp.Complete", "marshal completion request", err) }
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/completions", bytes.NewReader(body))
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/completions", bytes.NewReader(requestBody))
 	if err != nil {
-		return noChunks, func() error { return coreerr.E("llamacpp.Complete", "create completion request", err) }
+		return noStreamChunks, func() error { return coreerr.E("llamacpp.Complete", "create completion request", err) }
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "text/event-stream")
+	httpRequest.Header.Set("Content-Type", "application/json")
+	httpRequest.Header.Set("Accept", "text/event-stream")
 
-	resp, err := c.httpClient.Do(httpReq)
+	response, err := c.httpClient.Do(httpRequest)
 	if err != nil {
-		return noChunks, func() error { return coreerr.E("llamacpp.Complete", "completion request", err) }
+		return noStreamChunks, func() error { return coreerr.E("llamacpp.Complete", "completion request", err) }
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		defer resp.Body.Close()
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-		return noChunks, func() error {
-			return coreerr.E("llamacpp.Complete", fmt.Sprintf("completion returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody))), nil)
+	if response.StatusCode != http.StatusOK {
+		defer response.Body.Close()
+		responseBody, _ := io.ReadAll(io.LimitReader(response.Body, 256))
+		return noStreamChunks, func() error {
+			return coreerr.E("llamacpp.Complete", fmt.Sprintf("completion returned %d: %s", response.StatusCode, strings.TrimSpace(string(responseBody))), nil)
 		}
 	}
 
 	var (
 		streamErr error
 		closeOnce sync.Once
-		closeBody = func() { closeOnce.Do(func() { resp.Body.Close() }) }
+		closeBody = func() { closeOnce.Do(func() { response.Body.Close() }) }
 	)
-	sseData := parseSSE(resp.Body, &streamErr)
+	eventDataStream := streamSSEData(response.Body, &streamErr)
 
-	tokens := func(yield func(string) bool) {
+	tokenStream := func(yield func(string) bool) {
 		defer closeBody()
-		for raw := range sseData {
-			var chunk completionChunkResponse
-			if err := json.Unmarshal([]byte(raw), &chunk); err != nil {
+		for rawChunk := range eventDataStream {
+			var chunk completionStreamChunkResponse
+			if err := json.Unmarshal([]byte(rawChunk), &chunk); err != nil {
 				streamErr = coreerr.E("llamacpp.Complete", "decode completion chunk", err)
 				return
 			}
@@ -183,18 +192,19 @@ func (c *Client) Complete(ctx context.Context, req CompletionRequest) (iter.Seq[
 		}
 	}
 
-	return tokens, func() error {
+	return tokenStream, func() error {
 		closeBody()
 		return streamErr
 	}
 }
 
-// parseSSE reads SSE-formatted lines from r and yields the payload of each
-// "data: " line. It stops when it encounters "[DONE]" or an I/O error.
-// Any read error (other than EOF) is stored via errOut.
-func parseSSE(r io.Reader, errOut *error) iter.Seq[string] {
+// streamSSEData reads SSE-formatted lines from r and yields the payload of
+// each "data: " line. llama-server terminates successful streams with a
+// "[DONE]" sentinel; EOF before that marker is treated as a truncated stream.
+func streamSSEData(r io.Reader, errOut *error) iter.Seq[string] {
 	return func(yield func(string) bool) {
 		scanner := bufio.NewScanner(r)
+		sawDone := false
 		for scanner.Scan() {
 			line := scanner.Text()
 			if !strings.HasPrefix(line, "data: ") {
@@ -202,6 +212,7 @@ func parseSSE(r io.Reader, errOut *error) iter.Seq[string] {
 			}
 			payload := strings.TrimPrefix(line, "data: ")
 			if payload == "[DONE]" {
+				sawDone = true
 				return
 			}
 			if !yield(payload) {
@@ -209,10 +220,15 @@ func parseSSE(r io.Reader, errOut *error) iter.Seq[string] {
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			*errOut = coreerr.E("llamacpp.parseSSE", "read SSE stream", err)
+			*errOut = coreerr.E("llamacpp.streamSSEData", "read SSE stream", err)
+			return
+		}
+		if !sawDone {
+			*errOut = coreerr.E("llamacpp.streamSSEData", "stream ended before [DONE]", io.ErrUnexpectedEOF)
 		}
 	}
 }
 
-// noChunks is an empty iterator returned when an error occurs before streaming begins.
-func noChunks(func(string) bool) {}
+// noStreamChunks is an empty iterator returned when an error occurs before
+// streaming begins.
+func noStreamChunks(func(string) bool) {}

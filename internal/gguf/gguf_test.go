@@ -4,10 +4,8 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // writeTestGGUFOrdered creates a synthetic GGUF v3 file with KV pairs in the
@@ -19,17 +17,27 @@ func writeTestGGUFOrdered(t *testing.T, kvs [][2]any) string {
 	path := filepath.Join(dir, "test.gguf")
 
 	f, err := os.Create(path)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("os.Create: %v", err)
+	}
 	defer f.Close()
 
 	// Magic
-	require.NoError(t, binary.Write(f, binary.LittleEndian, uint32(0x46554747)))
+	if err := binary.Write(f, binary.LittleEndian, uint32(0x46554747)); err != nil {
+		t.Fatalf("write magic: %v", err)
+	}
 	// Version 3
-	require.NoError(t, binary.Write(f, binary.LittleEndian, uint32(3)))
+	if err := binary.Write(f, binary.LittleEndian, uint32(3)); err != nil {
+		t.Fatalf("write version: %v", err)
+	}
 	// Tensor count (uint64): 0
-	require.NoError(t, binary.Write(f, binary.LittleEndian, uint64(0)))
+	if err := binary.Write(f, binary.LittleEndian, uint64(0)); err != nil {
+		t.Fatalf("write tensor count: %v", err)
+	}
 	// KV count (uint64)
-	require.NoError(t, binary.Write(f, binary.LittleEndian, uint64(len(kvs))))
+	if err := binary.Write(f, binary.LittleEndian, uint64(len(kvs))); err != nil {
+		t.Fatalf("write kv count: %v", err)
+	}
 
 	for _, kv := range kvs {
 		key := kv[0].(string)
@@ -43,26 +51,42 @@ func writeKV(t *testing.T, f *os.File, key string, val any) {
 	t.Helper()
 
 	// Key: uint64 length + bytes
-	require.NoError(t, binary.Write(f, binary.LittleEndian, uint64(len(key))))
-	_, err := f.Write([]byte(key))
-	require.NoError(t, err)
+	if err := binary.Write(f, binary.LittleEndian, uint64(len(key))); err != nil {
+		t.Fatalf("write key len: %v", err)
+	}
+	if _, err := f.Write([]byte(key)); err != nil {
+		t.Fatalf("write key bytes: %v", err)
+	}
 
 	switch v := val.(type) {
 	case string:
 		// Type: 8 (string)
-		require.NoError(t, binary.Write(f, binary.LittleEndian, uint32(8)))
+		if err := binary.Write(f, binary.LittleEndian, uint32(8)); err != nil {
+			t.Fatalf("write string type: %v", err)
+		}
 		// String value: uint64 length + bytes
-		require.NoError(t, binary.Write(f, binary.LittleEndian, uint64(len(v))))
-		_, err := f.Write([]byte(v))
-		require.NoError(t, err)
+		if err := binary.Write(f, binary.LittleEndian, uint64(len(v))); err != nil {
+			t.Fatalf("write string len: %v", err)
+		}
+		if _, err := f.Write([]byte(v)); err != nil {
+			t.Fatalf("write string bytes: %v", err)
+		}
 	case uint32:
 		// Type: 4 (uint32)
-		require.NoError(t, binary.Write(f, binary.LittleEndian, uint32(4)))
-		require.NoError(t, binary.Write(f, binary.LittleEndian, v))
+		if err := binary.Write(f, binary.LittleEndian, uint32(4)); err != nil {
+			t.Fatalf("write uint32 type: %v", err)
+		}
+		if err := binary.Write(f, binary.LittleEndian, v); err != nil {
+			t.Fatalf("write uint32 val: %v", err)
+		}
 	case uint64:
 		// Type: 10 (uint64)
-		require.NoError(t, binary.Write(f, binary.LittleEndian, uint32(10)))
-		require.NoError(t, binary.Write(f, binary.LittleEndian, v))
+		if err := binary.Write(f, binary.LittleEndian, uint32(10)); err != nil {
+			t.Fatalf("write uint64 type: %v", err)
+		}
+		if err := binary.Write(f, binary.LittleEndian, v); err != nil {
+			t.Fatalf("write uint64 val: %v", err)
+		}
 	default:
 		t.Fatalf("writeKV: unsupported value type %T", val)
 	}
@@ -73,12 +97,18 @@ func writeKV(t *testing.T, f *os.File, key string, val any) {
 func writeRawKV(t *testing.T, f *os.File, key string, valType uint32, rawVal []byte) {
 	t.Helper()
 
-	require.NoError(t, binary.Write(f, binary.LittleEndian, uint64(len(key))))
-	_, err := f.Write([]byte(key))
-	require.NoError(t, err)
-	require.NoError(t, binary.Write(f, binary.LittleEndian, valType))
-	_, err = f.Write(rawVal)
-	require.NoError(t, err)
+	if err := binary.Write(f, binary.LittleEndian, uint64(len(key))); err != nil {
+		t.Fatalf("write key len: %v", err)
+	}
+	if _, err := f.Write([]byte(key)); err != nil {
+		t.Fatalf("write key bytes: %v", err)
+	}
+	if err := binary.Write(f, binary.LittleEndian, valType); err != nil {
+		t.Fatalf("write val type: %v", err)
+	}
+	if _, err := f.Write(rawVal); err != nil {
+		t.Fatalf("write raw val: %v", err)
+	}
 }
 
 // writeTestGGUFV2 creates a synthetic GGUF v2 file (uint32 tensor/kv counts).
@@ -89,17 +119,27 @@ func writeTestGGUFV2(t *testing.T, kvs [][2]any) string {
 	path := filepath.Join(dir, "test_v2.gguf")
 
 	f, err := os.Create(path)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("os.Create: %v", err)
+	}
 	defer f.Close()
 
 	// Magic
-	require.NoError(t, binary.Write(f, binary.LittleEndian, uint32(0x46554747)))
+	if err := binary.Write(f, binary.LittleEndian, uint32(0x46554747)); err != nil {
+		t.Fatalf("write magic: %v", err)
+	}
 	// Version 2
-	require.NoError(t, binary.Write(f, binary.LittleEndian, uint32(2)))
+	if err := binary.Write(f, binary.LittleEndian, uint32(2)); err != nil {
+		t.Fatalf("write version: %v", err)
+	}
 	// Tensor count (uint32 for v2): 0
-	require.NoError(t, binary.Write(f, binary.LittleEndian, uint32(0)))
+	if err := binary.Write(f, binary.LittleEndian, uint32(0)); err != nil {
+		t.Fatalf("write tensor count: %v", err)
+	}
 	// KV count (uint32 for v2)
-	require.NoError(t, binary.Write(f, binary.LittleEndian, uint32(len(kvs))))
+	if err := binary.Write(f, binary.LittleEndian, uint32(len(kvs))); err != nil {
+		t.Fatalf("write kv count: %v", err)
+	}
 
 	for _, kv := range kvs {
 		key := kv[0].(string)
@@ -120,15 +160,31 @@ func TestReadMetadata_Gemma3(t *testing.T) {
 	})
 
 	m, err := ReadMetadata(path)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("ReadMetadata: %v", err)
+	}
 
-	assert.Equal(t, "gemma3", m.Architecture)
-	assert.Equal(t, "Test Gemma3 1B", m.Name)
-	assert.Equal(t, uint32(17), m.FileType)
-	assert.Equal(t, "1B", m.SizeLabel)
-	assert.Equal(t, uint32(32768), m.ContextLength)
-	assert.Equal(t, uint32(26), m.BlockCount)
-	assert.Greater(t, m.FileSize, int64(0))
+	if m.Architecture != "gemma3" {
+		t.Errorf("Architecture = %q, want %q", m.Architecture, "gemma3")
+	}
+	if m.Name != "Test Gemma3 1B" {
+		t.Errorf("Name = %q, want %q", m.Name, "Test Gemma3 1B")
+	}
+	if m.FileType != uint32(17) {
+		t.Errorf("FileType = %d, want 17", m.FileType)
+	}
+	if m.SizeLabel != "1B" {
+		t.Errorf("SizeLabel = %q, want %q", m.SizeLabel, "1B")
+	}
+	if m.ContextLength != uint32(32768) {
+		t.Errorf("ContextLength = %d, want 32768", m.ContextLength)
+	}
+	if m.BlockCount != uint32(26) {
+		t.Errorf("BlockCount = %d, want 26", m.BlockCount)
+	}
+	if m.FileSize <= 0 {
+		t.Errorf("FileSize = %d, want > 0", m.FileSize)
+	}
 }
 
 func TestReadMetadata_Llama(t *testing.T) {
@@ -142,15 +198,31 @@ func TestReadMetadata_Llama(t *testing.T) {
 	})
 
 	m, err := ReadMetadata(path)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("ReadMetadata: %v", err)
+	}
 
-	assert.Equal(t, "llama", m.Architecture)
-	assert.Equal(t, "Test Llama 8B", m.Name)
-	assert.Equal(t, uint32(15), m.FileType)
-	assert.Equal(t, "8B", m.SizeLabel)
-	assert.Equal(t, uint32(131072), m.ContextLength)
-	assert.Equal(t, uint32(32), m.BlockCount)
-	assert.Greater(t, m.FileSize, int64(0))
+	if m.Architecture != "llama" {
+		t.Errorf("Architecture = %q, want %q", m.Architecture, "llama")
+	}
+	if m.Name != "Test Llama 8B" {
+		t.Errorf("Name = %q, want %q", m.Name, "Test Llama 8B")
+	}
+	if m.FileType != uint32(15) {
+		t.Errorf("FileType = %d, want 15", m.FileType)
+	}
+	if m.SizeLabel != "8B" {
+		t.Errorf("SizeLabel = %q, want %q", m.SizeLabel, "8B")
+	}
+	if m.ContextLength != uint32(131072) {
+		t.Errorf("ContextLength = %d, want 131072", m.ContextLength)
+	}
+	if m.BlockCount != uint32(32) {
+		t.Errorf("BlockCount = %d, want 32", m.BlockCount)
+	}
+	if m.FileSize <= 0 {
+		t.Errorf("FileSize = %d, want > 0", m.FileSize)
+	}
 }
 
 func TestReadMetadata_ArchAfterContextLength(t *testing.T) {
@@ -166,37 +238,67 @@ func TestReadMetadata_ArchAfterContextLength(t *testing.T) {
 	})
 
 	m, err := ReadMetadata(path)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("ReadMetadata: %v", err)
+	}
 
-	assert.Equal(t, "llama", m.Architecture)
-	assert.Equal(t, "Out-of-Order Model", m.Name)
-	assert.Equal(t, uint32(4096), m.ContextLength)
-	assert.Equal(t, uint32(32), m.BlockCount)
+	if m.Architecture != "llama" {
+		t.Errorf("Architecture = %q, want %q", m.Architecture, "llama")
+	}
+	if m.Name != "Out-of-Order Model" {
+		t.Errorf("Name = %q, want %q", m.Name, "Out-of-Order Model")
+	}
+	if m.ContextLength != uint32(4096) {
+		t.Errorf("ContextLength = %d, want 4096", m.ContextLength)
+	}
+	if m.BlockCount != uint32(32) {
+		t.Errorf("BlockCount = %d, want 32", m.BlockCount)
+	}
 }
 
 func TestReadMetadata_InvalidMagic(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "notgguf.bin")
 
-	err := os.WriteFile(path, []byte("this is not a GGUF file at all"), 0644)
-	require.NoError(t, err)
+	if err := os.WriteFile(path, []byte("this is not a GGUF file at all"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
 
-	_, err = ReadMetadata(path)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "invalid magic")
+	_, err := ReadMetadata(path)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid magic") {
+		t.Errorf("err = %v, want contains %q", err, "invalid magic")
+	}
 }
 
 func TestReadMetadata_FileNotFound(t *testing.T) {
 	_, err := ReadMetadata("/nonexistent/path/model.gguf")
-	require.Error(t, err)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "open file") {
+		t.Errorf("err = %v, want contains %q", err, "open file")
+	}
 }
 
 func TestFileTypeName(t *testing.T) {
-	assert.Equal(t, "Q4_K_M", FileTypeName(15))
-	assert.Equal(t, "Q5_K_M", FileTypeName(17))
-	assert.Equal(t, "Q8_0", FileTypeName(7))
-	assert.Equal(t, "F16", FileTypeName(1))
-	assert.Equal(t, "type_999", FileTypeName(999))
+	cases := []struct {
+		ft   uint32
+		want string
+	}{
+		{15, "Q4_K_M"},
+		{17, "Q5_K_M"},
+		{7, "Q8_0"},
+		{1, "F16"},
+		{999, "type_999"},
+	}
+	for _, c := range cases {
+		if got := FileTypeName(c.ft); got != c.want {
+			t.Errorf("FileTypeName(%d) = %q, want %q", c.ft, got, c.want)
+		}
+	}
 }
 
 func TestReadMetadata_V2(t *testing.T) {
@@ -210,13 +312,25 @@ func TestReadMetadata_V2(t *testing.T) {
 	})
 
 	m, err := ReadMetadata(path)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("ReadMetadata: %v", err)
+	}
 
-	assert.Equal(t, "llama", m.Architecture)
-	assert.Equal(t, "V2 Model", m.Name)
-	assert.Equal(t, uint32(15), m.FileType)
-	assert.Equal(t, uint32(2048), m.ContextLength)
-	assert.Equal(t, uint32(16), m.BlockCount)
+	if m.Architecture != "llama" {
+		t.Errorf("Architecture = %q, want %q", m.Architecture, "llama")
+	}
+	if m.Name != "V2 Model" {
+		t.Errorf("Name = %q, want %q", m.Name, "V2 Model")
+	}
+	if m.FileType != uint32(15) {
+		t.Errorf("FileType = %d, want 15", m.FileType)
+	}
+	if m.ContextLength != uint32(2048) {
+		t.Errorf("ContextLength = %d, want 2048", m.ContextLength)
+	}
+	if m.BlockCount != uint32(16) {
+		t.Errorf("BlockCount = %d, want 16", m.BlockCount)
+	}
 }
 
 func TestReadMetadata_UnsupportedVersion(t *testing.T) {
@@ -224,15 +338,25 @@ func TestReadMetadata_UnsupportedVersion(t *testing.T) {
 	path := filepath.Join(dir, "bad_version.gguf")
 
 	f, err := os.Create(path)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("os.Create: %v", err)
+	}
 
-	require.NoError(t, binary.Write(f, binary.LittleEndian, uint32(0x46554747))) // magic
-	require.NoError(t, binary.Write(f, binary.LittleEndian, uint32(99)))          // invalid version
+	if err := binary.Write(f, binary.LittleEndian, uint32(0x46554747)); err != nil {
+		t.Fatalf("write magic: %v", err)
+	}
+	if err := binary.Write(f, binary.LittleEndian, uint32(99)); err != nil {
+		t.Fatalf("write version: %v", err)
+	}
 	f.Close()
 
 	_, err = ReadMetadata(path)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unsupported GGUF version")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "unsupported GGUF version") {
+		t.Errorf("err = %v, want contains %q", err, "unsupported GGUF version")
+	}
 }
 
 func TestReadMetadata_SkipsUnknownValueTypes(t *testing.T) {
@@ -242,14 +366,24 @@ func TestReadMetadata_SkipsUnknownValueTypes(t *testing.T) {
 	path := filepath.Join(dir, "skip_types.gguf")
 
 	f, err := os.Create(path)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("os.Create: %v", err)
+	}
 
 	// Header: magic, v3, 0 tensors
-	require.NoError(t, binary.Write(f, binary.LittleEndian, uint32(0x46554747)))
-	require.NoError(t, binary.Write(f, binary.LittleEndian, uint32(3)))
-	require.NoError(t, binary.Write(f, binary.LittleEndian, uint64(0)))
+	if err := binary.Write(f, binary.LittleEndian, uint32(0x46554747)); err != nil {
+		t.Fatalf("write magic: %v", err)
+	}
+	if err := binary.Write(f, binary.LittleEndian, uint32(3)); err != nil {
+		t.Fatalf("write version: %v", err)
+	}
+	if err := binary.Write(f, binary.LittleEndian, uint64(0)); err != nil {
+		t.Fatalf("write tensor count: %v", err)
+	}
 	// 8 KV pairs: 6 skip types + 2 interesting keys
-	require.NoError(t, binary.Write(f, binary.LittleEndian, uint64(8)))
+	if err := binary.Write(f, binary.LittleEndian, uint64(8)); err != nil {
+		t.Fatalf("write kv count: %v", err)
+	}
 
 	// 1. uint8 (type 0) — 1 byte
 	raw := make([]byte, 1)
@@ -283,7 +417,7 @@ func TestReadMetadata_SkipsUnknownValueTypes(t *testing.T) {
 	b8 := make([]byte, 8)
 	binary.LittleEndian.PutUint64(b8, 3) // count: 3
 	arrBuf = append(arrBuf, b8...)
-	arrBuf = append(arrBuf, 10, 20, 30)  // 3 uint8 values
+	arrBuf = append(arrBuf, 10, 20, 30) // 3 uint8 values
 	writeRawKV(t, f, "custom.array_val", 9, arrBuf)
 
 	// 7-8. Interesting keys to verify parsing continued correctly.
@@ -293,10 +427,16 @@ func TestReadMetadata_SkipsUnknownValueTypes(t *testing.T) {
 	f.Close()
 
 	m, err := ReadMetadata(path)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("ReadMetadata: %v", err)
+	}
 
-	assert.Equal(t, "llama", m.Architecture)
-	assert.Equal(t, "Skip Test Model", m.Name)
+	if m.Architecture != "llama" {
+		t.Errorf("Architecture = %q, want %q", m.Architecture, "llama")
+	}
+	if m.Name != "Skip Test Model" {
+		t.Errorf("Name = %q, want %q", m.Name, "Skip Test Model")
+	}
 }
 
 func TestReadMetadata_Uint64ContextLength(t *testing.T) {
@@ -309,10 +449,16 @@ func TestReadMetadata_Uint64ContextLength(t *testing.T) {
 	})
 
 	m, err := ReadMetadata(path)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("ReadMetadata: %v", err)
+	}
 
-	assert.Equal(t, uint32(8192), m.ContextLength)
-	assert.Equal(t, uint32(32), m.BlockCount)
+	if m.ContextLength != uint32(8192) {
+		t.Errorf("ContextLength = %d, want 8192", m.ContextLength)
+	}
+	if m.BlockCount != uint32(32) {
+		t.Errorf("BlockCount = %d, want 32", m.BlockCount)
+	}
 }
 
 func TestReadMetadata_TruncatedFile(t *testing.T) {
@@ -321,13 +467,21 @@ func TestReadMetadata_TruncatedFile(t *testing.T) {
 
 	// Write only the magic — no version or counts.
 	f, err := os.Create(path)
-	require.NoError(t, err)
-	require.NoError(t, binary.Write(f, binary.LittleEndian, uint32(0x46554747)))
+	if err != nil {
+		t.Fatalf("os.Create: %v", err)
+	}
+	if err := binary.Write(f, binary.LittleEndian, uint32(0x46554747)); err != nil {
+		t.Fatalf("write magic: %v", err)
+	}
 	f.Close()
 
 	_, err = ReadMetadata(path)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "reading version")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "reading version") {
+		t.Errorf("err = %v, want contains %q", err, "reading version")
+	}
 }
 
 func TestReadMetadata_SkipsStringValue(t *testing.T) {
@@ -336,12 +490,22 @@ func TestReadMetadata_SkipsStringValue(t *testing.T) {
 	path := filepath.Join(dir, "skip_string.gguf")
 
 	f, err := os.Create(path)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("os.Create: %v", err)
+	}
 
-	require.NoError(t, binary.Write(f, binary.LittleEndian, uint32(0x46554747)))
-	require.NoError(t, binary.Write(f, binary.LittleEndian, uint32(3)))
-	require.NoError(t, binary.Write(f, binary.LittleEndian, uint64(0)))
-	require.NoError(t, binary.Write(f, binary.LittleEndian, uint64(2)))
+	if err := binary.Write(f, binary.LittleEndian, uint32(0x46554747)); err != nil {
+		t.Fatalf("write magic: %v", err)
+	}
+	if err := binary.Write(f, binary.LittleEndian, uint32(3)); err != nil {
+		t.Fatalf("write version: %v", err)
+	}
+	if err := binary.Write(f, binary.LittleEndian, uint64(0)); err != nil {
+		t.Fatalf("write tensor count: %v", err)
+	}
+	if err := binary.Write(f, binary.LittleEndian, uint64(2)); err != nil {
+		t.Fatalf("write kv count: %v", err)
+	}
 
 	// Uninteresting string key (exercises skipValue for typeString).
 	writeKV(t, f, "custom.description", "a long description value")
@@ -351,6 +515,10 @@ func TestReadMetadata_SkipsStringValue(t *testing.T) {
 	f.Close()
 
 	m, err := ReadMetadata(path)
-	require.NoError(t, err)
-	assert.Equal(t, "gemma3", m.Architecture)
+	if err != nil {
+		t.Fatalf("ReadMetadata: %v", err)
+	}
+	if m.Architecture != "gemma3" {
+		t.Errorf("Architecture = %q, want %q", m.Architecture, "gemma3")
+	}
 }

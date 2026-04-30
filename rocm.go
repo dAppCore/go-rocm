@@ -6,8 +6,8 @@
 // # Quick Start
 //
 //	import (
-//	    "forge.lthn.ai/core/go-inference"
-//	    _ "forge.lthn.ai/core/go-rocm" // auto-registers ROCm backend
+//	    "dappco.re/go/inference"
+//	    _ "dappco.re/go/rocm" // auto-registers ROCm backend
 //	)
 //
 //	m, err := inference.LoadModel("/path/to/model.gguf")

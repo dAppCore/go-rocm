@@ -3,13 +3,19 @@ package llamacpp
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return fn(r)
+}
 
 // sseLines writes SSE-formatted lines to a flushing response writer.
 func sseLines(w http.ResponseWriter, lines []string) {
@@ -29,8 +35,12 @@ func sseLines(w http.ResponseWriter, lines []string) {
 
 func TestChatComplete_Streaming(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "/v1/chat/completions", r.URL.Path)
-		assert.Equal(t, "POST", r.Method)
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Errorf("r.URL.Path = %q, want %q", r.URL.Path, "/v1/chat/completions")
+		}
+		if r.Method != "POST" {
+			t.Errorf("r.Method = %q, want %q", r.Method, "POST")
+		}
 		sseLines(w, []string{
 			`{"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}`,
 			`{"choices":[{"delta":{"content":" world"},"finish_reason":null}]}`,
@@ -52,8 +62,13 @@ func TestChatComplete_Streaming(t *testing.T) {
 	for tok := range tokens {
 		got = append(got, tok)
 	}
-	require.NoError(t, errFn())
-	assert.Equal(t, []string{"Hello", " world"}, got)
+	if err := errFn(); err != nil {
+		t.Fatalf("errFn: %v", err)
+	}
+	want := []string{"Hello", " world"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("tokens = %v, want %v", got, want)
+	}
 }
 
 func TestChatComplete_EmptyResponse(t *testing.T) {
@@ -73,8 +88,12 @@ func TestChatComplete_EmptyResponse(t *testing.T) {
 	for tok := range tokens {
 		got = append(got, tok)
 	}
-	require.NoError(t, errFn())
-	assert.Empty(t, got)
+	if err := errFn(); err != nil {
+		t.Fatalf("errFn: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got = %v, want empty", got)
+	}
 }
 
 func TestChatComplete_HTTPError(t *testing.T) {
@@ -94,10 +113,16 @@ func TestChatComplete_HTTPError(t *testing.T) {
 	for tok := range tokens {
 		got = append(got, tok)
 	}
-	assert.Empty(t, got)
+	if len(got) != 0 {
+		t.Errorf("got = %v, want empty", got)
+	}
 	err := errFn()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "500")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "500") {
+		t.Errorf("err = %v, want contains %q", err, "500")
+	}
 }
 
 func TestChatComplete_ContextCancelled(t *testing.T) {
@@ -137,13 +162,20 @@ func TestChatComplete_ContextCancelled(t *testing.T) {
 	// The error may or may not be nil depending on timing;
 	// the important thing is we got exactly 1 token.
 	_ = errFn()
-	assert.Equal(t, []string{"Hello"}, got)
+	want := []string{"Hello"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("tokens = %v, want %v", got, want)
+	}
 }
 
 func TestComplete_Streaming(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "/v1/completions", r.URL.Path)
-		assert.Equal(t, "POST", r.Method)
+		if r.URL.Path != "/v1/completions" {
+			t.Errorf("r.URL.Path = %q, want %q", r.URL.Path, "/v1/completions")
+		}
+		if r.Method != "POST" {
+			t.Errorf("r.Method = %q, want %q", r.Method, "POST")
+		}
 		sseLines(w, []string{
 			`{"choices":[{"text":"Once","finish_reason":null}]}`,
 			`{"choices":[{"text":" upon","finish_reason":null}]}`,
@@ -166,8 +198,13 @@ func TestComplete_Streaming(t *testing.T) {
 	for tok := range tokens {
 		got = append(got, tok)
 	}
-	require.NoError(t, errFn())
-	assert.Equal(t, []string{"Once", " upon", " a time"}, got)
+	if err := errFn(); err != nil {
+		t.Fatalf("errFn: %v", err)
+	}
+	want := []string{"Once", " upon", " a time"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("tokens = %v, want %v", got, want)
+	}
 }
 
 func TestComplete_HTTPError(t *testing.T) {
@@ -187,8 +224,54 @@ func TestComplete_HTTPError(t *testing.T) {
 	for tok := range tokens {
 		got = append(got, tok)
 	}
-	assert.Empty(t, got)
+	if len(got) != 0 {
+		t.Errorf("got = %v, want empty", got)
+	}
 	err := errFn()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "400")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "400") {
+		t.Errorf("err = %v, want contains %q", err, "400")
+	}
+}
+
+func TestComplete_TruncatedStreamReturnsError(t *testing.T) {
+	c := NewClientWithHTTPClient("http://llama.test", &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path != "/v1/completions" {
+				return nil, fmt.Errorf("unexpected path %q", r.URL.Path)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(strings.NewReader(
+					"data: " + `{"choices":[{"text":"partial","finish_reason":null}]}` + "\n\n",
+				)),
+				Request: r,
+			}, nil
+		}),
+	})
+	tokens, errFn := c.Complete(context.Background(), CompletionRequest{
+		Prompt:      "Hello",
+		Temperature: 0.0,
+		Stream:      true,
+	})
+
+	var got []string
+	for tok := range tokens {
+		got = append(got, tok)
+	}
+
+	want := []string{"partial"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("tokens = %v, want %v", got, want)
+	}
+	err := errFn()
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "stream ended before [DONE]") {
+		t.Errorf("err = %v, want contains %q", err, "stream ended before [DONE]")
+	}
 }

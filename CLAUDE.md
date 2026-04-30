@@ -1,52 +1,108 @@
-# CLAUDE.md
+# go-rocm — AMD ROCm GPU Inference
 
 ## What This Is
 
-AMD ROCm GPU inference for Linux. Module: `forge.lthn.ai/core/go-rocm`
+AMD ROCm GPU inference for Linux via managed `llama-server` subprocess. Module: `dappco.re/go/rocm`.
 
-Implements `inference.Backend` and `inference.TextModel` (from `core/go-inference`) using llama.cpp compiled with HIP/ROCm. Targets AMD RDNA 3+ GPUs.
+Implements `inference.Backend` and `inference.TextModel` (from `core/go-inference`) using llama.cpp compiled with `-DGGML_HIP=ON`. Targets AMD RDNA 2+ GPUs (tested on Radeon RX 7800 XT, gfx1100).
 
-## Target Hardware
+Sibling to `go-mlx` (Metal on macOS). Both expose the same interface; users select at runtime based on `Available()`.
 
-- **GPU**: AMD Radeon RX 7800 XT (gfx1100, RDNA 3, 16 GB VRAM) — confirmed gfx1100, not gfx1101
-- **OS**: Ubuntu 24.04 LTS (linux/amd64)
-- **ROCm**: 7.2.0 installed
-- **Kernel**: 6.17.0
+## Key Facts
 
-## Commands
+- **Subprocess model:** llama-server runs as isolated process, communicates via HTTP/SSE
+- **GGUF parser:** Reads model metadata (v2/v3) without loading tensors — enables fast discovery
+- **VRAM monitoring:** sysfs-based (no ROCm runtime library dependency)
+- **iGPU masking:** `HIP_VISIBLE_DEVICES=0` hardcoded — Ryzen 9 iGPU crashes llama-server if exposed
+- **Auto-register:** `init()` registers backend into `inference.Register()` on linux && amd64
+- **Platform stubs:** Exports no-op funcs on non-Linux/amd64 to avoid build failures
+- **Error wrapping:** All errors use `coreerr.E(scope, msg, cause)` from `go-log`
 
-```bash
-go test ./...                       # Unit tests (no GPU required)
-go test -tags rocm ./...            # Integration tests + benchmarks (GPU required)
-go test -tags rocm -v -run TestROCm ./...   # Full GPU tests only
-go test -tags rocm -bench=. -benchtime=3x ./...  # Benchmarks
-```
+## Hardware & OS
+
+| Component | Value |
+|-----------|-------|
+| GPU | Radeon RX 7800 XT (gfx1100, RDNA 3, 16 GB) |
+| CPU | Ryzen 9 9950X |
+| OS | Ubuntu 24.04 LTS |
+| ROCm | 7.2.0 |
+| Kernel | 6.17.0 |
 
 ## Architecture
 
-See `docs/architecture.md` for full detail.
-
 ```
-go-rocm/
-├── backend.go           inference.Backend (linux && amd64)
-├── model.go             inference.TextModel (linux && amd64)
-├── server.go            llama-server subprocess lifecycle
-├── vram.go              VRAM monitoring via sysfs
-├── discover.go          GGUF model discovery
-├── register_rocm.go     auto-registers via init() (linux && amd64)
-├── rocm_stub.go         stubs for non-linux/non-amd64
-└── internal/
-    ├── llamacpp/        llama-server HTTP client + health check
-    └── gguf/            GGUF v2/v3 binary metadata parser
+dappco.re/go/rocm/
+├── Public:
+│   ├── rocm.go              [VRAMInfo, ModelInfo types]
+│   ├── discover.go          [DiscoverModels(dir) -> []ModelInfo]
+│   ├── register_rocm.go     [init() register]
+│
+├── Backend/Model (linux && amd64):
+│   ├── backend.go           [rocmBackend impl]
+│   ├── model.go             [rocmModel impl, metrics, streaming]
+│   ├── server.go            [subprocess lifecycle, port mgmt]
+│   ├── vram.go              [GetVRAMInfo() via sysfs]
+│   ├── rocm_stub.go         [stubs for other platforms]
+│
+└── Internal:
+    ├── internal/gguf/
+    │   └── gguf.go          [GGUF v2/v3 binary header parser]
+    │
+    └── internal/llamacpp/
+        ├── client.go        [HTTP client, Complete, ChatComplete]
+        └── health.go        [/health endpoint polling]
 ```
 
-## Critical: iGPU Crash
+## Critical Rules
 
-The Ryzen 9 9950X iGPU appears as ROCm Device 1. llama-server crashes trying to split tensors across it. `serverEnv()` always sets `HIP_VISIBLE_DEVICES=0`. Do not remove or weaken this.
+1. **iGPU always masked:** `serverEnv()` enforces `HIP_VISIBLE_DEVICES=0`. This is non-negotiable. Do not accept as config or env var override.
 
-## Building llama-server with ROCm
+2. **Platform-specific:** Build tags `linux && amd64` for GPU code. Stubs on other platforms prevent build errors.
+
+3. **Subprocess isolation:** llama-server is not trusted. Runs at default perms, minimal env, auto-killed on exit.
+
+4. **Error scope:** All errors use `coreerr.E()`. No `fmt.Errorf`, no `errors.New`, no `log` package.
+
+5. **Banned imports:** `fmt`, `log`, `errors`, `os/exec` use their core.* equivalents. (Note: `os` used directly for file/env ops, justified by GPU module weight constraints.)
+
+6. **Metrics best-effort:** VRAM stats read non-atomically from sysfs. Under heavy churn, transient gaps expected. Recording is not real-time.
+
+## Spec Index
+
+See `/sessions/vibrant-sharp-fermat/mnt/plans/code/core/go/rocm/RFC.md`:
+
+- **§1–2:** Overview & package layout
+- **§3:** Type definitions (VRAMInfo, ModelInfo, rocmBackend, rocmModel, server)
+- **§4:** Inference pipeline (Load, Generate, Chat, metrics)
+- **§5:** GGUF parser internals
+- **§6:** llama-server HTTP bridge
+- **§7–9:** VRAM discovery, model discovery, platform support
+- **§10–16:** Error handling, config, quantisation, design notes, cross-refs
+
+## Working Commands
 
 ```bash
+# Unit tests (no GPU required)
+go test ./...
+
+# Integration tests + benchmarks (GPU required, gfx1100)
+go test -tags rocm ./...
+
+# Full GPU tests only
+go test -tags rocm -v -run TestROCm ./...
+
+# Benchmarks
+go test -tags rocm -bench=. -benchtime=3x ./...
+
+# Format & lint
+go fmt ./...
+```
+
+## Building llama-server
+
+```bash
+git clone https://github.com/ggerganov/llama.cpp
+cd llama.cpp
 cmake -B build \
     -DGGML_HIP=ON \
     -DAMDGPU_TARGETS=gfx1100 \
@@ -56,34 +112,26 @@ cmake --build build --parallel $(nproc) -t llama-server
 sudo cp build/bin/llama-server /usr/local/bin/llama-server
 ```
 
-## Environment Variables
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `ROCM_LLAMA_SERVER_PATH` | PATH lookup | Path to llama-server binary |
-| `HIP_VISIBLE_DEVICES` | overridden to `0` | Always forced to 0 — do not rely on ambient value |
-
-## Coding Standards
-
-- UK English
-- Tests: testify assert/require
-- Build tags: `linux && amd64` for GPU code, `rocm` for integration tests
-- Errors: `coreerr.E("pkg.Func", "what failed", err)` via `go-log`, never `fmt.Errorf` or `errors.New`
-- File I/O: `os` package used directly — `go-io` not imported (its transitive deps are too heavy for a GPU inference module)
-- Conventional commits
-- Co-Author: `Co-Authored-By: Virgil <virgil@lethean.io>`
-- Licence: EUPL-1.2
-
 ## Coordination
 
-- **Virgil** (core/go) is the orchestrator — writes tasks and reviews PRs
-- **go-mlx** is the sibling — Metal backend on macOS, same interface contract
-- **go-inference** defines the shared TextModel/Backend interfaces both backends implement
-- **go-ml** wraps both backends into the scoring engine
+- **Virgil** (forge.lthn.ai/core) — orchestrator, task writer, PR reviewer
+- **go-mlx** — sibling Metal backend (same interface contract)
+- **go-inference** — shared TextModel/Backend interface definitions
+- **go-ml** — scoring engine wrapping both backends
+- **LEM training** — uses go-rocm for model eval on Charon homelab
 
-## Documentation
+## Test Naming
 
-- `docs/architecture.md` — component design, data flow, interface contracts
-- `docs/development.md` — prerequisites, test commands, benchmarks, coding standards
-- `docs/history.md` — completed phases, commit hashes, known limitations
-- `docs/plans/` — phase design documents (read-only reference)
+Format: `TestFilename_Function_{Good,Bad,Ugly}` — all three categories mandatory.
+
+Example: `TestModel_Generate_Good`, `TestModel_Generate_Bad`, `TestModel_Generate_Ugly`.
+
+## Commit Style
+
+```
+type(scope): description
+
+Co-Authored-By: Virgil <virgil@lethean.io>
+```
+
+Example: `feat(rocm): add VRAM monitoring via sysfs`

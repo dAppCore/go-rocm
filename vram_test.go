@@ -6,42 +6,52 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestReadSysfsUint64(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test_value")
-	require.NoError(t, os.WriteFile(path, []byte("17163091968\n"), 0644))
+	if err := os.WriteFile(path, []byte("17163091968\n"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
 
 	val, err := readSysfsUint64(path)
-	require.NoError(t, err)
-	assert.Equal(t, uint64(17163091968), val)
+	if err != nil {
+		t.Fatalf("readSysfsUint64: %v", err)
+	}
+	if val != uint64(17163091968) {
+		t.Errorf("readSysfsUint64 = %d, want 17163091968", val)
+	}
 }
 
 func TestReadSysfsUint64_NotFound(t *testing.T) {
-	_, err := readSysfsUint64("/nonexistent/path")
-	assert.Error(t, err)
+	if _, err := readSysfsUint64("/nonexistent/path"); err == nil {
+		t.Error("expected error for missing path, got nil")
+	}
 }
 
 func TestReadSysfsUint64_InvalidContent(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bad_value")
-	require.NoError(t, os.WriteFile(path, []byte("not-a-number\n"), 0644))
+	if err := os.WriteFile(path, []byte("not-a-number\n"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
 
-	_, err := readSysfsUint64(path)
-	assert.Error(t, err)
+	if _, err := readSysfsUint64(path); err == nil {
+		t.Error("expected error for non-numeric content, got nil")
+	}
 }
 
 func TestReadSysfsUint64_EmptyFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "empty_value")
-	require.NoError(t, os.WriteFile(path, []byte(""), 0644))
+	if err := os.WriteFile(path, []byte(""), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
 
-	_, err := readSysfsUint64(path)
-	assert.Error(t, err)
+	if _, err := readSysfsUint64(path); err == nil {
+		t.Error("expected error for empty file, got nil")
+	}
 }
 
 func TestGetVRAMInfo(t *testing.T) {
@@ -51,7 +61,13 @@ func TestGetVRAMInfo(t *testing.T) {
 	}
 
 	// On this machine, the dGPU (RX 7800 XT) has ~16GB VRAM.
-	assert.Greater(t, info.Total, uint64(8*1024*1024*1024), "expected dGPU with >8GB VRAM")
-	assert.Greater(t, info.Used, uint64(0), "expected some VRAM in use")
-	assert.Equal(t, info.Total-info.Used, info.Free, "Free should equal Total-Used")
+	if info.Total <= uint64(8*1024*1024*1024) {
+		t.Errorf("Total = %d, expected dGPU with >8GB VRAM", info.Total)
+	}
+	if info.Used == 0 {
+		t.Error("Used = 0, expected some VRAM in use")
+	}
+	if info.Total-info.Used != info.Free {
+		t.Errorf("Free = %d, want Total-Used = %d", info.Free, info.Total-info.Used)
+	}
 }

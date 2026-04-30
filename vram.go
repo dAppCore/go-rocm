@@ -3,17 +3,24 @@
 package rocm
 
 import (
+	// Note: os: os.ReadFile for sysfs memory files; core.Fs() does not model sysfs
 	"os"
+	// Note: path/filepath: filepath.Glob/Join for sysfs path walking; no core equivalent for sysfs paths
 	"path/filepath"
+	// Note: strconv: numeric parsing of sysfs values; no core.ParseInt
 	"strconv"
+	// Note: strings: trimming sysfs output whitespace; core.* not in scope for this repo
 	"strings"
 
-	coreerr "forge.lthn.ai/core/go-log"
+	coreerr "dappco.re/go/log"
 )
 
-// GetVRAMInfo reads VRAM usage for the discrete GPU from sysfs.
-// It identifies the dGPU by selecting the card with the largest VRAM total,
-// which avoids hardcoding card numbers (e.g. card0=iGPU, card1=dGPU on Ryzen).
+//	info, err := GetVRAMInfo()
+//	fmt.Printf("%d MiB free\n", info.Free>>20)
+//
+// GetVRAMInfo reads VRAM usage for the discrete GPU from sysfs. It identifies
+// the dGPU by selecting the card with the largest VRAM total, which avoids
+// hardcoding card numbers (e.g. card0=iGPU, card1=dGPU on Ryzen).
 //
 // Note: total and used are read non-atomically from sysfs; transient
 // inconsistencies are possible under heavy allocation churn.
