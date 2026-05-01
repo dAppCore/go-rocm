@@ -1,4 +1,4 @@
-go 1.26.0
+go 1.26.2
 
 // Workspace mode for development: pulls local sources from external/ submodules.
 //
@@ -7,6 +7,6 @@ go 1.26.0
 use (
 	./go
 	./external/go
-	./external/go-inference
+	./external/go-inference/go
 	./external/go-log/go
 )
