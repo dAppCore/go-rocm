@@ -1,0 +1,12 @@
+[submodule "external/go"]
+	path = external/go
+	url = https://github.com/dappcore/go.git
+	branch = dev
+[submodule "external/go-inference"]
+	path = external/go-inference
+	url = https://github.com/dappcore/go-inference.git
+	branch = dev
+[submodule "external/go-log"]
+	path = external/go-log
+	url = https://github.com/dappcore/go-log.git
+	branch = dev
