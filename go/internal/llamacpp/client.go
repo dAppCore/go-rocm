@@ -1,3 +1,5 @@
+//go:build rocm_legacy_server
+
 package llamacpp
 
 import (

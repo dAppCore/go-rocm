@@ -13,4 +13,4 @@ func init() {
 //	}
 //
 // ROCmAvailable reports whether ROCm GPU inference is available.
-func ROCmAvailable() bool { return true }
+func ROCmAvailable() bool { return (&rocmBackend{}).Available() }

@@ -185,7 +185,7 @@ func TestModel_Model_Err_Ugly(t *testing.T) {
 func TestModel_Model_Close_Good(t *testing.T) {
 	variant := "Good"
 	core.AssertNotEmpty(t, variant)
-	m := &rocmModel{server: &server{processCommand: &core.Cmd{}}}
+	m := testModel()
 	core.AssertNoError(t, m.Close())
 	core.AssertNotNil(t, t)
 	core.AssertEqual(t, t.Name(), t.Name())
@@ -194,14 +194,14 @@ func TestModel_Model_Close_Bad(t *testing.T) {
 	variant := "Bad"
 	core.AssertNotEmpty(t, variant)
 	m := &rocmModel{}
-	core.AssertPanics(t, func() { m.Close() })
+	core.AssertNoError(t, m.Close())
 	core.AssertNotNil(t, t)
 	core.AssertEqual(t, t.Name(), t.Name())
 }
 func TestModel_Model_Close_Ugly(t *testing.T) {
 	variant := "Ugly"
 	core.AssertNotEmpty(t, variant)
-	m := &rocmModel{server: &server{processCommand: &core.Cmd{}}}
+	m := testModel()
 	core.AssertNoError(t, m.Close())
 	core.AssertNotNil(t, t)
 	core.AssertEqual(t, t.Name(), t.Name())

@@ -1,4 +1,4 @@
-//go:build linux && amd64
+//go:build linux && amd64 && rocm_legacy_server
 
 package rocm
 
@@ -231,14 +231,14 @@ func (m *rocmModel) Metrics() inference.GenerateMetrics {
 }
 
 // Err returns the error from the last Generate/Chat call, if any.
-func (m *rocmModel) Err() rocmFailure {
+func (m *rocmModel) Err() error {
 	m.stateMutex.Lock()
 	defer m.stateMutex.Unlock()
 	return m.lastError
 }
 
 // Close releases the llama-server subprocess and all associated resources.
-func (m *rocmModel) Close() rocmFailure {
+func (m *rocmModel) Close() error {
 	return m.server.stop()
 }
 

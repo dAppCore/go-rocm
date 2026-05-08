@@ -1,7 +1,13 @@
-// Package rocm provides AMD ROCm GPU inference for Linux.
+// Package rocm provides the AMD ROCm backend for the Core Go inference stack.
 //
-// This package implements the inference.Backend and inference.TextModel interfaces
-// using llama.cpp compiled with HIP/ROCm for AMD GPUs (RDNA 3+).
+// The default linux/amd64 build is native-first: it registers the ROCm backend
+// through go-inference, exposes model-fit planning, probing, benchmarking,
+// evaluation, tokenizer, and adapter contracts, and avoids the previous
+// OpenAI-compatible llama-server subprocess path.
+//
+// The native HIP loader is intentionally explicit. Until it is linked in,
+// Available reports false instead of hiding behind a server fallback. The old
+// subprocess backend is retained only behind the rocm_legacy_server build tag.
 //
 // # Quick Start
 //
@@ -18,10 +24,9 @@
 //
 // # Requirements
 //
-//   - Linux (amd64)
-//   - AMD GPU with ROCm support (RDNA 2+ / gfx10xx+, tested on RDNA 3 / gfx1100)
-//   - ROCm 6.x+ installed
-//   - llama-server binary (from llama.cpp built with -DGGML_HIP=ON)
+//   - Linux (amd64) for the ROCm runtime build
+//   - AMD GPU with ROCm support (RDNA 2+ / gfx10xx+ target class)
+//   - ROCm/HIP runtime for the forthcoming native loader
 package rocm
 
 // VRAMInfo reports GPU video memory usage in bytes.

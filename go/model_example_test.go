@@ -3,6 +3,8 @@
 package rocm
 
 import (
+	"context"
+
 	core "dappco.re/go"
 	"dappco.re/go/inference"
 )
@@ -10,16 +12,41 @@ import (
 func exampleModel() *rocmModel {
 	return &rocmModel{modelType: "llama", modelInfo: inference.ModelInfo{Architecture: "llama"}}
 }
-func ExampleModel_Generate() { core.Println(exampleModel().Generate != nil) /* Output: true */ }
-func ExampleModel_Chat()     { core.Println(exampleModel().Chat != nil) /* Output: true */ }
-func ExampleModel_Classify() { core.Println(exampleModel().Classify != nil) /* Output: true */ }
-func ExampleModel_BatchGenerate() {
-	core.Println(exampleModel().BatchGenerate != nil) /* Output: true */
+
+func Example_rocmModelGenerate() {
+	count := 0
+	for range exampleModel().Generate(context.Background(), "hello") {
+		count++
+	}
+	core.Println(count)
+	// Output: 0
 }
-func ExampleModel_ModelType() { core.Println(exampleModel().ModelType()) /* Output: llama */ }
-func ExampleModel_Info()      { core.Println(exampleModel().Info().Architecture) /* Output: llama */ }
-func ExampleModel_Metrics()   { core.Println(exampleModel().Metrics().GeneratedTokens) /* Output: 0 */ }
-func ExampleModel_Err()       { core.Println(exampleModel().Err() == nil) /* Output: true */ }
-func ExampleModel_Close() {
-	core.Println((&rocmModel{server: &server{processCommand: &core.Cmd{}}}).Close() == nil) /* Output: true */
+
+func Example_rocmModelChat() {
+	count := 0
+	for range exampleModel().Chat(context.Background(), []inference.Message{{Role: "user", Content: "hi"}}) {
+		count++
+	}
+	core.Println(count)
+	// Output: 0
 }
+
+func Example_rocmModelClassify() {
+	_, err := exampleModel().Classify(context.Background(), []string{"x"})
+	core.Println(err != nil)
+	// Output: true
+}
+
+func Example_rocmModelBatchGenerate() {
+	_, err := exampleModel().BatchGenerate(context.Background(), []string{"x"})
+	core.Println(err != nil)
+	// Output: true
+}
+
+func Example_rocmModelModelType() { core.Println(exampleModel().ModelType()) /* Output: llama */ }
+func Example_rocmModelInfo()      { core.Println(exampleModel().Info().Architecture) /* Output: llama */ }
+func Example_rocmModelMetrics() {
+	core.Println(exampleModel().Metrics().GeneratedTokens) /* Output: 0 */
+}
+func Example_rocmModelErr()   { core.Println(exampleModel().Err() == nil) /* Output: true */ }
+func Example_rocmModelClose() { core.Println(exampleModel().Close() == nil) /* Output: true */ }
