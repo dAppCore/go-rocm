@@ -17,6 +17,7 @@ import (
 
 func TestNativeContract_RocmBackendImplementsSharedPlanner_Good(t *testing.T) {
 	var _ inference.ModelFitPlanner = (*rocmBackend)(nil)
+	var _ inference.CapabilityReporter = (*rocmBackend)(nil)
 }
 
 func TestNativeContract_RocmModelImplementsSharedContracts_Good(t *testing.T) {
@@ -25,6 +26,55 @@ func TestNativeContract_RocmModelImplementsSharedContracts_Good(t *testing.T) {
 	var _ inference.ProbeableModel = (*rocmModel)(nil)
 	var _ inference.BenchableModel = (*rocmModel)(nil)
 	var _ inference.Evaluator = (*rocmModel)(nil)
+	var _ inference.CapabilityReporter = (*rocmModel)(nil)
+}
+
+func TestNativeContract_RocmBackendCapabilities_Good(t *testing.T) {
+	runtime := &fakeNativeRuntime{
+		available: true,
+		device:    nativeDeviceInfo{Name: "gfx1100", MemoryBytes: 16 * memoryGiB, FreeBytes: 8 * memoryGiB, Driver: "hip-test"},
+	}
+
+	report := newROCmBackendWithRuntime(runtime).Capabilities()
+
+	if report.Runtime.Backend != "rocm" || !report.Runtime.NativeRuntime || report.Runtime.Device != "gfx1100" {
+		t.Fatalf("runtime = %+v, want native ROCm device", report.Runtime)
+	}
+	if !report.Available {
+		t.Fatalf("Available = false, want true")
+	}
+	if !report.Supports(inference.CapabilityModelLoad) || !report.Supports(inference.CapabilityModelFit) {
+		t.Fatalf("capabilities = %+v, want load and fit planning", report.CapabilityIDs())
+	}
+	if report.Supports(inference.CapabilityGenerate) {
+		t.Fatalf("generate should be planned until native decode kernels are linked: %+v", report.CapabilityIDs())
+	}
+	if !report.Supports(inference.CapabilityTokenizer) || !report.Supports(inference.CapabilityProbeEvents) {
+		t.Fatalf("capabilities = %+v, want fallback tokenizer and probe stream", report.CapabilityIDs())
+	}
+	if len(report.Architectures) == 0 || len(report.Quantizations) == 0 || len(report.CacheModes) == 0 {
+		t.Fatalf("report = %+v, want architecture/quant/cache metadata", report)
+	}
+}
+
+func TestNativeContract_RocmModelCapabilities_Ugly(t *testing.T) {
+	model := &rocmModel{
+		modelType: "qwen3",
+		modelInfo: inference.ModelInfo{Architecture: "qwen3", NumLayers: 28, QuantBits: 4},
+		native:    &fakeNativeModel{adapter: inference.AdapterIdentity{Path: "domain.safetensors", Format: "lora"}},
+	}
+
+	report := model.Capabilities()
+
+	if !report.Available || report.Model.Architecture != "qwen3" || report.Adapter.Path != "domain.safetensors" {
+		t.Fatalf("report = %+v, want loaded model and adapter identity", report)
+	}
+	if report.Supports(inference.CapabilityLoRAInference) {
+		t.Fatalf("LoRA inference should be planned until HIP adapter application is linked")
+	}
+	if !report.Supports(inference.CapabilityEvaluation) {
+		t.Fatalf("evaluation should be experimentally available: %+v", report.CapabilityIDs())
+	}
 }
 
 func TestNativeContract_LoadModelUsesNativeRuntimeWithoutServer_Good(t *testing.T) {

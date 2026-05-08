@@ -81,6 +81,11 @@ func (b *rocmBackend) Available() bool {
 	return b.nativeRuntime().Available()
 }
 
+func (b *rocmBackend) Capabilities() inference.CapabilityReport {
+	runtime := b.nativeRuntime()
+	return rocmCapabilityReport(runtime.DeviceInfo(), inference.ModelIdentity{}, inference.AdapterIdentity{}, runtime.Available())
+}
+
 func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (inference.TextModel, error) {
 	loadConfig := inference.ApplyLoadOpts(opts)
 	modelPack, err := gguf.ReadInfo(path)
@@ -270,6 +275,13 @@ func (m *rocmModel) Info() inference.ModelInfo {
 		return inference.ModelInfo{}
 	}
 	return m.modelInfo
+}
+
+func (m *rocmModel) Capabilities() inference.CapabilityReport {
+	if m == nil {
+		return rocmCapabilityReport(nativeDeviceInfo{}, inference.ModelIdentity{}, inference.AdapterIdentity{}, false)
+	}
+	return rocmCapabilityReport(nativeDeviceInfo{}, m.modelIdentity(), m.ActiveAdapter(), m.native != nil)
 }
 
 func (m *rocmModel) Metrics() inference.GenerateMetrics {
@@ -567,6 +579,98 @@ func (m *rocmModel) modelIdentity() inference.ModelIdentity {
 		QuantGroup:   info.QuantGroup,
 	}
 }
+
+func rocmCapabilityReport(device nativeDeviceInfo, model inference.ModelIdentity, adapter inference.AdapterIdentity, available bool) inference.CapabilityReport {
+	labels := map[string]string{"library": "go-rocm"}
+	if device.FreeBytes > 0 {
+		labels["free_bytes"] = core.Sprintf("%d", device.FreeBytes)
+	}
+	runtimeLabels := map[string]string{}
+	if device.Driver != "" {
+		runtimeLabels["driver"] = device.Driver
+	}
+	if device.MemoryBytes > 0 {
+		runtimeLabels["memory_bytes"] = core.Sprintf("%d", device.MemoryBytes)
+	}
+	if len(runtimeLabels) == 0 {
+		runtimeLabels = nil
+	}
+	return inference.CapabilityReport{
+		Runtime: inference.RuntimeIdentity{
+			Backend:       "rocm",
+			Device:        device.Name,
+			Version:       device.Driver,
+			NativeRuntime: true,
+			Labels:        runtimeLabels,
+		},
+		Model:         model,
+		Adapter:       adapter,
+		Available:     available,
+		Architectures: append([]string(nil), rocmCapabilityArchitectures...),
+		Quantizations: append([]string(nil), rocmCapabilityQuantizations...),
+		CacheModes:    append([]string(nil), rocmCapabilityCacheModes...),
+		Capabilities: []inference.Capability{
+			inference.SupportedCapability(inference.CapabilityModelLoad, inference.CapabilityGroupRuntime),
+			inference.SupportedCapability(inference.CapabilityModelFit, inference.CapabilityGroupRuntime),
+			inference.SupportedCapability(inference.CapabilityMemoryPlanning, inference.CapabilityGroupRuntime),
+			inference.SupportedCapability(inference.CapabilityKVCachePlanning, inference.CapabilityGroupRuntime),
+			inference.PlannedCapability(inference.CapabilityBenchmark, inference.CapabilityGroupRuntime, "native decode kernels are not linked yet"),
+			inference.ExperimentalCapability(inference.CapabilityEvaluation, inference.CapabilityGroupRuntime, "token-count eval is available before prefill kernels are linked"),
+			inference.PlannedCapability(inference.CapabilityQuantization, inference.CapabilityGroupRuntime, "GGUF quantisation is owned by go-mlx/go-inference layer for now"),
+			inference.PlannedCapability(inference.CapabilityModelMerge, inference.CapabilityGroupRuntime, "model-pack merge is not implemented in the ROCm package yet"),
+			inference.PlannedCapability(inference.CapabilityGenerate, inference.CapabilityGroupModel, "native decode kernels are not linked yet"),
+			inference.PlannedCapability(inference.CapabilityChat, inference.CapabilityGroupModel, "native decode kernels are not linked yet"),
+			inference.PlannedCapability(inference.CapabilityClassify, inference.CapabilityGroupModel, "native prefill kernels are not linked yet"),
+			inference.PlannedCapability(inference.CapabilityBatchGenerate, inference.CapabilityGroupModel, "native decode kernels are not linked yet"),
+			inference.ExperimentalCapability(inference.CapabilityTokenizer, inference.CapabilityGroupModel, "fallback token approximation until native tokenizers are wired"),
+			inference.ExperimentalCapability(inference.CapabilityChatTemplate, inference.CapabilityGroupModel, "fallback chat template until model-native templates are wired"),
+			inference.PlannedCapability(inference.CapabilityLoRAInference, inference.CapabilityGroupModel, "native LoRA application is not linked yet"),
+			inference.PlannedCapability(inference.CapabilityStateBundle, inference.CapabilityGroupRuntime, "portable state bundle support belongs in go-inference; ROCm snapshots are not wired yet"),
+			inference.PlannedCapability(inference.CapabilityKVSnapshot, inference.CapabilityGroupRuntime, "binary KV snapshots need HIP cache ownership first"),
+			inference.PlannedCapability(inference.CapabilityPromptCache, inference.CapabilityGroupRuntime, "prompt cache needs native KV cache ownership first"),
+			inference.PlannedCapability(inference.CapabilityLoRATraining, inference.CapabilityGroupTraining, "native ROCm training kernels are not linked yet"),
+			inference.PlannedCapability(inference.CapabilityDistillation, inference.CapabilityGroupTraining, "distillation needs teacher/student forward kernels first"),
+			inference.PlannedCapability(inference.CapabilityGRPO, inference.CapabilityGroupTraining, "GRPO needs rollout generation kernels first"),
+			inference.ExperimentalCapability(inference.CapabilityProbeEvents, inference.CapabilityGroupProbe, "probe sink is wired around streams; kernel-level probes are pending"),
+			inference.PlannedCapability(inference.CapabilityAttentionProbe, inference.CapabilityGroupProbe, "attention probes need native prefill kernels first"),
+			inference.PlannedCapability(inference.CapabilityLogitProbe, inference.CapabilityGroupProbe, "logit probes need native prefill kernels first"),
+		},
+		Labels: labels,
+	}
+}
+
+var (
+	rocmCapabilityArchitectures = []string{
+		"bert",
+		"deepseek",
+		"gemma",
+		"gemma2",
+		"gemma3",
+		"gemma4",
+		"gpt-oss",
+		"llama",
+		"mistral",
+		"mixtral",
+		"phi",
+		"phi3",
+		"qwen2",
+		"qwen3",
+	}
+	rocmCapabilityQuantizations = []string{
+		"f16",
+		"f32",
+		"q2",
+		"q3",
+		"q4",
+		"q5",
+		"q6",
+		"q8",
+	}
+	rocmCapabilityCacheModes = []string{
+		"fp16",
+		"q8",
+	}
+)
 
 func resolveContextLength(requestedContextLength int, metadata gguf.Metadata) int {
 	if requestedContextLength > 0 {
