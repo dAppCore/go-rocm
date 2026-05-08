@@ -1,0 +1,29 @@
+// SPDX-Licence-Identifier: EUPL-1.2
+
+//go:build linux && amd64 && !cgo && !rocm_legacy_server
+
+package rocm
+
+import core "dappco.re/go"
+
+type unavailableHIPDriver struct{}
+
+func newSystemHIPDriver() nativeHIPDriver {
+	return unavailableHIPDriver{}
+}
+
+func (unavailableHIPDriver) Available() bool { return false }
+func (unavailableHIPDriver) DeviceInfo() nativeDeviceInfo {
+	info, err := GetVRAMInfo()
+	if err != nil {
+		return nativeDeviceInfo{}
+	}
+	return nativeDeviceInfo{Name: "rocm", MemoryBytes: info.Total, FreeBytes: info.Free}
+}
+func (unavailableHIPDriver) Malloc(uint64) (nativeDevicePointer, error) {
+	return 0, core.E("rocm.hip.Malloc", "cgo is disabled; native HIP driver is unavailable", nil)
+}
+func (unavailableHIPDriver) Free(nativeDevicePointer) error { return nil }
+func (unavailableHIPDriver) CopyHostToDevice(nativeDevicePointer, []byte) error {
+	return core.E("rocm.hip.CopyHostToDevice", "cgo is disabled; native HIP driver is unavailable", nil)
+}

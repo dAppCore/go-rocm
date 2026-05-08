@@ -8,7 +8,6 @@
 package gguf
 
 import (
-	"bufio"
 	"encoding/binary"
 	"io"
 	"math"
@@ -47,6 +46,26 @@ type Metadata struct {
 	FileSize      int64  // file size on disk in bytes
 }
 
+// TensorInfo describes one GGUF tensor entry without loading tensor bytes.
+type TensorInfo struct {
+	Name       string
+	Dimensions []uint64
+	Type       uint32
+	TypeName   string
+	Offset     uint64
+	ByteSize   uint64
+}
+
+// Info is the parsed GGUF header, including metadata and tensor directory.
+type Info struct {
+	Metadata   Metadata
+	Tensors    []TensorInfo
+	Alignment  uint32
+	DataOffset int64
+}
+
+const defaultAlignment = 32
+
 // fileTypeNames maps GGML quantisation file type numbers to human-readable names.
 var fileTypeNames = map[uint32]string{
 	0:  "F32",
@@ -67,6 +86,28 @@ var fileTypeNames = map[uint32]string{
 	18: "Q6_K",
 }
 
+var tensorTypeNames = map[uint32]string{
+	0:  "F32",
+	1:  "F16",
+	2:  "Q4_0",
+	3:  "Q4_1",
+	6:  "Q5_0",
+	7:  "Q5_1",
+	8:  "Q8_0",
+	10: "Q2_K",
+	11: "Q3_K",
+	12: "Q4_K",
+	13: "Q5_K",
+	14: "Q6_K",
+	15: "Q8_K",
+	24: "I8",
+	25: "I16",
+	26: "I32",
+	27: "I64",
+	28: "F64",
+	30: "BF16",
+}
+
 //	name := FileTypeName(15) // "Q4_K_M"
 //
 // FileTypeName returns a human-readable name for a GGML quantisation file
@@ -78,6 +119,14 @@ func FileTypeName(ft uint32) string {
 	return core.Sprintf("type_%d", ft)
 }
 
+// TensorTypeName returns a human-readable name for a GGML tensor type.
+func TensorTypeName(t uint32) string {
+	if name, ok := tensorTypeNames[t]; ok {
+		return name
+	}
+	return core.Sprintf("type_%d", t)
+}
+
 //	metadata, err := ReadMetadata("/models/gemma3-4b.gguf")
 //
 // ReadMetadata reads the GGUF header from the file at path and returns the
@@ -87,65 +136,85 @@ func ReadMetadata(path string) (
 	Metadata,
 	error,
 ) {
+	info, err := readInfo(path, false)
+	if err != nil {
+		return Metadata{}, err
+	}
+	return info.Metadata, nil
+}
+
+// ReadInfo reads the GGUF header and tensor directory from path. Tensor bytes
+// are not loaded.
+func ReadInfo(path string) (
+	Info,
+	error,
+) {
+	return readInfo(path, true)
+}
+
+func readInfo(path string, includeTensors bool) (
+	Info,
+	error,
+) {
 	fileResult := core.Open(path)
 	if !fileResult.OK {
-		return Metadata{}, core.E("gguf.ReadMetadata", "open file", fileResult.Value.(error))
+		return Info{}, core.E("gguf.ReadInfo", "open file", fileResult.Value.(error))
 	}
 	file := fileResult.Value.(*core.OSFile)
 	defer file.Close()
 
 	fileInfo, err := file.Stat()
 	if err != nil {
-		return Metadata{}, core.E("gguf.ReadMetadata", "stat file", err)
+		return Info{}, core.E("gguf.ReadInfo", "stat file", err)
 	}
 
-	reader := bufio.NewReader(file)
+	reader := &countingReader{r: file}
 
 	// Read and validate magic number.
 	var magic uint32
 	if err := binary.Read(reader, binary.LittleEndian, &magic); err != nil {
-		return Metadata{}, core.E("gguf.ReadMetadata", "reading magic", err)
+		return Info{}, core.E("gguf.ReadInfo", "reading magic", err)
 	}
 	if magic != ggufMagic {
-		return Metadata{}, core.E("gguf.ReadMetadata", core.Sprintf("invalid magic: 0x%08X (expected 0x%08X)", magic, ggufMagic), nil)
+		return Info{}, core.E("gguf.ReadInfo", core.Sprintf("invalid magic: 0x%08X (expected 0x%08X)", magic, ggufMagic), nil)
 	}
 
 	// Read version.
 	var version uint32
 	if err := binary.Read(reader, binary.LittleEndian, &version); err != nil {
-		return Metadata{}, core.E("gguf.ReadMetadata", "reading version", err)
+		return Info{}, core.E("gguf.ReadInfo", "reading version", err)
 	}
 	if version < 2 || version > 3 {
-		return Metadata{}, core.E("gguf.ReadMetadata", core.Sprintf("unsupported GGUF version: %d", version), nil)
+		return Info{}, core.E("gguf.ReadInfo", core.Sprintf("unsupported GGUF version: %d", version), nil)
 	}
 
 	// Read tensor count and KV count. v3 uses uint64, v2 uses uint32.
 	var tensorCount, kvCount uint64
 	if version == 3 {
 		if err := binary.Read(reader, binary.LittleEndian, &tensorCount); err != nil {
-			return Metadata{}, core.E("gguf.ReadMetadata", "reading tensor count", err)
+			return Info{}, core.E("gguf.ReadInfo", "reading tensor count", err)
 		}
 		if err := binary.Read(reader, binary.LittleEndian, &kvCount); err != nil {
-			return Metadata{}, core.E("gguf.ReadMetadata", "reading kv count", err)
+			return Info{}, core.E("gguf.ReadInfo", "reading kv count", err)
 		}
 	} else {
 		var tensorCount32, kvCount32 uint32
 		if err := binary.Read(reader, binary.LittleEndian, &tensorCount32); err != nil {
-			return Metadata{}, core.E("gguf.ReadMetadata", "reading tensor count", err)
+			return Info{}, core.E("gguf.ReadInfo", "reading tensor count", err)
 		}
 		if err := binary.Read(reader, binary.LittleEndian, &kvCount32); err != nil {
-			return Metadata{}, core.E("gguf.ReadMetadata", "reading kv count", err)
+			return Info{}, core.E("gguf.ReadInfo", "reading kv count", err)
 		}
 		tensorCount = uint64(tensorCount32)
 		kvCount = uint64(kvCount32)
 	}
-	_ = tensorCount // we only read metadata KVs
 
 	// Read all KV pairs. We store interesting keys and skip the rest.
 	// Architecture-specific keys (e.g. llama.context_length) may appear before
 	// the general.architecture key, so we collect all candidates and resolve after.
 	var meta Metadata
 	meta.FileSize = fileInfo.Size()
+	alignment := uint32(defaultAlignment)
 
 	// candidateContextLength and candidateBlockCount store values keyed by
 	// their full key name (e.g. "llama.context_length") so we can match them
@@ -156,12 +225,12 @@ func ReadMetadata(path string) (
 	for i := uint64(0); i < kvCount; i++ {
 		key, err := readString(reader)
 		if err != nil {
-			return Metadata{}, core.E("gguf.ReadMetadata", core.Sprintf("reading key %d", i), err)
+			return Info{}, core.E("gguf.ReadInfo", core.Sprintf("reading key %d", i), err)
 		}
 
 		var valType uint32
 		if err := binary.Read(reader, binary.LittleEndian, &valType); err != nil {
-			return Metadata{}, core.E("gguf.ReadMetadata", core.Sprintf("reading value type for key %q", key), err)
+			return Info{}, core.E("gguf.ReadInfo", core.Sprintf("reading value type for key %q", key), err)
 		}
 
 		// Check whether this is an interesting key before reading the value.
@@ -169,7 +238,7 @@ func ReadMetadata(path string) (
 		case key == "general.architecture":
 			value, err := readTypedValue(reader, valType)
 			if err != nil {
-				return Metadata{}, core.E("gguf.ReadMetadata", core.Sprintf("reading value for key %q", key), err)
+				return Info{}, core.E("gguf.ReadInfo", core.Sprintf("reading value for key %q", key), err)
 			}
 			if s, ok := value.(string); ok {
 				meta.Architecture = s
@@ -178,7 +247,7 @@ func ReadMetadata(path string) (
 		case key == "general.name":
 			value, err := readTypedValue(reader, valType)
 			if err != nil {
-				return Metadata{}, core.E("gguf.ReadMetadata", core.Sprintf("reading value for key %q", key), err)
+				return Info{}, core.E("gguf.ReadInfo", core.Sprintf("reading value for key %q", key), err)
 			}
 			if s, ok := value.(string); ok {
 				meta.Name = s
@@ -187,7 +256,7 @@ func ReadMetadata(path string) (
 		case key == "general.file_type":
 			value, err := readTypedValue(reader, valType)
 			if err != nil {
-				return Metadata{}, core.E("gguf.ReadMetadata", core.Sprintf("reading value for key %q", key), err)
+				return Info{}, core.E("gguf.ReadInfo", core.Sprintf("reading value for key %q", key), err)
 			}
 			if u, ok := value.(uint32); ok {
 				meta.FileType = u
@@ -196,7 +265,7 @@ func ReadMetadata(path string) (
 		case key == "general.size_label":
 			value, err := readTypedValue(reader, valType)
 			if err != nil {
-				return Metadata{}, core.E("gguf.ReadMetadata", core.Sprintf("reading value for key %q", key), err)
+				return Info{}, core.E("gguf.ReadInfo", core.Sprintf("reading value for key %q", key), err)
 			}
 			if s, ok := value.(string); ok {
 				meta.SizeLabel = s
@@ -205,7 +274,7 @@ func ReadMetadata(path string) (
 		case core.HasSuffix(key, ".context_length"):
 			value, err := readTypedValue(reader, valType)
 			if err != nil {
-				return Metadata{}, core.E("gguf.ReadMetadata", core.Sprintf("reading value for key %q", key), err)
+				return Info{}, core.E("gguf.ReadInfo", core.Sprintf("reading value for key %q", key), err)
 			}
 			if u, ok := value.(uint32); ok {
 				candidateContextLength[key] = u
@@ -214,16 +283,25 @@ func ReadMetadata(path string) (
 		case core.HasSuffix(key, ".block_count"):
 			value, err := readTypedValue(reader, valType)
 			if err != nil {
-				return Metadata{}, core.E("gguf.ReadMetadata", core.Sprintf("reading value for key %q", key), err)
+				return Info{}, core.E("gguf.ReadInfo", core.Sprintf("reading value for key %q", key), err)
 			}
 			if u, ok := value.(uint32); ok {
 				candidateBlockCount[key] = u
 			}
 
+		case key == "general.alignment":
+			value, err := readTypedValue(reader, valType)
+			if err != nil {
+				return Info{}, core.E("gguf.ReadInfo", core.Sprintf("reading value for key %q", key), err)
+			}
+			if u, ok := value.(uint32); ok && u > 0 {
+				alignment = u
+			}
+
 		default:
 			// Skip uninteresting value.
 			if err := skipValue(reader, valType); err != nil {
-				return Metadata{}, core.E("gguf.ReadMetadata", core.Sprintf("skipping value for key %q", key), err)
+				return Info{}, core.E("gguf.ReadInfo", core.Sprintf("skipping value for key %q", key), err)
 			}
 		}
 	}
@@ -239,7 +317,28 @@ func ReadMetadata(path string) (
 		}
 	}
 
-	return meta, nil
+	if !includeTensors {
+		return Info{
+			Metadata:  meta,
+			Alignment: alignment,
+		}, nil
+	}
+
+	tensors := make([]TensorInfo, 0, tensorCount)
+	for i := uint64(0); i < tensorCount; i++ {
+		tensor, err := readTensorInfo(reader)
+		if err != nil {
+			return Info{}, core.E("gguf.ReadInfo", core.Sprintf("reading tensor %d", i), err)
+		}
+		tensors = append(tensors, tensor)
+	}
+
+	return Info{
+		Metadata:   meta,
+		Tensors:    tensors,
+		Alignment:  alignment,
+		DataOffset: alignOffset(reader.n, int64(alignment)),
+	}, nil
 }
 
 // maxStringLength is a sanity limit for GGUF string values. No metadata string
@@ -248,6 +347,17 @@ const maxStringLength = 1 << 20
 
 type ggufFailure interface {
 	Error() string
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (reader *countingReader) Read(p []byte) (int, error) {
+	n, err := reader.r.Read(p)
+	reader.n += int64(n)
+	return n, err
 }
 
 // readString reads a GGUF string: uint64 length followed by that many bytes.
@@ -350,4 +460,130 @@ func discardBytes(r io.Reader, n int64) (
 	error,
 ) {
 	return io.CopyN(io.Discard, r, n)
+}
+
+func readTensorInfo(r io.Reader) (TensorInfo, error) {
+	name, err := readString(r)
+	if err != nil {
+		return TensorInfo{}, err
+	}
+	var dimensionCount uint32
+	if err := binary.Read(r, binary.LittleEndian, &dimensionCount); err != nil {
+		return TensorInfo{}, err
+	}
+	if dimensionCount > 8 {
+		return TensorInfo{}, core.E("gguf.readTensorInfo", core.Sprintf("tensor %q has %d dimensions", name, dimensionCount), nil)
+	}
+	dimensions := make([]uint64, dimensionCount)
+	for i := range dimensions {
+		if err := binary.Read(r, binary.LittleEndian, &dimensions[i]); err != nil {
+			return TensorInfo{}, err
+		}
+	}
+	var tensorType uint32
+	if err := binary.Read(r, binary.LittleEndian, &tensorType); err != nil {
+		return TensorInfo{}, err
+	}
+	var offset uint64
+	if err := binary.Read(r, binary.LittleEndian, &offset); err != nil {
+		return TensorInfo{}, err
+	}
+	byteSize, err := TensorByteSize(tensorType, dimensions)
+	if err != nil {
+		return TensorInfo{}, err
+	}
+	return TensorInfo{
+		Name:       name,
+		Dimensions: dimensions,
+		Type:       tensorType,
+		TypeName:   TensorTypeName(tensorType),
+		Offset:     offset,
+		ByteSize:   byteSize,
+	}, nil
+}
+
+// TensorByteSize returns the number of bytes occupied by a GGML tensor type.
+func TensorByteSize(tensorType uint32, dimensions []uint64) (uint64, error) {
+	elements, err := tensorElementCount(dimensions)
+	if err != nil {
+		return 0, err
+	}
+	blockSize, typeSize, ok := tensorBlockSize(tensorType)
+	if !ok {
+		return 0, core.E("gguf.TensorByteSize", core.Sprintf("unsupported GGUF tensor type: %d", tensorType), nil)
+	}
+	blocks := (elements + blockSize - 1) / blockSize
+	if blocks > math.MaxUint64/typeSize {
+		return 0, core.E("gguf.TensorByteSize", "tensor byte size overflows uint64", nil)
+	}
+	return blocks * typeSize, nil
+}
+
+func tensorElementCount(dimensions []uint64) (uint64, error) {
+	if len(dimensions) == 0 {
+		return 0, core.E("gguf.tensorElementCount", "tensor has no dimensions", nil)
+	}
+	elements := uint64(1)
+	for _, dimension := range dimensions {
+		if dimension == 0 {
+			return 0, core.E("gguf.tensorElementCount", "tensor has a zero dimension", nil)
+		}
+		if elements > math.MaxUint64/dimension {
+			return 0, core.E("gguf.tensorElementCount", "tensor element count overflows uint64", nil)
+		}
+		elements *= dimension
+	}
+	return elements, nil
+}
+
+func tensorBlockSize(tensorType uint32) (blockSize, typeSize uint64, ok bool) {
+	switch tensorType {
+	case 0:
+		return 1, 4, true
+	case 1, 30:
+		return 1, 2, true
+	case 2:
+		return 32, 18, true
+	case 3:
+		return 32, 20, true
+	case 6:
+		return 32, 22, true
+	case 7:
+		return 32, 24, true
+	case 8:
+		return 32, 34, true
+	case 10:
+		return 256, 84, true
+	case 11:
+		return 256, 110, true
+	case 12:
+		return 256, 144, true
+	case 13:
+		return 256, 176, true
+	case 14:
+		return 256, 210, true
+	case 15:
+		return 256, 292, true
+	case 24:
+		return 1, 1, true
+	case 25:
+		return 1, 2, true
+	case 26:
+		return 1, 4, true
+	case 27, 28:
+		return 1, 8, true
+	default:
+		return 0, 0, false
+	}
+}
+
+func alignOffset(offset, alignment int64) int64 {
+	if alignment <= 0 {
+		alignment = defaultAlignment
+	}
+	remainder := offset % alignment
+	if remainder == 0 {
+		return offset
+	}
+	return offset + alignment - remainder
 }

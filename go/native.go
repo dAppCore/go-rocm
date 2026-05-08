@@ -43,6 +43,17 @@ type nativeLoadConfig struct {
 	ParallelSlotCount int
 	AdapterPath       string
 	ModelInfo         inference.ModelInfo
+	DataOffset        int64
+	Tensors           []nativeTensorInfo
+}
+
+type nativeTensorInfo struct {
+	Name       string
+	Dimensions []uint64
+	Type       uint32
+	TypeName   string
+	Offset     uint64
+	ByteSize   uint64
 }
 
 type nativeModel interface {
@@ -72,10 +83,11 @@ func (b *rocmBackend) Available() bool {
 
 func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (inference.TextModel, error) {
 	loadConfig := inference.ApplyLoadOpts(opts)
-	metadata, err := gguf.ReadMetadata(path)
+	modelPack, err := gguf.ReadInfo(path)
 	if err != nil {
 		return nil, core.E("rocm.LoadModel", "read model metadata", err)
 	}
+	metadata := modelPack.Metadata
 
 	runtime := b.nativeRuntime()
 	if !runtime.Available() {
@@ -90,6 +102,8 @@ func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (infe
 		ParallelSlotCount: loadConfig.ParallelSlots,
 		AdapterPath:       loadConfig.AdapterPath,
 		ModelInfo:         modelInfo,
+		DataOffset:        modelPack.DataOffset,
+		Tensors:           nativeTensorInfos(modelPack.Tensors),
 	})
 	if err != nil {
 		return nil, core.E("rocm.LoadModel", "load native model", err)
@@ -175,21 +189,7 @@ func (b *rocmBackend) nativeRuntime() nativeRuntime {
 	if b != nil && b.runtime != nil {
 		return b.runtime
 	}
-	return systemNativeRuntime{}
-}
-
-type systemNativeRuntime struct{}
-
-func (systemNativeRuntime) Available() bool { return false }
-func (systemNativeRuntime) DeviceInfo() nativeDeviceInfo {
-	info, err := GetVRAMInfo()
-	if err != nil {
-		return nativeDeviceInfo{}
-	}
-	return nativeDeviceInfo{Name: "rocm", MemoryBytes: info.Total, FreeBytes: info.Free}
-}
-func (systemNativeRuntime) LoadModel(string, nativeLoadConfig) (nativeModel, error) {
-	return nil, core.E("rocm.native", "HIP runtime loader is not linked yet", nil)
+	return newSystemNativeRuntime()
 }
 
 type rocmModel struct {
@@ -581,6 +581,21 @@ func resolveContextLength(requestedContextLength int, metadata gguf.Metadata) in
 func modelInfoFromMetadata(metadata gguf.Metadata) inference.ModelInfo {
 	quantBits, quantGroup := quantisationFromFileType(metadata.FileType)
 	return inference.ModelInfo{Architecture: metadata.Architecture, NumLayers: int(metadata.BlockCount), QuantBits: quantBits, QuantGroup: quantGroup}
+}
+
+func nativeTensorInfos(tensors []gguf.TensorInfo) []nativeTensorInfo {
+	out := make([]nativeTensorInfo, len(tensors))
+	for i, tensor := range tensors {
+		out[i] = nativeTensorInfo{
+			Name:       tensor.Name,
+			Dimensions: append([]uint64(nil), tensor.Dimensions...),
+			Type:       tensor.Type,
+			TypeName:   tensor.TypeName,
+			Offset:     tensor.Offset,
+			ByteSize:   tensor.ByteSize,
+		}
+	}
+	return out
 }
 
 func quantisationFromFileType(fileType uint32) (bits, groupSize int) {

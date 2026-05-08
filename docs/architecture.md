@@ -15,9 +15,9 @@ The default `linux/amd64` build provides:
 - `inference.TokenizerModel`, `AdapterModel`, `ProbeableModel`, `BenchableModel`, and `Evaluator` on loaded models
 - GGUF metadata inspection without loading tensors
 - sysfs VRAM monitoring for memory planning and metrics
-- an internal `nativeRuntime` seam for the HIP loader and kernels
+- a native HIP runtime loader that allocates GPU buffers and copies GGUF tensor bytes through a dynamic `libamdhip64` driver
 
-Until the HIP runtime loader is linked, `Available()` intentionally returns false. That is preferable to silently falling back to an HTTP server because callers can make an explicit backend choice and tests can prove whether native execution is actually present.
+When cgo is disabled or `libamdhip64` cannot be opened, `Available()` intentionally returns false. That is preferable to silently falling back to an HTTP server because callers can make an explicit backend choice and tests can prove whether native execution is actually present.
 
 ## Package Structure
 
@@ -27,6 +27,9 @@ go-rocm/
 ├── go/register_rocm.go        linux && amd64 registration
 ├── go/rocm_stub.go            non-linux or non-amd64 stubs
 ├── go/native.go               default native ROCm contract surface
+├── go/hip_runtime.go          native tensor ownership and load path
+├── go/hip_driver_cgo.go       dynamic HIP driver, cgo only
+├── go/hip_driver_nocgo.go     unavailable HIP driver for cgo-off builds
 ├── go/backend.go              legacy server backend, rocm_legacy_server only
 ├── go/model.go                legacy server model, rocm_legacy_server only
 ├── go/server.go               legacy server lifecycle, rocm_legacy_server only
@@ -54,12 +57,12 @@ The `-exec=/usr/bin/true` gate proves compilation without trying to execute Linu
 ## Native Load Flow
 
 1. `register_rocm.go` registers `&rocmBackend{}` with `go-inference`.
-2. `LoadModel(path, opts...)` reads GGUF metadata with `gguf.ReadMetadata`.
-3. Load options become a `nativeLoadConfig`: context size, GPU layers, parallel slots, adapter path, and model metadata.
-4. `nativeRuntime.LoadModel` returns a backend-owned `nativeModel` once the HIP loader exists.
+2. `LoadModel(path, opts...)` reads GGUF metadata and tensor descriptors with `gguf.ReadInfo`.
+3. Load options become a `nativeLoadConfig`: context size, GPU layers, parallel slots, adapter path, model metadata, data offset, and tensor map.
+4. `hipRuntime.LoadModel` allocates device buffers and copies tensor bytes from the GGUF data section using HIP.
 5. `rocmModel` wraps that native model and exposes shared `go-inference` generation, tokenizer, adapter, probe, bench, and eval contracts.
 
-The native seam is deliberately small. HIP-specific ownership of tensors, graph execution, KV cache, adapter application, and eventual training stays behind `nativeModel` rather than leaking into consumers.
+The native seam is deliberately small. HIP-specific ownership of tensors, graph execution, KV cache, adapter application, and eventual training stays behind `nativeModel` rather than leaking into consumers. Decode/prefill kernels are not linked in this patch; generation returns an explicit kernel-not-linked error after the model weights are loaded.
 
 ## Memory Planning
 
@@ -82,7 +85,7 @@ The current benchmark/eval hooks are lightweight wrappers over the model surface
 
 ## GGUF Metadata Parser
 
-`internal/gguf/` is a standalone binary metadata reader. It supports GGUF v2 and v3, validates the magic/version, reads metadata KV pairs, and extracts architecture, name, file type, size label, context length, block count, and file size without loading tensor data.
+`internal/gguf/` is a standalone binary metadata reader. It supports GGUF v2 and v3, validates the magic/version, reads metadata KV pairs, and extracts architecture, name, file type, size label, context length, block count, file size, tensor names, tensor dimensions, tensor type names, tensor byte sizes, tensor offsets, alignment, and model data offset without loading tensor data.
 
 The parser reads only the header, not tensor payloads, so model discovery and fit planning remain cheap even for multi-GB packs.
 
