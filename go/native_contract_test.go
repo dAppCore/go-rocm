@@ -18,6 +18,7 @@ import (
 func TestNativeContract_RocmBackendImplementsSharedPlanner_Good(t *testing.T) {
 	var _ inference.ModelFitPlanner = (*rocmBackend)(nil)
 	var _ inference.CapabilityReporter = (*rocmBackend)(nil)
+	var _ inference.ModelPackInspector = (*rocmBackend)(nil)
 }
 
 func TestNativeContract_RocmModelImplementsSharedContracts_Good(t *testing.T) {
@@ -51,6 +52,32 @@ func TestNativeContract_RocmBackendCapabilities_Good(t *testing.T) {
 	}
 	if !report.Supports(inference.CapabilityTokenizer) || !report.Supports(inference.CapabilityProbeEvents) {
 		t.Fatalf("capabilities = %+v, want fallback tokenizer and probe stream", report.CapabilityIDs())
+	}
+	if cap, ok := report.Capability(inference.CapabilityJANGTQ); !ok || cap.Status != inference.CapabilityStatusPlanned {
+		t.Fatalf("JANGTQ capability = %+v ok=%v, want planned groundwork", cap, ok)
+	}
+	if cap, ok := report.Capability(inference.CapabilityScheduler); !ok || cap.Status != inference.CapabilityStatusPlanned {
+		t.Fatalf("scheduler capability = %+v ok=%v, want planned native scheduler", cap, ok)
+	}
+	for _, id := range []inference.CapabilityID{
+		inference.CapabilityRequestCancel,
+		inference.CapabilityCacheBlocks,
+		inference.CapabilityCacheWarm,
+		inference.CapabilityCacheDisk,
+		inference.CapabilityReasoningParse,
+		inference.CapabilityToolParse,
+		inference.CapabilitySpeculativeDecode,
+		inference.CapabilityPromptLookupDecode,
+		inference.CapabilityMoERouting,
+		inference.CapabilityMoELazyExperts,
+		inference.CapabilityJANGTQ,
+		inference.CapabilityCodebookVQ,
+		inference.CapabilityEmbeddings,
+		inference.CapabilityRerank,
+	} {
+		if _, ok := report.Capability(id); !ok {
+			t.Fatalf("capability %q missing from ROCm report: %+v", id, report.CapabilityIDs())
+		}
 	}
 	if len(report.Architectures) == 0 || len(report.Quantizations) == 0 || len(report.CacheModes) == 0 {
 		t.Fatalf("report = %+v, want architecture/quant/cache metadata", report)
@@ -120,6 +147,28 @@ func TestNativeContract_PlanModelFit_Good(t *testing.T) {
 	}
 	if report.MemoryPlan.CacheMode == "" || report.MemoryPlan.KVCacheBytes == 0 {
 		t.Fatalf("memory plan = %+v, want cache sizing", report.MemoryPlan)
+	}
+}
+
+func TestNativeContract_PlanModelFit_Rocm16GBMoELazyExperts_Good(t *testing.T) {
+	runtime := &fakeNativeRuntime{device: nativeDeviceInfo{MemoryBytes: 16 * memoryGiB, Name: "gfx1100"}}
+	report, err := newROCmBackendWithRuntime(runtime).PlanModelFit(context.Background(), inference.ModelIdentity{
+		Architecture:  "Qwen3MoeForCausalLM",
+		QuantBits:     2,
+		QuantType:     "jangtq",
+		QuantGroup:    64,
+		ContextLength: 32768,
+		NumLayers:     24,
+		HiddenSize:    2048,
+	}, 0)
+	if err != nil {
+		t.Fatalf("PlanModelFit: %v", err)
+	}
+	if report == nil || !report.Fits || report.MemoryPlan.MachineClass != "rocm-16gb" {
+		t.Fatalf("fit report = %+v, want fitting ROCm 16GB MoE plan", report)
+	}
+	if report.MemoryPlan.CacheMode != "k-q8-v-q4" || report.MemoryPlan.Labels["moe_lazy_experts"] != "true" || report.MemoryPlan.Labels["prefill_chunk_tokens"] != "512" {
+		t.Fatalf("memory plan = %+v, want compact KV, lazy experts, and chunked prefill", report.MemoryPlan)
 	}
 }
 
@@ -198,6 +247,9 @@ func TestNativeContract_BenchmarkAndEvaluateUseModelSurface_Ugly(t *testing.T) {
 	if bench.GeneratedTokens != 2 || bench.DecodeTokensPerSec == 0 {
 		t.Fatalf("bench = %+v, want generated token throughput", bench)
 	}
+	if bench.Labels["scheduler"] != "planned" || bench.Labels["cache.blocks"] != "planned" || bench.Labels["probe.events"] != "stream_tokens" {
+		t.Fatalf("bench labels = %+v, want ROCm parity probe/cache/scheduler fields", bench.Labels)
+	}
 
 	eval, err := model.Evaluate(context.Background(), &singleInferenceSample{sample: inference.DatasetSample{Text: "hello world"}}, inference.EvalConfig{MaxSamples: 1})
 	if err != nil {
@@ -205,6 +257,53 @@ func TestNativeContract_BenchmarkAndEvaluateUseModelSurface_Ugly(t *testing.T) {
 	}
 	if eval.Metrics.Samples != 1 || eval.Metrics.Tokens == 0 {
 		t.Fatalf("eval = %+v, want token counts", eval)
+	}
+}
+
+func TestNativeContract_ModelPackInspectorReadsSidecars_Good(t *testing.T) {
+	dir := t.TempDir()
+	writeNativeContractFile(t, core.PathJoin(dir, "config.json"), `{
+		"model_type":"MiniMaxM2ForCausalLM",
+		"hidden_size":2048,
+		"num_hidden_layers":24,
+		"vocab_size":32000,
+		"max_position_embeddings":32768,
+		"num_local_experts":32,
+		"num_experts_per_tok":2,
+		"quantization_config":{"quant_method":"jangtq","bits":2,"group_size":64,"weight_format":"mxtq"}
+	}`)
+	writeNativeContractSafetensors(t, core.PathJoin(dir, "model.safetensors"))
+	writeNativeContractFile(t, core.PathJoin(dir, "jang_config.json"), `{
+		"version":1,
+		"weight_format":"mxtq",
+		"profile":"JANGTQ",
+		"source_model":{"name":"MiniMax-M2.7","org":"dealignai","architecture":"MiniMaxM2ForCausalLM"},
+		"mxtq_bits":{"attention":8,"shared_expert":4,"routed_expert":2,"embed_tokens":8,"lm_head":8},
+		"quantization":{"method":"affine+mxtq","group_size":64,"bits_default":2},
+		"capabilities":{"reasoning_parser":"minimax","tool_parser":"json","supports_tools":true,"supports_thinking":true,"cache_type":"block-prefix"}
+	}`)
+	writeNativeContractFile(t, core.PathJoin(dir, "codebook_config.json"), `{
+		"type":"codebook",
+		"format":"vq",
+		"codebook_size":16,
+		"code_dim":2,
+		"index_bits":8,
+		"tensors":[{"name":"model.layers.0.mlp.down_proj.weight","shape":[2,4],"codes":"codes","codebook":"table"}]
+	}`)
+
+	backend := newROCmBackendWithRuntime(&fakeNativeRuntime{device: nativeDeviceInfo{MemoryBytes: 16 * memoryGiB, Name: "gfx1100"}})
+	inspection, err := backend.InspectModelPack(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("InspectModelPack: %v", err)
+	}
+	if !inspection.Supported || inspection.Format != "safetensors" || inspection.Model.Architecture != "minimax_m2" || inspection.Model.QuantType != "jangtq" {
+		t.Fatalf("inspection = %+v, want supported MiniMax/JANGTQ safetensors pack", inspection)
+	}
+	if inspection.Labels["memory_plan_machine_class"] != "rocm-16gb" || inspection.Labels["memory_plan_moe_lazy_experts"] != "true" || inspection.Labels["codebook_format"] != "vq" {
+		t.Fatalf("inspection labels = %+v, want memory fit and codebook metadata", inspection.Labels)
+	}
+	if !nativeInspectionHasCapability(inspection, inference.CapabilityJANGTQ) || !nativeInspectionHasCapability(inspection, inference.CapabilityCodebookVQ) || !nativeInspectionHasCapability(inspection, inference.CapabilityMoELazyExperts) {
+		t.Fatalf("inspection capabilities = %+v, want JANGTQ/codebook/MoE metadata", inspection.Capabilities)
 	}
 }
 
@@ -344,4 +443,35 @@ func nativeContractGGUF(t *testing.T) string {
 	result := core.WriteFile(path, buf.Bytes(), 0o644)
 	core.RequireTrue(t, result.OK)
 	return path
+}
+
+func writeNativeContractFile(t *testing.T, path, content string) {
+	t.Helper()
+	result := core.WriteFile(path, []byte(content), 0o644)
+	core.RequireTrue(t, result.OK)
+}
+
+func writeNativeContractSafetensors(t *testing.T, path string) {
+	t.Helper()
+	header := []byte(`{"model.layers.0.mlp.down_proj.weight":{"dtype":"F16","shape":[2,4],"data_offsets":[0,16]},"__metadata__":{"format":"pt"}}`)
+	buf := core.NewBuffer()
+	core.RequireNoError(t, binary.Write(buf, binary.LittleEndian, uint64(len(header))))
+	_, err := buf.Write(header)
+	core.RequireNoError(t, err)
+	_, err = buf.Write(make([]byte, 16))
+	core.RequireNoError(t, err)
+	result := core.WriteFile(path, buf.Bytes(), 0o644)
+	core.RequireTrue(t, result.OK)
+}
+
+func nativeInspectionHasCapability(inspection *inference.ModelPackInspection, id inference.CapabilityID) bool {
+	if inspection == nil {
+		return false
+	}
+	for _, capability := range inspection.Capabilities {
+		if capability.ID == id {
+			return true
+		}
+	}
+	return false
 }

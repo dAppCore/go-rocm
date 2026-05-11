@@ -152,14 +152,12 @@ func (b *rocmBackend) PlanModelFit(ctx context.Context, model inference.ModelIde
 		hidden = 4096
 	}
 
-	cacheMode := "fp16"
-	if memoryBytes <= 24*memoryGiB || contextLength > 8192 {
-		cacheMode = "q8"
-	}
+	cacheMode := rocmRecommendedCacheMode(memoryBytes, contextLength, model)
 	kvBytes := estimateKVCacheBytes(layers, contextLength, hidden, cacheMode)
 	architectureOK := supportedNativeArchitecture(model.Architecture)
 	quantizationOK := supportedNativeQuantization(model.QuantBits, model.QuantType)
 	fits := architectureOK && quantizationOK && kvBytes < memoryBytes*7/10
+	labels := rocmMemoryPlanLabels(memoryBytes, contextLength, model, kvBytes, cacheMode)
 	plan := inference.MemoryPlan{
 		MachineClass:      rocmMachineClass(memoryBytes),
 		DeviceMemoryBytes: memoryBytes,
@@ -169,6 +167,7 @@ func (b *rocmBackend) PlanModelFit(ctx context.Context, model inference.ModelIde
 		Quantization:      rocmQuantizationLabel(model),
 		KVCacheBytes:      kvBytes,
 		TrainingFeasible:  memoryBytes >= 16*memoryGiB && model.QuantBits <= 8,
+		Labels:            labels,
 	}
 	if !architectureOK {
 		plan.Notes = append(plan.Notes, "architecture is not in the native ROCm allow-list yet")
@@ -178,6 +177,15 @@ func (b *rocmBackend) PlanModelFit(ctx context.Context, model inference.ModelIde
 	}
 	if kvBytes >= memoryBytes*7/10 {
 		plan.Notes = append(plan.Notes, "KV cache estimate leaves too little memory for weights and workspace")
+	}
+	if memoryBytes <= 16*memoryGiB {
+		plan.Notes = append(plan.Notes, "ROCm 16GB plan uses chunked prefill, compact KV cache, and conservative allocator limits")
+	}
+	if isROCmMoEArchitecture(model.Architecture) {
+		plan.Notes = append(plan.Notes, "MoE lazy expert residency is required on 16GB-class ROCm devices")
+	}
+	if isROCmMetadataQuantization(model.QuantType) {
+		plan.Notes = append(plan.Notes, "metadata quantisation is recognised; native ROCm packed kernels are pending")
 	}
 
 	return &inference.ModelFitReport{
@@ -442,6 +450,18 @@ func (m *rocmModel) Benchmark(ctx context.Context, cfg inference.BenchConfig) (*
 		PrefillTokensPerSec: tokensPerSecond(aggregate.PromptTokens, aggregate.PrefillDuration),
 		DecodeTokensPerSec:  tokensPerSecond(aggregate.GeneratedTokens, aggregate.DecodeDuration),
 		PeakMemoryBytes:     aggregate.PeakMemoryBytes,
+		Labels: map[string]string{
+			"backend":              "rocm",
+			"cache.blocks":         "planned",
+			"cache.disk":           "planned",
+			"cache.warm":           "planned",
+			"native_runtime":       "hip",
+			"probe.events":         "stream_tokens",
+			"prompt.lookup.decode": "planned",
+			"request.cancel":       "planned",
+			"scheduler":            "planned",
+			"speculative.decode":   "planned",
+		},
 	}, nil
 }
 
@@ -634,6 +654,24 @@ func rocmCapabilityReport(device nativeDeviceInfo, model inference.ModelIdentity
 			inference.ExperimentalCapability(inference.CapabilityProbeEvents, inference.CapabilityGroupProbe, "probe sink is wired around streams; kernel-level probes are pending"),
 			inference.PlannedCapability(inference.CapabilityAttentionProbe, inference.CapabilityGroupProbe, "attention probes need native prefill kernels first"),
 			inference.PlannedCapability(inference.CapabilityLogitProbe, inference.CapabilityGroupProbe, "logit probes need native prefill kernels first"),
+			inference.PlannedCapability(inference.CapabilityResponsesAPI, inference.CapabilityGroupRuntime, "shared wire primitives are available; ROCm handler mount is pending"),
+			inference.PlannedCapability(inference.CapabilityAnthropicMessages, inference.CapabilityGroupRuntime, "shared wire primitives are available; ROCm handler mount is pending"),
+			inference.PlannedCapability(inference.CapabilityOllamaCompat, inference.CapabilityGroupRuntime, "shared wire primitives are available; ROCm handler mount is pending"),
+			inference.PlannedCapability(inference.CapabilityEmbeddings, inference.CapabilityGroupModel, "embedding contract is available; native ROCm embedding kernels are pending"),
+			inference.PlannedCapability(inference.CapabilityRerank, inference.CapabilityGroupModel, "rerank contract is available; native ROCm scorer is pending"),
+			inference.PlannedCapability(inference.CapabilityScheduler, inference.CapabilityGroupRuntime, "request scheduler will wrap native decode once kernels are linked"),
+			inference.PlannedCapability(inference.CapabilityRequestCancel, inference.CapabilityGroupRuntime, "request-id cancellation needs scheduler ownership"),
+			inference.PlannedCapability(inference.CapabilityCacheBlocks, inference.CapabilityGroupRuntime, "block-prefix cache needs native KV cache ownership first"),
+			inference.PlannedCapability(inference.CapabilityCacheDisk, inference.CapabilityGroupRuntime, "disk-backed KV blocks need native KV cache ownership first"),
+			inference.PlannedCapability(inference.CapabilityCacheWarm, inference.CapabilityGroupRuntime, "cache warming needs native prefill kernels first"),
+			inference.PlannedCapability(inference.CapabilityToolParse, inference.CapabilityGroupModel, "tool parser registry is shared but not wired into ROCm streams yet"),
+			inference.PlannedCapability(inference.CapabilityReasoningParse, inference.CapabilityGroupModel, "reasoning parser registry is shared but not wired into ROCm streams yet"),
+			inference.PlannedCapability(inference.CapabilitySpeculativeDecode, inference.CapabilityGroupModel, "speculative decode needs native decode kernels first"),
+			inference.PlannedCapability(inference.CapabilityPromptLookupDecode, inference.CapabilityGroupModel, "prompt lookup decode needs native prefill/decode kernels first"),
+			inference.PlannedCapability(inference.CapabilityMoERouting, inference.CapabilityGroupModel, "MoE routing probes need native MoE kernels first"),
+			inference.PlannedCapability(inference.CapabilityMoELazyExperts, inference.CapabilityGroupRuntime, "lazy expert residency follows native MoE support"),
+			inference.PlannedCapability(inference.CapabilityJANGTQ, inference.CapabilityGroupRuntime, "JANG/JANGTQ metadata can be shared; native ROCm packed kernels are pending"),
+			inference.PlannedCapability(inference.CapabilityCodebookVQ, inference.CapabilityGroupRuntime, "codebook/VQ metadata can be shared; native ROCm VQ kernels are pending"),
 		},
 		Labels: labels,
 	}
@@ -647,27 +685,50 @@ var (
 		"gemma2",
 		"gemma3",
 		"gemma4",
+		"glm",
+		"glm4",
 		"gpt-oss",
+		"granite",
+		"hermes",
+		"kimi",
 		"llama",
+		"minimax",
+		"minimax_m2",
 		"mistral",
 		"mixtral",
 		"phi",
 		"phi3",
 		"qwen2",
 		"qwen3",
+		"qwen3_moe",
+		"qwen3_next",
 	}
 	rocmCapabilityQuantizations = []string{
+		"codebook",
 		"f16",
 		"f32",
+		"iq",
+		"jang",
+		"jangtq",
+		"mxfp4",
+		"mxtq",
+		"nvfp4",
 		"q2",
 		"q3",
 		"q4",
+		"q4_k_m",
 		"q5",
+		"q5_k_m",
 		"q6",
 		"q8",
+		"q8_0",
+		"vq",
 	}
 	rocmCapabilityCacheModes = []string{
+		"disk-l2",
 		"fp16",
+		"k-q8-v-q4",
+		"paged",
 		"q8",
 	}
 )
@@ -684,7 +745,7 @@ func resolveContextLength(requestedContextLength int, metadata gguf.Metadata) in
 
 func modelInfoFromMetadata(metadata gguf.Metadata) inference.ModelInfo {
 	quantBits, quantGroup := quantisationFromFileType(metadata.FileType)
-	return inference.ModelInfo{Architecture: metadata.Architecture, NumLayers: int(metadata.BlockCount), QuantBits: quantBits, QuantGroup: quantGroup}
+	return inference.ModelInfo{Architecture: normalizeROCmArchitecture(metadata.Architecture), NumLayers: int(metadata.BlockCount), QuantBits: quantBits, QuantGroup: quantGroup}
 }
 
 func nativeTensorInfos(tensors []gguf.TensorInfo) []nativeTensorInfo {
@@ -726,14 +787,74 @@ func quantisationFromFileType(fileType uint32) (bits, groupSize int) {
 	}
 }
 
+func normalizeROCmArchitecture(architecture string) string {
+	normalized := core.Lower(architecture)
+	normalized = core.Replace(normalized, "-", "_")
+	normalized = core.Replace(normalized, ".", "_")
+	normalized = core.Replace(normalized, " ", "_")
+	switch {
+	case normalized == "":
+		return ""
+	case core.Contains(normalized, "minimax") && core.Contains(normalized, "m2"):
+		return "minimax_m2"
+	case core.Contains(normalized, "qwen3") && core.Contains(normalized, "moe"):
+		return "qwen3_moe"
+	case core.Contains(normalized, "qwen3") && core.Contains(normalized, "next"):
+		return "qwen3_next"
+	case core.Contains(normalized, "qwen3"):
+		return "qwen3"
+	case core.Contains(normalized, "qwen2"):
+		return "qwen2"
+	case core.Contains(normalized, "deepseek"):
+		if core.Contains(normalized, "r1") {
+			return "deepseek_r1"
+		}
+		return "deepseek"
+	case core.Contains(normalized, "gpt_oss") || core.Contains(normalized, "gptoss"):
+		return "gpt-oss"
+	case core.Contains(normalized, "gemma4"):
+		return "gemma4"
+	case core.Contains(normalized, "gemma3"):
+		return "gemma3"
+	case core.Contains(normalized, "gemma2"):
+		return "gemma2"
+	case core.Contains(normalized, "gemma"):
+		return "gemma"
+	case core.Contains(normalized, "mixtral"):
+		return "mixtral"
+	case core.Contains(normalized, "mistral"):
+		return "mistral"
+	case core.Contains(normalized, "phi3"):
+		return "phi3"
+	case core.Contains(normalized, "phi"):
+		return "phi"
+	case core.Contains(normalized, "bert"):
+		return "bert"
+	case core.Contains(normalized, "glm4"):
+		return "glm4"
+	case core.Contains(normalized, "glm"):
+		return "glm"
+	case core.Contains(normalized, "kimi"):
+		return "kimi"
+	case core.Contains(normalized, "hermes"):
+		return "hermes"
+	case core.Contains(normalized, "granite"):
+		return "granite"
+	default:
+		return normalized
+	}
+}
+
 func supportedNativeArchitecture(architecture string) bool {
+	architecture = normalizeROCmArchitecture(architecture)
 	if architecture == "" {
 		return true
 	}
 	supported := map[string]struct{}{
-		"bert": {}, "deepseek": {}, "gemma": {}, "gemma2": {}, "gemma3": {}, "gemma4": {},
-		"gpt-oss": {}, "llama": {}, "mistral": {}, "mixtral": {}, "phi": {}, "phi3": {},
-		"qwen2": {}, "qwen3": {},
+		"bert": {}, "deepseek": {}, "deepseek_r1": {}, "gemma": {}, "gemma2": {}, "gemma3": {}, "gemma4": {},
+		"glm": {}, "glm4": {}, "gpt-oss": {}, "granite": {}, "hermes": {}, "kimi": {}, "llama": {},
+		"minimax": {}, "minimax_m2": {}, "mistral": {}, "mixtral": {}, "phi": {}, "phi3": {},
+		"qwen2": {}, "qwen3": {}, "qwen3_moe": {}, "qwen3_next": {},
 	}
 	_, ok := supported[architecture]
 	return ok
@@ -747,15 +868,80 @@ func supportedNativeQuantization(bits int, quantType string) bool {
 		return true
 	}
 	quantType = core.Lower(quantType)
-	return core.Contains(quantType, "q4") || core.Contains(quantType, "q5") || core.Contains(quantType, "q8")
+	if quantType == "f16" || quantType == "f32" || quantType == "bf16" {
+		return true
+	}
+	return core.Contains(quantType, "q4") || core.Contains(quantType, "q5") || core.Contains(quantType, "q8") || isROCmMetadataQuantization(quantType)
+}
+
+func isROCmMetadataQuantization(quantType string) bool {
+	quantType = core.Lower(quantType)
+	return core.Contains(quantType, "jang") || core.Contains(quantType, "mxtq") || core.Contains(quantType, "codebook") || core.Contains(quantType, "vq") || core.Contains(quantType, "iq") || core.Contains(quantType, "mxfp4") || core.Contains(quantType, "nvfp4")
+}
+
+func isROCmMoEArchitecture(architecture string) bool {
+	architecture = normalizeROCmArchitecture(architecture)
+	return core.Contains(architecture, "moe") || architecture == "mixtral" || architecture == "minimax_m2"
+}
+
+func rocmRecommendedCacheMode(memoryBytes uint64, contextLength int, model inference.ModelIdentity) string {
+	if memoryBytes <= 16*memoryGiB && (contextLength > 8192 || isROCmMoEArchitecture(model.Architecture) || isROCmMetadataQuantization(model.QuantType)) {
+		return "k-q8-v-q4"
+	}
+	if memoryBytes <= 24*memoryGiB || contextLength > 8192 {
+		return "q8"
+	}
+	return "fp16"
 }
 
 func estimateKVCacheBytes(layers, contextLength, hidden int, cacheMode string) uint64 {
-	bytesPerElement := uint64(2)
-	if cacheMode == "q8" {
-		bytesPerElement = 1
+	base := uint64(layers) * uint64(contextLength) * uint64(hidden)
+	switch cacheMode {
+	case "q8", "paged":
+		return base * 2
+	case "k-q8-v-q4":
+		return (base*3 + 1) / 2
+	default:
+		return base * 4
 	}
-	return uint64(layers) * uint64(contextLength) * uint64(hidden) * 2 * bytesPerElement
+}
+
+func rocmMemoryPlanLabels(memoryBytes uint64, contextLength int, model inference.ModelIdentity, kvBytes uint64, cacheMode string) map[string]string {
+	batch := rocmRecommendedBatchSize(memoryBytes)
+	prefillChunk := 2048
+	if memoryBytes <= 16*memoryGiB {
+		prefillChunk = 512
+	} else if memoryBytes <= 24*memoryGiB || contextLength > 8192 {
+		prefillChunk = 1024
+	}
+	allocatorLimit := memoryBytes * 85 / 100
+	cacheLimit := memoryBytes * 30 / 100
+	labels := map[string]string{
+		"allocator_limit_bytes":    core.Sprintf("%d", allocatorLimit),
+		"cache_limit_bytes":        core.Sprintf("%d", cacheLimit),
+		"disk_cache":               "planned",
+		"kv_cache_bytes":           core.Sprintf("%d", kvBytes),
+		"max_prefill_batch_tokens": core.Sprintf("%d", prefillChunk*batch),
+		"paged_cache":              "planned",
+		"prefill_chunk_tokens":     core.Sprintf("%d", prefillChunk),
+		"prompt_lookup_decode":     "planned",
+		"recommended_cache_mode":   cacheMode,
+		"speculative_decode":       "planned",
+	}
+	if isROCmMoEArchitecture(model.Architecture) {
+		labels["moe_lazy_experts"] = "true"
+		labels["moe_max_resident_experts"] = "2"
+		if memoryBytes >= 24*memoryGiB {
+			labels["moe_max_resident_experts"] = "4"
+		}
+		labels["moe_router_top_k"] = "2"
+	} else {
+		labels["moe_lazy_experts"] = "false"
+	}
+	if isROCmMetadataQuantization(model.QuantType) {
+		labels["metadata_quantization"] = model.QuantType
+	}
+	return labels
 }
 
 func rocmMachineClass(memoryBytes uint64) string {
