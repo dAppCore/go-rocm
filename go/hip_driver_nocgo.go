@@ -27,3 +27,6 @@ func (unavailableHIPDriver) Free(nativeDevicePointer) error { return nil }
 func (unavailableHIPDriver) CopyHostToDevice(nativeDevicePointer, []byte) error {
 	return core.E("rocm.hip.CopyHostToDevice", "cgo is disabled; native HIP driver is unavailable", nil)
 }
+func (unavailableHIPDriver) CopyDeviceToHost(nativeDevicePointer, []byte) error {
+	return core.E("rocm.hip.CopyDeviceToHost", "cgo is disabled; native HIP driver is unavailable", nil)
+}

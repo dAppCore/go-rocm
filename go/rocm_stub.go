@@ -2,7 +2,24 @@
 
 package rocm
 
-import core "dappco.re/go"
+import (
+	core "dappco.re/go"
+	"dappco.re/go/inference"
+)
+
+func init() {
+	inference.Register(unavailableROCmBackend{})
+}
+
+type unavailableROCmBackend struct{}
+
+func (unavailableROCmBackend) Name() string { return "rocm" }
+func (unavailableROCmBackend) Available() bool {
+	return false
+}
+func (unavailableROCmBackend) LoadModel(string, ...inference.LoadOption) (inference.TextModel, error) {
+	return nil, core.E("rocm.LoadModel", "native ROCm runtime is not available on this platform", nil)
+}
 
 //	if !ROCmAvailable() {
 //	    fmt.Println("fall back to CPU or another backend")

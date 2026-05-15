@@ -246,6 +246,10 @@ func (m *rocmModel) Close() error {
 func (m *rocmModel) setServerExitErr() {
 	m.stateMutex.Lock()
 	defer m.stateMutex.Unlock()
+	if m.server == nil {
+		m.lastError = core.E("rocm.setServerExitErr", "server is not started", nil)
+		return
+	}
 	if m.server.processExitError != nil {
 		m.lastError = m.server.processFailure("rocm.setServerExitErr", "server has exited", m.server.processExitError)
 	} else {
@@ -312,6 +316,7 @@ func newCompletionRequest(prompt string, generateConfig inference.GenerateConfig
 		Temperature:   generateConfig.Temperature,
 		TopK:          generateConfig.TopK,
 		TopP:          generateConfig.TopP,
+		Stop:          append([]string(nil), generateConfig.StopSequences...),
 		RepeatPenalty: generateConfig.RepeatPenalty,
 	}
 }
@@ -323,6 +328,7 @@ func newChatRequest(messages []llamacpp.ChatMessage, generateConfig inference.Ge
 		Temperature:   generateConfig.Temperature,
 		TopK:          generateConfig.TopK,
 		TopP:          generateConfig.TopP,
+		Stop:          append([]string(nil), generateConfig.StopSequences...),
 		RepeatPenalty: generateConfig.RepeatPenalty,
 	}
 }

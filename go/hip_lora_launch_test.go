@@ -1,0 +1,177 @@
+// SPDX-Licence-Identifier: EUPL-1.2
+
+//go:build linux && amd64 && !rocm_legacy_server
+
+package rocm
+
+import (
+	"context"
+	"encoding/binary"
+	"math"
+	"testing"
+
+	core "dappco.re/go"
+)
+
+func TestHIPLoRAProjectionLaunchArgs_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	req := hipLoRAProjectionRequest{
+		Input:      []float32{2, 3},
+		BaseWeight: []float32{1, 0, 0, 1},
+		LoRAA:      []float32{1, 1},
+		LoRAB:      []float32{2, -1},
+		Rows:       2,
+		Cols:       2,
+		Rank:       1,
+		Alpha:      0.5,
+		Bias:       []float32{0.25, -0.5},
+	}
+	buffers, err := req.deviceBuffers(driver)
+	core.RequireNoError(t, err)
+	defer buffers.Close()
+
+	launch, err := req.launchArgs(buffers)
+	core.RequireNoError(t, err)
+	payload, err := launch.Binary()
+	core.RequireNoError(t, err)
+
+	core.AssertEqual(t, hipLoRALaunchArgsBytes, len(payload))
+	core.AssertEqual(t, hipLoRALaunchArgsVersion, binary.LittleEndian.Uint32(payload[0:]))
+	core.AssertEqual(t, uint32(hipLoRALaunchArgsBytes), binary.LittleEndian.Uint32(payload[4:]))
+	core.AssertEqual(t, uint64(buffers.Input.Pointer()), binary.LittleEndian.Uint64(payload[8:]))
+	core.AssertEqual(t, uint64(buffers.BaseWeight.Pointer()), binary.LittleEndian.Uint64(payload[16:]))
+	core.AssertEqual(t, uint64(buffers.LoRAA.Pointer()), binary.LittleEndian.Uint64(payload[24:]))
+	core.AssertEqual(t, uint64(buffers.LoRAB.Pointer()), binary.LittleEndian.Uint64(payload[32:]))
+	core.AssertEqual(t, uint64(buffers.Bias.Pointer()), binary.LittleEndian.Uint64(payload[40:]))
+	core.AssertEqual(t, uint64(buffers.Output.Pointer()), binary.LittleEndian.Uint64(payload[48:]))
+	core.AssertEqual(t, uint32(2), binary.LittleEndian.Uint32(payload[56:]))
+	core.AssertEqual(t, uint32(2), binary.LittleEndian.Uint32(payload[60:]))
+	core.AssertEqual(t, uint32(2), binary.LittleEndian.Uint32(payload[64:]))
+	core.AssertEqual(t, uint32(1), binary.LittleEndian.Uint32(payload[68:]))
+	core.AssertEqual(t, uint32(8), binary.LittleEndian.Uint32(payload[72:]))
+	core.AssertEqual(t, uint32(16), binary.LittleEndian.Uint32(payload[76:]))
+	core.AssertEqual(t, uint32(8), binary.LittleEndian.Uint32(payload[80:]))
+	core.AssertEqual(t, uint32(8), binary.LittleEndian.Uint32(payload[84:]))
+	core.AssertEqual(t, uint32(8), binary.LittleEndian.Uint32(payload[88:]))
+	core.AssertEqual(t, uint32(8), binary.LittleEndian.Uint32(payload[92:]))
+	core.AssertEqual(t, hipLoRALaunchFlagBias, binary.LittleEndian.Uint32(payload[100:]))
+}
+
+func TestHIPLoRAProjectionLaunch_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	req := hipLoRAProjectionRequest{
+		Input:      []float32{2, 3},
+		BaseWeight: []float32{1, 0, 0, 1},
+		LoRAA:      []float32{1, 1},
+		LoRAB:      []float32{2, -1},
+		Rows:       2,
+		Cols:       2,
+		Rank:       1,
+		Alpha:      0.5,
+		Bias:       []float32{0.25, -0.5},
+	}
+	want, err := rocmReferenceLoRAProjection(req.Input, req.BaseWeight, req.LoRAA, req.LoRAB, req.Rows, req.Cols, req.Rank, req.Alpha, req.Bias)
+	core.RequireNoError(t, err)
+
+	got, err := hipRunLoRAProjectionKernel(context.Background(), driver, req)
+	core.RequireNoError(t, err)
+
+	core.AssertEqual(t, 1, len(driver.launches))
+	core.AssertEqual(t, hipKernelNameLoRA, driver.launches[0].Name)
+	core.AssertEqual(t, hipLoRALaunchArgsBytes, len(driver.launches[0].Args))
+	assertFloat32SlicesNear(t, want, got, 0)
+}
+
+func TestHIPLoRAProjectionLaunch_Bad(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	_, err := hipRunLoRAProjectionKernel(context.Background(), driver, hipLoRAProjectionRequest{
+		Input:      []float32{1},
+		BaseWeight: []float32{1},
+		LoRAA:      []float32{1},
+		LoRAB:      []float32{1},
+		Rows:       1,
+		Cols:       1,
+		Rank:       0,
+		Alpha:      1,
+	})
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "rank must be positive")
+
+	_, err = hipRunLoRAProjectionKernel(context.Background(), driver, hipLoRAProjectionRequest{
+		Input:      []float32{1},
+		BaseWeight: []float32{1},
+		LoRAA:      []float32{1},
+		LoRAB:      []float32{1},
+		Rows:       1,
+		Cols:       1,
+		Rank:       1,
+		Alpha:      0,
+	})
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "alpha must be positive")
+
+	_, err = (hipLoRALaunchArgs{
+		InputPointer:      1,
+		BaseWeightPointer: 2,
+		LoRAAPointer:      3,
+		LoRABPointer:      4,
+		OutputPointer:     5,
+		InputCount:        2,
+		Rows:              2,
+		Cols:              2,
+		Rank:              1,
+		InputBytes:        4,
+		BaseWeightBytes:   16,
+		LoRAABytes:        8,
+		LoRABBytes:        8,
+		OutputBytes:       8,
+		Alpha:             1,
+	}).Binary()
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "input byte count")
+}
+
+func TestHIPLoRAProjectionReadOutputValidation_Bad(t *testing.T) {
+	_, err := (*hipLoRADeviceBuffers)(nil).ReadOutput()
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "LoRA output buffer is required")
+
+	req := hipLoRAProjectionRequest{
+		Input:      []float32{2, 3},
+		BaseWeight: []float32{1, 0, 0, 1},
+		LoRAA:      []float32{1, 1},
+		LoRAB:      []float32{2, -1},
+		Rows:       2,
+		Cols:       2,
+		Rank:       1,
+		Alpha:      0.5,
+	}
+	driver := &fakeHIPDriver{available: true}
+	buffers, err := req.deviceBuffers(driver)
+	core.RequireNoError(t, err)
+	defer buffers.Close()
+	buffers.Output.sizeBytes++
+	_, err = buffers.ReadOutput()
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "LoRA output byte count mismatch")
+
+	driver = &fakeHIPDriver{available: true}
+	buffers, err = req.deviceBuffers(driver)
+	core.RequireNoError(t, err)
+	defer buffers.Close()
+	payload, err := hipFloat32Payload([]float32{0, float32(math.Inf(1))})
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, driver.CopyHostToDevice(buffers.Output.Pointer(), payload))
+	_, err = buffers.ReadOutput()
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "finite")
+
+	driver = &fakeHIPDriver{available: true}
+	buffers, err = req.deviceBuffers(driver)
+	core.RequireNoError(t, err)
+	defer buffers.Close()
+	driver.copyErr = core.NewError("copy failed")
+	_, err = buffers.ReadOutput()
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "copy LoRA output")
+}

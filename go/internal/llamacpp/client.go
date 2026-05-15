@@ -26,19 +26,21 @@ type ChatRequest struct {
 	Temperature   float32       `json:"temperature"`
 	TopK          int           `json:"top_k,omitempty"`
 	TopP          float32       `json:"top_p,omitempty"`
+	Stop          []string      `json:"stop,omitempty"`
 	RepeatPenalty float32       `json:"repeat_penalty,omitempty"`
 	Stream        bool          `json:"stream"`
 }
 
 // CompletionRequest is the request body for /v1/completions.
 type CompletionRequest struct {
-	Prompt        string  `json:"prompt"`
-	MaxTokens     int     `json:"max_tokens,omitempty"`
-	Temperature   float32 `json:"temperature"`
-	TopK          int     `json:"top_k,omitempty"`
-	TopP          float32 `json:"top_p,omitempty"`
-	RepeatPenalty float32 `json:"repeat_penalty,omitempty"`
-	Stream        bool    `json:"stream"`
+	Prompt        string   `json:"prompt"`
+	MaxTokens     int      `json:"max_tokens,omitempty"`
+	Temperature   float32  `json:"temperature"`
+	TopK          int      `json:"top_k,omitempty"`
+	TopP          float32  `json:"top_p,omitempty"`
+	Stop          []string `json:"stop,omitempty"`
+	RepeatPenalty float32  `json:"repeat_penalty,omitempty"`
+	Stream        bool     `json:"stream"`
 }
 
 type chatStreamChunkResponse struct {

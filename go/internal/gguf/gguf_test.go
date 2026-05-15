@@ -1,8 +1,10 @@
 package gguf
 
 import (
+	"bytes"
 	core "dappco.re/go"
 	"encoding/binary"
+	"strings"
 	"testing"
 )
 
@@ -95,6 +97,57 @@ func TestGguf_ReadInfo_Ugly_EmptyTensorDirectory(t *testing.T) {
 	core.AssertNoError(t, err)
 	core.AssertEqual(t, 0, len(info.Tensors))
 	core.AssertGreater(t, info.DataOffset, int64(0))
+}
+
+func TestGguf_SkipValue_Good_ScalarsStringsAndArrays(t *testing.T) {
+	var buf bytes.Buffer
+	buf.WriteByte(1)
+	core.RequireNoError(t, skipValue(&buf, typeUint8))
+	core.AssertEqual(t, 0, buf.Len())
+
+	binary.Write(&buf, binary.LittleEndian, uint16(7))
+	core.RequireNoError(t, skipValue(&buf, typeUint16))
+	core.AssertEqual(t, 0, buf.Len())
+
+	binary.Write(&buf, binary.LittleEndian, uint32(9))
+	core.RequireNoError(t, skipValue(&buf, typeFloat32))
+	core.AssertEqual(t, 0, buf.Len())
+
+	binary.Write(&buf, binary.LittleEndian, uint64(11))
+	core.RequireNoError(t, skipValue(&buf, typeFloat64))
+	core.AssertEqual(t, 0, buf.Len())
+
+	binary.Write(&buf, binary.LittleEndian, uint64(3))
+	buf.WriteString("abc")
+	core.RequireNoError(t, skipValue(&buf, typeString))
+	core.AssertEqual(t, 0, buf.Len())
+
+	binary.Write(&buf, binary.LittleEndian, uint32(typeUint16))
+	binary.Write(&buf, binary.LittleEndian, uint64(2))
+	binary.Write(&buf, binary.LittleEndian, uint16(1))
+	binary.Write(&buf, binary.LittleEndian, uint16(2))
+	core.RequireNoError(t, skipValue(&buf, typeArray))
+	core.AssertEqual(t, 0, buf.Len())
+}
+
+func TestGguf_SkipValue_Bad_Errors(t *testing.T) {
+	core.AssertError(t, skipValue(strings.NewReader(""), typeUint64))
+	core.AssertError(t, skipValue(bytes.NewReader([]byte{1}), typeUint16))
+	core.AssertError(t, skipValue(bytes.NewReader(nil), 999))
+
+	var longString bytes.Buffer
+	binary.Write(&longString, binary.LittleEndian, uint64(maxStringLength+1))
+	core.AssertError(t, skipValue(&longString, typeString))
+
+	var truncatedArray bytes.Buffer
+	binary.Write(&truncatedArray, binary.LittleEndian, uint32(typeUint32))
+	binary.Write(&truncatedArray, binary.LittleEndian, uint64(1))
+	truncatedArray.WriteByte(1)
+	core.AssertError(t, skipValue(&truncatedArray, typeArray))
+
+	n, err := discardBytes(strings.NewReader("x"), 2)
+	core.AssertError(t, err)
+	core.AssertEqual(t, int64(1), n)
 }
 
 func tensorGGUF(t *testing.T) string {

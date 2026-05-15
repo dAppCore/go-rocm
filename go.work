@@ -2,9 +2,10 @@ go 1.26.2
 
 // Workspace mode for development: pulls local sources from external/ submodules.
 //
-// CI: GOWORK=off uses go/go.mod tags for reproducible resolution.
+// CI: GOWORK=off uses root/go.mod replacements for reproducible resolution.
 
 use (
+	.
 	./go
 	./external/go
 	./external/go-inference/go

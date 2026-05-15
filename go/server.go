@@ -53,6 +53,9 @@ type serverStartConfig struct {
 
 // alive reports whether the llama-server process is still running.
 func (s *server) alive() bool {
+	if s == nil || s.processExited == nil {
+		return false
+	}
 	select {
 	case <-s.processExited:
 		return false
@@ -233,7 +236,7 @@ func (s *server) waitReady(ctx context.Context) rocmFailure {
 // stop sends SIGTERM and waits up to 5s, then SIGKILL. Exit caused by those
 // signals is treated as a successful caller-initiated shutdown.
 func (s *server) stop() rocmFailure {
-	if s.processCommand.Process == nil {
+	if s == nil || s.processCommand == nil || s.processCommand.Process == nil {
 		return nil
 	}
 

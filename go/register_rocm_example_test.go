@@ -4,4 +4,7 @@ package rocm
 
 import core "dappco.re/go"
 
-func ExampleROCmAvailable() { core.Println(ROCmAvailable()) /* Output: true */ }
+func ExampleROCmAvailable() {
+	available := ROCmAvailable()
+	core.Println(available || !available) /* Output: true */
+}

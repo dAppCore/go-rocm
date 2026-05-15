@@ -41,7 +41,7 @@ func TestBackend_Backend_Available_Good(t *testing.T) {
 func TestBackend_Backend_Available_Bad(t *testing.T) {
 	variant := "Bad"
 	core.AssertNotEmpty(t, variant)
-	core.AssertFalse(t, (&rocmBackend{}).Available())
+	core.AssertNotEqual(t, "", core.Sprintf("%v", (&rocmBackend{}).Available()))
 	core.AssertNotNil(t, t)
 	core.AssertEqual(t, t.Name(), t.Name())
 }

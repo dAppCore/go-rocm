@@ -5,13 +5,18 @@
 package rocm
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"io"
 	"slices"
+	"strconv"
 
 	core "dappco.re/go"
 	"dappco.re/go/inference"
+	"dappco.re/go/inference/quant/codebook"
+	"dappco.re/go/inference/quant/jang"
 	"dappco.re/go/rocm/internal/gguf"
 )
 
@@ -20,22 +25,69 @@ const maxSafetensorsHeaderBytes = 64 << 20
 type rocmModelPackConfigProbe struct {
 	ModelType             string                       `json:"model_type"`
 	Architectures         []string                     `json:"architectures"`
+	DType                 string                       `json:"dtype"`
 	HiddenSize            int                          `json:"hidden_size"`
 	NumHiddenLayers       int                          `json:"num_hidden_layers"`
 	NumLayers             int                          `json:"num_layers"`
 	NumAttentionHeads     int                          `json:"num_attention_heads"`
 	NumKeyValueHeads      int                          `json:"num_key_value_heads"`
+	NumGlobalKVHeads      int                          `json:"num_global_key_value_heads"`
+	HeadDim               int                          `json:"head_dim"`
+	GlobalHeadDim         int                          `json:"global_head_dim"`
 	VocabSize             int                          `json:"vocab_size"`
 	MaxPositionEmbeddings int                          `json:"max_position_embeddings"`
 	MaxSequenceLength     int                          `json:"max_sequence_length"`
 	SeqLength             int                          `json:"seq_length"`
 	SlidingWindow         int                          `json:"sliding_window"`
+	LayerTypes            []string                     `json:"layer_types"`
+	RMSNormEps            float64                      `json:"rms_norm_eps"`
+	FinalLogitSoftcap     float64                      `json:"final_logit_softcapping"`
 	NumLocalExperts       int                          `json:"num_local_experts"`
 	NumExperts            int                          `json:"num_experts"`
 	NumExpertsPerTok      int                          `json:"num_experts_per_tok"`
 	QuantizationConfig    rocmQuantizationConfigProbe  `json:"quantization_config"`
 	Quantization          rocmQuantizationConfigProbe  `json:"quantization"`
-	TaskSpecificParams    map[string]map[string]string `json:"task_specific_params"`
+	TaskSpecificParams    map[string]any               `json:"task_specific_params"`
+	TextConfig            rocmModelPackTextConfigProbe `json:"text_config"`
+	TieWordEmbeddings     bool                         `json:"tie_word_embeddings"`
+}
+
+type rocmModelPackTextConfigProbe struct {
+	ModelType             string   `json:"model_type"`
+	Architectures         []string `json:"architectures"`
+	DType                 string   `json:"dtype"`
+	HiddenSize            int      `json:"hidden_size"`
+	NumHiddenLayers       int      `json:"num_hidden_layers"`
+	NumLayers             int      `json:"num_layers"`
+	NumAttentionHeads     int      `json:"num_attention_heads"`
+	NumKeyValueHeads      int      `json:"num_key_value_heads"`
+	NumGlobalKVHeads      int      `json:"num_global_key_value_heads"`
+	HeadDim               int      `json:"head_dim"`
+	GlobalHeadDim         int      `json:"global_head_dim"`
+	VocabSize             int      `json:"vocab_size"`
+	MaxPositionEmbeddings int      `json:"max_position_embeddings"`
+	MaxSequenceLength     int      `json:"max_sequence_length"`
+	SeqLength             int      `json:"seq_length"`
+	SlidingWindow         int      `json:"sliding_window"`
+	LayerTypes            []string `json:"layer_types"`
+	RMSNormEps            float64  `json:"rms_norm_eps"`
+	FinalLogitSoftcap     float64  `json:"final_logit_softcapping"`
+	TieWordEmbeddings     bool     `json:"tie_word_embeddings"`
+}
+
+type rocmTokenizerJSONProbe struct {
+	Model struct {
+		Type string `json:"type"`
+	} `json:"model"`
+}
+
+type rocmTokenizerConfigProbe struct {
+	TokenizerClass string                      `json:"tokenizer_class"`
+	ChatTemplate   string                      `json:"chat_template"`
+	BOSID          rocmTokenizerTokenID        `json:"bos_token_id"`
+	EOSID          rocmTokenizerTokenID        `json:"eos_token_id"`
+	PADID          rocmTokenizerTokenID        `json:"pad_token_id"`
+	ModelMaxLength rocmTokenizerModelMaxLength `json:"model_max_length"`
 }
 
 type rocmQuantizationConfigProbe struct {
@@ -48,80 +100,8 @@ type rocmQuantizationConfigProbe struct {
 	LoadIn8Bit   bool   `json:"load_in_8bit"`
 }
 
-type rocmJANGQuantizationInfo struct {
-	Version            int                  `json:"version,omitempty"`
-	WeightFormat       string               `json:"weight_format,omitempty"`
-	Profile            string               `json:"profile,omitempty"`
-	Method             string               `json:"method,omitempty"`
-	GroupSize          int                  `json:"group_size,omitempty"`
-	BitsDefault        int                  `json:"bits_default,omitempty"`
-	AttentionBits      int                  `json:"attention_bits,omitempty"`
-	SharedExpertBits   int                  `json:"shared_expert_bits,omitempty"`
-	RoutedExpertBits   int                  `json:"routed_expert_bits,omitempty"`
-	EmbedTokensBits    int                  `json:"embed_tokens_bits,omitempty"`
-	LMHeadBits         int                  `json:"lm_head_bits,omitempty"`
-	SourceName         string               `json:"source_name,omitempty"`
-	SourceOrg          string               `json:"source_org,omitempty"`
-	SourceArchitecture string               `json:"source_architecture,omitempty"`
-	Capabilities       rocmJANGCapabilities `json:"capabilities,omitempty"`
-}
-
-type rocmJANGCapabilities struct {
-	ReasoningParser  string `json:"reasoning_parser,omitempty"`
-	ToolParser       string `json:"tool_parser,omitempty"`
-	ThinkInTemplate  bool   `json:"think_in_template,omitempty"`
-	SupportsTools    bool   `json:"supports_tools,omitempty"`
-	SupportsThinking bool   `json:"supports_thinking,omitempty"`
-	Family           string `json:"family,omitempty"`
-	Modality         string `json:"modality,omitempty"`
-	CacheType        string `json:"cache_type,omitempty"`
-}
-
-type rocmJANGConfigProbe struct {
-	Version      int    `json:"version"`
-	WeightFormat string `json:"weight_format"`
-	Profile      string `json:"profile"`
-	SourceModel  struct {
-		Name         string `json:"name"`
-		Org          string `json:"org"`
-		Architecture string `json:"architecture"`
-	} `json:"source_model"`
-	MXTQBits struct {
-		Attention    int `json:"attention"`
-		SharedExpert int `json:"shared_expert"`
-		RoutedExpert int `json:"routed_expert"`
-		EmbedTokens  int `json:"embed_tokens"`
-		LMHead       int `json:"lm_head"`
-	} `json:"mxtq_bits"`
-	Quantization struct {
-		Method      string `json:"method"`
-		GroupSize   int    `json:"group_size"`
-		BitsDefault int    `json:"bits_default"`
-	} `json:"quantization"`
-	Capabilities rocmJANGCapabilities `json:"capabilities"`
-}
-
-type rocmCodebookProfile struct {
-	Type         string                      `json:"type,omitempty"`
-	Format       string                      `json:"format,omitempty"`
-	CodebookSize int                         `json:"codebook_size,omitempty"`
-	CodeDim      int                         `json:"code_dim,omitempty"`
-	IndexBits    int                         `json:"index_bits,omitempty"`
-	Source       string                      `json:"source,omitempty"`
-	Tensors      []rocmCodebookTensorProfile `json:"tensors,omitempty"`
-}
-
-type rocmCodebookTensorProfile struct {
-	Name          string   `json:"name,omitempty"`
-	Shape         []uint64 `json:"shape,omitempty"`
-	CodesName     string   `json:"codes,omitempty"`
-	CodebookName  string   `json:"codebook,omitempty"`
-	CodesShape    []uint64 `json:"codes_shape,omitempty"`
-	CodebookShape []uint64 `json:"codebook_shape,omitempty"`
-	CodebookSize  int      `json:"codebook_size,omitempty"`
-	CodeDim       int      `json:"code_dim,omitempty"`
-	IndexBits     int      `json:"index_bits,omitempty"`
-}
+type rocmJANGQuantizationInfo = jang.Info
+type rocmCodebookProfile = codebook.Profile
 
 type rocmSafetensorsTensor struct {
 	DType       string   `json:"dtype"`
@@ -134,6 +114,83 @@ type rocmSafetensorsSummary struct {
 	HeaderBytes  uint64
 	PayloadBytes uint64
 	DTypes       []string
+}
+
+type rocmSafetensorsIndexProbe struct {
+	Metadata  rocmSafetensorsIndexMetadata `json:"metadata"`
+	WeightMap map[string]string            `json:"weight_map"`
+}
+
+type rocmSafetensorsIndexMetadata struct {
+	TotalSize       uint64 `json:"total_size"`
+	TotalParameters uint64 `json:"total_parameters"`
+}
+
+type rocmSafetensorsPayloadRange struct {
+	Name  string
+	Start uint64
+	End   uint64
+}
+
+type rocmTokenizerTokenID struct {
+	Values []int32
+}
+
+type rocmTokenizerModelMaxLength struct {
+	Value int
+}
+
+func (length *rocmTokenizerModelMaxLength) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		return nil
+	}
+	var raw any
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&raw); err != nil {
+		return nil
+	}
+	var text string
+	switch value := raw.(type) {
+	case json.Number:
+		text = value.String()
+	case string:
+		text = value
+	default:
+		return nil
+	}
+	parsed, err := strconv.ParseUint(text, 10, 64)
+	if err != nil || parsed > 1<<30 {
+		return nil
+	}
+	length.Value = int(parsed)
+	return nil
+}
+
+func (id *rocmTokenizerTokenID) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		return nil
+	}
+	var single int32
+	if err := json.Unmarshal(data, &single); err == nil {
+		id.Values = []int32{single}
+		return nil
+	}
+	var many []int32
+	if err := json.Unmarshal(data, &many); err == nil {
+		id.Values = append([]int32(nil), many...)
+		return nil
+	}
+	return nil
+}
+
+func (id rocmTokenizerTokenID) First() int32 {
+	for _, value := range id.Values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 func (b *rocmBackend) InspectModelPack(ctx context.Context, path string) (*inference.ModelPackInspection, error) {
@@ -174,14 +231,27 @@ func (b *rocmBackend) InspectModelPack(ctx context.Context, path string) (*infer
 	} else if cfg != nil {
 		applyROCmModelConfig(inspection, *cfg)
 	}
+	weightMetadataValid := len(weights) > 0
 	for _, weight := range weights {
+		valid := false
 		switch core.Lower(core.PathExt(weight)) {
 		case ".gguf":
-			applyROCmGGUFInspection(inspection, weight)
+			valid = applyROCmGGUFInspection(inspection, weight)
 		case ".safetensors":
-			applyROCmSafetensorsInspection(inspection, weight)
+			valid = applyROCmSafetensorsInspection(inspection, weight)
 		}
+		weightMetadataValid = weightMetadataValid && valid
 	}
+	if indexValid, err := applyROCmSafetensorsIndexInspection(inspection, root, weights); err != nil {
+		inspection.Notes = append(inspection.Notes, "safetensors index could not be parsed: "+err.Error())
+		weightMetadataValid = false
+	} else {
+		weightMetadataValid = weightMetadataValid && indexValid
+	}
+	if !weightMetadataValid {
+		clearROCmWeightMetadataLabels(inspection.Labels)
+	}
+	inspection.Labels["weight_metadata_valid"] = core.Sprintf("%t", weightMetadataValid)
 	if jang, err := readROCmJANGConfig(root); err != nil {
 		inspection.Notes = append(inspection.Notes, "jang_config.json could not be parsed: "+err.Error())
 	} else if jang != nil {
@@ -192,7 +262,13 @@ func (b *rocmBackend) InspectModelPack(ctx context.Context, path string) (*infer
 	} else if codebook != nil {
 		applyROCmCodebookInspection(inspection, *codebook)
 	}
-	applyROCmArchitectureInspection(inspection)
+	if err := applyROCmTokenizerJSONInspection(inspection, root); err != nil {
+		inspection.Notes = append(inspection.Notes, "tokenizer.json could not be parsed: "+err.Error())
+	}
+	if err := applyROCmTokenizerConfigInspection(inspection, root); err != nil {
+		inspection.Notes = append(inspection.Notes, "tokenizer_config.json could not be parsed: "+err.Error())
+	}
+	applyROCmArchitectureInspection(inspection, weightMetadataValid)
 	applyROCmMemoryFitInspection(ctx, b, inspection)
 	inspection.Capabilities = append(inspection.Capabilities,
 		inference.SupportedCapability(inference.CapabilityModelFit, inference.CapabilityGroupRuntime),
@@ -275,17 +351,21 @@ func readROCmModelConfig(root string) (*rocmModelPackConfigProbe, error) {
 func applyROCmModelConfig(inspection *inference.ModelPackInspection, cfg rocmModelPackConfigProbe) {
 	model := inspection.Model
 	model.Architecture = firstNonEmptyString(model.Architecture, rocmConfigArchitecture(cfg))
-	model.ContextLength = firstPositiveInt(model.ContextLength, cfg.MaxPositionEmbeddings, cfg.MaxSequenceLength, cfg.SeqLength, cfg.SlidingWindow)
-	model.NumLayers = firstPositiveInt(model.NumLayers, cfg.NumHiddenLayers, cfg.NumLayers)
-	model.HiddenSize = firstPositiveInt(model.HiddenSize, cfg.HiddenSize)
-	model.VocabSize = firstPositiveInt(model.VocabSize, cfg.VocabSize)
+	model.ContextLength = firstPositiveInt(model.ContextLength, cfg.MaxPositionEmbeddings, cfg.MaxSequenceLength, cfg.SeqLength, cfg.SlidingWindow, cfg.TextConfig.MaxPositionEmbeddings, cfg.TextConfig.MaxSequenceLength, cfg.TextConfig.SeqLength, cfg.TextConfig.SlidingWindow)
+	model.NumLayers = firstPositiveInt(model.NumLayers, cfg.NumHiddenLayers, cfg.NumLayers, cfg.TextConfig.NumHiddenLayers, cfg.TextConfig.NumLayers)
+	model.HiddenSize = firstPositiveInt(model.HiddenSize, cfg.HiddenSize, cfg.TextConfig.HiddenSize)
+	model.VocabSize = firstPositiveInt(model.VocabSize, cfg.VocabSize, cfg.TextConfig.VocabSize)
 	quant := cfg.QuantizationConfig
-	if quant.QuantMethod == "" && quant.Bits == 0 && quant.GroupSize == 0 {
+	if rocmQuantConfigEmpty(quant) {
 		quant = cfg.Quantization
 	}
 	model.QuantBits = firstPositiveInt(model.QuantBits, rocmQuantConfigBits(quant))
 	model.QuantGroup = firstPositiveInt(model.QuantGroup, quant.GroupSize)
-	model.QuantType = firstNonEmptyString(model.QuantType, rocmQuantConfigType(quant))
+	quantType := rocmQuantConfigType(quant)
+	if quantType == "" && model.QuantBits == 0 {
+		quantType = firstNonEmptyString(rocmConfigDTypeQuantizationType(cfg.DType), rocmConfigDTypeQuantizationType(cfg.TextConfig.DType))
+	}
+	model.QuantType = firstNonEmptyString(model.QuantType, quantType)
 	inspection.Model = model
 	if cfg.NumLocalExperts > 0 || cfg.NumExperts > 0 {
 		inspection.Labels["moe_experts"] = core.Sprintf("%d", firstPositiveInt(cfg.NumLocalExperts, cfg.NumExperts))
@@ -293,6 +373,28 @@ func applyROCmModelConfig(inspection *inference.ModelPackInspection, cfg rocmMod
 	if cfg.NumExpertsPerTok > 0 {
 		inspection.Labels["moe_top_k"] = core.Sprintf("%d", cfg.NumExpertsPerTok)
 	}
+	if rocmConfigTiedWordEmbeddings(cfg) {
+		inspection.Labels["tied_word_embeddings"] = "true"
+	}
+	applyROCmAttentionConfigLabels(inspection, cfg)
+	if rocmConfigHasEmbeddingTask(cfg) {
+		inspection.Labels["embedding_model"] = "true"
+		appendROCmInspectionCapability(inspection, inference.PlannedCapability(inference.CapabilityEmbeddings, inference.CapabilityGroupModel, "embedding model-pack metadata is recognised; native ROCm embedding kernels are pending"))
+	}
+	if rocmConfigHasRerankTask(cfg) {
+		inspection.Labels["rerank_model"] = "true"
+		appendROCmInspectionCapability(inspection, inference.PlannedCapability(inference.CapabilityRerank, inference.CapabilityGroupModel, "rerank model-pack metadata is recognised; native ROCm scorer kernels are pending"))
+	}
+	if rocmConfigHasClassifierTask(cfg) {
+		inspection.Labels["classifier_model"] = "true"
+		capability := inference.PlannedCapability(inference.CapabilityClassify, inference.CapabilityGroupModel, "BERT sequence-classifier metadata is recognised; loaded ROCm classifier path is experimental when embedding and projection kernels are linked")
+		capability.Labels = map[string]string{"classify_path": "bert_sequence_classifier"}
+		appendROCmInspectionCapability(inspection, capability)
+	}
+}
+
+func rocmQuantConfigEmpty(quant rocmQuantizationConfigProbe) bool {
+	return quant.QuantMethod == "" && quant.Bits == 0 && quant.GroupSize == 0 && quant.WeightFormat == "" && quant.Format == "" && !quant.LoadIn4Bit && !quant.LoadIn8Bit
 }
 
 func rocmConfigArchitecture(cfg rocmModelPackConfigProbe) string {
@@ -304,7 +406,101 @@ func rocmConfigArchitecture(cfg rocmModelPackConfigProbe) string {
 			return normalized
 		}
 	}
+	if cfg.TextConfig.ModelType != "" {
+		return normalizeROCmArchitecture(cfg.TextConfig.ModelType)
+	}
+	for _, architecture := range cfg.TextConfig.Architectures {
+		if normalized := normalizeROCmArchitecture(architecture); normalized != "" {
+			return normalized
+		}
+	}
 	return ""
+}
+
+func rocmConfigTiedWordEmbeddings(cfg rocmModelPackConfigProbe) bool {
+	return cfg.TieWordEmbeddings || cfg.TextConfig.TieWordEmbeddings
+}
+
+func applyROCmAttentionConfigLabels(inspection *inference.ModelPackInspection, cfg rocmModelPackConfigProbe) {
+	labels := rocmAttentionConfigLabels(cfg)
+	if len(labels) == 0 {
+		return
+	}
+	model := inspection.Model
+	if model.Labels == nil {
+		model.Labels = map[string]string{}
+	}
+	for key, value := range labels {
+		inspection.Labels[key] = value
+		model.Labels[key] = value
+	}
+	inspection.Model = model
+}
+
+func rocmAttentionConfigLabels(cfg rocmModelPackConfigProbe) map[string]string {
+	out := map[string]string{}
+	if slidingWindow := firstPositiveInt(cfg.SlidingWindow, cfg.TextConfig.SlidingWindow); slidingWindow > 0 {
+		out["sliding_window"] = core.Sprintf("%d", slidingWindow)
+	}
+	attentionHeads := firstPositiveInt(cfg.NumAttentionHeads, cfg.TextConfig.NumAttentionHeads)
+	kvHeads := firstPositiveInt(cfg.NumKeyValueHeads, cfg.TextConfig.NumKeyValueHeads)
+	globalKVHeads := firstPositiveInt(cfg.NumGlobalKVHeads, cfg.TextConfig.NumGlobalKVHeads)
+	headDim := firstPositiveInt(cfg.HeadDim, cfg.TextConfig.HeadDim)
+	globalHeadDim := firstPositiveInt(cfg.GlobalHeadDim, cfg.TextConfig.GlobalHeadDim)
+	if attentionHeads > 0 {
+		out["attention_heads"] = core.Sprintf("%d", attentionHeads)
+	}
+	if kvHeads > 0 {
+		out["attention_kv_heads"] = core.Sprintf("%d", kvHeads)
+	}
+	if globalKVHeads > 0 {
+		out["attention_global_kv_heads"] = core.Sprintf("%d", globalKVHeads)
+	}
+	if headDim > 0 {
+		out["attention_head_dim"] = core.Sprintf("%d", headDim)
+	}
+	if globalHeadDim > 0 {
+		out["attention_global_head_dim"] = core.Sprintf("%d", globalHeadDim)
+	}
+	if attentionHeads > 0 && headDim > 0 {
+		out["attention_query_width"] = core.Sprintf("%d", attentionHeads*headDim)
+	}
+	if kvHeads > 0 && headDim > 0 {
+		out["attention_kv_width"] = core.Sprintf("%d", kvHeads*headDim)
+	}
+	if globalKVHeads > 0 && globalHeadDim > 0 {
+		out["attention_global_kv_width"] = core.Sprintf("%d", globalKVHeads*globalHeadDim)
+	}
+	if attentionHeads > 0 && kvHeads > 0 && attentionHeads != kvHeads {
+		out["attention_gqa"] = "true"
+	}
+	if eps := firstPositiveFloat(cfg.RMSNormEps, cfg.TextConfig.RMSNormEps); eps > 0 {
+		out["rms_norm_eps"] = formatROCmFloat(eps)
+	}
+	if cap := firstPositiveFloat(cfg.FinalLogitSoftcap, cfg.TextConfig.FinalLogitSoftcap); cap > 0 {
+		out["final_logit_softcapping"] = formatROCmFloat(cap)
+	}
+	fullLayers := 0
+	slidingLayers := 0
+	for _, layerType := range append(append([]string(nil), cfg.LayerTypes...), cfg.TextConfig.LayerTypes...) {
+		lower := core.Lower(layerType)
+		switch {
+		case core.Contains(lower, "sliding"):
+			slidingLayers++
+		case core.Contains(lower, "full"):
+			fullLayers++
+		}
+	}
+	if fullLayers > 0 {
+		out["attention_full_layers"] = core.Sprintf("%d", fullLayers)
+	}
+	if slidingLayers > 0 {
+		out["attention_sliding_layers"] = core.Sprintf("%d", slidingLayers)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func rocmQuantConfigBits(quant rocmQuantizationConfigProbe) int {
@@ -321,14 +517,27 @@ func rocmQuantConfigBits(quant rocmQuantizationConfigProbe) int {
 }
 
 func rocmQuantConfigType(quant rocmQuantizationConfigProbe) string {
-	return core.Lower(firstNonEmptyString(quant.WeightFormat, quant.Format, quant.QuantMethod))
+	return normalizeROCmQuantizationAlias(firstNonEmptyString(quant.QuantMethod, quant.WeightFormat, quant.Format))
 }
 
-func applyROCmGGUFInspection(inspection *inference.ModelPackInspection, path string) {
+func rocmConfigDTypeQuantizationType(dtype string) string {
+	switch core.Lower(dtype) {
+	case "bfloat16", "bf16":
+		return "bf16"
+	case "float16", "fp16", "f16":
+		return "f16"
+	case "float32", "fp32", "f32":
+		return "f32"
+	default:
+		return ""
+	}
+}
+
+func applyROCmGGUFInspection(inspection *inference.ModelPackInspection, path string) bool {
 	info, err := gguf.ReadInfo(path)
 	if err != nil {
 		inspection.Notes = append(inspection.Notes, "GGUF metadata could not be parsed: "+err.Error())
-		return
+		return false
 	}
 	metadata := info.Metadata
 	model := inspection.Model
@@ -346,26 +555,367 @@ func applyROCmGGUFInspection(inspection *inference.ModelPackInspection, path str
 	if metadata.FileSize > 0 {
 		inspection.Labels["weight_bytes"] = core.Sprintf("%d", metadata.FileSize)
 	}
+	return true
 }
 
-func applyROCmSafetensorsInspection(inspection *inference.ModelPackInspection, path string) {
+func applyROCmSafetensorsInspection(inspection *inference.ModelPackInspection, path string) bool {
 	summary, err := readROCmSafetensorsSummary(path)
 	if err != nil {
 		inspection.Notes = append(inspection.Notes, "safetensors header could not be parsed: "+err.Error())
-		return
+		return false
 	}
 	model := inspection.Model
 	model.Path = firstNonEmptyString(model.Path, path)
 	inspection.Model = model
-	inspection.Labels["safetensors_tensors"] = core.Sprintf("%d", summary.TensorCount)
-	inspection.Labels["safetensors_header_bytes"] = core.Sprintf("%d", summary.HeaderBytes)
-	inspection.Labels["safetensors_payload_bytes"] = core.Sprintf("%d", summary.PayloadBytes)
-	if len(summary.DTypes) > 0 {
-		inspection.Labels["safetensors_dtypes"] = core.Join(",", summary.DTypes...)
+	mergeROCmSafetensorsSummaryLabels(inspection.Labels, summary)
+	return true
+}
+
+func applyROCmSafetensorsIndexInspection(inspection *inference.ModelPackInspection, root string, weights []string) (bool, error) {
+	path := core.PathJoin(root, "model.safetensors.index.json")
+	read := core.ReadFile(path)
+	if !read.OK {
+		if core.IsNotExist(read.Value.(error)) {
+			return true, nil
+		}
+		return false, read.Value.(error)
+	}
+	var index rocmSafetensorsIndexProbe
+	if result := core.JSONUnmarshal(read.Value.([]byte), &index); !result.OK {
+		return false, result.Value.(error)
+	}
+	if len(index.WeightMap) == 0 {
+		return false, core.NewError("safetensors index weight_map is empty")
+	}
+	knownShards := map[string]bool{}
+	safetensorsWeightCount := 0
+	for _, weight := range weights {
+		if core.Lower(core.PathExt(weight)) != ".safetensors" {
+			continue
+		}
+		safetensorsWeightCount++
+		knownShards[core.PathBase(weight)] = true
+	}
+	referencedShards := map[string]bool{}
+	for tensorName, shard := range index.WeightMap {
+		if core.Trim(tensorName) == "" || core.Trim(shard) == "" {
+			return false, core.NewError("safetensors index contains an empty tensor or shard entry")
+		}
+		shardBase := core.PathBase(shard)
+		if !knownShards[shardBase] {
+			return false, core.NewError("safetensors index references missing shard " + shard)
+		}
+		referencedShards[shardBase] = true
+	}
+	if safetensorsWeightCount != len(referencedShards) {
+		return false, core.NewError(core.Sprintf("safetensors index references %d shard files but %d safetensors files were discovered", len(referencedShards), safetensorsWeightCount))
+	}
+	inspection.Labels["safetensors_index"] = "present"
+	inspection.Labels["safetensors_index_tensors"] = core.Sprintf("%d", len(index.WeightMap))
+	inspection.Labels["safetensors_index_shards"] = core.Sprintf("%d", len(referencedShards))
+	if len(referencedShards) > 1 {
+		inspection.Labels["sharded_safetensors"] = "true"
+	}
+	if index.Metadata.TotalSize > 0 {
+		inspection.Labels["safetensors_index_total_size"] = core.FormatUint(index.Metadata.TotalSize, 10)
+		inspection.Labels["weight_bytes"] = core.FormatUint(index.Metadata.TotalSize, 10)
+	}
+	if index.Metadata.TotalParameters > 0 {
+		inspection.Labels["safetensors_index_total_parameters"] = core.FormatUint(index.Metadata.TotalParameters, 10)
+	}
+	return true, nil
+}
+
+func (b *rocmBackend) safetensorsNativeLoadConfig(ctx context.Context, path string, loadConfig inference.LoadConfig) (string, nativeLoadConfig, error) {
+	inspection, err := b.InspectModelPack(ctx, path)
+	if err != nil {
+		return "", nativeLoadConfig{}, err
+	}
+	if inspection.Format != "safetensors" {
+		return "", nativeLoadConfig{}, core.NewError("native safetensors load requires a safetensors model pack")
+	}
+	if !inspection.Supported {
+		return "", nativeLoadConfig{}, core.NewError("model pack is not supported for native ROCm load")
+	}
+	weightPaths, err := rocmSafetensorsWeightFiles(path)
+	if err != nil {
+		return "", nativeLoadConfig{}, err
+	}
+	tensors := []nativeTensorInfo{}
+	for _, weightPath := range weightPaths {
+		weightTensors, err := readROCmSafetensorsNativeTensors(weightPath)
+		if err != nil {
+			return "", nativeLoadConfig{}, err
+		}
+		tensors = append(tensors, weightTensors...)
+	}
+	loadPath := path
+	if len(weightPaths) == 1 {
+		loadPath = weightPaths[0]
+	}
+	cfg := nativeLoadConfig{
+		ContextSize:        resolveModelContextLength(loadConfig.ContextLen, inspection.Model.ContextLength),
+		GPULayerCount:      loadConfig.GPULayers,
+		ParallelSlotCount:  loadConfig.ParallelSlots,
+		AdapterPath:        loadConfig.AdapterPath,
+		ModelInfo:          modelInfoFromIdentity(inspection.Model),
+		TokenizerPath:      inspection.Tokenizer.Path,
+		Tensors:            tensors,
+		TiedWordEmbeddings: inspection.Labels["tied_word_embeddings"] == "true",
+	}
+	if len(weightPaths) == 1 && len(tensors) > 0 {
+		cfg.DataOffset = tensors[0].DataOffset
+	}
+	return loadPath, cfg, nil
+}
+
+func rocmSafetensorsWeightFiles(path string) ([]string, error) {
+	resolvedPath := path
+	if abs := core.PathAbs(path); abs.OK {
+		resolvedPath = abs.Value.(string)
+	}
+	stat := core.Stat(resolvedPath)
+	if !stat.OK {
+		return nil, stat.Value.(error)
+	}
+	weights := discoverROCmWeightFiles(resolvedPath, stat.Value.(core.FsFileInfo))
+	safetensors := []string{}
+	for _, weight := range weights {
+		if core.Lower(core.PathExt(weight)) == ".safetensors" {
+			safetensors = append(safetensors, weight)
+		}
+	}
+	if len(safetensors) == 0 {
+		return nil, core.NewError("native safetensors load requires at least one safetensors weight file")
+	}
+	return safetensors, nil
+}
+
+func readROCmSafetensorsNativeTensors(path string) ([]nativeTensorInfo, error) {
+	stat := core.Stat(path)
+	if !stat.OK {
+		return nil, stat.Value.(error)
+	}
+	fileSize := stat.Value.(core.FsFileInfo).Size()
+	open := core.Open(path)
+	if !open.OK {
+		return nil, open.Value.(error)
+	}
+	file := open.Value.(*core.OSFile)
+	defer file.Close()
+	var headerLength uint64
+	if err := binary.Read(file, binary.LittleEndian, &headerLength); err != nil {
+		return nil, err
+	}
+	if headerLength == 0 || headerLength > maxSafetensorsHeaderBytes {
+		return nil, core.NewError(core.Sprintf("safetensors header length %d is outside supported bounds", headerLength))
+	}
+	dataOffset := int64(8 + headerLength)
+	if fileSize < dataOffset {
+		return nil, core.NewError(core.Sprintf("safetensors file size %d is smaller than header span %d", fileSize, dataOffset))
+	}
+	header := make([]byte, int(headerLength))
+	if _, err := io.ReadFull(file, header); err != nil {
+		return nil, err
+	}
+	if err := rejectDuplicateROCmSafetensorsHeaderKeys(header); err != nil {
+		return nil, err
+	}
+	tensors := map[string]rocmSafetensorsTensor{}
+	if result := core.JSONUnmarshal(header, &tensors); !result.OK {
+		return nil, result.Value.(error)
+	}
+	names := make([]string, 0, len(tensors))
+	for name := range tensors {
+		if name != "__metadata__" {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	out := make([]nativeTensorInfo, 0, len(names))
+	payloadBytes := uint64(fileSize - dataOffset)
+	for _, name := range names {
+		tensor := tensors[name]
+		if len(tensor.DataOffsets) != 2 {
+			return nil, core.NewError("safetensors tensor " + name + " has invalid data_offsets")
+		}
+		if tensor.DataOffsets[1] < tensor.DataOffsets[0] || tensor.DataOffsets[1] > payloadBytes {
+			return nil, core.NewError("safetensors tensor " + name + " has invalid payload range")
+		}
+		tensorType, ok := rocmSafetensorsNativeTensorType(tensor.DType)
+		if !ok {
+			return nil, core.NewError("safetensors tensor " + name + " has unsupported dtype " + tensor.DType)
+		}
+		out = append(out, nativeTensorInfo{
+			Name:       name,
+			Dimensions: append([]uint64(nil), tensor.Shape...),
+			Type:       tensorType,
+			TypeName:   tensor.DType,
+			SourcePath: path,
+			DataOffset: dataOffset,
+			Offset:     tensor.DataOffsets[0],
+			ByteSize:   tensor.DataOffsets[1] - tensor.DataOffsets[0],
+		})
+	}
+	if len(out) == 0 {
+		return nil, core.NewError("safetensors header contains no tensor entries")
+	}
+	return out, nil
+}
+
+func rocmSafetensorsNativeTensorType(dtype string) (uint32, bool) {
+	switch core.Upper(dtype) {
+	case "F32":
+		return 0, true
+	case "F16":
+		return 1, true
+	case "BF16":
+		return 30, true
+	case "BOOL", "I8", "U8":
+		return 24, true
+	case "I16", "U16":
+		return 25, true
+	case "I32", "U32":
+		return 26, true
+	case "I64":
+		return 27, true
+	case "U64":
+		return 28, true
+	default:
+		return 0, false
 	}
 }
 
+func mergeROCmSafetensorsSummaryLabels(labels map[string]string, summary rocmSafetensorsSummary) {
+	labels["safetensors_tensors"] = core.FormatUint(rocmLabelUint(labels["safetensors_tensors"])+uint64(summary.TensorCount), 10)
+	labels["safetensors_header_bytes"] = core.FormatUint(rocmLabelUint(labels["safetensors_header_bytes"])+summary.HeaderBytes, 10)
+	labels["safetensors_payload_bytes"] = core.FormatUint(rocmLabelUint(labels["safetensors_payload_bytes"])+summary.PayloadBytes, 10)
+	labels["weight_bytes"] = core.FormatUint(rocmLabelUint(labels["weight_bytes"])+summary.PayloadBytes, 10)
+	dtypes := map[string]bool{}
+	if existing := labels["safetensors_dtypes"]; existing != "" {
+		for _, dtype := range core.Split(existing, ",") {
+			if dtype != "" {
+				dtypes[dtype] = true
+			}
+		}
+	}
+	for _, dtype := range summary.DTypes {
+		if dtype != "" {
+			dtypes[dtype] = true
+		}
+	}
+	if len(dtypes) == 0 {
+		return
+	}
+	values := make([]string, 0, len(dtypes))
+	for dtype := range dtypes {
+		values = append(values, dtype)
+	}
+	slices.Sort(values)
+	labels["safetensors_dtypes"] = core.Join(",", values...)
+}
+
+func rocmLabelUint(value string) uint64 {
+	if value == "" {
+		return 0
+	}
+	parsed := core.ParseInt(value, 10, 64)
+	if !parsed.OK {
+		return 0
+	}
+	if parsed.Value.(int64) < 0 {
+		return 0
+	}
+	return uint64(parsed.Value.(int64))
+}
+
+func clearROCmWeightMetadataLabels(labels map[string]string) {
+	for _, key := range []string{
+		"gguf_tensors",
+		"gguf_alignment",
+		"safetensors_tensors",
+		"safetensors_header_bytes",
+		"safetensors_payload_bytes",
+		"safetensors_dtypes",
+		"safetensors_index",
+		"safetensors_index_tensors",
+		"safetensors_index_shards",
+		"safetensors_index_total_size",
+		"safetensors_index_total_parameters",
+		"sharded_safetensors",
+		"weight_bytes",
+	} {
+		delete(labels, key)
+	}
+}
+
+func applyROCmTokenizerJSONInspection(inspection *inference.ModelPackInspection, root string) error {
+	path := core.PathJoin(root, "tokenizer.json")
+	read := core.ReadFile(path)
+	if !read.OK {
+		if core.IsNotExist(read.Value.(error)) {
+			return nil
+		}
+		return read.Value.(error)
+	}
+	var probe rocmTokenizerJSONProbe
+	if result := core.JSONUnmarshal(read.Value.([]byte), &probe); !result.OK {
+		return result.Value.(error)
+	}
+	tokenizer := inspection.Tokenizer
+	tokenizer.Path = firstNonEmptyString(tokenizer.Path, path)
+	tokenizer.Kind = firstNonEmptyString(tokenizer.Kind, probe.Model.Type, "tokenizer.json")
+	inspection.Tokenizer = tokenizer
+	inspection.Labels["tokenizer_json"] = "present"
+	if probe.Model.Type != "" {
+		inspection.Labels["tokenizer_json_model"] = probe.Model.Type
+	}
+	appendROCmInspectionCapability(inspection, inference.ExperimentalCapability(inference.CapabilityTokenizer, inference.CapabilityGroupModel, "tokenizer sidecar metadata is present; native tokenizer loading is pending"))
+	return nil
+}
+
+func applyROCmTokenizerConfigInspection(inspection *inference.ModelPackInspection, root string) error {
+	path := core.PathJoin(root, "tokenizer_config.json")
+	read := core.ReadFile(path)
+	if !read.OK {
+		if core.IsNotExist(read.Value.(error)) {
+			return nil
+		}
+		return read.Value.(error)
+	}
+	var probe rocmTokenizerConfigProbe
+	if result := core.JSONUnmarshal(read.Value.([]byte), &probe); !result.OK {
+		return result.Value.(error)
+	}
+	tokenizer := inspection.Tokenizer
+	tokenizer.Path = firstNonEmptyString(tokenizer.Path, path)
+	tokenizer.Kind = firstNonEmptyString(probe.TokenizerClass, tokenizer.Kind, "tokenizer_config.json")
+	tokenizer.ChatTemplate = firstNonEmptyString(tokenizer.ChatTemplate, probe.ChatTemplate)
+	tokenizer.BOSID = firstNonZeroInt32(tokenizer.BOSID, probe.BOSID.First())
+	tokenizer.EOSID = firstNonZeroInt32(tokenizer.EOSID, probe.EOSID.First())
+	tokenizer.PADID = firstNonZeroInt32(tokenizer.PADID, probe.PADID.First())
+	inspection.Tokenizer = tokenizer
+	inspection.Labels["tokenizer_config"] = "present"
+	if probe.ModelMaxLength.Value > 0 {
+		model := inspection.Model
+		model.ContextLength = firstPositiveInt(model.ContextLength, probe.ModelMaxLength.Value)
+		inspection.Model = model
+		inspection.Labels["tokenizer_model_max_length"] = core.Sprintf("%d", probe.ModelMaxLength.Value)
+	}
+	appendROCmInspectionCapability(inspection, inference.ExperimentalCapability(inference.CapabilityTokenizer, inference.CapabilityGroupModel, "tokenizer sidecar metadata is present; native tokenizer loading is pending"))
+	if probe.ChatTemplate != "" {
+		inspection.Labels["chat_template"] = "present"
+		appendROCmInspectionCapability(inspection, inference.ExperimentalCapability(inference.CapabilityChatTemplate, inference.CapabilityGroupModel, "chat template metadata is present; native template parser loading is pending"))
+	}
+	return nil
+}
+
 func readROCmSafetensorsSummary(path string) (rocmSafetensorsSummary, error) {
+	stat := core.Stat(path)
+	if !stat.OK {
+		return rocmSafetensorsSummary{}, stat.Value.(error)
+	}
+	fileSize := stat.Value.(core.FsFileInfo).Size()
 	open := core.Open(path)
 	if !open.OK {
 		return rocmSafetensorsSummary{}, open.Value.(error)
@@ -379,8 +929,16 @@ func readROCmSafetensorsSummary(path string) (rocmSafetensorsSummary, error) {
 	if headerLength == 0 || headerLength > maxSafetensorsHeaderBytes {
 		return rocmSafetensorsSummary{}, core.NewError(core.Sprintf("safetensors header length %d is outside supported bounds", headerLength))
 	}
+	payloadOffset := int64(8 + headerLength)
+	if fileSize < payloadOffset {
+		return rocmSafetensorsSummary{}, core.NewError(core.Sprintf("safetensors file size %d is smaller than header span %d", fileSize, payloadOffset))
+	}
+	payloadBytes := uint64(fileSize - payloadOffset)
 	header := make([]byte, int(headerLength))
 	if _, err := io.ReadFull(file, header); err != nil {
+		return rocmSafetensorsSummary{}, err
+	}
+	if err := rejectDuplicateROCmSafetensorsHeaderKeys(header); err != nil {
 		return rocmSafetensorsSummary{}, err
 	}
 	tensors := map[string]rocmSafetensorsTensor{}
@@ -389,57 +947,195 @@ func readROCmSafetensorsSummary(path string) (rocmSafetensorsSummary, error) {
 	}
 	summary := rocmSafetensorsSummary{HeaderBytes: headerLength}
 	dtypeSeen := map[string]bool{}
+	payloadRanges := []rocmSafetensorsPayloadRange{}
 	for name, tensor := range tensors {
-		if core.HasPrefix(name, "__") {
+		if name == "__metadata__" {
 			continue
+		}
+		if tensor.DType == "" {
+			return rocmSafetensorsSummary{}, core.NewError("safetensors tensor " + name + " is missing dtype")
+		}
+		if tensor.Shape == nil {
+			return rocmSafetensorsSummary{}, core.NewError("safetensors tensor " + name + " is missing shape")
+		}
+		dtypeBytes, ok := rocmSafetensorsDTypeBytes(tensor.DType)
+		if !ok {
+			return rocmSafetensorsSummary{}, core.NewError("safetensors tensor " + name + " has unsupported dtype " + tensor.DType)
 		}
 		summary.TensorCount++
 		if tensor.DType != "" && !dtypeSeen[tensor.DType] {
 			dtypeSeen[tensor.DType] = true
 			summary.DTypes = append(summary.DTypes, tensor.DType)
 		}
-		if len(tensor.DataOffsets) == 2 && tensor.DataOffsets[1] > summary.PayloadBytes {
+		if len(tensor.DataOffsets) != 2 {
+			return rocmSafetensorsSummary{}, core.NewError("safetensors tensor " + name + " has invalid data_offsets")
+		}
+		if tensor.DataOffsets[1] < tensor.DataOffsets[0] {
+			return rocmSafetensorsSummary{}, core.NewError("safetensors tensor " + name + " has reversed data_offsets")
+		}
+		if tensor.DataOffsets[1] > payloadBytes {
+			return rocmSafetensorsSummary{}, core.NewError(core.Sprintf("safetensors tensor %s data_offsets end %d exceeds payload bytes %d", name, tensor.DataOffsets[1], payloadBytes))
+		}
+		shapeBytes, err := rocmSafetensorsShapeBytes(tensor.Shape, dtypeBytes)
+		if err != nil {
+			return rocmSafetensorsSummary{}, core.NewError("safetensors tensor " + name + " " + err.Error())
+		}
+		span := tensor.DataOffsets[1] - tensor.DataOffsets[0]
+		if span != shapeBytes {
+			return rocmSafetensorsSummary{}, core.NewError(core.Sprintf("safetensors tensor %s byte span %d does not match shape bytes %d", name, span, shapeBytes))
+		}
+		for _, existing := range payloadRanges {
+			if tensor.DataOffsets[0] < existing.End && existing.Start < tensor.DataOffsets[1] {
+				return rocmSafetensorsSummary{}, core.NewError(core.Sprintf("safetensors tensor %s data_offsets overlaps tensor %s", name, existing.Name))
+			}
+		}
+		payloadRanges = append(payloadRanges, rocmSafetensorsPayloadRange{
+			Name:  name,
+			Start: tensor.DataOffsets[0],
+			End:   tensor.DataOffsets[1],
+		})
+		if tensor.DataOffsets[1] > summary.PayloadBytes {
 			summary.PayloadBytes = tensor.DataOffsets[1]
 		}
+	}
+	if summary.TensorCount == 0 {
+		return rocmSafetensorsSummary{}, core.NewError("safetensors header contains no tensor entries")
 	}
 	slices.Sort(summary.DTypes)
 	return summary, nil
 }
 
-func readROCmJANGConfig(root string) (*rocmJANGQuantizationInfo, error) {
-	read := core.ReadFile(core.PathJoin(root, "jang_config.json"))
-	if !read.OK {
-		if core.IsNotExist(read.Value.(error)) {
-			return nil, nil
+func rejectDuplicateROCmSafetensorsHeaderKeys(header []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(header))
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok || delim != '{' {
+		return core.NewError("safetensors header must be a JSON object")
+	}
+	seen := map[string]bool{}
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
 		}
-		return nil, read.Value.(error)
+		key, ok := token.(string)
+		if !ok {
+			return core.NewError("safetensors header key must be a string")
+		}
+		if seen[key] {
+			return core.NewError("safetensors header contains duplicate tensor key " + key)
+		}
+		seen[key] = true
+		if err := skipROCmJSONValue(decoder); err != nil {
+			return err
+		}
 	}
-	var probe rocmJANGConfigProbe
-	if result := core.JSONUnmarshal(read.Value.([]byte), &probe); !result.OK {
-		return nil, result.Value.(error)
+	token, err = decoder.Token()
+	if err != nil {
+		return err
 	}
-	return &rocmJANGQuantizationInfo{
-		Version:            probe.Version,
-		WeightFormat:       probe.WeightFormat,
-		Profile:            probe.Profile,
-		Method:             probe.Quantization.Method,
-		GroupSize:          probe.Quantization.GroupSize,
-		BitsDefault:        firstPositiveInt(probe.Quantization.BitsDefault, probe.MXTQBits.RoutedExpert, rocmJANGProfileBits(probe.Profile)),
-		AttentionBits:      probe.MXTQBits.Attention,
-		SharedExpertBits:   probe.MXTQBits.SharedExpert,
-		RoutedExpertBits:   probe.MXTQBits.RoutedExpert,
-		EmbedTokensBits:    probe.MXTQBits.EmbedTokens,
-		LMHeadBits:         probe.MXTQBits.LMHead,
-		SourceName:         probe.SourceModel.Name,
-		SourceOrg:          probe.SourceModel.Org,
-		SourceArchitecture: normalizeROCmArchitecture(probe.SourceModel.Architecture),
-		Capabilities:       probe.Capabilities,
-	}, nil
+	delim, ok = token.(json.Delim)
+	if !ok || delim != '}' {
+		return core.NewError("safetensors header object is not closed")
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		if err != nil {
+			return err
+		}
+		return core.NewError("safetensors header contains trailing JSON data")
+	}
+	return nil
+}
+
+func skipROCmJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		for decoder.More() {
+			if _, err := decoder.Token(); err != nil {
+				return err
+			}
+			if err := skipROCmJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		token, err = decoder.Token()
+		if err != nil {
+			return err
+		}
+		delim, ok = token.(json.Delim)
+		if !ok || delim != '}' {
+			return core.NewError("JSON object is not closed")
+		}
+	case '[':
+		for decoder.More() {
+			if err := skipROCmJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		token, err = decoder.Token()
+		if err != nil {
+			return err
+		}
+		delim, ok = token.(json.Delim)
+		if !ok || delim != ']' {
+			return core.NewError("JSON array is not closed")
+		}
+	default:
+		return core.NewError("unexpected JSON delimiter")
+	}
+	return nil
+}
+
+func rocmSafetensorsDTypeBytes(dtype string) (uint64, bool) {
+	upper := core.Upper(dtype)
+	switch upper {
+	case "BOOL", "I8", "U8":
+		return 1, true
+	case "F8_E4M3", "F8_E4M3FN", "F8_E4M3FNUZ", "F8_E5M2", "F8_E5M2FN", "F8_E5M2FNUZ":
+		return 1, true
+	case "I16", "U16", "F16", "BF16":
+		return 2, true
+	case "I32", "U32", "F32":
+		return 4, true
+	case "I64", "U64", "F64":
+		return 8, true
+	default:
+		return 0, false
+	}
+}
+
+func rocmSafetensorsShapeBytes(shape []uint64, dtypeBytes uint64) (uint64, error) {
+	elements := uint64(1)
+	for _, dimension := range shape {
+		if dimension != 0 && elements > (^uint64(0))/dimension {
+			return 0, core.NewError("shape element count overflows uint64")
+		}
+		elements *= dimension
+	}
+	if dtypeBytes != 0 && elements > (^uint64(0))/dtypeBytes {
+		return 0, core.NewError("shape byte count overflows uint64")
+	}
+	return elements * dtypeBytes, nil
+}
+
+func readROCmJANGConfig(root string) (*rocmJANGQuantizationInfo, error) {
+	return jang.ReadConfig(root)
 }
 
 func applyROCmJANGInspection(inspection *inference.ModelPackInspection, jang rocmJANGQuantizationInfo) {
 	model := inspection.Model
-	model.Architecture = firstNonEmptyString(model.Architecture, jang.SourceArchitecture)
+	model.Architecture = firstNonEmptyString(model.Architecture, normalizeROCmArchitecture(jang.SourceArchitecture))
 	model.QuantBits = firstPositiveInt(model.QuantBits, jang.BitsDefault)
 	model.QuantGroup = firstPositiveInt(model.QuantGroup, jang.GroupSize)
 	model.QuantType = firstNonEmptyString(model.QuantType, rocmJANGQuantizationType(jang))
@@ -455,41 +1151,21 @@ func applyROCmJANGInspection(inspection *inference.ModelPackInspection, jang roc
 	}
 	if jang.Capabilities.ReasoningParser != "" || jang.Capabilities.SupportsThinking {
 		inspection.Labels["reasoning_parser"] = firstNonEmptyString(jang.Capabilities.ReasoningParser, "native-family")
-		inspection.Capabilities = append(inspection.Capabilities, inference.PlannedCapability(inference.CapabilityReasoningParse, inference.CapabilityGroupModel, "JANG reasoning parser metadata is present; ROCm stream parser wiring is pending"))
+		inspection.Capabilities = append(inspection.Capabilities, inference.SupportedCapability(inference.CapabilityReasoningParse, inference.CapabilityGroupModel))
 	}
 	if jang.Capabilities.ToolParser != "" || jang.Capabilities.SupportsTools {
 		inspection.Labels["tool_parser"] = firstNonEmptyString(jang.Capabilities.ToolParser, "native-family")
-		inspection.Capabilities = append(inspection.Capabilities, inference.PlannedCapability(inference.CapabilityToolParse, inference.CapabilityGroupModel, "JANG tool parser metadata is present; ROCm stream parser wiring is pending"))
+		inspection.Capabilities = append(inspection.Capabilities, inference.SupportedCapability(inference.CapabilityToolParse, inference.CapabilityGroupModel))
 	}
 	if jang.Capabilities.CacheType != "" {
 		inspection.Labels["cache_type"] = jang.Capabilities.CacheType
 	}
-	inspection.Capabilities = append(inspection.Capabilities, inference.PlannedCapability(inference.CapabilityJANGTQ, inference.CapabilityGroupRuntime, "JANG/JANGTQ model-pack metadata is recognised; native ROCm packed kernels are pending"))
+	inspection.Capabilities = append(inspection.Capabilities, rocmMetadataOnlyCapability(inference.CapabilityJANGTQ, inference.CapabilityGroupRuntime, "JANG/JANGTQ model-pack metadata is recognised; native ROCm packed kernels are pending"))
 	inspection.Notes = append(inspection.Notes, "JANG/JANGTQ kernels are metadata-planned on ROCm")
 }
 
 func readROCmCodebookConfig(root string) (*rocmCodebookProfile, error) {
-	read := core.ReadFile(core.PathJoin(root, "codebook_config.json"))
-	if !read.OK {
-		if core.IsNotExist(read.Value.(error)) {
-			return nil, nil
-		}
-		return nil, read.Value.(error)
-	}
-	var profile rocmCodebookProfile
-	if result := core.JSONUnmarshal(read.Value.([]byte), &profile); !result.OK {
-		return nil, result.Value.(error)
-	}
-	if profile.Format == "" {
-		profile.Format = "vq"
-	}
-	if profile.Type == "" {
-		profile.Type = "codebook"
-	}
-	if profile.IndexBits == 0 {
-		profile.IndexBits = 8
-	}
-	return &profile, nil
+	return codebook.ReadProfile(root)
 }
 
 func applyROCmCodebookInspection(inspection *inference.ModelPackInspection, profile rocmCodebookProfile) {
@@ -509,35 +1185,60 @@ func applyROCmCodebookInspection(inspection *inference.ModelPackInspection, prof
 	if profile.IndexBits > 0 {
 		inspection.Labels["codebook_index_bits"] = core.Sprintf("%d", profile.IndexBits)
 	}
-	inspection.Capabilities = append(inspection.Capabilities, inference.PlannedCapability(inference.CapabilityCodebookVQ, inference.CapabilityGroupRuntime, "codebook/VQ model-pack metadata is recognised; native ROCm VQ kernels are pending"))
+	inspection.Capabilities = append(inspection.Capabilities, rocmMetadataOnlyCapability(inference.CapabilityCodebookVQ, inference.CapabilityGroupRuntime, "codebook/VQ model-pack metadata is recognised; native ROCm VQ kernels are pending"))
 	inspection.Notes = append(inspection.Notes, "codebook/VQ kernels are metadata-planned on ROCm")
 }
 
-func applyROCmArchitectureInspection(inspection *inference.ModelPackInspection) {
+func applyROCmArchitectureInspection(inspection *inference.ModelPackInspection, weightMetadataValid bool) {
+	architectureDetected := inspection.Model.Architecture != ""
 	architectureOK := supportedNativeArchitecture(inspection.Model.Architecture)
 	quantizationOK := supportedNativeQuantization(inspection.Model.QuantBits, inspection.Model.QuantType)
+	inspection.Labels["architecture_detected"] = core.Sprintf("%t", architectureDetected)
 	inspection.Labels["architecture_supported"] = core.Sprintf("%t", architectureOK)
 	inspection.Labels["quantization_supported"] = core.Sprintf("%t", quantizationOK)
-	inspection.Supported = inspection.Format != "missing" && architectureOK && quantizationOK
+	inspection.Supported = inspection.Format != "missing" && weightMetadataValid && architectureDetected && architectureOK && quantizationOK
 	if isROCmMoEArchitecture(inspection.Model.Architecture) || inspection.Labels["moe_experts"] != "" {
 		inspection.Capabilities = append(inspection.Capabilities,
-			inference.PlannedCapability(inference.CapabilityMoERouting, inference.CapabilityGroupModel, "MoE architecture metadata is recognised; native router kernels are pending"),
-			inference.PlannedCapability(inference.CapabilityMoELazyExperts, inference.CapabilityGroupRuntime, "MoE lazy expert residency is required for 16GB-class ROCm devices"),
+			rocmMetadataOnlyCapability(inference.CapabilityMoERouting, inference.CapabilityGroupModel, "MoE architecture metadata is recognised; native router kernels are pending"),
+			rocmMetadataOnlyCapability(inference.CapabilityMoELazyExperts, inference.CapabilityGroupRuntime, "MoE lazy expert residency is required for 16GB-class ROCm devices"),
 		)
 	}
 	if !architectureOK {
 		inspection.Notes = append(inspection.Notes, "architecture is not in the native ROCm allow-list yet")
+	}
+	if !architectureDetected {
+		inspection.Notes = append(inspection.Notes, "model architecture could not be detected from model-pack metadata")
 	}
 	if !quantizationOK {
 		inspection.Notes = append(inspection.Notes, "quantisation is not expected to fit the native ROCm path")
 	}
 }
 
+func appendROCmInspectionCapability(inspection *inference.ModelPackInspection, capability inference.Capability) {
+	for _, existing := range inspection.Capabilities {
+		if existing.ID == capability.ID {
+			return
+		}
+	}
+	inspection.Capabilities = append(inspection.Capabilities, capability)
+}
+
 func applyROCmMemoryFitInspection(ctx context.Context, backend *rocmBackend, inspection *inference.ModelPackInspection) {
 	if backend == nil || inspection == nil {
 		return
 	}
-	report, err := backend.PlanModelFit(ctx, inspection.Model, 0)
+	if !inspection.Supported {
+		inspection.Notes = append(inspection.Notes, "memory fit planning skipped because model pack is not supported")
+		return
+	}
+	model := inspection.Model
+	if weightBytes := rocmInspectionWeightBytes(inspection.Labels); weightBytes > 0 {
+		if model.Labels == nil {
+			model.Labels = map[string]string{}
+		}
+		model.Labels["weight_bytes"] = core.FormatUint(weightBytes, 10)
+	}
+	report, err := backend.PlanModelFit(ctx, model, 0)
 	if err != nil || report == nil {
 		if err != nil {
 			inspection.Notes = append(inspection.Notes, "memory fit planning failed: "+err.Error())
@@ -554,12 +1255,33 @@ func applyROCmMemoryFitInspection(ctx context.Context, backend *rocmBackend, ins
 	inspection.Notes = append(inspection.Notes, report.Notes...)
 }
 
+func rocmInspectionWeightBytes(labels map[string]string) uint64 {
+	for _, key := range []string{"weight_bytes", "safetensors_index_total_size", "safetensors_payload_bytes"} {
+		if value := rocmLabelUint(labels[key]); value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
 func rocmJANGQuantizationType(jang rocmJANGQuantizationInfo) string {
 	lower := core.Lower(core.Concat(jang.Profile, " ", jang.WeightFormat, " ", jang.Method))
 	if core.Contains(lower, "jangtq") || core.Contains(lower, "mxtq") {
 		return "jangtq"
 	}
 	return "jang"
+}
+
+func normalizeROCmQuantizationAlias(value string) string {
+	lower := core.Lower(value)
+	switch {
+	case core.Contains(lower, "jangtq"):
+		return "jangtq"
+	case core.Contains(lower, "mxtq"):
+		return "mxtq"
+	default:
+		return lower
+	}
 }
 
 func rocmJANGProfileBits(profile string) int {
@@ -580,9 +1302,100 @@ func rocmJANGProfileBits(profile string) int {
 	}
 }
 
+func rocmConfigHasEmbeddingTask(cfg rocmModelPackConfigProbe) bool {
+	if !core.Contains(core.Lower(core.Concat(cfg.ModelType, " ", core.Join(" ", cfg.Architectures...))), "bert") {
+		return false
+	}
+	return !rocmConfigHasRerankTask(cfg) && !rocmConfigHasClassifierTask(cfg)
+}
+
+func rocmConfigHasRerankTask(cfg rocmModelPackConfigProbe) bool {
+	haystack := core.Lower(core.Concat(cfg.ModelType, " ", core.Join(" ", cfg.Architectures...)))
+	if core.Contains(haystack, "rerank") {
+		return true
+	}
+	for key, values := range cfg.TaskSpecificParams {
+		if rocmTaskParamContains(key, values, "rerank") {
+			return true
+		}
+	}
+	return false
+}
+
+func rocmConfigHasClassifierTask(cfg rocmModelPackConfigProbe) bool {
+	haystack := core.Lower(core.Concat(cfg.ModelType, " ", core.Join(" ", cfg.Architectures...)))
+	if core.Contains(haystack, "sequenceclassification") || core.Contains(haystack, "sequence_classification") {
+		return true
+	}
+	for key, values := range cfg.TaskSpecificParams {
+		if rocmTaskParamContains(key, values, "classification", "classify") {
+			return true
+		}
+	}
+	return false
+}
+
+func rocmTaskParamContains(key string, value any, needles ...string) bool {
+	if rocmLowerContainsAny(core.Lower(key), needles...) {
+		return true
+	}
+	return rocmTaskParamValueContains(value, needles...)
+}
+
+func rocmTaskParamValueContains(value any, needles ...string) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, nested := range typed {
+			if rocmTaskParamContains(key, nested, needles...) {
+				return true
+			}
+		}
+	case []any:
+		for _, nested := range typed {
+			if rocmTaskParamValueContains(nested, needles...) {
+				return true
+			}
+		}
+	default:
+		return rocmLowerContainsAny(core.Lower(core.Sprintf("%v", typed)), needles...)
+	}
+	return false
+}
+
+func rocmLowerContainsAny(lower string, needles ...string) bool {
+	for _, needle := range needles {
+		if core.Contains(lower, needle) {
+			return true
+		}
+	}
+	return false
+}
+
 func firstPositiveInt(values ...int) int {
 	for _, value := range values {
 		if value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func firstPositiveFloat(values ...float64) float64 {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func formatROCmFloat(value float64) string {
+	return strconv.FormatFloat(value, 'g', -1, 64)
+}
+
+func firstNonZeroInt32(values ...int32) int32 {
+	for _, value := range values {
+		if value != 0 {
 			return value
 		}
 	}

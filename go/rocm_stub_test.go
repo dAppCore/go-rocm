@@ -4,8 +4,21 @@ package rocm
 
 import (
 	core "dappco.re/go"
+	"dappco.re/go/inference"
 	"testing"
 )
+
+func TestRocmStub_BackendRegistration_Good(t *testing.T) {
+	variant := "Good"
+	core.AssertNotEmpty(t, variant)
+	backend, ok := inference.Get("rocm")
+	core.AssertTrue(t, ok)
+	core.AssertFalse(t, backend.Available())
+	model, err := backend.LoadModel("model.gguf")
+	core.AssertError(t, err)
+	core.AssertNil(t, model)
+	core.AssertContains(t, err.Error(), "not available on this platform")
+}
 
 func TestRocmStub_ROCmAvailable_Good(t *testing.T) {
 	variant := "Good"

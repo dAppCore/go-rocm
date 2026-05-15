@@ -1,0 +1,21 @@
+coverage:
+  precision: 1
+  round: down
+  range: "80...95"
+  status:
+    project:
+      default:
+        target: 90%
+        threshold: 0%
+
+ignore:
+  # HIP implementation files are exercised by opt-in hardware and generated
+  # HSACO smoke shards. The large metadata/parser surfaces below are tested
+  # heavily with fixtures, but they dominate statement denominators with
+  # malformed-format edge branches. Keep the project status focused on the
+  # package contracts, request validation, wire handlers, scheduling,
+  # cache/state, and CPU-testable helpers.
+  - "go/hip_*.go"
+  - "go/internal/gguf/**"
+  - "go/model_pack.go"
+  - "go/embedding_model.go"

@@ -1,0 +1,659 @@
+// SPDX-Licence-Identifier: EUPL-1.2
+
+//go:build linux && amd64 && !rocm_legacy_server
+
+package rocm
+
+import (
+	"encoding/binary"
+	"math"
+	"testing"
+
+	core "dappco.re/go"
+)
+
+func TestKVCache_Good_FP16RoundTripsFakeBlocks(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeFP16, 2)
+	core.RequireNoError(t, err)
+	err = cache.Append(0, []float32{1, 0.5, -2, 4}, []float32{0, 2, 3, 0.25})
+	core.RequireNoError(t, err)
+
+	keys, values, err := cache.Restore(0, 4)
+
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{1, 0.5, -2, 4}, keys, 0)
+	assertFloat32SlicesNear(t, []float32{0, 2, 3, 0.25}, values, 0)
+}
+
+func TestKVCache_Good_Q8RoundTripsWithinTolerance(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeQ8, 4)
+	core.RequireNoError(t, err)
+	err = cache.Append(0, []float32{-1, -0.25, 0.5, 1}, []float32{0.75, -0.5, 0.25, -1})
+	core.RequireNoError(t, err)
+
+	keys, values, err := cache.Restore(0, 4)
+
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{-1, -0.25, 0.5, 1}, keys, 0.01)
+	assertFloat32SlicesNear(t, []float32{0.75, -0.5, 0.25, -1}, values, 0.01)
+}
+
+func TestKVCache_Good_KQ8VQ4UsesLessMemory(t *testing.T) {
+	keys := []float32{-1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1, 0.5, 0, -0.5, -1, -0.5, 0, 0.5}
+	values := []float32{1, 0.8, 0.6, 0.4, 0.2, 0, -0.2, -0.4, -0.6, -0.8, -1, -0.8, -0.6, -0.4, -0.2, 0}
+	q8, err := newROCmKVCache(rocmKVCacheModeQ8, 16)
+	core.RequireNoError(t, err)
+	compact, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 16)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, q8.Append(0, keys, values))
+	core.RequireNoError(t, compact.Append(0, keys, values))
+
+	restoredKeys, restoredValues, err := compact.Restore(0, len(keys))
+
+	core.RequireNoError(t, err)
+	if compact.MemoryBytes() >= q8.MemoryBytes() {
+		t.Fatalf("compact memory = %d, q8 memory = %d, want k-q8-v-q4 lower byte count", compact.MemoryBytes(), q8.MemoryBytes())
+	}
+	assertFloat32SlicesNear(t, keys, restoredKeys, 0.01)
+	assertFloat32SlicesNear(t, values, restoredValues, 0.15)
+}
+
+func TestKVCache_Good_PagedAppendAvoidsFullConcatenation(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeQ8, 2)
+	core.RequireNoError(t, err)
+
+	err = cache.Append(0, []float32{1, 2, 3, 4, 5}, []float32{5, 4, 3, 2, 1})
+
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 3, cache.PageCount())
+	for _, block := range cache.blocks {
+		if block.tokenCount > 2 {
+			t.Fatalf("block = %+v, want paged blocks no larger than configured block size", block)
+		}
+	}
+}
+
+func TestKVCache_Good_RestoresOutOfOrderNonOverlappingPages(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeFP16, 2)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.Append(2, []float32{3, 4}, []float32{7, 8}))
+	core.RequireNoError(t, cache.Append(0, []float32{1, 2}, []float32{5, 6}))
+
+	keys, values, err := cache.Restore(0, 4)
+
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{1, 2, 3, 4}, keys, 0)
+	assertFloat32SlicesNear(t, []float32{5, 6, 7, 8}, values, 0)
+	if cache.blocks[0].tokenStart != 0 || cache.blocks[1].tokenStart != 2 {
+		t.Fatalf("blocks = %+v, want deterministic token order", cache.blocks)
+	}
+}
+
+func TestKVCache_Good_RoundTripsPagedTokenVectors(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeFP16, 2)
+	core.RequireNoError(t, err)
+	err = cache.AppendVectors(
+		10,
+		2,
+		3,
+		[]float32{1, 0, 0.5, -0.5, -1, 1},
+		[]float32{1, 2, 3, 4, 5, 6, 7, 8, 9},
+	)
+	core.RequireNoError(t, err)
+
+	keys, values, err := cache.Restore(11, 2)
+
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 2, cache.PageCount())
+	core.AssertEqual(t, 13, cache.TokenCount())
+	assertFloat32SlicesNear(t, []float32{0.5, -0.5, -1, 1}, keys, 0)
+	assertFloat32SlicesNear(t, []float32{4, 5, 6, 7, 8, 9}, values, 0)
+}
+
+func TestKVCache_Good_AppendsSingleDecodeTokenVector(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeQ8, 2)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(0, 2, 2, []float32{1, 0, 0, 1}, []float32{2, 0, 0, 2}))
+
+	err = cache.AppendToken(cache.TokenCount(), []float32{-1, 1}, []float32{3, -3})
+
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 3, cache.TokenCount())
+	keys, values, err := cache.Restore(2, 1)
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{-1, 1}, keys, 0.01)
+	assertFloat32SlicesNear(t, []float32{3, -3}, values, 0.03)
+}
+
+func TestKVCache_Good_StatsHitRateRestoreTime(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeQ8, 2)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.Append(0, []float32{1, 2}, []float32{2, 1}))
+	_, _, err = cache.Restore(0, 2)
+	core.RequireNoError(t, err)
+	_, _, err = cache.Restore(4, 1)
+	core.AssertError(t, err)
+
+	stats := cache.Stats()
+
+	core.AssertEqual(t, 1, stats.Blocks)
+	core.AssertEqual(t, uint64(1), stats.Hits)
+	core.AssertEqual(t, uint64(1), stats.Misses)
+	assertFloat32Near(t, 0.5, float32(stats.HitRate))
+	if stats.RestoreMillis <= 0 {
+		t.Fatalf("restore millis = %f, want positive restore timing", stats.RestoreMillis)
+	}
+	core.AssertEqual(t, rocmKVCacheModeQ8, stats.CacheMode)
+	core.AssertEqual(t, "package_local", stats.Labels["kv_backing"])
+	core.AssertEqual(t, "planned", stats.Labels["kv_device_backing"])
+	core.AssertEqual(t, "2", stats.Labels["kv_block_size"])
+	core.AssertEqual(t, "1", stats.Labels["kv_key_width"])
+	core.AssertEqual(t, "1", stats.Labels["kv_value_width"])
+	core.AssertEqual(t, "1", stats.Labels["kv_pages"])
+	core.AssertEqual(t, "2", stats.Labels["kv_tokens"])
+}
+
+func TestKVCache_Good_SnapshotRoundTripsRuntimeOwnedPages(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 2)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(
+		0,
+		2,
+		3,
+		[]float32{1, 0.5, -1, 0},
+		[]float32{0.75, -0.5, 0.25, 1, -1, 0.5},
+	))
+
+	payload, err := cache.Snapshot()
+	core.RequireNoError(t, err)
+	restored, err := newROCmKVCacheFromSnapshot(payload)
+	core.RequireNoError(t, err)
+	keys, values, err := restored.Restore(0, 2)
+
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, rocmKVCacheModeKQ8VQ4, restored.Stats().CacheMode)
+	core.AssertEqual(t, 1, restored.PageCount())
+	core.AssertEqual(t, 2, restored.TokenCount())
+	assertFloat32SlicesNear(t, []float32{1, 0.5, -1, 0}, keys, 0.01)
+	assertFloat32SlicesNear(t, []float32{0.75, -0.5, 0.25, 1, -1, 0.5}, values, 0.15)
+}
+
+func TestKVCache_Good_CloneDoesNotAliasRuntimeOwnedPages(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeQ8, 2)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(0, 2, 2, []float32{1, 0, 0, 1}, []float32{2, 0, 0, 2}))
+
+	clone, err := cache.Clone()
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, clone.AppendToken(2, []float32{3, 4}, []float32{5, 6}))
+
+	core.AssertEqual(t, 2, cache.TokenCount())
+	core.AssertEqual(t, 3, clone.TokenCount())
+	core.AssertEqual(t, rocmKVCacheModeQ8, clone.Stats().CacheMode)
+	core.AssertEqual(t, "2", clone.Stats().Labels["kv_key_width"])
+	core.AssertEqual(t, "2", clone.Stats().Labels["kv_value_width"])
+}
+
+func TestKVCache_Good_MirrorsPagesToHIPDevice(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 2)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(
+		0,
+		2,
+		3,
+		[]float32{1, 0.5, -1, 0},
+		[]float32{0.75, -0.5, 0.25, 1, -1, 0.5},
+	))
+	driver := &fakeHIPDriver{available: true}
+
+	device, err := cache.MirrorToDevice(driver)
+	core.RequireNoError(t, err)
+	defer device.Close()
+
+	core.AssertEqual(t, rocmKVCacheModeKQ8VQ4, device.mode)
+	core.AssertEqual(t, 1, device.PageCount())
+	core.AssertEqual(t, 2, device.TokenCount())
+	core.AssertEqual(t, uint64(15), device.MemoryBytes())
+	core.AssertEqual(t, []uint64{8, 7}, driver.allocations)
+	core.AssertEqual(t, []uint64{8, 7}, driver.copies)
+	stats := device.Stats()
+	core.AssertEqual(t, 1, stats.Blocks)
+	core.AssertEqual(t, uint64(15), stats.MemoryBytes)
+	core.AssertEqual(t, rocmKVCacheModeKQ8VQ4, stats.CacheMode)
+	core.AssertEqual(t, "hip_device_mirror", stats.Labels["kv_backing"])
+	core.AssertEqual(t, "mirrored", stats.Labels["kv_device_backing"])
+	core.AssertEqual(t, "2", stats.Labels["kv_key_width"])
+	core.AssertEqual(t, "3", stats.Labels["kv_value_width"])
+	core.AssertEqual(t, "1", stats.Labels["kv_pages"])
+	core.AssertEqual(t, "2", stats.Labels["kv_tokens"])
+	descriptor, err := device.KernelDescriptor()
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, rocmKVCacheModeKQ8VQ4, descriptor.Mode)
+	core.AssertEqual(t, 2, descriptor.BlockSize)
+	core.AssertEqual(t, 2, descriptor.TokenCount)
+	core.AssertEqual(t, 1, len(descriptor.Pages))
+	core.AssertTrue(t, descriptor.Pages[0].KeyPointer != 0)
+	core.AssertTrue(t, descriptor.Pages[0].ValuePointer != 0)
+	core.AssertEqual(t, rocmKVEncodingQ8, descriptor.Pages[0].KeyEncoding)
+	core.AssertEqual(t, rocmKVEncodingQ4, descriptor.Pages[0].ValueEncoding)
+	core.AssertEqual(t, uint64(8), descriptor.Pages[0].KeyBytes)
+	core.AssertEqual(t, uint64(7), descriptor.Pages[0].ValueBytes)
+	descriptorBytes, err := device.KernelDescriptorBytes()
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, rocmDeviceKVDescriptorHeaderBytes+rocmDeviceKVDescriptorPageBytes, len(descriptorBytes))
+	core.AssertEqual(t, rocmDeviceKVDescriptorVersion, binary.LittleEndian.Uint32(descriptorBytes[0:]))
+	core.AssertEqual(t, uint32(rocmDeviceKVDescriptorHeaderBytes), binary.LittleEndian.Uint32(descriptorBytes[4:]))
+	core.AssertEqual(t, uint32(rocmDeviceKVDescriptorPageBytes), binary.LittleEndian.Uint32(descriptorBytes[8:]))
+	core.AssertEqual(t, rocmDeviceKVDescriptorModeKQ8VQ4, binary.LittleEndian.Uint32(descriptorBytes[12:]))
+	core.AssertEqual(t, uint32(1), binary.LittleEndian.Uint32(descriptorBytes[16:]))
+	core.AssertEqual(t, uint32(2), binary.LittleEndian.Uint32(descriptorBytes[20:]))
+	core.AssertEqual(t, uint64(2), binary.LittleEndian.Uint64(descriptorBytes[24:]))
+	pageBytes := descriptorBytes[rocmDeviceKVDescriptorHeaderBytes:]
+	core.AssertEqual(t, uint64(0), binary.LittleEndian.Uint64(pageBytes[0:]))
+	core.AssertEqual(t, uint64(2), binary.LittleEndian.Uint64(pageBytes[8:]))
+	core.AssertEqual(t, uint32(2), binary.LittleEndian.Uint32(pageBytes[16:]))
+	core.AssertEqual(t, uint32(3), binary.LittleEndian.Uint32(pageBytes[20:]))
+	core.AssertEqual(t, rocmDeviceKVDescriptorEncodingQ8, binary.LittleEndian.Uint32(pageBytes[24:]))
+	core.AssertEqual(t, rocmDeviceKVDescriptorEncodingQ4, binary.LittleEndian.Uint32(pageBytes[28:]))
+	core.AssertEqual(t, uint64(descriptor.Pages[0].KeyPointer), binary.LittleEndian.Uint64(pageBytes[32:]))
+	core.AssertEqual(t, uint64(descriptor.Pages[0].ValuePointer), binary.LittleEndian.Uint64(pageBytes[40:]))
+	core.AssertEqual(t, uint64(8), binary.LittleEndian.Uint64(pageBytes[48:]))
+	core.AssertEqual(t, uint64(7), binary.LittleEndian.Uint64(pageBytes[56:]))
+	table, err := device.KernelDescriptorTable()
+	core.RequireNoError(t, err)
+	core.AssertTrue(t, table.Pointer() != 0)
+	core.AssertEqual(t, uint64(len(descriptorBytes)), table.SizeBytes())
+	core.AssertEqual(t, rocmDeviceKVDescriptorVersion, table.version)
+	core.AssertEqual(t, 1, table.pageCount)
+	core.AssertEqual(t, []uint64{8, 7, uint64(len(descriptorBytes))}, driver.allocations)
+	core.AssertEqual(t, []uint64{8, 7, uint64(len(descriptorBytes))}, driver.copies)
+	core.RequireNoError(t, table.Close())
+	core.AssertEqual(t, nativeDevicePointer(0), table.Pointer())
+	core.AssertEqual(t, uint64(0), table.SizeBytes())
+	core.RequireNoError(t, table.Close())
+
+	core.RequireNoError(t, device.Close())
+	_, err = device.KernelDescriptor()
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "closed")
+	_, err = device.KernelDescriptorBytes()
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "closed")
+	core.RequireNoError(t, device.Close())
+	core.AssertEqual(t, 3, len(driver.frees))
+}
+
+func TestKVCache_Good_DeviceMirrorSnapshotsFromHIPMemory(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 2)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(
+		0,
+		2,
+		3,
+		[]float32{1, 0.5, -1, 0},
+		[]float32{0.75, -0.5, 0.25, 1, -1, 0.5},
+	))
+	device, err := cache.MirrorToDevice(&fakeHIPDriver{available: true})
+	core.RequireNoError(t, err)
+	defer device.Close()
+
+	payload, err := device.Snapshot()
+	core.RequireNoError(t, err)
+	restored, err := newROCmKVCacheFromSnapshot(payload)
+	core.RequireNoError(t, err)
+	keys, values, err := restored.Restore(0, 2)
+
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, rocmKVCacheModeKQ8VQ4, restored.Stats().CacheMode)
+	core.AssertEqual(t, 1, restored.PageCount())
+	core.AssertEqual(t, 2, restored.TokenCount())
+	assertFloat32SlicesNear(t, []float32{1, 0.5, -1, 0}, keys, 0.01)
+	assertFloat32SlicesNear(t, []float32{0.75, -0.5, 0.25, 1, -1, 0.5}, values, 0.15)
+}
+
+func TestKVCache_Good_DeviceMirrorAppendsDecodeTokenIncrementally(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeQ8, 2)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(0, 2, 2, []float32{1, 0, 0, 1}, []float32{2, 0, 0, 2}))
+	driver := &fakeHIPDriver{available: true}
+	device, err := cache.MirrorToDevice(driver)
+	core.RequireNoError(t, err)
+	sourcePageCount := device.PageCount()
+
+	next, err := device.withAppendedToken([]float32{-1, 1}, []float32{3, -3})
+	core.RequireNoError(t, err)
+	table, err := next.KernelDescriptorTable()
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, device.transferPagesTo(next))
+	core.RequireNoError(t, device.Close())
+	core.AssertEqual(t, true, device.closed)
+	core.AssertEqual(t, 3, next.TokenCount())
+	core.AssertEqual(t, 2, next.PageCount())
+	core.AssertEqual(t, uint64(rocmDeviceKVDescriptorHeaderBytes+2*rocmDeviceKVDescriptorPageBytes), table.SizeBytes())
+	core.AssertEqual(t, 2, table.pageCount)
+	core.AssertEqual(t, []uint64{8, 8, 6, 6, uint64(rocmDeviceKVDescriptorHeaderBytes + 2*rocmDeviceKVDescriptorPageBytes)}, driver.allocations)
+	core.AssertEqual(t, []uint64{8, 8, 6, 6, uint64(rocmDeviceKVDescriptorHeaderBytes + 2*rocmDeviceKVDescriptorPageBytes)}, driver.copies)
+	payload, err := next.Snapshot()
+	core.RequireNoError(t, err)
+	restored, err := newROCmKVCacheFromSnapshot(payload)
+	core.RequireNoError(t, err)
+	keys, values, err := restored.Restore(0, 3)
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{1, 0, 0, 1, -1, 1}, keys, 0.01)
+	assertFloat32SlicesNear(t, []float32{2, 0, 0, 2, 3, -3}, values, 0.03)
+	core.RequireNoError(t, table.Close())
+	core.RequireNoError(t, next.Close())
+	core.AssertEqual(t, 1, sourcePageCount)
+	core.AssertEqual(t, 5, len(driver.frees))
+}
+
+func TestKVCache_Bad_DeviceMirrorAppendRollbackOnDescriptorFailure(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeQ8, 2)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(0, 2, 2, []float32{1, 0, 0, 1}, []float32{2, 0, 0, 2}))
+	driver := &fakeHIPDriver{available: true}
+	device, table, err := hipMirrorTinyKV(driver, cache, map[string]string{})
+	core.RequireNoError(t, err)
+	defer device.Close()
+	defer table.Close()
+	driver.copyErr = core.NewError("descriptor copy failed")
+	driver.copyErrAt = len(driver.copies) + 3
+
+	next, nextTable, err := hipAppendDecodeDeviceKV(hipDecodeRequest{
+		KV:              cache,
+		DeviceKV:        device,
+		DescriptorTable: table,
+	}, []float32{-1, 1}, []float32{3, -3}, map[string]string{})
+
+	core.AssertNil(t, next)
+	core.AssertNil(t, nextTable)
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "copy descriptor table")
+	core.AssertEqual(t, 2, device.TokenCount())
+	core.AssertEqual(t, false, device.closed)
+	core.AssertEqual(t, false, table.closed)
+	core.AssertEqual(t, 3, len(driver.frees))
+	payload, err := device.Snapshot()
+	core.RequireNoError(t, err)
+	restored, err := newROCmKVCacheFromSnapshot(payload)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 2, restored.TokenCount())
+}
+
+func TestKVCache_Bad_DeviceMirrorAppendScratchCloseDoesNotFreeSourcePages(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeQ8, 2)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(0, 2, 2, []float32{1, 0, 0, 1}, []float32{2, 0, 0, 2}))
+	driver := &fakeHIPDriver{available: true}
+	device, err := cache.MirrorToDevice(driver)
+	core.RequireNoError(t, err)
+	defer device.Close()
+	next, err := device.withAppendedToken([]float32{-1, 1}, []float32{3, -3})
+	core.RequireNoError(t, err)
+
+	core.RequireNoError(t, next.Close())
+
+	core.AssertEqual(t, false, device.closed)
+	core.AssertEqual(t, 2, device.TokenCount())
+	core.AssertEqual(t, 2, len(driver.frees))
+	payload, err := device.Snapshot()
+	core.RequireNoError(t, err)
+	restored, err := newROCmKVCacheFromSnapshot(payload)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 2, restored.TokenCount())
+}
+
+func TestKVCache_Bad_RejectsInvalidModeRangeAndSnapshot(t *testing.T) {
+	cache, err := newROCmKVCache("not-a-mode", 0)
+	core.AssertNil(t, cache)
+	core.AssertError(t, err)
+
+	cache, err = newROCmKVCache(rocmKVCacheModeFP16, 2)
+	core.RequireNoError(t, err)
+	err = cache.Append(0, []float32{1}, []float32{})
+	core.AssertError(t, err)
+	err = cache.AppendVectors(0, 2, 1, []float32{1, 2, 3}, []float32{1})
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "vector widths")
+	_, _, err = cache.Restore(0, 1)
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "cache block range")
+
+	err = cache.Append(0, []float32{1, 2}, []float32{2, 1})
+	core.RequireNoError(t, err)
+	err = cache.Append(1, []float32{3, 4}, []float32{4, 3})
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "overlap")
+	core.AssertEqual(t, 2, cache.TokenCount())
+
+	err = cache.AppendToken(2, []float32{3, 4}, []float32{4, 3})
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "KV vector widths")
+	core.AssertEqual(t, 2, cache.TokenCount())
+
+	_, err = newROCmKVCacheFromSnapshot([]byte(`{"version":1,"mode":"q8","block_size":2,"blocks":[{"token_start":0,"token_count":2,"key":{"encoding":"q8","length":2,"scale":0,"q8":[1,2]},"value":{"encoding":"q8","length":2,"scale":1,"q8":[1,2]}}]}`))
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "q8 scale")
+
+	_, err = newROCmKVCacheFromSnapshot([]byte(`{"version":1,"mode":"fp16","block_size":2,"blocks":[{"token_start":0,"token_count":2,"key":{"encoding":"fp16","length":2,"f16":[15360,16384]},"value":{"encoding":"fp16","length":2,"f16":[15360,16384]}},{"token_start":1,"token_count":1,"key":{"encoding":"fp16","length":1,"f16":[16896]},"value":{"encoding":"fp16","length":1,"f16":[16896]}}]}`))
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "overlap")
+
+	_, err = newROCmKVCacheFromSnapshot([]byte(`{"version":1,"mode":"fp16","block_size":2,"blocks":[{"token_start":0,"token_count":1,"key_width":1,"value_width":1,"key":{"encoding":"fp16","length":1,"f16":[15360]},"value":{"encoding":"fp16","length":1,"f16":[15360]}},{"token_start":1,"token_count":1,"key_width":2,"value_width":1,"key":{"encoding":"fp16","length":2,"f16":[15360,16384]},"value":{"encoding":"fp16","length":1,"f16":[16896]}}]}`))
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "KV vector widths")
+}
+
+func TestKVCache_Bad_DeviceMirrorRollbackOnCopyFailure(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeQ8, 2)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.Append(0, []float32{1, 2}, []float32{3, 4}))
+	driver := &fakeHIPDriver{available: true, copyErr: core.NewError("copy failed"), copyErrAt: 2}
+
+	device, err := cache.MirrorToDevice(driver)
+
+	core.AssertNil(t, device)
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "copy KV value page")
+	core.AssertEqual(t, []uint64{6, 6}, driver.allocations)
+	core.AssertEqual(t, []uint64{6, 6}, driver.copies)
+	core.AssertEqual(t, 2, len(driver.frees))
+	core.AssertEqual(t, 2, cache.TokenCount())
+
+	device, err = cache.MirrorToDevice(nil)
+	core.AssertNil(t, device)
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "HIP driver is nil")
+}
+
+func TestKVCache_Bad_DeviceMirrorSnapshotRejectsClosedAndCopyFailure(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeQ8, 2)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.Append(0, []float32{1, 2}, []float32{3, 4}))
+	driver := &fakeHIPDriver{available: true}
+	device, err := cache.MirrorToDevice(driver)
+	core.RequireNoError(t, err)
+	driver.copyErr = core.NewError("device read failed")
+	driver.copyErrAt = len(driver.copies) + 1
+
+	payload, err := device.Snapshot()
+
+	core.AssertNil(t, payload)
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "copy KV key page")
+
+	driver.copyErr = nil
+	driver.copyErrAt = 0
+	core.RequireNoError(t, device.Close())
+	payload, err = device.Snapshot()
+	core.AssertNil(t, payload)
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "closed")
+}
+
+func TestKVCache_Bad_DeviceDescriptorTableRollbackOnCopyFailure(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeQ8, 2)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.Append(0, []float32{1, 2}, []float32{3, 4}))
+	driver := &fakeHIPDriver{available: true}
+	device, err := cache.MirrorToDevice(driver)
+	core.RequireNoError(t, err)
+	defer device.Close()
+	driver.copyErr = core.NewError("descriptor copy failed")
+	driver.copyErrAt = len(driver.copies) + 1
+
+	table, err := device.KernelDescriptorTable()
+
+	core.AssertNil(t, table)
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "copy descriptor table")
+	core.AssertEqual(t, []uint64{6, 6, uint64(rocmDeviceKVDescriptorHeaderBytes + rocmDeviceKVDescriptorPageBytes)}, driver.allocations)
+	core.AssertEqual(t, []uint64{6, 6, uint64(rocmDeviceKVDescriptorHeaderBytes + rocmDeviceKVDescriptorPageBytes)}, driver.copies)
+	core.AssertEqual(t, 1, len(driver.frees))
+
+	core.RequireNoError(t, device.Close())
+	_, err = device.KernelDescriptorTable()
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "closed")
+
+	noDriver := &rocmDeviceKVCache{mode: rocmKVCacheModeQ8, blockSize: 1}
+	table, err = noDriver.KernelDescriptorTable()
+	core.AssertNil(t, table)
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "HIP driver is nil")
+}
+
+func TestKVCache_Bad_DeviceDescriptorBytesRejectUnsupportedABIValues(t *testing.T) {
+	validPage := rocmDeviceKVPageDescriptor{
+		TokenStart:    0,
+		TokenCount:    1,
+		KeyWidth:      2,
+		ValueWidth:    2,
+		KeyPointer:    1,
+		ValuePointer:  2,
+		KeyBytes:      8,
+		ValueBytes:    8,
+		KeyEncoding:   rocmKVEncodingQ8,
+		ValueEncoding: rocmKVEncodingQ8,
+	}
+	_, err := (rocmDeviceKVDescriptor{
+		Mode:       "not-a-mode",
+		BlockSize:  1,
+		TokenCount: 1,
+		Pages:      []rocmDeviceKVPageDescriptor{validPage},
+	}).Binary()
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "unsupported cache mode")
+
+	badEncoding := validPage
+	badEncoding.ValueEncoding = "packed"
+	_, err = (rocmDeviceKVDescriptor{
+		Mode:       rocmKVCacheModeQ8,
+		BlockSize:  1,
+		TokenCount: 1,
+		Pages:      []rocmDeviceKVPageDescriptor{badEncoding},
+	}).Binary()
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "unsupported tensor encoding")
+
+	nilPointer := validPage
+	nilPointer.KeyPointer = 0
+	_, err = (rocmDeviceKVDescriptor{
+		Mode:       rocmKVCacheModeQ8,
+		BlockSize:  1,
+		TokenCount: 1,
+		Pages:      []rocmDeviceKVPageDescriptor{nilPointer},
+	}).Binary()
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "nil pointer")
+
+	_, err = (rocmDeviceKVDescriptor{
+		Mode:       rocmKVCacheModeQ8,
+		BlockSize:  -1,
+		TokenCount: 1,
+		Pages:      []rocmDeviceKVPageDescriptor{validPage},
+	}).Binary()
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "block size")
+
+	zeroWidth := validPage
+	zeroWidth.KeyWidth = 0
+	_, err = (rocmDeviceKVDescriptor{
+		Mode:       rocmKVCacheModeQ8,
+		BlockSize:  1,
+		TokenCount: 1,
+		Pages:      []rocmDeviceKVPageDescriptor{zeroWidth},
+	}).Binary()
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "key width")
+
+	outOfRange := validPage
+	outOfRange.TokenStart = 1
+	_, err = (rocmDeviceKVDescriptor{
+		Mode:       rocmKVCacheModeQ8,
+		BlockSize:  1,
+		TokenCount: 1,
+		Pages:      []rocmDeviceKVPageDescriptor{outOfRange},
+	}).Binary()
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "token range")
+
+	overlap := validPage
+	overlap.TokenStart = 0
+	_, err = (rocmDeviceKVDescriptor{
+		Mode:       rocmKVCacheModeQ8,
+		BlockSize:  1,
+		TokenCount: 2,
+		Pages:      []rocmDeviceKVPageDescriptor{validPage, overlap},
+	}).Binary()
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "non-overlap")
+
+	validLaunch := rocmDeviceKVLaunchDescriptor{
+		DescriptorPointer: 1,
+		DescriptorBytes:   uint64(rocmDeviceKVDescriptorHeaderBytes + rocmDeviceKVDescriptorPageBytes),
+		DescriptorVersion: rocmDeviceKVDescriptorVersion,
+		Mode:              rocmKVCacheModeQ8,
+		ModeCode:          rocmDeviceKVDescriptorModeQ8,
+		BlockSize:         2,
+		PageCount:         1,
+		TokenCount:        1,
+		KeyWidth:          2,
+		ValueWidth:        2,
+	}
+	badLaunch := validLaunch
+	badLaunch.DescriptorPointer = 0
+	_, err = badLaunch.Binary()
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "descriptor pointer")
+
+	badLaunch = validLaunch
+	badLaunch.ModeCode = 99
+	_, err = badLaunch.Binary()
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "mode code")
+
+	badLaunch = validLaunch
+	badLaunch.ModeCode = rocmDeviceKVDescriptorModeFP16
+	_, err = badLaunch.Binary()
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "mode code mismatch")
+
+	badLaunch = validLaunch
+	badLaunch.KeyWidth = 0
+	_, err = badLaunch.Binary()
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "key width")
+}
+
+func assertFloat32SlicesNear(t *testing.T, want, got []float32, tolerance float32) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("slice len = %d, want %d: %+v", len(got), len(want), got)
+	}
+	for i := range want {
+		if math.Abs(float64(want[i]-got[i])) > float64(tolerance) {
+			t.Fatalf("slice[%d] = %f, want %f within %f; got %+v", i, got[i], want[i], tolerance, got)
+		}
+	}
+}

@@ -29,9 +29,9 @@ Confirm `/dev/kfd` exists and is accessible to your user. Add yourself to the `r
 sudo usermod -aG render,video $USER
 ```
 
-### llama-server
+### llama-server Legacy Path
 
-llama-server must be built from llama.cpp with HIP/ROCm support. The package does not ship or download the binary.
+llama-server is only required for `-tags rocm_legacy_server`. The default native package path does not spawn a server.
 
 **Build steps** (from the homelab):
 
@@ -61,19 +61,11 @@ Alternatively, set `ROCM_LLAMA_SERVER_PATH` to the full binary path.
 
 ### Go
 
-Go 1.25.5 or later (as specified in `go.mod`). The module uses Go 1.22+ range-over-integer syntax and Go 1.23 `iter.Seq`.
+Go 1.26.x as specified in `go.work` and `go/go.mod`.
 
-### go-inference
+### Workspace
 
-go-rocm depends on `forge.lthn.ai/core/go-inference`. The `go.mod` replaces it with a local path (`../go-inference`). The go-inference directory must be present as a sibling of go-rocm:
-
-```
-Code/
-├── go-rocm/
-└── go-inference/
-```
-
-If checking out go-rocm independently: `go work sync` or adjust the `replace` directive.
+This repository uses the Core `go/` subtree layout. Root `go.work` links local submodules under `external/`, and the root module is a workspace gate for `go test ./...`: native cgo test runs delegate to the real `go/` module and shared `external/go-inference/go` contract tests, while static cross-builds compile the ROCm package through local replacements without trying to execute foreign test binaries. For tight iteration, run the same commands from `go/` or a specific submodule.
 
 ## Running Tests
 
@@ -82,43 +74,73 @@ If checking out go-rocm independently: `go work sync` or adjust the `replace` di
 The standard test invocation runs unit tests that do not touch GPU hardware:
 
 ```bash
-go test ./...
+go test ./... -count=1
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./... -count=1
+go test -tags rocm_legacy_server ./... -count=1
 ```
 
+When running directly inside `go/` from a Linux host and compiling the Darwin
+surface, add an execution shim so Go does not try to run a macOS test binary:
+
+```bash
+cd go
+GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go test -exec=/bin/true ./... -count=1
+```
+
+On non-Linux or non-amd64 platforms, the ROCm package registers an unavailable
+`rocm` backend with `go-inference`; `ROCmAvailable()` returns false and
+`LoadModel` returns a platform-unavailable error. The cross-build command above
+checks that stub surface compiles, but the final developer-Mac gate should still
+run on macOS so those stub tests and examples execute.
+
 This covers:
-- `server_test.go` — `findLlamaServer`, `freePort`, `serverEnv`, `server.alive()`, dead-server error handling, retry behaviour
-- `vram_test.go` — sysfs parsing logic
-- `discover_test.go` — model discovery
-- `internal/llamacpp/health_test.go` and `client_test.go` — HTTP client and SSE parser
+- native ROCm contract reporting
+- model-pack inspection for GGUF, safetensors, tokenizer sidecars, malformed-weight rejection, Gemma4 nested text-config/tied-embedding metadata, BERT embedding/rerank/classifier metadata hints, metadata-only MoE/JANGTQ/codebook capabilities (`runtime_status=metadata_only`) with fixture-kernel and pending production-integration labels, and architecture aliases
+- scheduler/cancellation wrapper behaviour
+- cache warm/stats/clear compatibility logic, optional metadata and portable KV snapshot disk refs, exact cold disk-ref rehydrate, disk-byte accounting, and best-effort HIP device remirroring for warmed/cold-restored portable KV snapshots
+- speculative and prompt-lookup decode package helpers over the shared `go-inference/decode` harness, including model stream error propagation
+- OpenAI service mux cache/cancel endpoint routing and cache-warm validation over ROCm wrappers
+- parser registry behaviour
+- benchmark warmup runs across all prompts, measured-run and measured latency/duration labels, shared active/peak memory fields plus memory labels, measured probe counts, cache-pressure and memory-pressure probe emission, cache-label mirroring for KV shape and optional disk refs, and active-adapter LoRA overhead labels
+- eval token-count metrics, batched experimental classification loss/perplexity from `target_token_id` plus logits when available, explicit native cross-entropy fixture capability labels and eval-result labels (`loss_kernel`, `loss_kernel_name`, `loss_scope`) even when loss is unsupported or not requested, compact classification logit/entropy probe events for `WithLogits`, unsupported/logits-unavailable loss labels otherwise, and qualitative probe results that record unavailable generation without failing the eval report
+- state wake/sleep/fork metadata lifecycle, metadata-only `StatefulModel` bundle capture/restore, package-local KV snapshot sleep/wake refs, HIP device-mirror snapshot refs, loaded-model best-effort wake/fork remirror with package-local fallback until production kernels own restore, and state-runtime close coverage when wake/restore/close replaces owned handles
+- package-local fp16/q8/k-q8-v-q4 KV cache page round trips, paging, byte counts, hit rate, restore timing, binary snapshot refs, constructibility of planner-selected cache modes through cache warm, and fake-driver HIP device mirror allocation/copy/free accounting plus incremental decoded-token page appends, device-to-host portable snapshots, fixed descriptor byte layout, descriptor-table copy/rollback, 64-byte KV launch descriptor validation, 64-byte prefill launch-packet encoding, and 96-byte decode launch-packet encoding
+- CPU reference MoE routing/lazy residency, residual summaries, JANGTQ/MXTQ packed projection, codebook lookup, embedding mean-pool, rerank cosine, and LoRA projection
+- HIP tensor validation/allocation/copy, typed prefill/decode/projection kernel seams carrying device KV mirrors plus descriptor tables, KV launch descriptors, prefill/decode launch packets, 96-byte projection and JANGTQ-projection launch packets, 64-byte codebook-lookup/embedding-mean-pool/rerank-cosine/RMSNorm/RoPE/greedy-sampler/MoE-router/MoE-lazy-expert launch packets, 96-byte attention launch packets, 128-byte LoRA-projection launch packets, 160-byte tiny-prefill/tiny-decode launch packets with fp32/fp16/q8 output-head encodings, native GGUF plus safetensors weight loading into HIP memory, including sharded packs, Gemma4-E2B-style tied U32 4-bit embedding validation, loaded tiny-model generation/classification through device-resident f32 embeddings and f32/f16/raw-q8/JANGTQ/codebook output heads, BERT-style f32 word-embedding-only model load with experimental mean-pool embedding, embedding-cosine rerank, f32/f16 sequence-classifier rerank scoring, and BERT classifier LoRA adapter application, experimental loaded tiny-model `rocm-tiny-lora` adapter application and Qwen/Gemma small LM-head adapter application through `rocm_lora_projection`, typed loaded Qwen/Gemma small decode smoke coverage that reads the request token embedding row from loaded device memory, appends package-local KV, and incrementally appends supplied device KV mirrors, token/projection/transformer device-buffer upload/rollback coverage, device-to-host copy coverage, optional fake-testable kernel launch config validation, fake prefill/decode packet and referenced-memory validation, fake projection/JANGTQ-projection/codebook-lookup/LoRA-projection/embedding-mean-pool/rerank-cosine/RMSNorm/RoPE/greedy/attention/MoE-router/MoE-lazy-expert/tiny-prefill/tiny-decode launch output readback, not-linked decode launch preflight for supplied device KV resources, projection rank/model-dimension/byte-size checks, token embedding lookup, single-head and multi-head attention, causal prefill attention, decode-with-KV, integrated tiny LM prefill/decode, composed Qwen/Gemma small decode smoke coverage using fixture and loaded device-resident weights, fp16/q8/f32 projection, JANGTQ/MXTQ packed projection and codebook lookup including loaded tiny output-head logits, LoRA projection, RMSNorm, RoPE, MoE top-k routing and lazy expert residency bitmaps, greedy and top-k/temperature sampler references, logit, entropy, selected-head, and layer-coherence probe summaries, prompt-lookup draft, speculative-accept, embedding mean-pool, rerank cosine, cross-entropy/perplexity, distillation KL, and GRPO advantage reference fixtures, kernel status labels, and kernel-not-linked errors
+- planned training capability labels for `lora.training`, `distillation`, and `grpo`, including `runtime_status=planned`, `training_kernel=not_linked`, `training_interface=not_implemented`, exact `required_kernel` values (`lora_backward`, `distillation_forward_loss`, and `grpo_rollout_policy`), explicit `distillation_kernel`/`grpo_kernel`-aware toy fixture labels for distillation KL and GRPO advantage normalization, and package-local loaded-model hooks for those toy fixtures without shared training-interface support
+- fake HIP driver nil/unavailable/malloc/free failure handling
+- import-boundary enforcement against concrete workflow/runtime package imports, including skip-safe scans of local `go-ai`, `go-ml`, and `go-inference` checkouts when present
 - `internal/gguf/gguf_test.go` — GGUF binary parser
 
-Some unit tests in `server_test.go` have the `//go:build linux && amd64` constraint and will only run on Linux. They do not require a GPU but do require llama-server to be present in PATH.
+Legacy server tests are covered by `go test -tags rocm_legacy_server ./... -count=1` and do not require hardware.
 
 ### Integration Tests (GPU required)
 
-Integration tests are gated behind the `rocm` build tag:
+Hardware tests are opt-in through environment variables:
 
 ```bash
-go test -tags rocm -v -run TestROCm ./...
+GO_ROCM_RUN_HIP_TESTS=1 go test ./go -run 'TestHIP|TestNative' -count=1
+GO_ROCM_RUN_MODEL_TESTS=1 go test ./go -run 'Test.*Smoke|Test.*Generate|Test.*Decode' -count=1
+GO_ROCM_RUN_CACHE_TESTS=1 go test ./go -run 'Test.*KV|Test.*Cache' -count=1
 ```
 
-These tests require:
-- `/dev/kfd` present
-- `llama-server` in PATH or `ROCM_LLAMA_SERVER_PATH` set
-- The test model at `/data/lem/gguf/LEK-Gemma3-1B-layered-v2-Q5_K_M.gguf` (SMB mount from M3)
+Hardware tests must skip with a clear message when the environment variable is not set. Model smoke tests also require `GO_ROCM_MODEL_PATH` to point at a local GGUF or safetensors model pack; the Gemma4-E2B smokes use `/data/lem/models/gemma4/LEM-Gemma4-E2B` for the BF16 correctness anchor and `/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit` for the faster MLX-q4 loop when present. The cache smoke mirrors a toy package-local KV cache into HIP allocations and verifies device-mirror stats, descriptor fields, descriptor-table allocation, token-buffer prefill launch packets, and projection launch packets; production decode kernels still cannot consume those pages. Until production kernels are linked, generic generation returns `native decode kernels are not linked yet` and capability reports set `kernel_status=not_linked`, while the loaded Gemma4 MLX-q4 path exposes experimental package-local Generate/Chat/BatchGenerate/Classify/Benchmark/Eval plus speculative and prompt-lookup helper smokes with production decode/prefill/KV labels still `not_linked`. Gemma4 text-only metadata follows the current `go-mlx` dev alias convention: `gemma4_text`, `Gemma4ForCausalLM`, and `Gemma4TextForCausalLM` inspect as text-model packs while conditional-generation Gemma4 packs remain `gemma4`; both aliases reach the experimental q4 text route.
 
-Each test calls `skipIfNoROCm(t)` and `skipIfNoModel(t)` so they skip cleanly when hardware or the model mount is unavailable.
+The current live q4 smoke for the RX 7800 XT pins the real discrete card by UUID because device 0 may otherwise resolve to the onboard GPU:
 
-**Available integration tests:**
+```bash
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 \
+  GO_ROCM_RUN_MODEL_TESTS=1 \
+  GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit \
+  GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco \
+  GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE=1 \
+  GO_ROCM_GEMMA4_Q4_GENERATE_PROMPT='text:Hi' \
+  go test ./go -run 'TestNative(DecodeSmokeKernelStatus|ModelPackSmokeGemma4E2B)_Good' -count=1 -v
+```
 
-| Test | What it verifies |
-|------|-----------------|
-| `TestROCm_LoadAndGenerate` | Full load + Generate, checks architecture from GGUF metadata |
-| `TestROCm_Chat` | Multi-turn Chat with chat template applied by llama-server |
-| `TestROCm_ContextCancellation` | Context cancel stops iteration mid-stream |
-| `TestROCm_GracefulShutdown` | Server survives context cancel; second Generate succeeds |
-| `TestROCm_ConcurrentRequests` | Three goroutines calling Generate simultaneously |
-| `TestROCm_DiscoverModels` | DiscoverModels returns non-empty result for model directory |
+On 2026-05-13 this passed with q4 package `Prefill`/`Decode` output and public q4 `Generate` for BOS-aware prompt tokens `[2 10979]`, generated tokens `[236764 3307]`, and decoded text `["," "my"]` over `/tmp/go-rocm-kernels-gfx1100.hsaco`. The BF16 correctness anchor also passed `TestNativeDecodeSmokeKernelStatus_Good` on the same pinned RX 7800 XT against `/data/lem/models/gemma4/LEM-Gemma4-E2B`, reaching the layer-0 tied LM-head greedy check.
+
+The optional native launcher expects a precompiled HSACO path in `GO_ROCM_KERNEL_HSACO`. Kernels are looked up by the internal names `rocm_prefill`, `rocm_decode`, `rocm_projection`, `rocm_jangtq_projection`, `rocm_codebook_lookup`, `rocm_lora_projection`, `rocm_embedding_mean_pool`, `rocm_rerank_cosine`, `rocm_rms_norm`, `rocm_rope`, `rocm_greedy_sample`, `rocm_attention`, `rocm_moe_router`, `rocm_moe_lazy_experts`, `rocm_tiny_prefill`, `rocm_tiny_decode`, `rocm_cross_entropy_loss`, `rocm_distillation_kl_loss`, and `rocm_grpo_advantage`, and receive one device pointer to the fixed little-endian launch packet. The first source artifact is `kernels/rocm_kernels.hip`; build it with `hipcc --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o build/rocm_kernels_gfx1100.hsaco`. If the variable is unset or the module lacks a compatible symbol, launch attempts fail before any fallback path is used. When the variable is set, loaded HIP models select a projection/embedding/rerank/LoRA-linked kernel set for package-local projection requests; tiny vocab-major f32 loaded models with f32/f16/raw-q8/JANGTQ/codebook output heads can run toy prefill/decode/generate through the compiled tiny kernels plus packed/codebook output logits through `rocm_jangtq_projection`, `rocm_codebook_lookup`, and `rocm_projection`, experimental model-level embedding mean-pool/rerank calls, and experimental `rocm-tiny-lora` output-head adapter application through `rocm_lora_projection`; BERT sequence-classification packs can run classifier-head rerank plus experimental classifier LoRA adapters through the same LoRA projection kernel; fixture-scale Qwen/Gemma loaded models can run typed `DecodeToken` by reading a loaded f32 token embedding row, composing the first-layer primitive kernels, appending package-local KV, incrementally appending supplied device KV mirrors, and applying an experimental LM-head LoRA adapter through `rocm_lora_projection`; and loaded HIP models can run package-local toy cross-entropy, distillation KL, and GRPO advantage fixtures through the compiled loss kernels. Capability, benchmark, and eval quality-probe labels for linked tiny generation/decode helpers include `kernel_scope=toy_tiny_fixture` plus `production_decode=not_linked` and `production_prefill=not_linked`; embedding/rerank capability labels include loaded fixture scopes plus `production_embedding_models=not_linked` and `production_rerank_models=not_linked`; LoRA capability labels include `kernel_scope=loaded_adapter_fixtures`, `supported_adapter_scopes=tiny_output_head,qwen_gemma_small_lm_head,bert_sequence_classifier`, and `production_adapter_application=not_linked`; future production decode/prefill labels use `rocm_decode`/`rocm_prefill`. Full production model-family decode/prefill generation and shared training interfaces still report not-linked status; the loaded Gemma4 MLX-q4 route is an experimental package-local exception for development smoke coverage and labels its production decode/prefill/KV backing as not linked. `GO_ROCM_RUN_HIP_TESTS=1 GO_ROCM_KERNEL_HSACO=... go test ./go -run 'TestHIPHardware.*KernelSource' -count=1 -v` verifies direct and loaded-model fp16/q8 projection launch, direct JANGTQ/MXTQ packed projection launch, direct codebook lookup launch, direct LoRA projection launch, direct embedding mean-pool and rerank cosine launch, direct RMSNorm/RoPE/greedy/attention/MoE-router/MoE-lazy-expert primitive launch, direct cross-entropy/distillation/GRPO loss fixture launch, composed Qwen3 small decode smokes through those primitives using fixture and loaded device-resident weights, typed loaded-model Qwen3 small `DecodeToken` from a device embedding row with fp16 package-local KV plus q8/k-q8-v-q4 package-local and incrementally appended device-KV paths, direct toy tiny-prefill logits/attention/KV/greedy readback, direct toy tiny-decode updated-KV/logits/attention/greedy readback using prefill-written KV, loaded tiny-model generation from device-resident tensors including raw q8 and codebook output heads, fp16/q8 tiny output-head variants, and prefill/decode packet-consumer launches on hardware for fp16, q8, and k-q8-v-q4 cache modes, including device-written status markers from reserved launch-packet fields. `GO_ROCM_RUN_CACHE_TESTS=1 go test ./go -run TestHIPHardwareKVCacheSmoke_Good -count=1 -v` also verifies block-cache warm remirroring into HIP device pages before the lower-level descriptor and launch-packet smoke checks.
 
 ### Benchmarks (GPU required)
 
@@ -168,6 +190,7 @@ Concurrent throughput (4 parallel slots, 4 goroutines, 32 tokens each):
 |----------|---------|---------|
 | `ROCM_LLAMA_SERVER_PATH` | PATH lookup | Explicit path to llama-server binary |
 | `HIP_VISIBLE_DEVICES` | overridden to `0` | go-rocm always sets this to 0 when spawning llama-server |
+| `ROCR_VISIBLE_DEVICES` | process default | Native HIP hardware smokes can pin the real dGPU by UUID, e.g. `GPU-880ed6479d653a85` for the RX 7800 XT when the onboard GPU is also visible |
 | `HSA_OVERRIDE_GFX_VERSION` | unset | Not required; GPU is native gfx1100 |
 | `ROCM_MODEL_DIR` | none | Conventional directory for model files (not read by go-rocm itself) |
 

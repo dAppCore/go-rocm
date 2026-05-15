@@ -86,7 +86,7 @@ Current capability stance:
 - Generate/chat/classify/batch: planned until kernels are linked.
 - Scheduler/cancel/cache/parsers/state: planned until wrapper/cache/state code
   is implemented.
-- JANGTQ/codebook/MoE: metadata recognised, native kernels pending.
+- JANGTQ/codebook/MoE: metadata recognised; toy JANGTQ/codebook launch fixtures and loaded tiny output-head paths exist; production native integration pending.
 
 ## 5. Target Capability Matrix
 
@@ -112,9 +112,9 @@ Current capability stance:
 | `kv.snapshot` | backend-owned KV snapshot | planned | experimental after KV ownership |
 | `prompt.cache` | cache service plus state refs | planned | experimental after KV ownership |
 | `probe.events` | `inference.ProbeableModel` | experimental stream/scheduler/cache events | supported with kernel probes |
-| `benchmark` | `inference.BenchableModel` | experimental fake/native-error fields | supported with real timings |
+| `benchmark` | `inference.BenchableModel` | experimental measured run, latency, cache, and probe fields | supported with real timings |
 | `evaluation` | `inference.Evaluator` | experimental token counts | supported with loss/perplexity |
-| `lora.inference` | `inference.AdapterModel` | planned | experimental after tensor overlays |
+| `lora.inference` | `inference.AdapterModel` | planned except tiny, Qwen/Gemma small LM-head, and BERT classifier fixtures | experimental after production tensor overlays |
 | `lora.training` | training contracts | planned | planned until forward/backward kernels exist |
 | `distillation` | training contracts | planned | planned until logits/teacher path exists |
 | `grpo` | training contracts | planned | planned until rollout generation exists |
@@ -125,7 +125,7 @@ Current capability stance:
 | `moe.routing` | model-pack/runtime probes | metadata-only experimental | experimental with router kernel |
 | `moe.lazy_experts` | memory planner plus runtime residency | metadata-only experimental | experimental with expert page-in |
 | `jangtq` | metadata plus packed kernels | metadata-only experimental | experimental with MXTQ dequant/projection |
-| `codebook.vq` | metadata plus VQ kernels | metadata-only experimental | experimental with codebook lookup |
+| `codebook.vq` | metadata plus VQ kernels | metadata-only experimental | experimental with codebook lookup and tiny output-head smoke |
 | `responses.api` | `go-inference/openai` | supported when handlers mount | supported |
 | `anthropic.messages` | `go-inference/anthropic` | supported when handlers mount | supported |
 | `ollama.compat` | `go-inference/ollama` | supported when handlers mount | supported |
@@ -410,8 +410,10 @@ Write tests in `go/model_pack_test.go` or extend `go/native_contract_test.go`:
   that shape.
 - BERT-like config reports embeddings capability.
 - Reranker-like config reports rerank capability.
-- Malformed safetensors header fails with a bounded error before reading a huge
-  payload.
+- Malformed GGUF/safetensors weight metadata fails bounded inspection and keeps
+  the model pack out of the supported set even when sidecars parse.
+- Safetensors packs require detected architecture metadata before they report
+  `Supported=true`.
 
 Implementation:
 
@@ -536,6 +538,7 @@ Write tests:
 - JANGTQ/MXTQ descriptor validation rejects invalid bit layouts.
 - Packed dequant/projection matches CPU reference for a tiny tensor.
 - Codebook lookup matches CPU reference for a tiny tensor.
+- Loaded tiny JANGTQ/codebook output-head logits match the f32 toy fixture.
 
 Implementation:
 
