@@ -120,6 +120,8 @@ type hipGemma4Q4ForwardRequest struct {
 	SuppressTokens     []int32
 	AttentionWorkspace *hipAttentionHeadsChunkedWorkspace
 	OmitDebugTensors   bool
+	OmitLabels         bool
+	OmitHostState      bool
 }
 
 type hipGemma4Q4LayerKVState struct {
@@ -579,7 +581,10 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 	if !req.OmitDebugTensors {
 		layerResults = make([]hipGemma4Q4DecoderLayerResult, 0, len(cfg.Layers))
 	}
-	nextState := hipGemma4Q4DecodeState{Layers: make([]hipGemma4Q4LayerKVState, len(cfg.Layers))}
+	nextState := hipGemma4Q4DecodeState{}
+	if !req.OmitHostState {
+		nextState.Layers = make([]hipGemma4Q4LayerKVState, len(cfg.Layers))
+	}
 	var nextDeviceState *hipGemma4Q4DeviceDecodeState
 	if req.ReturnDeviceState {
 		mode := firstNonEmptyString(req.DeviceKVMode, rocmKVCacheModeFP16)
@@ -605,8 +610,9 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 			_ = precomputedLayerInputBuffer.Close()
 		}
 	}()
-	hostKVRequiredByLayer := make([]bool, len(cfg.Layers))
+	var hostKVRequiredByLayer []bool
 	if !useDeviceSharedKV {
+		hostKVRequiredByLayer = make([]bool, len(cfg.Layers))
 		for index, source := range sharedSources {
 			if source != index && source >= 0 && source < len(hostKVRequiredByLayer) {
 				hostKVRequiredByLayer[source] = true
@@ -636,7 +642,7 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 			AttentionWorkspace:   req.AttentionWorkspace,
 			OmitDebugTensors:     req.OmitDebugTensors,
 			ReturnDeviceHidden:   req.OmitDebugTensors,
-			OmitHostKV:           req.DeviceKVAttention && req.ReturnDeviceState && req.OmitDebugTensors && !hostKVRequiredByLayer[index],
+			OmitHostKV:           req.DeviceKVAttention && req.ReturnDeviceState && req.OmitDebugTensors && (len(hostKVRequiredByLayer) == 0 || !hostKVRequiredByLayer[index]),
 		}
 		if precomputedLayerInputBuffer != nil {
 			layerReq.LayerInputDevice = precomputedLayerInputBuffer
@@ -713,7 +719,9 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 		if !req.OmitDebugTensors {
 			layerResults = append(layerResults, layer)
 		}
-		nextState.Layers[index] = hipGemma4Q4LayerKVState{Keys: layer.UpdatedKeys, Values: layer.UpdatedValues}
+		if !req.OmitHostState {
+			nextState.Layers[index] = hipGemma4Q4LayerKVState{Keys: layer.UpdatedKeys, Values: layer.UpdatedValues}
+		}
 		if hiddenBuffer != nil {
 			_ = hiddenBuffer.Close()
 			hiddenBuffer = nil
@@ -778,35 +786,40 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
 		}
 	}
-	labels := hipGemma4Q4ForwardLabels(cfg, req)
-	if req.DeviceFinalSample {
-		labels["gemma4_q4_final_sample"] = "device_q4_projection_softcap_greedy"
-	}
-	if req.SkipFinalSample {
-		labels["gemma4_q4_final_sample"] = "skipped"
-	}
-	if req.OmitDebugTensors {
-		labels["gemma4_q4_debug_tensors"] = "omitted"
-	}
-	if req.DeviceKVAttention {
-		labels["attention_kv_append_layers"] = core.Sprintf("%d", deviceAppendLayers)
-		labels["attention_kv_remirror_layers"] = core.Sprintf("%d", deviceRemirrorLayers)
-		labels["attention_kv_shared_device_layers"] = core.Sprintf("%d", deviceSharedLayers)
-	}
-	if cfg.KVSharedLayers > 0 {
-		labels["gemma4_q4_kv_shared_layers"] = core.Sprintf("%d", cfg.KVSharedLayers)
-		labels["gemma4_q4_kv_shared_runtime_layers"] = core.Sprintf("%d", sharedKVLayers)
-	}
 	if nextDeviceState != nil {
 		nextDeviceState.appendLayers = deviceAppendLayers
 		nextDeviceState.remirrorLayers = deviceRemirrorLayers
 		if err := hipFinalizeGemma4Q4ForwardDeviceState(req.PriorDeviceState, nextDeviceState); err != nil {
 			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
 		}
-		labels["gemma4_q4_forward_device_state"] = "returned"
-		labels["gemma4_q4_device_kv_append_layers"] = core.Sprintf("%d", deviceAppendLayers)
-		labels["gemma4_q4_device_kv_remirror_layers"] = core.Sprintf("%d", deviceRemirrorLayers)
-		labels["gemma4_q4_device_kv_shared_layers"] = core.Sprintf("%d", deviceSharedLayers)
+	}
+	var labels map[string]string
+	if !req.OmitLabels {
+		labels = hipGemma4Q4ForwardLabels(cfg, req)
+		if req.DeviceFinalSample {
+			labels["gemma4_q4_final_sample"] = "device_q4_projection_softcap_greedy"
+		}
+		if req.SkipFinalSample {
+			labels["gemma4_q4_final_sample"] = "skipped"
+		}
+		if req.OmitDebugTensors {
+			labels["gemma4_q4_debug_tensors"] = "omitted"
+		}
+		if req.DeviceKVAttention {
+			labels["attention_kv_append_layers"] = core.Sprintf("%d", deviceAppendLayers)
+			labels["attention_kv_remirror_layers"] = core.Sprintf("%d", deviceRemirrorLayers)
+			labels["attention_kv_shared_device_layers"] = core.Sprintf("%d", deviceSharedLayers)
+		}
+		if cfg.KVSharedLayers > 0 {
+			labels["gemma4_q4_kv_shared_layers"] = core.Sprintf("%d", cfg.KVSharedLayers)
+			labels["gemma4_q4_kv_shared_runtime_layers"] = core.Sprintf("%d", sharedKVLayers)
+		}
+		if nextDeviceState != nil {
+			labels["gemma4_q4_forward_device_state"] = "returned"
+			labels["gemma4_q4_device_kv_append_layers"] = core.Sprintf("%d", deviceAppendLayers)
+			labels["gemma4_q4_device_kv_remirror_layers"] = core.Sprintf("%d", deviceRemirrorLayers)
+			labels["gemma4_q4_device_kv_shared_layers"] = core.Sprintf("%d", deviceSharedLayers)
+		}
 	}
 	success = true
 	result := hipGemma4Q4ForwardResult{
@@ -1270,11 +1283,19 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 		}
 	}
 
-	attentionOutputBuffer, err := hipAllocateByteBuffer(driver, hipGemma4Q4Layer0Operation, "Gemma4 q4 attention concat output", uint64(cfg.QueryHeads*cfg.HeadDim*4), cfg.QueryHeads*cfg.HeadDim)
-	if err != nil {
-		return hipGemma4Q4DecoderLayerResult{}, err
+	var attentionOutputBuffer *hipDeviceByteBuffer
+	if req.AttentionWorkspace != nil && req.OmitDebugTensors {
+		attentionOutputBuffer, err = req.AttentionWorkspace.EnsureAttentionOutput(driver, cfg.QueryHeads, cfg.HeadDim)
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+	} else {
+		attentionOutputBuffer, err = hipAllocateByteBuffer(driver, hipGemma4Q4Layer0Operation, "Gemma4 q4 attention concat output", uint64(cfg.QueryHeads*cfg.HeadDim*4), cfg.QueryHeads*cfg.HeadDim)
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+		defer attentionOutputBuffer.Close()
 	}
-	defer attentionOutputBuffer.Close()
 	if ropeQueryBuffer == nil {
 		ropeQueryConcat := make([]float32, 0, cfg.QueryHeads*cfg.HeadDim)
 		for _, ropeQuery := range ropeQueries {

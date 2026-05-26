@@ -1942,10 +1942,11 @@ func hipRunAttentionHeadsBatchCausalOutputFromDeviceQueryToDeviceKernel(ctx cont
 }
 
 type hipAttentionHeadsChunkedWorkspace struct {
-	Partial    *hipDeviceByteBuffer
-	Stats      *hipDeviceByteBuffer
-	partialCap int
-	statsCap   int
+	Partial          *hipDeviceByteBuffer
+	Stats            *hipDeviceByteBuffer
+	AttentionOutputs map[int]*hipDeviceByteBuffer
+	partialCap       int
+	statsCap         int
 }
 
 func (workspace *hipAttentionHeadsChunkedWorkspace) Ensure(driver nativeHIPDriver, headCount, dim, tokenCount, chunkSize int) error {
@@ -1983,6 +1984,31 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) Ensure(driver nativeHIPDrive
 	return nil
 }
 
+func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureAttentionOutput(driver nativeHIPDriver, headCount, dim int) (*hipDeviceByteBuffer, error) {
+	if workspace == nil {
+		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "attention workspace is required", nil)
+	}
+	if headCount <= 0 || dim <= 0 {
+		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "attention output dimensions must be positive", nil)
+	}
+	count := headCount * dim
+	if workspace.AttentionOutputs == nil {
+		workspace.AttentionOutputs = make(map[int]*hipDeviceByteBuffer, 2)
+	}
+	if output := workspace.AttentionOutputs[count]; output != nil && output.Pointer() != 0 && output.Count() == count && output.SizeBytes() == uint64(count*4) {
+		return output, nil
+	}
+	if err := workspace.AttentionOutputs[count].Close(); err != nil {
+		return nil, err
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.AttentionHeadsChunkedLaunch", "attention concat output", uint64(count*4), count)
+	if err != nil {
+		return nil, err
+	}
+	workspace.AttentionOutputs[count] = output
+	return output, nil
+}
+
 func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 	if workspace == nil {
 		return nil
@@ -1994,6 +2020,12 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 	if err := workspace.Stats.Close(); err != nil {
 		lastErr = err
 	}
+	for _, output := range workspace.AttentionOutputs {
+		if err := output.Close(); err != nil {
+			lastErr = err
+		}
+	}
+	workspace.AttentionOutputs = nil
 	return lastErr
 }
 
@@ -2067,13 +2099,16 @@ func hipRunAttentionHeadsChunked(ctx context.Context, driver nativeHIPDriver, re
 	if err != nil {
 		return err
 	}
-	stage2LaunchBytes := append([]byte(nil), launchBytes...)
+	stage2LaunchBytes := hipBorrowLaunchPacket(len(launchBytes))
+	copy(stage2LaunchBytes, launchBytes)
 	sharedMemBytes, err := hipAttentionHeadsChunkedSharedMemBytes(chunkSize, dim)
 	if err != nil {
+		hipReleaseLaunchPacket(stage2LaunchBytes)
 		return err
 	}
 	gridX, err := rocmDeviceKVPositiveUint32("attention chunked stage1 blocks", headCount*chunkCount)
 	if err != nil {
+		hipReleaseLaunchPacket(stage2LaunchBytes)
 		return err
 	}
 	stage1 := hipKernelLaunchConfig{
@@ -2105,6 +2140,7 @@ func hipRunAttentionHeadsChunked(ctx context.Context, driver nativeHIPDriver, re
 		SharedMemBytes: 0,
 	}
 	if err := stage2.Validate(); err != nil {
+		hipReleaseLaunchPacket(stage2LaunchBytes)
 		return err
 	}
 	return hipLaunchKernel(driver, stage2)

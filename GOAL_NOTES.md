@@ -1,5 +1,36 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-26 Allocation/Transfer Step-Down Pass
+
+- Followed the measured allocation-reduction path rather than exact story-text
+  comparison. Separate generations are allowed to differ; the retained book
+  acceptance signal is wall/decode timing plus chapter-10 arc retention.
+- Kept a production-only forward fast path that omits unused per-token forward
+  labels and host KV state when device-resident retained KV is already returned.
+  This preserves the debug/test paths that still assert labels and host state.
+- Reused the chunked-attention concat output buffer through the existing
+  attention workspace, then changed the chunked stage-2 launch argument copy to
+  use the launch-packet pool instead of an allocating `append` copy. Added
+  `BenchmarkHIPAttentionHeadsChunkedWorkspace_AttentionOutputReused`, which
+  reports about `2.98 ns/op`, `0 B/op`, and `0 allocs/op`.
+- Live RX 7800 XT focused checks passed:
+  `TestHIPHardwareTransformerKernelSource_Good/attention-heads-chunked-direct-token-kv`,
+  `git diff --check`, and the AX-11 pool benchmarks.
+- Short 2048-token guard, prompt `text:Hi`, context `128`, Gemma4-E2B q4:
+  before this pass the best typed-pool result was `103.5 tok/s`,
+  `187353064 B/op`, and `1982073 allocs/op`; after workspace label/host-state
+  omission and pooled stage-2 launch packets it reports `103.2 tok/s`,
+  `160949264 B/op`, and `1781980 allocs/op`.
+- The accepted retained 10-turn full-cap greedy book benchmark remained green:
+  `41.21s` wall, `36.98s` decode, `3021` generated tokens, `73.31 tok/s`
+  average, `63.65 tok/s` on turn 10, empty stderr, no cap hits, and
+  chapter-10 anchor hits of `3`. Resource use dropped to `439319760 B/op` and
+  `2797196 allocs/op`.
+- Current allocation sequence on the short guard is now visible:
+  `3.40M -> 2.04M -> 1.98M -> 1.85M -> 1.78M allocs/op`. Continue chasing
+  buffer/transfer reductions while keeping decode above the short `100 tok/s`
+  guard and improving late book-turn decode toward `90-100+ tok/s`.
+
 ## 2026-05-26 Full-Chapter Book and Long-Attention Pass
 
 - The 512-token chapter cap is invalid for the book acceptance workload. The

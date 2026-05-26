@@ -910,10 +910,11 @@ func TestHIPGemma4Q4PrefillDeviceKVBatch_Good(t *testing.T) {
 	core.RequireNoError(t, err)
 	defer deviceKV.Close()
 
-	core.AssertEqual(t, 1, countLaunchName(driver.launches[start:], hipKernelNameKVEncodeToken))
+	wantPages := gemma4Q4DeviceKVPagesForTokens(tokenCount)
+	core.AssertEqual(t, wantPages, countLaunchName(driver.launches[start:], hipKernelNameKVEncodeToken))
 	core.AssertEqual(t, tokenCount, deviceKV.Cache.TokenCount())
-	core.AssertEqual(t, 1, deviceKV.Cache.PageCount())
-	core.AssertEqual(t, tokenCount, deviceKV.Cache.pages[0].tokenCount)
+	core.AssertEqual(t, wantPages, deviceKV.Cache.PageCount())
+	core.AssertEqual(t, min(tokenCount, hipGemma4Q4DeviceKVBlockSize()), deviceKV.Cache.pages[0].tokenCount)
 	core.AssertEqual(t, cfg.HeadDim, deviceKV.Launch.KeyWidth)
 	core.AssertEqual(t, cfg.HeadDim, deviceKV.Launch.ValueWidth)
 	core.AssertEqual(t, tokenCount, deviceKV.Launch.TokenCount)
@@ -924,7 +925,7 @@ func TestHIPGemma4Q4PrefillDeviceKVBatch_Good(t *testing.T) {
 	core.AssertEqual(t, uint64(tokenCount), binary.LittleEndian.Uint64(descriptorPayload[24:]))
 	pageOffset := rocmDeviceKVDescriptorHeaderBytes
 	core.AssertEqual(t, uint64(0), binary.LittleEndian.Uint64(descriptorPayload[pageOffset:]))
-	core.AssertEqual(t, uint64(tokenCount), binary.LittleEndian.Uint64(descriptorPayload[pageOffset+8:]))
+	core.AssertEqual(t, uint64(min(tokenCount, hipGemma4Q4DeviceKVBlockSize())), binary.LittleEndian.Uint64(descriptorPayload[pageOffset+8:]))
 	core.AssertEqual(t, uint32(cfg.HeadDim), binary.LittleEndian.Uint32(descriptorPayload[pageOffset+16:]))
 	core.AssertEqual(t, uint32(cfg.HeadDim), binary.LittleEndian.Uint32(descriptorPayload[pageOffset+20:]))
 }
@@ -986,13 +987,13 @@ func TestHIPGemma4Q4PrefillLayerKVBatch_Good(t *testing.T) {
 	core.AssertEqual(t, tokenCount*cfg.HeadDim, layer.QK.Key.Count())
 	core.AssertEqual(t, tokenCount*cfg.HeadDim, layer.Value.Count())
 	core.AssertEqual(t, tokenCount, layer.DeviceKV.Cache.TokenCount())
-	core.AssertEqual(t, 1, layer.DeviceKV.Cache.PageCount())
+	core.AssertEqual(t, gemma4Q4DeviceKVPagesForTokens(tokenCount), layer.DeviceKV.Cache.PageCount())
 
 	launches := driver.launches[start:]
 	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameRMSNormHeads))
 	core.AssertEqual(t, 3, countLaunchName(launches, hipKernelNameMLXQ4ProjBatch))
 	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameRMSNormRoPEHeadsBatch))
-	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameKVEncodeToken))
+	core.AssertEqual(t, gemma4Q4DeviceKVPagesForTokens(tokenCount), countLaunchName(launches, hipKernelNameKVEncodeToken))
 	core.AssertEqual(t, tokenCount, layer.DeviceKV.Launch.TokenCount)
 	core.AssertEqual(t, cfg.HeadDim, layer.DeviceKV.Launch.KeyWidth)
 	core.AssertEqual(t, cfg.HeadDim, layer.DeviceKV.Launch.ValueWidth)
@@ -1261,7 +1262,7 @@ func TestHIPGemma4Q4PrefillForwardBatch_Good(t *testing.T) {
 	core.AssertEqual(t, 12, countLaunchName(launches, hipKernelNameMLXQ4ProjBatch))
 	core.AssertEqual(t, 12, countLaunchName(launches, hipKernelNameRMSNormHeads))
 	core.AssertEqual(t, 4, countLaunchName(launches, hipKernelNameRMSNormRoPEHeadsBatch))
-	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameKVEncodeToken))
+	core.AssertEqual(t, len(cfg.Layers)*gemma4Q4DeviceKVPagesForTokens(len(tokens)), countLaunchName(launches, hipKernelNameKVEncodeToken))
 	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameAttentionHeadsBatchCausal))
 	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameMLXQ4GELUTanhMulBatch))
 	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameMLXQ4GELUTanhProjBatch))
@@ -1357,7 +1358,7 @@ func TestHIPGemma4Q4PrefillForwardBatchWithPrior_Good(t *testing.T) {
 		core.AssertEqual(t, uint32(len(tokens)), binary.LittleEndian.Uint32(launch.Args[60:]))
 		core.AssertEqual(t, uint32(len(tokens)), binary.LittleEndian.Uint32(launch.Args[64:]))
 	}
-	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameKVEncodeToken))
+	core.AssertEqual(t, len(cfg.Layers)*gemma4Q4DeviceKVPagesForTokens(len(tokens)), countLaunchName(launches, hipKernelNameKVEncodeToken))
 }
 
 func TestHIPGemma4Q4PrefillForwardBatchWithGeneratedPerLayerInput_Good(t *testing.T) {
@@ -1992,6 +1993,17 @@ func countLaunchName(launches []hipKernelLaunchConfig, name string) int {
 	return count
 }
 
+func gemma4Q4DeviceKVPagesForTokens(tokens int) int {
+	if tokens <= 0 {
+		return 0
+	}
+	blockSize := hipGemma4Q4DeviceKVBlockSize()
+	if blockSize <= 0 {
+		return tokens
+	}
+	return (tokens + blockSize - 1) / blockSize
+}
+
 func countKVEncodeTokenLaunches(launches []hipKernelLaunchConfig) int {
 	var count int
 	for _, launch := range launches {
@@ -2085,6 +2097,29 @@ func BenchmarkHIPLaunchPacketPool_ReusedSize(b *testing.B) {
 			b.Fatalf("packet len = %d, want %d", len(packet), hipMLXQ4TripleProjLaunchArgsBytes)
 		}
 		hipReleaseLaunchPacket(packet)
+	}
+}
+
+func BenchmarkHIPAttentionHeadsChunkedWorkspace_AttentionOutputReused(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	output, err := workspace.EnsureAttentionOutput(driver, 8, 256)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if output.Count() != 2048 || output.SizeBytes() != 8192 {
+		b.Fatalf("attention output shape = %d/%d, want 2048/8192", output.Count(), output.SizeBytes())
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		output, err = workspace.EnsureAttentionOutput(driver, 8, 256)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if output.Count() != 2048 || output.SizeBytes() != 8192 {
+			b.Fatalf("attention output shape = %d/%d, want 2048/8192", output.Count(), output.SizeBytes())
+		}
 	}
 }
 

@@ -143,9 +143,17 @@ while reducing object churn from `5.18M` to `3.18M allocs/op`; the one-shot book
 `B/op` rose to `1.09GB/op`, so the next allocation pass should target byte
 volume and unique temporary buffer sizes rather than only object count. A typed
 KV page-slice pool then improved the short 2048-token guard from `3.40M` to
-`1.98M allocs/op` overall while keeping decode at `103.5 tok/s`. This is the
-current best production-candidate route for the book endpoint, but not the final
-driver endpoint: later-turn decode is still only `63.9 tok/s`, below the
+`1.98M allocs/op` overall while keeping decode at `103.5 tok/s`. The next
+allocation pass skipped unused production forward labels/host state, reused the
+chunked-attention output buffer from the workspace, and pooled the chunked
+stage-2 launch packet copy. The short 2048-token guard now reports
+`19835935211 ns/op`, `103.2 tok/s`, `160949264 B/op`, and `1781980 allocs/op`.
+The retained 10-turn full-cap book route stayed green at `41.21s` wall,
+`36.98s` decode, `73.31 tok/s` average, `63.65 tok/s` on turn 10, empty
+stderr, and chapter-10 anchor hits of `3`, while reducing the book benchmark to
+`439319760 B/op` and `2797196 allocs/op`. This is the current best
+production-candidate route for the book endpoint, but not the final driver
+endpoint: later-turn decode is still only `63.7 tok/s`, below the
 `90-100+ tok/s` target, and the visible output remains repetitive. Keep tuning
 retained long-context attention and state quality until the later turns stay
 near the target.
@@ -163,7 +171,7 @@ max_new_tokens  route                    tok/s   B/op       allocs/op
 2048            chunked-128 device KV     90.53  314.81M     3426653
 4096            non-chunked value-fast    72.45  633.26M     6833550
 4096            chunked-128 query cache   80.33  885.71M     6749654
-2048 text:Hi    query cache + pools      103.5   187.35M     1982073
+2048 text:Hi    workspace + pools        103.2   160.95M     1781980
 ```
 
 The earlier 256-token chunked route was rejected because it fell to `58.24

@@ -1110,6 +1110,8 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 						SuppressTokens:     suppressTokens,
 						AttentionWorkspace: attentionWorkspace,
 						OmitDebugTensors:   true,
+						OmitLabels:         true,
+						OmitHostState:      true,
 					}, false)
 					if err != nil {
 						runErr = err
@@ -1221,6 +1223,8 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 				SuppressTokens:     suppressTokens,
 				AttentionWorkspace: attentionWorkspace,
 				OmitDebugTensors:   true,
+				OmitLabels:         true,
+				OmitHostState:      true,
 			}, false)
 			if err != nil {
 				runErr = err

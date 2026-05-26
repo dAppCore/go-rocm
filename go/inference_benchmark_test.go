@@ -641,6 +641,8 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 		SuppressTokens:     suppressTokens,
 		AttentionWorkspace: session.attentionWorkspace,
 		OmitDebugTensors:   true,
+		OmitLabels:         true,
+		OmitHostState:      true,
 	}, false)
 	if err != nil {
 		return inferenceBenchmarkGemma4Q4RetainedTurn{}, err
@@ -690,6 +692,8 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 			SuppressTokens:     suppressTokens,
 			AttentionWorkspace: session.attentionWorkspace,
 			OmitDebugTensors:   true,
+			OmitLabels:         true,
+			OmitHostState:      true,
 		}
 		forward, nextHostState, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx, session.model.driver, session.cfg, session.hostState, request, false)
 		if err != nil {
