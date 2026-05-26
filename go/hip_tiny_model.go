@@ -7,6 +7,8 @@ package rocm
 import (
 	"context"
 	"iter"
+	"math"
+	"math/rand"
 	"os"
 	"strconv"
 	"strings"
@@ -1033,9 +1035,45 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 			runErr = err
 			return
 		}
+		suppressTokens := hipGemma4Q4GenerationSuppressTokenIDs(model, generate.StopTokens)
+		hostSampling := hipGemma4Q4HostSamplingRequested(generate)
 		if err := req.validate(cfg); err != nil {
 			runErr = err
 			return
+		}
+		ubatchTokens, err := hipGemma4Q4PrefillUBatchTokens()
+		if err != nil {
+			runErr = err
+			return
+		}
+		prefillPlan, err := hipGemma4Q4PlanPromptPrefill(promptTokens, req.Position, ubatchTokens)
+		if err != nil {
+			runErr = err
+			return
+		}
+		deviceKVMode, err := hipGemma4Q4GenerateDeviceKVMode()
+		if err != nil {
+			runErr = err
+			return
+		}
+		finalGreedyBuffer, err := hipAllocateByteBuffer(model.driver, "rocm.hip.Gemma4Q4Generate", "Gemma4 q4 final greedy result", hipMLXQ4ProjectionBestBytes, 1)
+		if err != nil {
+			runErr = err
+			return
+		}
+		defer func() {
+			if err := finalGreedyBuffer.Close(); err != nil && runErr == nil {
+				runErr = err
+			}
+		}()
+		var attentionWorkspace *hipAttentionHeadsChunkedWorkspace
+		if hipGemma4Q4ChunkedAttentionEnabled(len(promptTokens)) {
+			attentionWorkspace = &hipAttentionHeadsChunkedWorkspace{}
+			defer func() {
+				if err := attentionWorkspace.Close(); err != nil && runErr == nil {
+					runErr = err
+				}
+			}()
 		}
 		state := hipGemma4Q4DecodeState{}
 		var deviceState *hipGemma4Q4DeviceDecodeState
@@ -1046,39 +1084,118 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 		}()
 		position := req.Position
 		var current hipGemma4Q4ForwardResult
-		for _, promptToken := range promptTokens {
+		haveCurrent := false
+		var history []int32
+		useBatchedPrefill := hipGemma4Q4CanUseBatchedGeneratePrefill(cfg) && !hostSampling
+		for _, ubatch := range prefillPlan.Batches {
+			if !useBatchedPrefill {
+				for index, promptToken := range ubatch.Tokens {
+					if err := hipContextErr(ctx); err != nil {
+						runErr = err
+						return
+					}
+					outputToken := ubatch.OutputTokens[index]
+					var err error
+					current, state, err = hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx, model.driver, cfg, state, hipGemma4Q4ForwardRequest{
+						TokenID:            promptToken,
+						Position:           ubatch.Position + index,
+						Epsilon:            req.Epsilon,
+						DeviceKVAttention:  true,
+						DeviceKVMode:       deviceKVMode,
+						PriorDeviceState:   deviceState,
+						ReturnDeviceState:  true,
+						DeviceFinalSample:  outputToken && !hostSampling,
+						SkipFinalSample:    !outputToken,
+						FinalGreedyBuffer:  finalGreedyBuffer,
+						SuppressTokens:     suppressTokens,
+						AttentionWorkspace: attentionWorkspace,
+						OmitDebugTensors:   true,
+					}, false)
+					if err != nil {
+						runErr = err
+						return
+					}
+					if current.DeviceState == nil {
+						runErr = core.E(hipGemma4Q4Layer0Operation, "forward did not return device KV state", nil)
+						return
+					}
+					deviceState = current.DeviceState
+					current.DeviceState = nil
+					if outputToken {
+						if hostSampling {
+							current.Greedy, err = hipGemma4Q4HostSampleResult(current.Logits, generate, suppressTokens, history, rand.Float64())
+							if err != nil {
+								runErr = err
+								return
+							}
+						}
+						haveCurrent = true
+					}
+				}
+				continue
+			}
 			if err := hipContextErr(ctx); err != nil {
 				runErr = err
 				return
 			}
-			var err error
-			current, state, err = hipRunGemma4Q4SingleTokenForwardWithState(ctx, model.driver, cfg, state, hipGemma4Q4ForwardRequest{
-				TokenID:           promptToken,
-				Position:          position,
-				Epsilon:           req.Epsilon,
-				DeviceKVAttention: true,
-				DeviceKVMode:      rocmKVCacheModeKQ8VQ4,
-				PriorDeviceState:  deviceState,
-				ReturnDeviceState: true,
-			})
+			var priorLayerKV []*rocmDeviceKVCache
+			if deviceState != nil {
+				priorLayerKV = make([]*rocmDeviceKVCache, len(cfg.Layers))
+				for index := range priorLayerKV {
+					priorLayerKV[index] = deviceState.layerCache(index)
+				}
+			}
+			forward, err := hipRunGemma4Q4PrefillForwardBatchWithPrior(ctx, model.driver, cfg, ubatch.Tokens, ubatch.Position, req.Epsilon, deviceKVMode, priorLayerKV, nil, ubatch.OutputTokens, finalGreedyBuffer)
 			if err != nil {
 				runErr = err
 				return
 			}
-			if current.DeviceState == nil {
-				runErr = core.E(hipGemma4Q4Layer0Operation, "forward did not return device KV state", nil)
+			if len(forward.Greedy) > 0 {
+				greedyOut := forward.Greedy[len(forward.Greedy)-1]
+				current.Greedy = greedyOut.Greedy
+				if hipTokenIsSuppressed(int32(current.Greedy.TokenID), suppressTokens) {
+					last := cfg.Layers[len(cfg.Layers)-1]
+					current.Greedy, err = hipRunGemma4Q4PrefillFinalGreedyForRowSuppress(ctx, model.driver, last, forward.FinalHidden, len(ubatch.Tokens), greedyOut.Row, req.Epsilon, finalGreedyBuffer, suppressTokens)
+					if err != nil {
+						_ = forward.Close()
+						runErr = err
+						return
+					}
+				}
+				haveCurrent = true
+			}
+			nextDeviceState, err := hipGemma4Q4DeviceDecodeStateFromPrefillForward(forward, deviceKVMode)
+			closeErr := forward.Close()
+			if err != nil {
+				runErr = err
 				return
 			}
-			deviceState = current.DeviceState
-			current.DeviceState = nil
-			position++
+			if closeErr != nil {
+				_ = nextDeviceState.Close()
+				runErr = closeErr
+				return
+			}
+			if err := hipFinalizeGemma4Q4ForwardDeviceState(deviceState, nextDeviceState); err != nil {
+				_ = nextDeviceState.Close()
+				runErr = err
+				return
+			}
+			deviceState = nextDeviceState
 		}
+		if !haveCurrent {
+			runErr = core.E(hipGemma4Q4Layer0Operation, "prefill did not produce a final greedy token", nil)
+			return
+		}
+		position = prefillPlan.NextPosition()
 		for generated := 0; generated < generate.MaxTokens; generated++ {
 			if err := hipContextErr(ctx); err != nil {
 				runErr = err
 				return
 			}
 			tokenID := int32(current.Greedy.TokenID)
+			if hipTokenIsStop(tokenID, generate.StopTokens) {
+				return
+			}
 			token := inference.Token{
 				ID:   tokenID,
 				Text: hipGeneratedTokenText(model, tokenID),
@@ -1086,22 +1203,25 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 			if !yield(token) {
 				return
 			}
-			if hipTokenIsStop(tokenID, generate.StopTokens) {
-				return
-			}
+			history = append(history, tokenID)
 			if generated == generate.MaxTokens-1 {
 				return
 			}
 			var err error
-			current, state, err = hipRunGemma4Q4SingleTokenForwardWithState(ctx, model.driver, cfg, state, hipGemma4Q4ForwardRequest{
-				TokenID:           tokenID,
-				Position:          position,
-				Epsilon:           req.Epsilon,
-				DeviceKVAttention: true,
-				DeviceKVMode:      rocmKVCacheModeKQ8VQ4,
-				PriorDeviceState:  deviceState,
-				ReturnDeviceState: true,
-			})
+			current, state, err = hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx, model.driver, cfg, state, hipGemma4Q4ForwardRequest{
+				TokenID:            tokenID,
+				Position:           position,
+				Epsilon:            req.Epsilon,
+				DeviceKVAttention:  true,
+				DeviceKVMode:       deviceKVMode,
+				PriorDeviceState:   deviceState,
+				ReturnDeviceState:  true,
+				DeviceFinalSample:  !hostSampling,
+				FinalGreedyBuffer:  finalGreedyBuffer,
+				SuppressTokens:     suppressTokens,
+				AttentionWorkspace: attentionWorkspace,
+				OmitDebugTensors:   true,
+			}, false)
 			if err != nil {
 				runErr = err
 				return
@@ -1112,9 +1232,45 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 			}
 			deviceState = current.DeviceState
 			current.DeviceState = nil
+			if hostSampling {
+				current.Greedy, err = hipGemma4Q4HostSampleResult(current.Logits, generate, suppressTokens, history, rand.Float64())
+				if err != nil {
+					runErr = err
+					return
+				}
+			}
 			position++
 		}
 	}, func() error { return runErr }
+}
+
+func hipGemma4Q4GenerateDeviceKVMode() (string, error) {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("GO_ROCM_GEMMA4_Q4_DEVICE_KV_MODE")))
+	if raw == "" {
+		return rocmKVCacheModeKQ8VQ4, nil
+	}
+	if !isROCmKVCacheMode(raw) {
+		return "", core.E(hipGemma4Q4Layer0Operation, core.Sprintf("unsupported Gemma4 q4 device KV cache mode %q", raw), nil)
+	}
+	return raw, nil
+}
+
+const hipGemma4Q4ChunkedAttentionAutoPromptTokens = 4000
+
+func hipGemma4Q4ChunkedAttentionEnabled(promptTokens int) bool {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("GO_ROCM_GEMMA4_Q4_CHUNKED_ATTENTION")))
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true
+	case "auto":
+		return promptTokens >= hipGemma4Q4ChunkedAttentionAutoPromptTokens
+	case "0", "false", "no", "off":
+		return false
+	case "":
+		return true
+	default:
+		return false
+	}
 }
 
 func hipGemma4Q4TokenPromptIDs(prompt string, vocabSize int) ([]int32, bool, error) {
@@ -1145,14 +1301,14 @@ func hipGemma4Q4TokenPromptIDs(prompt string, vocabSize int) ([]int32, bool, err
 
 func hipGemma4Q4TextPromptIDs(prompt string, model *hipLoadedModel) ([]int32, bool, error) {
 	const prefix = "text:"
-	trimmed := strings.TrimSpace(prompt)
-	prefixed := strings.HasPrefix(strings.ToLower(trimmed), prefix)
+	leftTrimmed := strings.TrimLeft(prompt, " \t\r\n\v\f")
+	prefixed := strings.HasPrefix(strings.ToLower(leftTrimmed), prefix)
 	if !prefixed && !hipGemma4Q4ExperimentalTextGenerateEnabled(model) {
 		return nil, false, nil
 	}
 	body := prompt
 	if prefixed {
-		body = strings.TrimSpace(trimmed[len(prefix):])
+		body = leftTrimmed[len(prefix):]
 	}
 	if strings.TrimSpace(body) == "" {
 		return nil, true, core.E(hipGemma4Q4Layer0Operation, "text prompt must contain prompt text", nil)
@@ -1476,6 +1632,203 @@ func hipTokenIsStop(id int32, stopTokens []int32) bool {
 		}
 	}
 	return false
+}
+
+func hipTokenIsSuppressed(id int32, suppressTokens []int32) bool {
+	for _, suppressed := range suppressTokens {
+		if id == suppressed {
+			return true
+		}
+	}
+	return false
+}
+
+func hipGemma4Q4DefaultSuppressTokenIDs(model *hipLoadedModel) []int32 {
+	if model == nil || model.tokenText == nil || !isROCmGemma4Architecture(model.modelInfo.Architecture) {
+		return nil
+	}
+	return hipTokenTextIDs(model.tokenText, []string{
+		"<pad>",
+		"<bos>",
+		"<unk>",
+		"<mask>",
+		"<|tool>",
+		"<tool|>",
+		"<|tool_call>",
+		"<tool_call|>",
+		"<|tool_response>",
+		"<tool_response|>",
+		`<|"|>`,
+		"<|think|>",
+		"<|channel>",
+		"<channel|>",
+		"<|turn>",
+		"<|image>",
+		"<|audio>",
+		"<|image|>",
+		"<|audio|>",
+		"<image|>",
+		"<audio|>",
+		"<|video|>",
+	})
+}
+
+func hipGemma4Q4DefaultStopTokenIDs(model *hipLoadedModel) []int32 {
+	if model == nil || model.tokenText == nil || !isROCmGemma4Architecture(model.modelInfo.Architecture) {
+		return nil
+	}
+	return hipTokenTextIDs(model.tokenText, []string{
+		"<eos>",
+		"<turn|>",
+		"<|tool_response>",
+	})
+}
+
+func hipGemma4Q4GenerationSuppressTokenIDs(model *hipLoadedModel, stopTokens []int32) []int32 {
+	suppressTokens := hipGemma4Q4DefaultSuppressTokenIDs(model)
+	if len(stopTokens) > 0 {
+		return suppressTokens
+	}
+	for _, id := range hipGemma4Q4DefaultStopTokenIDs(model) {
+		if !hipTokenIsSuppressed(id, suppressTokens) {
+			suppressTokens = append(suppressTokens, id)
+		}
+	}
+	return suppressTokens
+}
+
+func hipGemma4Q4HostSamplingRequested(generate inference.GenerateConfig) bool {
+	return generate.Temperature > 0 ||
+		generate.TopK > 0 ||
+		generate.TopP > 0 ||
+		generate.RepeatPenalty > 1
+}
+
+func hipGemma4Q4HostSampleResult(logits []float32, generate inference.GenerateConfig, suppressTokens []int32, history []int32, draw float64) (hipGreedySampleResult, error) {
+	if len(logits) == 0 {
+		return hipGreedySampleResult{}, core.E("rocm.hip.Gemma4Q4HostSampler", "logits are required", nil)
+	}
+	working := append([]float32(nil), logits...)
+	for _, id := range suppressTokens {
+		if id >= 0 && int(id) < len(working) {
+			working[id] = float32(math.Inf(-1))
+		}
+	}
+	if generate.RepeatPenalty > 1 {
+		if math.IsNaN(float64(generate.RepeatPenalty)) || math.IsInf(float64(generate.RepeatPenalty), 0) {
+			return hipGreedySampleResult{}, core.E("rocm.hip.Gemma4Q4HostSampler", "repeat penalty must be finite", nil)
+		}
+		for _, id := range history {
+			if id < 0 || int(id) >= len(working) {
+				continue
+			}
+			if working[id] < 0 {
+				working[id] *= generate.RepeatPenalty
+			} else {
+				working[id] /= generate.RepeatPenalty
+			}
+		}
+	}
+	if generate.Temperature <= 0 && generate.TopK <= 0 && generate.TopP <= 0 {
+		tokenID, score, err := hipReferenceGreedySampleSuppress(working, nil)
+		if err != nil {
+			return hipGreedySampleResult{}, err
+		}
+		return hipGreedySampleResult{TokenID: tokenID, Score: score}, nil
+	}
+	temperature := generate.Temperature
+	if temperature == 0 {
+		temperature = 1
+	}
+	if temperature <= 0 || math.IsNaN(float64(temperature)) || math.IsInf(float64(temperature), 0) {
+		return hipGreedySampleResult{}, core.E("rocm.hip.Gemma4Q4HostSampler", "temperature must be positive and finite", nil)
+	}
+	topP := generate.TopP
+	if topP == 0 {
+		topP = 1
+	}
+	if topP <= 0 || topP > 1 || math.IsNaN(float64(topP)) || math.IsInf(float64(topP), 0) {
+		return hipGreedySampleResult{}, core.E("rocm.hip.Gemma4Q4HostSampler", "top-p must be in (0, 1]", nil)
+	}
+	candidates := make([]hipReferenceCandidate, 0, len(working))
+	for index, value := range working {
+		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+			continue
+		}
+		candidates = append(candidates, hipReferenceCandidate{index: index, value: value})
+	}
+	if len(candidates) == 0 {
+		return hipGreedySampleResult{}, core.E("rocm.hip.Gemma4Q4HostSampler", "all logits are suppressed", nil)
+	}
+	sortHIPReferenceCandidates(candidates)
+	topK := generate.TopK
+	if topK < 0 || topK > len(working) {
+		return hipGreedySampleResult{}, core.E("rocm.hip.Gemma4Q4HostSampler", "top-k must be within vocabulary size", nil)
+	}
+	if topK == 0 || topK > len(candidates) {
+		topK = len(candidates)
+	}
+	candidates = candidates[:topK]
+	maxValue := float64(candidates[0].value) / float64(temperature)
+	weights := make([]float64, len(candidates))
+	total := 0.0
+	for index, candidate := range candidates {
+		weight := math.Exp(float64(candidate.value)/float64(temperature) - maxValue)
+		weights[index] = weight
+		total += weight
+	}
+	if total <= 0 || math.IsNaN(total) || math.IsInf(total, 0) {
+		return hipGreedySampleResult{}, core.E("rocm.hip.Gemma4Q4HostSampler", "sampling distribution is invalid", nil)
+	}
+	limit := len(candidates)
+	if topP < 1 {
+		cumulative := 0.0
+		for index, weight := range weights {
+			cumulative += weight
+			if cumulative/total >= float64(topP) {
+				limit = index + 1
+				break
+			}
+		}
+	}
+	selectedTotal := 0.0
+	for _, weight := range weights[:limit] {
+		selectedTotal += weight
+	}
+	if draw < 0 {
+		draw = 0
+	}
+	if draw >= 1 {
+		draw = math.Nextafter(1, 0)
+	}
+	target := draw * selectedTotal
+	cumulative := 0.0
+	for index, weight := range weights[:limit] {
+		cumulative += weight
+		if target <= cumulative {
+			candidate := candidates[index]
+			return hipGreedySampleResult{TokenID: candidate.index, Score: candidate.value}, nil
+		}
+	}
+	candidate := candidates[limit-1]
+	return hipGreedySampleResult{TokenID: candidate.index, Score: candidate.value}, nil
+}
+
+func hipTokenTextIDs(decoder *hipTokenTextDecoder, texts []string) []int32 {
+	if decoder == nil || len(texts) == 0 {
+		return nil
+	}
+	ids := make([]int32, 0, len(texts))
+	seen := map[int32]bool{}
+	for _, text := range texts {
+		id, ok := decoder.specialText[text]
+		if !ok || seen[id] {
+			continue
+		}
+		ids = append(ids, id)
+		seen[id] = true
+	}
+	return ids
 }
 
 func hipContextErr(ctx context.Context) error {

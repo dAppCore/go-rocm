@@ -5,9 +5,11 @@
 package rocm
 
 import (
+	"os"
 	"testing"
 
 	core "dappco.re/go"
+	"dappco.re/go/inference"
 )
 
 func TestHIPTokenTextDecoder_Good_LoadEncodeDecode(t *testing.T) {
@@ -41,6 +43,69 @@ func TestHIPTokenTextDecoder_Good_LoadEncodeDecode(t *testing.T) {
 	core.AssertNotNil(t, loadHIPTokenTextDecoderIfPresent(path))
 	core.AssertNil(t, loadHIPTokenTextDecoderIfPresent(" "))
 	core.AssertNil(t, loadHIPTokenTextDecoderIfPresent(core.PathJoin(t.TempDir(), "missing.json")))
+}
+
+func TestHIPTokenTextDecoder_Gemma4TextPromptPreservesGenerationNewline(t *testing.T) {
+	decoder := &hipTokenTextDecoder{
+		vocab: map[string]int32{
+			"<bos>":   2,
+			"<0x0A>":  107,
+			"<|turn>": 105,
+		},
+		pieces:      map[int32]string{2: "<bos>", 107: "<0x0A>", 105: "<|turn>"},
+		special:     map[int32]bool{2: true, 105: true},
+		specialText: map[string]int32{"<bos>": 2, "<|turn>": 105},
+		bosID:       2,
+		hasBOS:      true,
+	}
+	model := &hipLoadedModel{
+		modelInfo: inference.ModelInfo{Architecture: "gemma4", QuantBits: 4},
+		tokenText: decoder,
+	}
+	tokens, ok, err := hipGemma4Q4TextPromptIDs("text:<bos><|turn>\n", model)
+	core.RequireNoError(t, err)
+	core.RequireTrue(t, ok)
+	core.AssertEqual(t, []int32{2, 105, 107}, tokens)
+}
+
+func TestHIPTokenTextDecoder_Gemma4LocalChatTemplateIDs_Good(t *testing.T) {
+	path := os.Getenv("GO_ROCM_GEMMA4_Q4_TOKENIZER_PATH")
+	if path == "" {
+		t.Skip("set GO_ROCM_GEMMA4_Q4_TOKENIZER_PATH to verify local Gemma4 tokenizer chat-template IDs")
+	}
+	decoder, err := loadHIPTokenTextDecoder(path)
+	core.RequireNoError(t, err)
+	got := decoder.Encode("<bos><|turn>user\nHi<turn|>\n<|turn>model\n")
+	core.AssertEqual(t, []int32{2, 105, 2364, 107, 10979, 106, 107, 105, 4368, 107}, got)
+}
+
+func TestHIPTokenTextDecoder_Gemma4DefaultSuppressTokenIDs_Good(t *testing.T) {
+	decoder := &hipTokenTextDecoder{
+		specialText: map[string]int32{
+			"<pad>":        0,
+			"<bos>":        2,
+			"<|turn>":      105,
+			"<turn|>":      106,
+			"<|tool_call>": 200,
+			"<notlisted|>": 201,
+		},
+	}
+	model := &hipLoadedModel{
+		modelInfo: inference.ModelInfo{Architecture: "gemma4", QuantBits: 4},
+		tokenText: decoder,
+	}
+	ids := hipGemma4Q4DefaultSuppressTokenIDs(model)
+	core.AssertTrue(t, hipTokenIsSuppressed(0, ids))
+	core.AssertTrue(t, hipTokenIsSuppressed(2, ids))
+	core.AssertTrue(t, hipTokenIsSuppressed(105, ids))
+	core.AssertTrue(t, hipTokenIsSuppressed(200, ids))
+	core.AssertFalse(t, hipTokenIsSuppressed(106, ids))
+	core.AssertFalse(t, hipTokenIsSuppressed(201, ids))
+
+	generationIDs := hipGemma4Q4GenerationSuppressTokenIDs(model, nil)
+	core.AssertTrue(t, hipTokenIsSuppressed(106, generationIDs))
+	explicitStopIDs := hipGemma4Q4GenerationSuppressTokenIDs(model, []int32{106})
+	core.AssertFalse(t, hipTokenIsSuppressed(106, explicitStopIDs))
 }
 
 func TestHIPTokenTextDecoder_Bad_MergeAndFallbackEdges(t *testing.T) {

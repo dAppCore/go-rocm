@@ -8,6 +8,8 @@ import core "dappco.re/go"
 
 type unavailableHIPDriver struct{}
 
+const rocmHIPPinnedHostCopySupported = false
+
 func newSystemHIPDriver() nativeHIPDriver {
 	return unavailableHIPDriver{}
 }
@@ -29,4 +31,8 @@ func (unavailableHIPDriver) CopyHostToDevice(nativeDevicePointer, []byte) error 
 }
 func (unavailableHIPDriver) CopyDeviceToHost(nativeDevicePointer, []byte) error {
 	return core.E("rocm.hip.CopyDeviceToHost", "cgo is disabled; native HIP driver is unavailable", nil)
+}
+
+func hipCopyPinnedHostToDevice(driver nativeHIPDriver, pointer nativeDevicePointer, data []byte) error {
+	return hipCopyHostToDevice(driver, pointer, data)
 }

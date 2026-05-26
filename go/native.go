@@ -281,7 +281,7 @@ func (m *rocmModel) Generate(ctx context.Context, prompt string, opts ...inferen
 	promptTokens := m.promptTokenCount(prompt)
 	start := time.Now()
 	stream, streamError := m.native.Generate(ctx, prompt, cloneGenerateConfig(cfg))
-	return m.wrapTokenStream(stream, streamError, promptTokens, start, cfg.StopSequences)
+	return m.wrapTokenStream(stream, streamError, promptTokens, start, nil)
 }
 
 func (m *rocmModel) Chat(ctx context.Context, messages []inference.Message, opts ...inference.GenerateOption) iter.Seq[inference.Token] {
@@ -304,7 +304,7 @@ func (m *rocmModel) Chat(ctx context.Context, messages []inference.Message, opts
 	promptTokens := m.chatPromptTokenCount(messages)
 	start := time.Now()
 	stream, streamError := m.native.Chat(ctx, append([]inference.Message(nil), messages...), cloneGenerateConfig(cfg))
-	return m.wrapTokenStream(stream, streamError, promptTokens, start, cfg.StopSequences)
+	return m.wrapTokenStream(stream, streamError, promptTokens, start, nil)
 }
 
 func (m *rocmModel) Classify(ctx context.Context, prompts []string, opts ...inference.GenerateOption) ([]inference.ClassifyResult, error) {
@@ -351,7 +351,6 @@ func stripClassifyLogits(results []inference.ClassifyResult) {
 
 func cloneGenerateConfig(cfg inference.GenerateConfig) inference.GenerateConfig {
 	cfg.StopTokens = append([]int32(nil), cfg.StopTokens...)
-	cfg.StopSequences = append([]string(nil), cfg.StopSequences...)
 	return cfg
 }
 
@@ -428,7 +427,6 @@ func (m *rocmModel) BatchGenerate(ctx context.Context, prompts []string, opts ..
 	cfg := cloneGenerateConfig(inference.ApplyGenerateOpts(opts))
 	results, err := m.native.BatchGenerate(ctx, append([]string(nil), prompts...), cloneGenerateConfig(cfg))
 	results = cloneBatchResults(results)
-	applyBatchStopSequences(results, cfg.StopSequences)
 	generated := 0
 	for _, result := range results {
 		generated += len(result.Tokens)
@@ -821,7 +819,7 @@ func (m *rocmModel) Benchmark(ctx context.Context, cfg inference.BenchConfig) (r
 	if maxTokens <= 0 {
 		maxTokens = 32
 	}
-	stopSequences := append([]string(nil), cfg.StopSequences...)
+	var stopSequences []string
 	if err := m.benchmarkWarmupRuns(ctx, prompts, maxTokens, warmupRuns, stopSequences); err != nil {
 		return nil, err
 	}
@@ -894,7 +892,6 @@ func (m *rocmModel) Benchmark(ctx context.Context, cfg inference.BenchConfig) (r
 		PrefillTokensPerSec:   tokensPerSecond(aggregate.PromptTokens, aggregate.PrefillDuration),
 		DecodeTokensPerSec:    tokensPerSecond(aggregate.GeneratedTokens, aggregate.DecodeDuration),
 		PeakMemoryBytes:       aggregate.PeakMemoryBytes,
-		ActiveMemoryBytes:     aggregate.ActiveMemoryBytes,
 		PromptCacheHitRate:    cacheStats.HitRate,
 		KVRestoreMilliseconds: cacheStats.RestoreMillis,
 		Labels:                labels,
@@ -1046,9 +1043,6 @@ func hipGemma4Q4PromptHasExplicitMode(prompt string) bool {
 
 func benchmarkGenerateOptions(maxTokens int, stopSequences []string) []inference.GenerateOption {
 	opts := []inference.GenerateOption{inference.WithMaxTokens(maxTokens)}
-	if len(stopSequences) > 0 {
-		opts = append(opts, inference.WithStopSequences(stopSequences...))
-	}
 	return opts
 }
 
@@ -1244,7 +1238,7 @@ func (m *rocmModel) Evaluate(ctx context.Context, dataset inference.DatasetStrea
 		"perplexity_status": lossStatus,
 	}
 	loss.apply(ctx, m, &metrics, labels)
-	probes, failures, probeError, err := m.evaluateQualityProbes(ctx, cfg.Probes, firstPositiveInt(cfg.MaxSeqLen, 32), cfg.StopSequences)
+	probes, failures, probeError, err := m.evaluateQualityProbes(ctx, cfg.Probes, firstPositiveInt(cfg.MaxSeqLen, 32), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1905,7 +1899,7 @@ func rocmCapabilityReport(device nativeDeviceInfo, model inference.ModelIdentity
 	} else if option.Gemma4Q4GenerateLinked {
 		generateCapability = inference.ExperimentalCapability(inference.CapabilityGenerate, inference.CapabilityGroupModel, "loaded Gemma4 MLX-q4 token/text prompt generation is linked through the experimental q4 path; production native prefill/decode remain pending")
 		generateCapability.Labels = rocmGemma4Q4GenerateCapabilityLabels(model)
-		chatCapability = inference.ExperimentalCapability(inference.CapabilityChat, inference.CapabilityGroupModel, "loaded Gemma4 MLX-q4 chat generation is linked through fallback chat templates and the experimental q4 text prompt path; production native prefill/decode remain pending")
+		chatCapability = inference.ExperimentalCapability(inference.CapabilityChat, inference.CapabilityGroupModel, "loaded Gemma4 MLX-q4 chat generation is linked through the Gemma4 chat template and the experimental q4 text prompt path; production native prefill/decode remain pending")
 		chatCapability.Labels = rocmGemma4Q4ChatCapabilityLabels(model)
 		batchCapability = inference.ExperimentalCapability(inference.CapabilityBatchGenerate, inference.CapabilityGroupModel, "loaded Gemma4 MLX-q4 batch generation is linked through the experimental q4 path; production native prefill/decode remain pending")
 		batchCapability.Labels = rocmGemma4Q4BatchGenerateCapabilityLabels(model)
@@ -2839,6 +2833,57 @@ func formatFallbackChatTemplate(messages []inference.Message) string {
 		builder.WriteString("\n")
 	}
 	return builder.String()
+}
+
+func formatGemma4ChatTemplate(messages []inference.Message) string {
+	builder := core.NewBuilder()
+	builder.WriteString("<bos>")
+	start := 0
+	if len(messages) > 0 {
+		role := core.Lower(core.Trim(messages[0].Role))
+		if role == "system" || role == "developer" {
+			builder.WriteString("<|turn>system\n")
+			builder.WriteString(core.Trim(messages[0].Content))
+			builder.WriteString("<turn|>\n")
+			start = 1
+		}
+	}
+	for _, message := range messages[start:] {
+		role := core.Lower(core.Trim(message.Role))
+		if role == "assistant" {
+			role = "model"
+		}
+		if role == "" {
+			role = "user"
+		}
+		builder.WriteString("<|turn>")
+		builder.WriteString(role)
+		builder.WriteByte('\n')
+		content := core.Trim(message.Content)
+		if role == "model" {
+			content = stripGemma4ThinkingChannels(content)
+		}
+		builder.WriteString(content)
+		builder.WriteString("<turn|>\n")
+	}
+	builder.WriteString("<|turn>model\n")
+	return builder.String()
+}
+
+func stripGemma4ThinkingChannels(text string) string {
+	if text == "" || !strings.Contains(text, "<channel|>") {
+		return core.Trim(text)
+	}
+	var builder strings.Builder
+	for _, part := range strings.Split(text, "<channel|>") {
+		before, _, found := strings.Cut(part, "<|channel>")
+		if found {
+			builder.WriteString(before)
+			continue
+		}
+		builder.WriteString(part)
+	}
+	return core.Trim(builder.String())
 }
 
 func sampleText(sample inference.DatasetSample) string {

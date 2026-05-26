@@ -27,6 +27,43 @@ type nativeHIPDriver interface {
 	CopyDeviceToHost(pointer nativeDevicePointer, data []byte) error
 }
 
+type nativeHIPAsyncHostToDevice interface {
+	CopyHostToDeviceAsync(pointer nativeDevicePointer, data []byte) error
+}
+
+type nativeHIPDeviceMemset interface {
+	MemsetAsync(pointer nativeDevicePointer, value byte, size uint64) error
+}
+
+func hipCopyHostToDevice(driver nativeHIPDriver, pointer nativeDevicePointer, data []byte) error {
+	if async, ok := driver.(nativeHIPAsyncHostToDevice); ok {
+		return async.CopyHostToDeviceAsync(pointer, data)
+	}
+	return driver.CopyHostToDevice(pointer, data)
+}
+
+func hipMemsetDevice(driver nativeHIPDriver, pointer nativeDevicePointer, value byte, size uint64) error {
+	if size == 0 {
+		return nil
+	}
+	if pointer == 0 {
+		return core.E("rocm.hip.MemsetDevice", "device pointer is nil", nil)
+	}
+	if memset, ok := driver.(nativeHIPDeviceMemset); ok {
+		return memset.MemsetAsync(pointer, value, size)
+	}
+	if size > uint64(int(^uint(0)>>1)) {
+		return core.E("rocm.hip.MemsetDevice", "device memset size is out of range", nil)
+	}
+	payload := make([]byte, int(size))
+	if value != 0 {
+		for index := range payload {
+			payload[index] = value
+		}
+	}
+	return hipCopyHostToDevice(driver, pointer, payload)
+}
+
 type hipRuntime struct {
 	driver nativeHIPDriver
 }
@@ -71,12 +108,13 @@ func (runtime *hipRuntime) LoadModel(path string, cfg nativeLoadConfig) (nativeM
 		return nil, core.E("rocm.hip.LoadModel", "validate tensor file ranges", err)
 	}
 	model := &hipLoadedModel{
-		driver:    runtime.driver,
-		kernels:   newHIPRuntimeKernelSet(runtime.driver),
-		modelInfo: cfg.ModelInfo,
-		tensors:   make(map[string]hipTensor, len(cfg.Tensors)),
-		tokenText: loadHIPTokenTextDecoderIfPresent(cfg.TokenizerPath),
-		createdAt: time.Now(),
+		driver:      runtime.driver,
+		kernels:     newHIPRuntimeKernelSet(runtime.driver),
+		modelInfo:   cfg.ModelInfo,
+		contextSize: cfg.ContextSize,
+		tensors:     make(map[string]hipTensor, len(cfg.Tensors)),
+		tokenText:   loadHIPTokenTextDecoderIfPresent(cfg.TokenizerPath),
+		createdAt:   time.Now(),
 	}
 	for _, tensor := range cfg.Tensors {
 		if tensor.ByteSize == 0 {
@@ -103,17 +141,18 @@ type hipTensor struct {
 }
 
 type hipLoadedModel struct {
-	driver    nativeHIPDriver
-	kernels   hipKernelSet
-	modelInfo inference.ModelInfo
-	tensors   map[string]hipTensor
-	adapter   inference.AdapterIdentity
-	tinyLoRA  *hipLoadedTinyLoRAAdapter
-	smallLoRA *hipLoadedSmallLoRAAdapter
-	classLoRA *hipLoadedClassifierLoRAAdapter
-	tokenText *hipTokenTextDecoder
-	createdAt time.Time
-	closed    bool
+	driver      nativeHIPDriver
+	kernels     hipKernelSet
+	modelInfo   inference.ModelInfo
+	contextSize int
+	tensors     map[string]hipTensor
+	adapter     inference.AdapterIdentity
+	tinyLoRA    *hipLoadedTinyLoRAAdapter
+	smallLoRA   *hipLoadedSmallLoRAAdapter
+	classLoRA   *hipLoadedClassifierLoRAAdapter
+	tokenText   *hipTokenTextDecoder
+	createdAt   time.Time
+	closed      bool
 }
 
 func (model *hipLoadedModel) Generate(ctx context.Context, prompt string, cfg inference.GenerateConfig) (iter.Seq[inference.Token], func() error) {
@@ -162,6 +201,9 @@ func (model *hipLoadedModel) Decode(ids []int32) string {
 }
 
 func (model *hipLoadedModel) ApplyChatTemplate(messages []inference.Message) (string, error) {
+	if model != nil && isROCmGemma4Architecture(model.modelInfo.Architecture) {
+		return formatGemma4ChatTemplate(messages), nil
+	}
 	return formatFallbackChatTemplate(messages), nil
 }
 

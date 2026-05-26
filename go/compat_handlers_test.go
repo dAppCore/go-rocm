@@ -83,22 +83,6 @@ func TestCompatHandlers_Good_OllamaChatAndGenerate(t *testing.T) {
 	}
 }
 
-func TestCompatHandlers_Good_OllamaGenerateAppliesStopSequences(t *testing.T) {
-	model := &openAITestModel{tokens: []inference.Token{{Text: "visible "}, {Text: "EN"}, {Text: "D hidden"}}}
-	mux := NewOllamaHandler(openaicompat.NewStaticResolver(map[string]inference.TextModel{"qwen": model}))
-	req := httptest.NewRequest(http.MethodPost, ollama.DefaultGeneratePath, strings.NewReader(`{"model":"qwen","prompt":"hello","options":{"stop":["END"]}}`))
-	rec := httptest.NewRecorder()
-
-	mux.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), `"response":"visible "`) || strings.Contains(rec.Body.String(), "hidden") {
-		t.Fatalf("body = %s, want response truncated before stop sequence", rec.Body.String())
-	}
-}
-
 func TestCompatHandlers_Bad_OllamaRejectsStreaming(t *testing.T) {
 	model := &openAITestModel{tokens: []inference.Token{{Text: "ok"}}}
 	mux := NewOllamaHandler(openaicompat.NewStaticResolver(map[string]inference.TextModel{"qwen": model}))

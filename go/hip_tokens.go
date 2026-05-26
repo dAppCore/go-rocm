@@ -47,7 +47,7 @@ func hipUploadTokenIDs(driver nativeHIPDriver, tokenIDs []int32) (*hipDeviceToke
 	if err != nil {
 		return nil, core.E("rocm.hip.Tokens", "allocate token buffer", err)
 	}
-	if err := driver.CopyHostToDevice(pointer, payload); err != nil {
+	if err := hipCopyHostToDevice(driver, pointer, payload); err != nil {
 		_ = driver.Free(pointer)
 		return nil, core.E("rocm.hip.Tokens", "copy token buffer", err)
 	}

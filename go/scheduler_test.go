@@ -25,12 +25,12 @@ func TestScheduler_Good_StreamsQueuedRequest(t *testing.T) {
 	core.RequireNoError(t, err)
 	defer model.Close()
 
-	handle, stream, err := model.Schedule(context.Background(), inference.ScheduledRequest{ID: "req-1", Prompt: "hello", Sampler: inference.SamplerConfig{MaxTokens: 2, StopSequences: []string{"END"}}})
+	handle, stream, err := model.Schedule(context.Background(), inference.ScheduledRequest{ID: "req-1", Prompt: "hello", Sampler: inference.SamplerConfig{MaxTokens: 2, StopTokens: []int32{2}}})
 
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, "req-1", handle.ID)
 	core.AssertEqual(t, []string{"a", "b"}, collectScheduledTokenText(stream))
-	core.AssertEqual(t, []string{"END"}, fake.lastConfig.StopSequences)
+	core.AssertEqual(t, []int32{2}, fake.lastConfig.StopTokens)
 }
 
 func TestScheduler_Good_NormalizesBlankRequestID(t *testing.T) {
@@ -78,18 +78,18 @@ func TestScheduler_Good_ClonesQueuedRequestMessagesAndSampler(t *testing.T) {
 	req := inference.ScheduledRequest{
 		ID:       "queued",
 		Messages: []inference.Message{{Role: "user", Content: "original"}},
-		Sampler:  inference.SamplerConfig{MaxTokens: 1, StopSequences: []string{"END"}},
+		Sampler:  inference.SamplerConfig{MaxTokens: 1, StopTokens: []int32{2}},
 	}
 	_, second, err := model.Schedule(context.Background(), req)
 	core.RequireNoError(t, err)
 	req.Messages[0].Content = "mutated"
-	req.Sampler.StopSequences[0] = "changed"
+	req.Sampler.StopTokens[0] = 99
 
 	close(release)
 	core.AssertEqual(t, []string{"ok"}, collectScheduledTokenText(first))
 	core.AssertEqual(t, "original", <-fake.started)
 	core.AssertEqual(t, []string{"ok"}, collectScheduledTokenText(second))
-	core.AssertEqual(t, []string{"END"}, fake.lastConfig.StopSequences)
+	core.AssertEqual(t, []int32{2}, fake.lastConfig.StopTokens)
 }
 
 func TestScheduler_Good_GenerateUsesSchedulerQueue(t *testing.T) {

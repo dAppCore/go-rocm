@@ -16,7 +16,7 @@ func ExampleParserRegistry_ParseReasoning() {
 }
 
 func ExampleParserRegistry_ParseTools() {
-	result, _ := NewParserRegistry("mistral").ParseTools(nil, `[TOOL_CALLS] [{"name":"search","arguments":{"q":"rocm"}}]`)
+	result, _ := NewParserRegistry("mistral").ParseTools(nil, `<tool_call>{"name":"search","arguments":{"q":"rocm"}}</tool_call>`)
 	core.Println(result.Calls[0].Name)
 	// Output: search
 }
@@ -30,7 +30,7 @@ func Example_rocmModel_ParseReasoning() {
 
 func Example_rocmModel_ParseTools() {
 	model := &rocmModel{modelInfo: inference.ModelInfo{Architecture: "mistral"}}
-	result, _ := model.ParseTools(nil, `[TOOL_CALLS] [{"name":"search","arguments":{"q":"rocm"}}]`)
+	result, _ := model.ParseTools(nil, `<tool_call>{"name":"search","arguments":{"q":"rocm"}}</tool_call>`)
 	core.Println(result.Calls[0].Name)
 	// Output: search
 }

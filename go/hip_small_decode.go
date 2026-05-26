@@ -752,6 +752,119 @@ func hipRunProjectionKernelWithDeviceWeightEncoding(ctx context.Context, driver 
 	return hipReadFloat32DeviceOutput(output, "rocm.hip.ProjectionLaunch", "projection output", rows)
 }
 
+func hipRunProjectionKernelWithDeviceInputWeightEncoding(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, weightPointer nativeDevicePointer, weightBytes uint64, rows, cols int, encoding uint32) (*hipDeviceByteBuffer, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return nil, err
+	}
+	if input == nil || input.Pointer() == 0 {
+		return nil, core.E("rocm.hip.ProjectionLaunch", "projection device input is required", nil)
+	}
+	weightElements, err := hipProjectionDeviceWeightElementCount(weightBytes, encoding)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateHIPProjectionShape(input.Count(), weightElements, 0, rows, cols); err != nil {
+		return nil, err
+	}
+	if input.SizeBytes() != uint64(cols*4) {
+		return nil, core.E("rocm.hip.ProjectionLaunch", "projection device input byte count mismatch", nil)
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.ProjectionLaunch", "projection output", uint64(rows*4), rows)
+	if err != nil {
+		return nil, err
+	}
+	success := false
+	defer func() {
+		if !success {
+			_ = output.Close()
+		}
+	}()
+	launchBytes, err := (hipProjectionLaunchArgs{
+		InputPointer:   input.Pointer(),
+		InputCount:     input.Count(),
+		InputBytes:     input.SizeBytes(),
+		WeightPointer:  weightPointer,
+		WeightBytes:    weightBytes,
+		OutputPointer:  output.Pointer(),
+		OutputBytes:    output.SizeBytes(),
+		Rows:           rows,
+		Cols:           cols,
+		WeightEncoding: encoding,
+	}).Binary()
+	if err != nil {
+		return nil, err
+	}
+	config, err := hipOneDimensionalLaunchConfig(hipKernelNameProjection, launchBytes, rows)
+	if err != nil {
+		return nil, err
+	}
+	if err := hipLaunchKernel(driver, config); err != nil {
+		return nil, err
+	}
+	success = true
+	return output, nil
+}
+
+func hipRunProjectionBatchKernelWithDeviceInputWeightEncoding(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, weightPointer nativeDevicePointer, weightBytes uint64, rows, cols int, encoding uint32, batch int) (*hipDeviceByteBuffer, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return nil, err
+	}
+	if driver == nil || !driver.Available() {
+		return nil, core.E("rocm.hip.ProjectionBatchLaunch", "HIP driver is not available", nil)
+	}
+	if input == nil || input.Pointer() == 0 {
+		return nil, core.E("rocm.hip.ProjectionBatchLaunch", "projection batch device input is required", nil)
+	}
+	if batch <= 0 {
+		return nil, core.E("rocm.hip.ProjectionBatchLaunch", "projection batch size must be positive", nil)
+	}
+	weightElements, err := hipProjectionDeviceWeightElementCount(weightBytes, encoding)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateHIPProjectionShape(cols, weightElements, 0, rows, cols); err != nil {
+		return nil, err
+	}
+	if input.Count() != cols*batch || input.SizeBytes() != uint64(cols*batch*4) {
+		return nil, core.E("rocm.hip.ProjectionBatchLaunch", "projection batch device input shape mismatch", nil)
+	}
+	outputCount := rows * batch
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.ProjectionBatchLaunch", "projection batch output", uint64(outputCount*4), outputCount)
+	if err != nil {
+		return nil, err
+	}
+	success := false
+	defer func() {
+		if !success {
+			_ = output.Close()
+		}
+	}()
+	launchBytes, err := (hipProjectionBatchLaunchArgs{
+		InputPointer:   input.Pointer(),
+		WeightPointer:  weightPointer,
+		WeightBytes:    weightBytes,
+		OutputPointer:  output.Pointer(),
+		InputBytes:     input.SizeBytes(),
+		OutputBytes:    output.SizeBytes(),
+		Rows:           rows,
+		Cols:           cols,
+		Batch:          batch,
+		WeightEncoding: encoding,
+	}).Binary()
+	if err != nil {
+		return nil, err
+	}
+	config, err := hipProjectionBatchLaunchConfig(launchBytes, rows, batch)
+	if err != nil {
+		return nil, err
+	}
+	if err := hipLaunchKernel(driver, config); err != nil {
+		return nil, err
+	}
+	success = true
+	return output, nil
+}
+
 func hipProjectionDeviceWeightElementCount(weightBytes uint64, encoding uint32) (int, error) {
 	if weightBytes == 0 {
 		return 0, core.E("rocm.hip.ProjectionLaunch", "projection weight bytes are required", nil)
@@ -794,7 +907,7 @@ func hipRunRMSNormKernel(ctx context.Context, driver nativeHIPDriver, req hipRMS
 	if err != nil {
 		return nil, err
 	}
-	config, err := hipOneDimensionalLaunchConfig(hipKernelNameRMSNorm, launchBytes, buffers.Count)
+	config, err := hipSingleBlockLaunchConfig(hipKernelNameRMSNorm, launchBytes, 256)
 	if err != nil {
 		return nil, err
 	}
@@ -821,7 +934,14 @@ func hipRunRMSNormKernelWithDeviceWeightConfig(ctx context.Context, driver nativ
 	if driver == nil || !driver.Available() {
 		return nil, core.E("rocm.hip.RMSNormLaunch", "HIP driver is not available", nil)
 	}
-	if cfg.WeightPointer == 0 {
+	if cfg.WeightEncoding == hipRMSNormWeightEncodingNone {
+		if cfg.Flags != 0 {
+			return nil, core.E("rocm.hip.RMSNormLaunch", "unit RMSNorm weight does not support flags", nil)
+		}
+		if cfg.WeightPointer != 0 || cfg.WeightBytes != 0 {
+			return nil, core.E("rocm.hip.RMSNormLaunch", "unit RMSNorm weight must not provide a weight pointer", nil)
+		}
+	} else if cfg.WeightPointer == 0 {
 		return nil, core.E("rocm.hip.RMSNormLaunch", "RMSNorm weight pointer is required", nil)
 	}
 	if cfg.Count <= 0 {
@@ -839,17 +959,56 @@ func hipRunRMSNormKernelWithDeviceWeightConfig(ctx context.Context, driver nativ
 		return nil, err
 	}
 	defer inputBuffer.Close()
-	output, err := hipAllocateByteBuffer(driver, "rocm.hip.RMSNormLaunch", "rms norm output", uint64(cfg.Count*4), cfg.Count)
+	output, err := hipRunRMSNormKernelWithDeviceInputWeightConfig(ctx, driver, inputBuffer, cfg)
 	if err != nil {
 		return nil, err
 	}
 	defer output.Close()
+	return hipReadFloat32DeviceOutput(output, "rocm.hip.RMSNormLaunch", "rms norm output", cfg.Count)
+}
+
+func hipRunRMSNormKernelWithDeviceInputWeightConfig(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipRMSNormDeviceWeightConfig) (*hipDeviceByteBuffer, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return nil, err
+	}
+	if driver == nil || !driver.Available() {
+		return nil, core.E("rocm.hip.RMSNormLaunch", "HIP driver is not available", nil)
+	}
+	if input == nil || input.Pointer() == 0 {
+		return nil, core.E("rocm.hip.RMSNormLaunch", "RMSNorm input device buffer is required", nil)
+	}
+	if cfg.WeightEncoding == hipRMSNormWeightEncodingNone {
+		if cfg.Flags != 0 {
+			return nil, core.E("rocm.hip.RMSNormLaunch", "unit RMSNorm weight does not support flags", nil)
+		}
+		if cfg.WeightPointer != 0 || cfg.WeightBytes != 0 {
+			return nil, core.E("rocm.hip.RMSNormLaunch", "unit RMSNorm weight must not provide a weight pointer", nil)
+		}
+	} else if cfg.WeightPointer == 0 {
+		return nil, core.E("rocm.hip.RMSNormLaunch", "RMSNorm weight pointer is required", nil)
+	}
+	if cfg.Count <= 0 {
+		return nil, core.E("rocm.hip.RMSNormLaunch", "count must be positive", nil)
+	}
+	if input.Count() != cfg.Count || input.SizeBytes() != uint64(cfg.Count*4) {
+		return nil, core.E("rocm.hip.RMSNormLaunch", "RMSNorm input device buffer shape mismatch", nil)
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.RMSNormLaunch", "rms norm output", uint64(cfg.Count*4), cfg.Count)
+	if err != nil {
+		return nil, err
+	}
+	success := false
+	defer func() {
+		if !success {
+			_ = output.Close()
+		}
+	}()
 	launchBytes, err := (hipRMSNormLaunchArgs{
-		InputPointer:   inputBuffer.Pointer(),
+		InputPointer:   input.Pointer(),
 		WeightPointer:  cfg.WeightPointer,
 		OutputPointer:  output.Pointer(),
 		Count:          cfg.Count,
-		InputBytes:     inputBuffer.SizeBytes(),
+		InputBytes:     input.SizeBytes(),
 		WeightBytes:    cfg.WeightBytes,
 		OutputBytes:    output.SizeBytes(),
 		Epsilon:        cfg.Epsilon,
@@ -859,14 +1018,420 @@ func hipRunRMSNormKernelWithDeviceWeightConfig(ctx context.Context, driver nativ
 	if err != nil {
 		return nil, err
 	}
-	config, err := hipOneDimensionalLaunchConfig(hipKernelNameRMSNorm, launchBytes, cfg.Count)
+	config, err := hipSingleBlockLaunchConfig(hipKernelNameRMSNorm, launchBytes, 256)
 	if err != nil {
 		return nil, err
 	}
 	if err := hipLaunchKernel(driver, config); err != nil {
 		return nil, err
 	}
-	return hipReadFloat32DeviceOutput(output, "rocm.hip.RMSNormLaunch", "rms norm output", cfg.Count)
+	success = true
+	return output, nil
+}
+
+func hipRunRMSNormResidualAddKernelWithDeviceInputWeightConfig(ctx context.Context, driver nativeHIPDriver, input, residual *hipDeviceByteBuffer, cfg hipRMSNormDeviceWeightConfig) (*hipDeviceByteBuffer, error) {
+	return hipRunRMSNormResidualAddScaledKernelWithDeviceInputWeightConfig(ctx, driver, input, residual, cfg, 1)
+}
+
+func hipRunRMSNormResidualAddScaledKernelWithDeviceInputWeightConfig(ctx context.Context, driver nativeHIPDriver, input, residual *hipDeviceByteBuffer, cfg hipRMSNormDeviceWeightConfig, outputScale float32) (*hipDeviceByteBuffer, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return nil, err
+	}
+	if driver == nil || !driver.Available() {
+		return nil, core.E("rocm.hip.RMSNormResidualAddLaunch", "HIP driver is not available", nil)
+	}
+	if input == nil || input.Pointer() == 0 {
+		return nil, core.E("rocm.hip.RMSNormResidualAddLaunch", "RMSNorm input device buffer is required", nil)
+	}
+	if residual == nil || residual.Pointer() == 0 {
+		return nil, core.E("rocm.hip.RMSNormResidualAddLaunch", "residual device buffer is required", nil)
+	}
+	if cfg.WeightEncoding == hipRMSNormWeightEncodingNone {
+		if cfg.Flags != 0 {
+			return nil, core.E("rocm.hip.RMSNormResidualAddLaunch", "unit RMSNorm weight does not support flags", nil)
+		}
+		if cfg.WeightPointer != 0 || cfg.WeightBytes != 0 {
+			return nil, core.E("rocm.hip.RMSNormResidualAddLaunch", "unit RMSNorm weight must not provide a weight pointer", nil)
+		}
+	} else if cfg.WeightPointer == 0 {
+		return nil, core.E("rocm.hip.RMSNormResidualAddLaunch", "RMSNorm weight pointer is required", nil)
+	}
+	if cfg.Count <= 0 {
+		return nil, core.E("rocm.hip.RMSNormResidualAddLaunch", "count must be positive", nil)
+	}
+	if math.IsNaN(float64(outputScale)) || math.IsInf(float64(outputScale), 0) {
+		return nil, core.E("rocm.hip.RMSNormResidualAddLaunch", "output scale must be finite", nil)
+	}
+	if input.Count() != cfg.Count || residual.Count() != cfg.Count || input.SizeBytes() != uint64(cfg.Count*4) || residual.SizeBytes() != uint64(cfg.Count*4) {
+		return nil, core.E("rocm.hip.RMSNormResidualAddLaunch", "RMSNorm residual-add device buffer shape mismatch", nil)
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.RMSNormResidualAddLaunch", "rms norm residual-add output", uint64(cfg.Count*4), cfg.Count)
+	if err != nil {
+		return nil, err
+	}
+	success := false
+	defer func() {
+		if !success {
+			_ = output.Close()
+		}
+	}()
+	launchBytes, err := (hipRMSNormResidualAddLaunchArgs{
+		InputPointer:    input.Pointer(),
+		WeightPointer:   cfg.WeightPointer,
+		ResidualPointer: residual.Pointer(),
+		OutputPointer:   output.Pointer(),
+		Count:           cfg.Count,
+		InputBytes:      input.SizeBytes(),
+		WeightBytes:     cfg.WeightBytes,
+		ResidualBytes:   residual.SizeBytes(),
+		OutputBytes:     output.SizeBytes(),
+		Epsilon:         cfg.Epsilon,
+		WeightEncoding:  cfg.WeightEncoding,
+		Flags:           cfg.Flags,
+		OutputScale:     outputScale,
+	}).Binary()
+	if err != nil {
+		return nil, err
+	}
+	config, err := hipSingleBlockLaunchConfig(hipKernelNameRMSNormResidualAdd, launchBytes, 256)
+	if err != nil {
+		return nil, err
+	}
+	if err := hipLaunchKernel(driver, config); err != nil {
+		return nil, err
+	}
+	success = true
+	return output, nil
+}
+
+func hipRunRMSNormResidualAddNormKernelWithDeviceInputWeightConfig(ctx context.Context, driver nativeHIPDriver, input, residual *hipDeviceByteBuffer, residualCfg, normCfg hipRMSNormDeviceWeightConfig) (*hipDeviceByteBuffer, *hipDeviceByteBuffer, error) {
+	return hipRunRMSNormResidualAddNormScaledKernelWithDeviceInputWeightConfig(ctx, driver, input, residual, residualCfg, normCfg, 1)
+}
+
+func hipRunRMSNormResidualAddNormScaledKernelWithDeviceInputWeightConfig(ctx context.Context, driver nativeHIPDriver, input, residual *hipDeviceByteBuffer, residualCfg, normCfg hipRMSNormDeviceWeightConfig, outputScale float32) (*hipDeviceByteBuffer, *hipDeviceByteBuffer, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return nil, nil, err
+	}
+	if driver == nil || !driver.Available() {
+		return nil, nil, core.E("rocm.hip.RMSNormResidualAddNormLaunch", "HIP driver is not available", nil)
+	}
+	if input == nil || input.Pointer() == 0 {
+		return nil, nil, core.E("rocm.hip.RMSNormResidualAddNormLaunch", "RMSNorm input device buffer is required", nil)
+	}
+	if residual == nil || residual.Pointer() == 0 {
+		return nil, nil, core.E("rocm.hip.RMSNormResidualAddNormLaunch", "residual device buffer is required", nil)
+	}
+	if err := hipValidateRMSNormDeviceWeightConfig("RMSNormResidualAddNormLaunch", residualCfg); err != nil {
+		return nil, nil, err
+	}
+	if err := hipValidateRMSNormDeviceWeightConfig("RMSNormResidualAddNormLaunch", normCfg); err != nil {
+		return nil, nil, err
+	}
+	if residualCfg.Count <= 0 || residualCfg.Count != normCfg.Count {
+		return nil, nil, core.E("rocm.hip.RMSNormResidualAddNormLaunch", "RMSNorm counts must be positive and equal", nil)
+	}
+	if input.Count() != residualCfg.Count || residual.Count() != residualCfg.Count ||
+		input.SizeBytes() != uint64(residualCfg.Count*4) ||
+		residual.SizeBytes() != uint64(residualCfg.Count*4) {
+		return nil, nil, core.E("rocm.hip.RMSNormResidualAddNormLaunch", "RMSNorm residual-add-norm device buffer shape mismatch", nil)
+	}
+	residualOutput, err := hipAllocateByteBuffer(driver, "rocm.hip.RMSNormResidualAddNormLaunch", "rms norm residual-add output", uint64(residualCfg.Count*4), residualCfg.Count)
+	if err != nil {
+		return nil, nil, err
+	}
+	normOutput, err := hipAllocateByteBuffer(driver, "rocm.hip.RMSNormResidualAddNormLaunch", "rms norm residual-add norm output", uint64(normCfg.Count*4), normCfg.Count)
+	if err != nil {
+		_ = residualOutput.Close()
+		return nil, nil, err
+	}
+	success := false
+	defer func() {
+		if !success {
+			_ = normOutput.Close()
+			_ = residualOutput.Close()
+		}
+	}()
+	launchBytes, err := (hipRMSNormResidualAddNormLaunchArgs{
+		InputPointer:          input.Pointer(),
+		WeightPointer:         residualCfg.WeightPointer,
+		ResidualPointer:       residual.Pointer(),
+		ResidualOutputPointer: residualOutput.Pointer(),
+		NormWeightPointer:     normCfg.WeightPointer,
+		NormOutputPointer:     normOutput.Pointer(),
+		Count:                 residualCfg.Count,
+		InputBytes:            input.SizeBytes(),
+		WeightBytes:           residualCfg.WeightBytes,
+		ResidualBytes:         residual.SizeBytes(),
+		ResidualOutputBytes:   residualOutput.SizeBytes(),
+		NormWeightBytes:       normCfg.WeightBytes,
+		NormOutputBytes:       normOutput.SizeBytes(),
+		Epsilon:               residualCfg.Epsilon,
+		WeightEncoding:        residualCfg.WeightEncoding,
+		Flags:                 residualCfg.Flags,
+		NormEpsilon:           normCfg.Epsilon,
+		NormWeightEncoding:    normCfg.WeightEncoding,
+		NormFlags:             normCfg.Flags,
+		OutputScale:           outputScale,
+	}).Binary()
+	if err != nil {
+		return nil, nil, err
+	}
+	config, err := hipSingleBlockLaunchConfig(hipKernelNameRMSNormResAddNorm, launchBytes, 256)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := hipLaunchKernel(driver, config); err != nil {
+		return nil, nil, err
+	}
+	success = true
+	return residualOutput, normOutput, nil
+}
+
+func hipValidateRMSNormDeviceWeightConfig(operation string, cfg hipRMSNormDeviceWeightConfig) error {
+	if cfg.WeightEncoding == hipRMSNormWeightEncodingNone {
+		if cfg.Flags != 0 {
+			return core.E("rocm.hip."+operation, "unit RMSNorm weight does not support flags", nil)
+		}
+		if cfg.WeightPointer != 0 || cfg.WeightBytes != 0 {
+			return core.E("rocm.hip."+operation, "unit RMSNorm weight must not provide a weight pointer", nil)
+		}
+		return nil
+	}
+	if cfg.WeightPointer == 0 {
+		return core.E("rocm.hip."+operation, "RMSNorm weight pointer is required", nil)
+	}
+	return nil
+}
+
+func hipRunRMSNormDeviceToDeviceKernel(ctx context.Context, driver nativeHIPDriver, inputPointer nativeDevicePointer, inputBytes uint64, outputPointer nativeDevicePointer, outputBytes uint64, cfg hipRMSNormDeviceWeightConfig) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	if cfg.WeightEncoding == hipRMSNormWeightEncodingNone {
+		if cfg.Flags != 0 {
+			return core.E("rocm.hip.RMSNormLaunch", "unit RMSNorm weight does not support flags", nil)
+		}
+		if cfg.WeightPointer != 0 || cfg.WeightBytes != 0 {
+			return core.E("rocm.hip.RMSNormLaunch", "unit RMSNorm weight must not provide a weight pointer", nil)
+		}
+	} else if cfg.WeightPointer == 0 {
+		return core.E("rocm.hip.RMSNormLaunch", "RMSNorm weight pointer is required", nil)
+	}
+	launchBytes, err := (hipRMSNormLaunchArgs{
+		InputPointer:   inputPointer,
+		WeightPointer:  cfg.WeightPointer,
+		OutputPointer:  outputPointer,
+		Count:          cfg.Count,
+		InputBytes:     inputBytes,
+		WeightBytes:    cfg.WeightBytes,
+		OutputBytes:    outputBytes,
+		Epsilon:        cfg.Epsilon,
+		WeightEncoding: cfg.WeightEncoding,
+		Flags:          cfg.Flags,
+	}).Binary()
+	if err != nil {
+		return err
+	}
+	config, err := hipSingleBlockLaunchConfig(hipKernelNameRMSNorm, launchBytes, 256)
+	if err != nil {
+		return err
+	}
+	return hipLaunchKernel(driver, config)
+}
+
+func hipRunRMSNormHeadsKernelWithDeviceInputWeightConfig(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipRMSNormDeviceWeightConfig, headCount int) (*hipDeviceByteBuffer, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return nil, err
+	}
+	if driver == nil || !driver.Available() {
+		return nil, core.E("rocm.hip.RMSNormHeadsLaunch", "HIP driver is not available", nil)
+	}
+	if input == nil || input.Pointer() == 0 {
+		return nil, core.E("rocm.hip.RMSNormHeadsLaunch", "RMSNorm heads input device buffer is required", nil)
+	}
+	if cfg.Count <= 0 || headCount <= 0 {
+		return nil, core.E("rocm.hip.RMSNormHeadsLaunch", "head dim and head count must be positive", nil)
+	}
+	if input.Count() != cfg.Count*headCount || input.SizeBytes() != uint64(input.Count()*4) {
+		return nil, core.E("rocm.hip.RMSNormHeadsLaunch", "RMSNorm heads input device buffer shape mismatch", nil)
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.RMSNormHeadsLaunch", "rms norm heads output", input.SizeBytes(), input.Count())
+	if err != nil {
+		return nil, err
+	}
+	success := false
+	defer func() {
+		if !success {
+			_ = output.Close()
+		}
+	}()
+	launchBytes, err := (hipRMSNormHeadsLaunchArgs{
+		InputPointer:   input.Pointer(),
+		WeightPointer:  cfg.WeightPointer,
+		OutputPointer:  output.Pointer(),
+		HeadDim:        cfg.Count,
+		HeadCount:      headCount,
+		InputBytes:     input.SizeBytes(),
+		WeightBytes:    cfg.WeightBytes,
+		OutputBytes:    output.SizeBytes(),
+		Epsilon:        cfg.Epsilon,
+		WeightEncoding: cfg.WeightEncoding,
+		Flags:          cfg.Flags,
+	}).Binary()
+	if err != nil {
+		return nil, err
+	}
+	config := hipKernelLaunchConfig{
+		Name:   hipKernelNameRMSNormHeads,
+		Args:   append([]byte(nil), launchBytes...),
+		GridX:  uint32(headCount),
+		GridY:  1,
+		GridZ:  1,
+		BlockX: 256,
+		BlockY: 1,
+		BlockZ: 1,
+	}
+	if err := config.Validate(); err != nil {
+		return nil, err
+	}
+	if err := hipLaunchKernel(driver, config); err != nil {
+		return nil, err
+	}
+	success = true
+	return output, nil
+}
+
+func hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfig(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipRMSNormDeviceWeightConfig, headCount int, position int, base float32, frequencyDim int, rotaryCount int) (*hipDeviceByteBuffer, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return nil, err
+	}
+	if driver == nil || !driver.Available() {
+		return nil, core.E("rocm.hip.RMSNormRoPEHeadsLaunch", "HIP driver is not available", nil)
+	}
+	if input == nil || input.Pointer() == 0 {
+		return nil, core.E("rocm.hip.RMSNormRoPEHeadsLaunch", "RMSNorm RoPE heads input device buffer is required", nil)
+	}
+	if cfg.Count <= 0 || cfg.Count%2 != 0 || headCount <= 0 {
+		return nil, core.E("rocm.hip.RMSNormRoPEHeadsLaunch", "head dim must be positive/even and head count must be positive", nil)
+	}
+	if input.Count() != cfg.Count*headCount || input.SizeBytes() != uint64(input.Count()*4) {
+		return nil, core.E("rocm.hip.RMSNormRoPEHeadsLaunch", "RMSNorm RoPE heads input device buffer shape mismatch", nil)
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.RMSNormRoPEHeadsLaunch", "rms norm rope heads output", input.SizeBytes(), input.Count())
+	if err != nil {
+		return nil, err
+	}
+	success := false
+	defer func() {
+		if !success {
+			_ = output.Close()
+		}
+	}()
+	launchBytes, err := (hipRMSNormRoPEHeadsLaunchArgs{
+		InputPointer:   input.Pointer(),
+		WeightPointer:  cfg.WeightPointer,
+		OutputPointer:  output.Pointer(),
+		HeadDim:        cfg.Count,
+		HeadCount:      headCount,
+		InputBytes:     input.SizeBytes(),
+		WeightBytes:    cfg.WeightBytes,
+		OutputBytes:    output.SizeBytes(),
+		Epsilon:        cfg.Epsilon,
+		WeightEncoding: cfg.WeightEncoding,
+		Flags:          cfg.Flags,
+		Position:       position,
+		Base:           base,
+		FrequencyDim:   frequencyDim,
+		RotaryCount:    rotaryCount,
+	}).Binary()
+	if err != nil {
+		return nil, err
+	}
+	config := hipKernelLaunchConfig{
+		Name:   hipKernelNameRMSNormRoPEHeads,
+		Args:   append([]byte(nil), launchBytes...),
+		GridX:  uint32(headCount),
+		GridY:  1,
+		GridZ:  1,
+		BlockX: 256,
+		BlockY: 1,
+		BlockZ: 1,
+	}
+	if err := config.Validate(); err != nil {
+		return nil, err
+	}
+	if err := hipLaunchKernel(driver, config); err != nil {
+		return nil, err
+	}
+	success = true
+	return output, nil
+}
+
+func hipRunRMSNormRoPEHeadsBatchKernelWithDeviceInputWeightConfig(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipRMSNormDeviceWeightConfig, headCount int, batch int, startPosition int, base float32, frequencyDim int, rotaryCount int) (*hipDeviceByteBuffer, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return nil, err
+	}
+	if driver == nil || !driver.Available() {
+		return nil, core.E("rocm.hip.RMSNormRoPEHeadsBatchLaunch", "HIP driver is not available", nil)
+	}
+	if input == nil || input.Pointer() == 0 {
+		return nil, core.E("rocm.hip.RMSNormRoPEHeadsBatchLaunch", "RMSNorm RoPE heads batch input device buffer is required", nil)
+	}
+	if cfg.Count <= 0 || cfg.Count%2 != 0 || headCount <= 0 || batch <= 0 {
+		return nil, core.E("rocm.hip.RMSNormRoPEHeadsBatchLaunch", "head dim must be positive/even and head count/batch must be positive", nil)
+	}
+	if input.Count() != cfg.Count*headCount*batch || input.SizeBytes() != uint64(input.Count()*4) {
+		return nil, core.E("rocm.hip.RMSNormRoPEHeadsBatchLaunch", "RMSNorm RoPE heads batch input device buffer shape mismatch", nil)
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.RMSNormRoPEHeadsBatchLaunch", "rms norm rope heads batch output", input.SizeBytes(), input.Count())
+	if err != nil {
+		return nil, err
+	}
+	success := false
+	defer func() {
+		if !success {
+			_ = output.Close()
+		}
+	}()
+	launchBytes, err := (hipRMSNormRoPEHeadsBatchLaunchArgs{
+		InputPointer:   input.Pointer(),
+		WeightPointer:  cfg.WeightPointer,
+		OutputPointer:  output.Pointer(),
+		HeadDim:        cfg.Count,
+		HeadCount:      headCount,
+		Batch:          batch,
+		InputBytes:     input.SizeBytes(),
+		WeightBytes:    cfg.WeightBytes,
+		OutputBytes:    output.SizeBytes(),
+		Epsilon:        cfg.Epsilon,
+		WeightEncoding: cfg.WeightEncoding,
+		Flags:          cfg.Flags,
+		StartPosition:  startPosition,
+		Base:           base,
+		FrequencyDim:   frequencyDim,
+		RotaryCount:    rotaryCount,
+	}).Binary()
+	if err != nil {
+		return nil, err
+	}
+	config := hipKernelLaunchConfig{
+		Name:   hipKernelNameRMSNormRoPEHeadsBatch,
+		Args:   append([]byte(nil), launchBytes...),
+		GridX:  uint32(headCount),
+		GridY:  uint32(batch),
+		GridZ:  1,
+		BlockX: 256,
+		BlockY: 1,
+		BlockZ: 1,
+	}
+	if err := config.Validate(); err != nil {
+		return nil, err
+	}
+	if err := hipLaunchKernel(driver, config); err != nil {
+		return nil, err
+	}
+	success = true
+	return output, nil
 }
 
 func hipRunRoPEKernel(ctx context.Context, driver nativeHIPDriver, req hipRoPERequest) ([]float32, error) {
@@ -886,7 +1451,7 @@ func hipRunRoPEKernel(ctx context.Context, driver nativeHIPDriver, req hipRoPERe
 	if err != nil {
 		return nil, err
 	}
-	config, err := hipOneDimensionalLaunchConfig(hipKernelNameRoPE, launchBytes, buffers.Count)
+	config, err := hipOneDimensionalLaunchConfig(hipKernelNameRoPE, launchBytes, buffers.Count/2)
 	if err != nil {
 		return nil, err
 	}
@@ -894,6 +1459,115 @@ func hipRunRoPEKernel(ctx context.Context, driver nativeHIPDriver, req hipRoPERe
 		return nil, err
 	}
 	return buffers.ReadOutput()
+}
+
+func hipRunRoPEDeviceKernel(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, position int, base float32, frequencyDim int) (*hipDeviceByteBuffer, error) {
+	return hipRunRoPEDeviceKernelWithRotaryCount(ctx, driver, input, position, base, frequencyDim, 0)
+}
+
+func hipRunRoPEDeviceKernelWithRotaryCount(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, position int, base float32, frequencyDim int, rotaryCount int) (*hipDeviceByteBuffer, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return nil, err
+	}
+	if input == nil || input.Pointer() == 0 {
+		return nil, core.E("rocm.hip.RoPELaunch", "rope device input is required", nil)
+	}
+	if input.Count() <= 0 || input.Count()%2 != 0 || input.SizeBytes() != uint64(input.Count()*4) {
+		return nil, core.E("rocm.hip.RoPELaunch", "rope device input shape mismatch", nil)
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.RoPELaunch", "rope output", input.SizeBytes(), input.Count())
+	if err != nil {
+		return nil, err
+	}
+	success := false
+	defer func() {
+		if !success {
+			_ = output.Close()
+		}
+	}()
+	if err := hipRunRoPEDeviceToDeviceKernelWithRotaryCount(ctx, driver, input.Pointer(), input.SizeBytes(), output.Pointer(), output.SizeBytes(), input.Count(), position, base, frequencyDim, rotaryCount); err != nil {
+		return nil, err
+	}
+	success = true
+	return output, nil
+}
+
+func hipRunRoPEDeviceToDeviceKernel(ctx context.Context, driver nativeHIPDriver, inputPointer nativeDevicePointer, inputBytes uint64, outputPointer nativeDevicePointer, outputBytes uint64, count int, position int, base float32, frequencyDim int) error {
+	return hipRunRoPEDeviceToDeviceKernelWithRotaryCount(ctx, driver, inputPointer, inputBytes, outputPointer, outputBytes, count, position, base, frequencyDim, 0)
+}
+
+func hipRunRoPEDeviceToDeviceKernelWithRotaryCount(ctx context.Context, driver nativeHIPDriver, inputPointer nativeDevicePointer, inputBytes uint64, outputPointer nativeDevicePointer, outputBytes uint64, count int, position int, base float32, frequencyDim int, rotaryCount int) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	launchBytes, err := (hipRoPELaunchArgs{
+		InputPointer:  inputPointer,
+		OutputPointer: outputPointer,
+		Count:         count,
+		InputBytes:    inputBytes,
+		OutputBytes:   outputBytes,
+		Position:      position,
+		Base:          base,
+		FrequencyDim:  frequencyDim,
+		RotaryCount:   rotaryCount,
+	}).Binary()
+	if err != nil {
+		return err
+	}
+	config, err := hipOneDimensionalLaunchConfig(hipKernelNameRoPE, launchBytes, count/2)
+	if err != nil {
+		return err
+	}
+	return hipLaunchKernel(driver, config)
+}
+
+func hipRunRoPEHeadsDeviceKernelWithRotaryCount(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, headDim, headCount int, position int, base float32, frequencyDim int, rotaryCount int) (*hipDeviceByteBuffer, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return nil, err
+	}
+	if input == nil || input.Pointer() == 0 {
+		return nil, core.E("rocm.hip.RoPEHeadsLaunch", "rope heads device input is required", nil)
+	}
+	if headDim <= 0 || headDim%2 != 0 || headCount <= 0 {
+		return nil, core.E("rocm.hip.RoPEHeadsLaunch", "head dim must be positive/even and head count must be positive", nil)
+	}
+	if input.Count() != headDim*headCount || input.SizeBytes() != uint64(input.Count()*4) {
+		return nil, core.E("rocm.hip.RoPEHeadsLaunch", "rope heads device input shape mismatch", nil)
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.RoPEHeadsLaunch", "rope heads output", input.SizeBytes(), input.Count())
+	if err != nil {
+		return nil, err
+	}
+	success := false
+	defer func() {
+		if !success {
+			_ = output.Close()
+		}
+	}()
+	launchBytes, err := (hipRoPEHeadsLaunchArgs{
+		InputPointer:  input.Pointer(),
+		OutputPointer: output.Pointer(),
+		HeadDim:       headDim,
+		HeadCount:     headCount,
+		InputBytes:    input.SizeBytes(),
+		OutputBytes:   output.SizeBytes(),
+		Position:      position,
+		Base:          base,
+		FrequencyDim:  frequencyDim,
+		RotaryCount:   rotaryCount,
+	}).Binary()
+	if err != nil {
+		return nil, err
+	}
+	config, err := hipOneDimensionalLaunchConfig(hipKernelNameRoPEHeads, launchBytes, headCount*(headDim/2))
+	if err != nil {
+		return nil, err
+	}
+	if err := hipLaunchKernel(driver, config); err != nil {
+		return nil, err
+	}
+	success = true
+	return output, nil
 }
 
 func hipRunAttentionKernel(ctx context.Context, driver nativeHIPDriver, req hipAttentionRequest) (hipAttentionResult, error) {
@@ -923,6 +1597,551 @@ func hipRunAttentionKernel(ctx context.Context, driver nativeHIPDriver, req hipA
 	return buffers.ReadOutput()
 }
 
+func hipRunAttentionOutputKernel(ctx context.Context, driver nativeHIPDriver, req hipAttentionRequest) ([]float32, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return nil, err
+	}
+	buffers, err := req.deviceBuffers(driver)
+	if err != nil {
+		return nil, err
+	}
+	defer buffers.Close()
+	launch, err := req.launchArgs(buffers)
+	if err != nil {
+		return nil, err
+	}
+	launchBytes, err := launch.Binary()
+	if err != nil {
+		return nil, err
+	}
+	config, err := hipOneDimensionalLaunchConfig(hipKernelNameAttention, launchBytes, buffers.TokenCount)
+	if err != nil {
+		return nil, err
+	}
+	if err := hipLaunchKernel(driver, config); err != nil {
+		return nil, err
+	}
+	return buffers.ReadOutputOnly()
+}
+
+func hipRunAttentionOutputToDeviceKernel(ctx context.Context, driver nativeHIPDriver, req hipAttentionRequest, output *hipDeviceByteBuffer, outputElementOffset int) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	queryPayload, err := hipFloat32Payload(req.Query)
+	if err != nil {
+		return core.E("rocm.hip.AttentionLaunch", "encode query", err)
+	}
+	query, err := hipUploadByteBuffer(driver, "rocm.hip.AttentionLaunch", "attention query", queryPayload, len(req.Query))
+	if err != nil {
+		return err
+	}
+	defer query.Close()
+	return hipRunAttentionOutputFromDeviceQueryToDeviceKernel(ctx, driver, req, query, 0, output, outputElementOffset)
+}
+
+func hipRunAttentionOutputFromDeviceQueryToDeviceKernel(ctx context.Context, driver nativeHIPDriver, req hipAttentionRequest, query *hipDeviceByteBuffer, queryElementOffset int, output *hipDeviceByteBuffer, outputElementOffset int) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	dim, tokenCount, err := req.shape()
+	if err != nil {
+		return err
+	}
+	if query == nil || query.Pointer() == 0 {
+		return core.E("rocm.hip.AttentionLaunch", "attention query device buffer is required", nil)
+	}
+	if queryElementOffset < 0 || query.Count() < queryElementOffset+dim || query.SizeBytes() < uint64(queryElementOffset+dim)*4 {
+		return core.E("rocm.hip.AttentionLaunch", "attention query device buffer shape mismatch", nil)
+	}
+	if output == nil || output.Pointer() == 0 {
+		return core.E("rocm.hip.AttentionLaunch", "attention destination output buffer is required", nil)
+	}
+	if outputElementOffset < 0 || output.Count() < outputElementOffset+dim || output.SizeBytes() < uint64(outputElementOffset+dim)*4 {
+		return core.E("rocm.hip.AttentionLaunch", "attention destination output buffer shape mismatch", nil)
+	}
+	weights, err := hipAllocateByteBuffer(driver, "rocm.hip.AttentionLaunch", "attention weights", uint64(tokenCount*4), tokenCount)
+	if err != nil {
+		return err
+	}
+	defer weights.Close()
+
+	launch := hipAttentionLaunchArgs{
+		QueryPointer:  nativeDevicePointer(uintptr(query.Pointer()) + uintptr(queryElementOffset*4)),
+		OutputPointer: nativeDevicePointer(uintptr(output.Pointer()) + uintptr(outputElementOffset*4)),
+		WeightPointer: weights.Pointer(),
+		Dim:           dim,
+		TokenCount:    tokenCount,
+		QueryBytes:    uint64(dim * 4),
+		OutputBytes:   uint64(dim * 4),
+		WeightBytes:   weights.SizeBytes(),
+		Scale:         req.Scale,
+	}
+	if req.DeviceKV == nil {
+		keyPayload, err := hipFloat32Payload(req.Keys)
+		if err != nil {
+			return core.E("rocm.hip.AttentionLaunch", "encode keys", err)
+		}
+		keys, err := hipUploadByteBuffer(driver, "rocm.hip.AttentionLaunch", "attention keys", keyPayload, len(req.Keys))
+		if err != nil {
+			return err
+		}
+		defer keys.Close()
+		valuePayload, err := hipFloat32Payload(req.Values)
+		if err != nil {
+			return core.E("rocm.hip.AttentionLaunch", "encode values", err)
+		}
+		values, err := hipUploadByteBuffer(driver, "rocm.hip.AttentionLaunch", "attention values", valuePayload, len(req.Values))
+		if err != nil {
+			return err
+		}
+		defer values.Close()
+		launch.KVSource = hipAttentionKVSourceContiguous
+		launch.KeyPointer = keys.Pointer()
+		launch.ValuePointer = values.Pointer()
+		launch.KeyBytes = keys.SizeBytes()
+		launch.ValueBytes = values.SizeBytes()
+	} else {
+		launch.KVSource = hipAttentionKVSourceDevice
+		launch.DescriptorPointer = req.DescriptorTable.Pointer()
+		launch.DescriptorBytes = req.DescriptorTable.SizeBytes()
+	}
+	launchBytes, err := launch.Binary()
+	if err != nil {
+		return err
+	}
+	config, err := hipOneDimensionalLaunchConfig(hipKernelNameAttention, launchBytes, tokenCount)
+	if err != nil {
+		return err
+	}
+	return hipLaunchKernel(driver, config)
+}
+
+func hipRunAttentionHeadsOutputFromDeviceQueryToDeviceKernel(ctx context.Context, driver nativeHIPDriver, req hipAttentionRequest, query *hipDeviceByteBuffer, headCount int, output *hipDeviceByteBuffer) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	dim, tokenCount, err := req.shape()
+	if err != nil {
+		return err
+	}
+	if headCount <= 0 {
+		return core.E("rocm.hip.AttentionHeadsLaunch", "head count must be positive", nil)
+	}
+	if query == nil || query.Pointer() == 0 || query.Count() != headCount*dim || query.SizeBytes() != uint64(headCount*dim*4) {
+		return core.E("rocm.hip.AttentionHeadsLaunch", "attention query device buffer shape mismatch", nil)
+	}
+	if output == nil || output.Pointer() == 0 || output.Count() != headCount*dim || output.SizeBytes() != uint64(headCount*dim*4) {
+		return core.E("rocm.hip.AttentionHeadsLaunch", "attention output device buffer shape mismatch", nil)
+	}
+	useSharedWeights := tokenCount <= hipAttentionHeadsSharedMaxTokens
+	var weights *hipDeviceByteBuffer
+	if !useSharedWeights {
+		weights, err = hipAllocateByteBuffer(driver, "rocm.hip.AttentionHeadsLaunch", "attention head weights", uint64(headCount*tokenCount*4), headCount*tokenCount)
+		if err != nil {
+			return err
+		}
+		defer weights.Close()
+	}
+	launch := hipAttentionHeadsLaunchArgs{
+		QueryPointer:  query.Pointer(),
+		OutputPointer: output.Pointer(),
+		Dim:           dim,
+		TokenCount:    tokenCount,
+		HeadCount:     headCount,
+		QueryBytes:    query.SizeBytes(),
+		OutputBytes:   output.SizeBytes(),
+		Scale:         req.Scale,
+	}
+	var sharedMemBytes uint32
+	if useSharedWeights {
+		sharedMemBytes, err = hipAttentionHeadsSharedMemBytes(tokenCount, req.DeviceKV != nil)
+		if err != nil {
+			return err
+		}
+		launch.SharedMemBytes = uint64(sharedMemBytes)
+	} else {
+		launch.WeightPointer = weights.Pointer()
+		launch.WeightBytes = weights.SizeBytes()
+	}
+	if req.DeviceKV == nil {
+		launch.KVSource = hipAttentionKVSourceContiguous
+		keyPayload, err := hipFloat32Payload(req.Keys)
+		if err != nil {
+			return core.E("rocm.hip.AttentionHeadsLaunch", "encode keys", err)
+		}
+		keys, err := hipUploadByteBuffer(driver, "rocm.hip.AttentionHeadsLaunch", "attention keys", keyPayload, len(req.Keys))
+		if err != nil {
+			return err
+		}
+		defer keys.Close()
+		valuePayload, err := hipFloat32Payload(req.Values)
+		if err != nil {
+			return core.E("rocm.hip.AttentionHeadsLaunch", "encode values", err)
+		}
+		values, err := hipUploadByteBuffer(driver, "rocm.hip.AttentionHeadsLaunch", "attention values", valuePayload, len(req.Values))
+		if err != nil {
+			return err
+		}
+		defer values.Close()
+		launch.KeyPointer = keys.Pointer()
+		launch.ValuePointer = values.Pointer()
+		launch.KeyBytes = keys.SizeBytes()
+		launch.ValueBytes = values.SizeBytes()
+	} else {
+		launch.KVSource = hipAttentionKVSourceDevice
+		launch.DescriptorPointer = req.DescriptorTable.Pointer()
+		launch.DescriptorBytes = req.DescriptorTable.SizeBytes()
+	}
+	launchBytes, err := launch.Binary()
+	if err != nil {
+		return err
+	}
+	config := hipKernelLaunchConfig{
+		Name:           hipKernelNameAttentionHeads,
+		Args:           launchBytes,
+		GridX:          uint32(headCount),
+		GridY:          1,
+		GridZ:          1,
+		BlockX:         hipAttentionHeadsBlockSize(tokenCount),
+		BlockY:         1,
+		BlockZ:         1,
+		SharedMemBytes: sharedMemBytes,
+	}
+	if err := config.Validate(); err != nil {
+		return err
+	}
+	return hipLaunchKernel(driver, config)
+}
+
+type hipAttentionHeadsBatchCausalDeviceRequest struct {
+	Key             *hipDeviceByteBuffer
+	Value           *hipDeviceByteBuffer
+	DeviceKV        *rocmDeviceKVCache
+	DescriptorTable *rocmDeviceKVDescriptorTable
+	Dim             int
+	TokenCount      int
+	HeadCount       int
+	QueryCount      int
+	QueryStartToken int
+	Scale           float32
+}
+
+func hipRunAttentionHeadsBatchCausalOutputFromDeviceQueryToDeviceKernel(ctx context.Context, driver nativeHIPDriver, req hipAttentionHeadsBatchCausalDeviceRequest, query *hipDeviceByteBuffer, output *hipDeviceByteBuffer) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	if req.Dim <= 0 || req.TokenCount <= 0 || req.HeadCount <= 0 || req.QueryCount <= 0 {
+		return core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "attention batch dimensions must be positive", nil)
+	}
+	if req.QueryStartToken < 0 || uint64(req.QueryStartToken)+uint64(req.QueryCount) > uint64(req.TokenCount) {
+		return core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "causal query window exceeds token count", nil)
+	}
+	if req.Scale < 0 || math.IsNaN(float64(req.Scale)) || math.IsInf(float64(req.Scale), 0) {
+		return core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "scale must be non-negative and finite", nil)
+	}
+	queryCount := req.QueryCount * req.HeadCount * req.Dim
+	if query == nil || query.Pointer() == 0 || query.Count() != queryCount || query.SizeBytes() != uint64(queryCount*4) {
+		return core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "attention query device buffer shape mismatch", nil)
+	}
+	if output == nil || output.Pointer() == 0 || output.Count() != queryCount || output.SizeBytes() != uint64(queryCount*4) {
+		return core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "attention output device buffer shape mismatch", nil)
+	}
+	launch := hipAttentionHeadsBatchCausalLaunchArgs{
+		QueryPointer:    query.Pointer(),
+		OutputPointer:   output.Pointer(),
+		Dim:             req.Dim,
+		TokenCount:      req.TokenCount,
+		HeadCount:       req.HeadCount,
+		QueryCount:      req.QueryCount,
+		QueryStartToken: req.QueryStartToken,
+		QueryBytes:      query.SizeBytes(),
+		OutputBytes:     output.SizeBytes(),
+		Scale:           req.Scale,
+	}
+	if req.DeviceKV == nil {
+		if req.DescriptorTable != nil {
+			return core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "descriptor table requires device KV cache", nil)
+		}
+		if req.Key == nil || req.Key.Pointer() == 0 || req.Value == nil || req.Value.Pointer() == 0 {
+			return core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "attention key and value device buffers are required", nil)
+		}
+		kvCount := req.TokenCount * req.Dim
+		if req.Key.Count() != kvCount || req.Value.Count() != kvCount ||
+			req.Key.SizeBytes() != uint64(kvCount*4) || req.Value.SizeBytes() != uint64(kvCount*4) {
+			return core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "attention key/value device buffer shape mismatch", nil)
+		}
+		launch.KVSource = hipAttentionKVSourceContiguous
+		launch.KeyPointer = req.Key.Pointer()
+		launch.ValuePointer = req.Value.Pointer()
+		launch.KeyBytes = req.Key.SizeBytes()
+		launch.ValueBytes = req.Value.SizeBytes()
+	} else {
+		if req.Key != nil || req.Value != nil {
+			return core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "device KV attention must not set contiguous KV buffers", nil)
+		}
+		if req.DescriptorTable == nil {
+			return core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "device KV attention requires descriptor table", nil)
+		}
+		if err := req.DescriptorTable.CompatibleWith(req.DeviceKV); err != nil {
+			return core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "descriptor table does not match device KV cache", err)
+		}
+		keyWidth, valueWidth, ok := req.DeviceKV.LastVectorWidths()
+		if !ok {
+			return core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "device KV cache has no pages", nil)
+		}
+		if keyWidth != req.Dim || valueWidth != req.Dim {
+			return core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "device KV widths must match attention dimension", nil)
+		}
+		if req.DeviceKV.TokenCount() != req.TokenCount {
+			return core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "device KV token count mismatch", nil)
+		}
+		launch.KVSource = hipAttentionKVSourceDevice
+		launch.DescriptorPointer = req.DescriptorTable.Pointer()
+		launch.DescriptorBytes = req.DescriptorTable.SizeBytes()
+	}
+	useSharedWeights := req.TokenCount <= hipAttentionHeadsSharedMaxTokens
+	var sharedMemBytes uint32
+	var weights *hipDeviceByteBuffer
+	var err error
+	if useSharedWeights {
+		sharedMemBytes, err = hipAttentionHeadsSharedMemBytes(req.TokenCount, req.DeviceKV != nil)
+		if err != nil {
+			return err
+		}
+		launch.SharedMemBytes = uint64(sharedMemBytes)
+	} else {
+		weightCount := req.QueryCount * req.HeadCount * req.TokenCount
+		weights, err = hipAllocateByteBuffer(driver, "rocm.hip.AttentionHeadsBatchCausalLaunch", "attention batch head weights", uint64(weightCount)*4, weightCount)
+		if err != nil {
+			return err
+		}
+		defer weights.Close()
+		launch.WeightPointer = weights.Pointer()
+		launch.WeightBytes = weights.SizeBytes()
+	}
+	launchBytes, err := launch.Binary()
+	if err != nil {
+		return err
+	}
+	config := hipKernelLaunchConfig{
+		Name:           hipKernelNameAttentionHeadsBatchCausal,
+		Args:           launchBytes,
+		GridX:          uint32(req.HeadCount),
+		GridY:          uint32(req.QueryCount),
+		GridZ:          1,
+		BlockX:         hipAttentionHeadsBlockSize(req.TokenCount),
+		BlockY:         1,
+		BlockZ:         1,
+		SharedMemBytes: sharedMemBytes,
+	}
+	if err := config.Validate(); err != nil {
+		return err
+	}
+	return hipLaunchKernel(driver, config)
+}
+
+type hipAttentionHeadsChunkedWorkspace struct {
+	Partial    *hipDeviceByteBuffer
+	Stats      *hipDeviceByteBuffer
+	partialCap int
+	statsCap   int
+}
+
+func (workspace *hipAttentionHeadsChunkedWorkspace) Ensure(driver nativeHIPDriver, headCount, dim, tokenCount, chunkSize int) error {
+	if workspace == nil {
+		return core.E("rocm.hip.AttentionHeadsChunkedLaunch", "attention workspace is required", nil)
+	}
+	if headCount <= 0 || dim <= 0 || tokenCount <= 0 || chunkSize <= 0 {
+		return core.E("rocm.hip.AttentionHeadsChunkedLaunch", "workspace dimensions must be positive", nil)
+	}
+	chunkCount := (tokenCount + chunkSize - 1) / chunkSize
+	partialCount := headCount * chunkCount * dim
+	statsCount := headCount * chunkCount * 2
+	if workspace.Partial == nil || workspace.Partial.Pointer() == 0 || workspace.partialCap < partialCount {
+		if err := workspace.Partial.Close(); err != nil {
+			return err
+		}
+		partial, err := hipAllocateByteBuffer(driver, "rocm.hip.AttentionHeadsChunkedLaunch", "attention chunked partials", uint64(partialCount*4), partialCount)
+		if err != nil {
+			return err
+		}
+		workspace.Partial = partial
+		workspace.partialCap = partialCount
+	}
+	if workspace.Stats == nil || workspace.Stats.Pointer() == 0 || workspace.statsCap < statsCount {
+		if err := workspace.Stats.Close(); err != nil {
+			return err
+		}
+		stats, err := hipAllocateByteBuffer(driver, "rocm.hip.AttentionHeadsChunkedLaunch", "attention chunked stats", uint64(statsCount*4), statsCount)
+		if err != nil {
+			return err
+		}
+		workspace.Stats = stats
+		workspace.statsCap = statsCount
+	}
+	return nil
+}
+
+func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
+	if workspace == nil {
+		return nil
+	}
+	var lastErr error
+	if err := workspace.Partial.Close(); err != nil {
+		lastErr = err
+	}
+	if err := workspace.Stats.Close(); err != nil {
+		lastErr = err
+	}
+	return lastErr
+}
+
+func hipRunAttentionHeadsOutputFromDeviceQueryToDeviceKernelWithWorkspace(ctx context.Context, driver nativeHIPDriver, req hipAttentionRequest, query *hipDeviceByteBuffer, headCount int, output *hipDeviceByteBuffer, workspace *hipAttentionHeadsChunkedWorkspace) error {
+	if workspace == nil {
+		return hipRunAttentionHeadsOutputFromDeviceQueryToDeviceKernel(ctx, driver, req, query, headCount, output)
+	}
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	dim, tokenCount, err := req.shape()
+	if err != nil {
+		return err
+	}
+	if !hipAttentionHeadsChunkedEligible(req, dim, tokenCount) {
+		return hipRunAttentionHeadsOutputFromDeviceQueryToDeviceKernel(ctx, driver, req, query, headCount, output)
+	}
+	if headCount <= 0 {
+		return core.E("rocm.hip.AttentionHeadsChunkedLaunch", "head count must be positive", nil)
+	}
+	if query == nil || query.Pointer() == 0 || query.Count() != headCount*dim || query.SizeBytes() != uint64(headCount*dim*4) {
+		return core.E("rocm.hip.AttentionHeadsChunkedLaunch", "attention query device buffer shape mismatch", nil)
+	}
+	if output == nil || output.Pointer() == 0 || output.Count() != headCount*dim || output.SizeBytes() != uint64(headCount*dim*4) {
+		return core.E("rocm.hip.AttentionHeadsChunkedLaunch", "attention output device buffer shape mismatch", nil)
+	}
+	return hipRunAttentionHeadsChunked(ctx, driver, req, query, headCount, dim, tokenCount, output, workspace)
+}
+
+func hipAttentionHeadsChunkedEligible(req hipAttentionRequest, dim, tokenCount int) bool {
+	if dim <= 0 || dim > hipAttentionHeadsChunkedBlockSize || tokenCount < hipAttentionHeadsChunkSize {
+		return false
+	}
+	if req.DeviceKV == nil || req.DescriptorTable == nil {
+		return false
+	}
+	if req.DeviceKV.mode != rocmKVCacheModeKQ8VQ4 {
+		return false
+	}
+	return req.DeviceKV.TokenCount() == tokenCount && req.DeviceKV.PageCount() == tokenCount
+}
+
+func hipRunAttentionHeadsChunked(ctx context.Context, driver nativeHIPDriver, req hipAttentionRequest, query *hipDeviceByteBuffer, headCount, dim, tokenCount int, output *hipDeviceByteBuffer, workspace *hipAttentionHeadsChunkedWorkspace) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	chunkSize := hipAttentionHeadsChunkSize
+	chunkCount := (tokenCount + chunkSize - 1) / chunkSize
+	if err := workspace.Ensure(driver, headCount, dim, tokenCount, chunkSize); err != nil {
+		return err
+	}
+	launch := hipAttentionHeadsChunkedLaunchArgs{
+		QueryPointer:      query.Pointer(),
+		DescriptorPointer: req.DescriptorTable.Pointer(),
+		PartialPointer:    workspace.Partial.Pointer(),
+		StatsPointer:      workspace.Stats.Pointer(),
+		OutputPointer:     output.Pointer(),
+		Dim:               dim,
+		TokenCount:        tokenCount,
+		HeadCount:         headCount,
+		ChunkSize:         chunkSize,
+		ChunkCount:        chunkCount,
+		QueryBytes:        query.SizeBytes(),
+		DescriptorBytes:   req.DescriptorTable.SizeBytes(),
+		PartialBytes:      uint64(headCount * chunkCount * dim * 4),
+		StatsBytes:        uint64(headCount * chunkCount * 2 * 4),
+		OutputBytes:       output.SizeBytes(),
+		Scale:             req.Scale,
+	}
+	launchBytes, err := launch.Binary()
+	if err != nil {
+		return err
+	}
+	stage2LaunchBytes := append([]byte(nil), launchBytes...)
+	gridX, err := rocmDeviceKVPositiveUint32("attention chunked stage1 blocks", headCount*chunkCount)
+	if err != nil {
+		return err
+	}
+	stage1 := hipKernelLaunchConfig{
+		Name:           hipKernelNameAttentionHeadsChunkedStage1,
+		Args:           launchBytes,
+		GridX:          gridX,
+		GridY:          1,
+		GridZ:          1,
+		BlockX:         hipAttentionHeadsChunkedBlockSize,
+		BlockY:         1,
+		BlockZ:         1,
+		SharedMemBytes: uint32(chunkSize * (4 + 8 + 4)),
+	}
+	if err := stage1.Validate(); err != nil {
+		return err
+	}
+	if err := hipLaunchKernel(driver, stage1); err != nil {
+		return err
+	}
+	stage2 := hipKernelLaunchConfig{
+		Name:           hipKernelNameAttentionHeadsChunkedStage2,
+		Args:           stage2LaunchBytes,
+		GridX:          uint32(headCount),
+		GridY:          1,
+		GridZ:          1,
+		BlockX:         hipAttentionHeadsChunkedBlockSize,
+		BlockY:         1,
+		BlockZ:         1,
+		SharedMemBytes: 0,
+	}
+	if err := stage2.Validate(); err != nil {
+		return err
+	}
+	return hipLaunchKernel(driver, stage2)
+}
+
+func hipAttentionHeadsSharedMemBytes(tokenCount int, deviceKV bool) (uint32, error) {
+	tokens, err := rocmDeviceKVPositiveUint32("attention token count", tokenCount)
+	if err != nil {
+		return 0, err
+	}
+	bytes := uint64(tokens) * 4
+	if deviceKV && tokenCount >= 16 {
+		bytes = hipAttentionHeadsAlignSharedBytes(bytes, 8)
+		bytes += uint64(tokens) * 8
+		bytes = hipAttentionHeadsAlignSharedBytes(bytes, 4)
+		bytes += uint64(tokens) * 4
+	}
+	if bytes > math.MaxUint32 {
+		return 0, core.E("rocm.hip.AttentionHeadsLaunch", "attention shared memory byte count is out of uint32 range", nil)
+	}
+	return uint32(bytes), nil
+}
+
+func hipAttentionHeadsAlignSharedBytes(value, alignment uint64) uint64 {
+	if alignment <= 1 {
+		return value
+	}
+	remainder := value % alignment
+	if remainder == 0 {
+		return value
+	}
+	return value + alignment - remainder
+}
+
+func hipAttentionHeadsBlockSize(tokenCount int) uint32 {
+	if tokenCount >= 16 {
+		return 512
+	}
+	return 256
+}
+
 func hipRunVectorAddKernel(ctx context.Context, driver nativeHIPDriver, req hipVectorAddRequest) ([]float32, error) {
 	if err := hipContextErr(ctx); err != nil {
 		return nil, err
@@ -948,6 +2167,51 @@ func hipRunVectorAddKernel(ctx context.Context, driver nativeHIPDriver, req hipV
 		return nil, err
 	}
 	return buffers.ReadOutput()
+}
+
+func hipRunVectorAddDeviceKernel(ctx context.Context, driver nativeHIPDriver, left, right *hipDeviceByteBuffer) (*hipDeviceByteBuffer, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return nil, err
+	}
+	if left == nil || right == nil || left.Pointer() == 0 || right.Pointer() == 0 {
+		return nil, core.E("rocm.hip.VectorAddLaunch", "vector add device inputs are required", nil)
+	}
+	if left.Count() <= 0 || right.Count() != left.Count() ||
+		left.SizeBytes() != uint64(left.Count()*4) ||
+		right.SizeBytes() != uint64(right.Count()*4) {
+		return nil, core.E("rocm.hip.VectorAddLaunch", "vector add device input shape mismatch", nil)
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.VectorAddLaunch", "vector add output", left.SizeBytes(), left.Count())
+	if err != nil {
+		return nil, err
+	}
+	success := false
+	defer func() {
+		if !success {
+			_ = output.Close()
+		}
+	}()
+	launchBytes, err := (hipVectorAddLaunchArgs{
+		LeftPointer:   left.Pointer(),
+		RightPointer:  right.Pointer(),
+		OutputPointer: output.Pointer(),
+		Count:         left.Count(),
+		LeftBytes:     left.SizeBytes(),
+		RightBytes:    right.SizeBytes(),
+		OutputBytes:   output.SizeBytes(),
+	}).Binary()
+	if err != nil {
+		return nil, err
+	}
+	config, err := hipOneDimensionalLaunchConfig(hipKernelNameVectorAdd, launchBytes, left.Count())
+	if err != nil {
+		return nil, err
+	}
+	if err := hipLaunchKernel(driver, config); err != nil {
+		return nil, err
+	}
+	success = true
+	return output, nil
 }
 
 func hipRunVectorScaleKernel(ctx context.Context, driver nativeHIPDriver, req hipVectorScaleRequest) ([]float32, error) {
@@ -977,6 +2241,51 @@ func hipRunVectorScaleKernel(ctx context.Context, driver nativeHIPDriver, req hi
 	return buffers.ReadOutput()
 }
 
+func hipRunVectorScaleDeviceKernel(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, scale float32) (*hipDeviceByteBuffer, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return nil, err
+	}
+	if input == nil || input.Pointer() == 0 {
+		return nil, core.E("rocm.hip.VectorScaleLaunch", "vector scale device input is required", nil)
+	}
+	if input.Count() <= 0 || input.SizeBytes() != uint64(input.Count()*4) {
+		return nil, core.E("rocm.hip.VectorScaleLaunch", "vector scale device input shape mismatch", nil)
+	}
+	if math.IsNaN(float64(scale)) || math.IsInf(float64(scale), 0) {
+		return nil, core.E("rocm.hip.VectorScaleLaunch", "scale must be finite", nil)
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.VectorScaleLaunch", "vector scale output", input.SizeBytes(), input.Count())
+	if err != nil {
+		return nil, err
+	}
+	success := false
+	defer func() {
+		if !success {
+			_ = output.Close()
+		}
+	}()
+	launchBytes, err := (hipVectorScaleLaunchArgs{
+		InputPointer:  input.Pointer(),
+		OutputPointer: output.Pointer(),
+		Count:         input.Count(),
+		InputBytes:    input.SizeBytes(),
+		OutputBytes:   output.SizeBytes(),
+		Scale:         scale,
+	}).Binary()
+	if err != nil {
+		return nil, err
+	}
+	config, err := hipOneDimensionalLaunchConfig(hipKernelNameVectorScale, launchBytes, input.Count())
+	if err != nil {
+		return nil, err
+	}
+	if err := hipLaunchKernel(driver, config); err != nil {
+		return nil, err
+	}
+	success = true
+	return output, nil
+}
+
 func hipRunSwiGLUKernel(ctx context.Context, driver nativeHIPDriver, req hipSwiGLURequest) ([]float32, error) {
 	if err := hipContextErr(ctx); err != nil {
 		return nil, err
@@ -1004,6 +2313,67 @@ func hipRunSwiGLUKernel(ctx context.Context, driver nativeHIPDriver, req hipSwiG
 	return buffers.ReadOutput()
 }
 
+func hipRunGELUTanhMultiplyKernel(ctx context.Context, driver nativeHIPDriver, req hipGELUTanhMultiplyRequest) ([]float32, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return nil, err
+	}
+	buffers, err := req.deviceBuffers(driver)
+	if err != nil {
+		return nil, err
+	}
+	defer buffers.Close()
+	if err := hipLaunchGELUTanhMultiplyDeviceBuffers(driver, buffers); err != nil {
+		return nil, err
+	}
+	return buffers.ReadOutput()
+}
+
+func hipRunGELUTanhMultiplyDeviceKernel(ctx context.Context, driver nativeHIPDriver, gate, up *hipDeviceByteBuffer) (*hipDeviceByteBuffer, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return nil, err
+	}
+	if gate == nil || up == nil || gate.Pointer() == 0 || up.Pointer() == 0 {
+		return nil, core.E("rocm.hip.GELUTanhMultiplyLaunch", "gate and up device buffers are required", nil)
+	}
+	if gate.Count() <= 0 || up.Count() != gate.Count() ||
+		gate.SizeBytes() != uint64(gate.Count()*4) ||
+		up.SizeBytes() != uint64(up.Count()*4) {
+		return nil, core.E("rocm.hip.GELUTanhMultiplyLaunch", "gate and up device buffer shape mismatch", nil)
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.GELUTanhMultiplyLaunch", "GELU tanh multiply output", gate.SizeBytes(), gate.Count())
+	if err != nil {
+		return nil, err
+	}
+	buffers := &hipGELUTanhMultiplyDeviceBuffers{Gate: gate, Up: up, Output: output, Count: gate.Count()}
+	success := false
+	defer func() {
+		if !success {
+			_ = output.Close()
+		}
+	}()
+	if err := hipLaunchGELUTanhMultiplyDeviceBuffers(driver, buffers); err != nil {
+		return nil, err
+	}
+	success = true
+	return output, nil
+}
+
+func hipLaunchGELUTanhMultiplyDeviceBuffers(driver nativeHIPDriver, buffers *hipGELUTanhMultiplyDeviceBuffers) error {
+	launch, err := hipGELUTanhMultiplyLaunchArgsForDeviceBuffers(buffers)
+	if err != nil {
+		return err
+	}
+	launchBytes, err := launch.Binary()
+	if err != nil {
+		return err
+	}
+	config, err := hipOneDimensionalLaunchConfig(hipKernelNameGELUTanhMul, launchBytes, buffers.Count)
+	if err != nil {
+		return err
+	}
+	return hipLaunchKernel(driver, config)
+}
+
 func hipRunGreedyKernel(ctx context.Context, driver nativeHIPDriver, req hipGreedySampleRequest) (hipGreedySampleResult, error) {
 	if err := hipContextErr(ctx); err != nil {
 		return hipGreedySampleResult{}, err
@@ -1029,4 +2399,55 @@ func hipRunGreedyKernel(ctx context.Context, driver nativeHIPDriver, req hipGree
 		return hipGreedySampleResult{}, err
 	}
 	return buffers.ReadOutput()
+}
+
+func hipRunSoftcapGreedyKernelWithDeviceLogits(ctx context.Context, driver nativeHIPDriver, logits *hipDeviceByteBuffer, softcap float32) (hipGreedySampleResult, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return hipGreedySampleResult{}, err
+	}
+	if driver == nil || !driver.Available() {
+		return hipGreedySampleResult{}, core.E("rocm.hip.SoftcapGreedyLaunch", "HIP driver is not available", nil)
+	}
+	if logits == nil || logits.Pointer() == 0 {
+		return hipGreedySampleResult{}, core.E("rocm.hip.SoftcapGreedyLaunch", "logits device buffer is required", nil)
+	}
+	if logits.Count() <= 0 || logits.SizeBytes() != uint64(logits.Count()*4) {
+		return hipGreedySampleResult{}, core.E("rocm.hip.SoftcapGreedyLaunch", "logits device buffer shape mismatch", nil)
+	}
+	if softcap < 0 || math.IsNaN(float64(softcap)) || math.IsInf(float64(softcap), 0) {
+		return hipGreedySampleResult{}, core.E("rocm.hip.SoftcapGreedyLaunch", "softcap must be non-negative and finite", nil)
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.SoftcapGreedyLaunch", "softcap greedy output", hipGreedyResultBytes, 1)
+	if err != nil {
+		return hipGreedySampleResult{}, err
+	}
+	defer output.Close()
+	launchBytes, err := (hipSoftcapGreedySampleLaunchArgs{
+		LogitsPointer: logits.Pointer(),
+		OutputPointer: output.Pointer(),
+		Count:         logits.Count(),
+		LogitsBytes:   logits.SizeBytes(),
+		OutputBytes:   output.SizeBytes(),
+		Softcap:       softcap,
+	}).Binary()
+	if err != nil {
+		return hipGreedySampleResult{}, err
+	}
+	config := hipKernelLaunchConfig{
+		Name:   hipKernelNameSoftcapGreedy,
+		Args:   launchBytes,
+		GridX:  1,
+		GridY:  1,
+		GridZ:  1,
+		BlockX: 256,
+		BlockY: 1,
+		BlockZ: 1,
+	}
+	if err := config.Validate(); err != nil {
+		return hipGreedySampleResult{}, err
+	}
+	if err := hipLaunchKernel(driver, config); err != nil {
+		return hipGreedySampleResult{}, err
+	}
+	return hipReadGreedyResult(output, "rocm.hip.SoftcapGreedyLaunch", "softcap greedy output", logits.Count())
 }

@@ -180,8 +180,12 @@ func hipFinalizeGemma4Q4ForwardDeviceState(previous, next *hipGemma4Q4DeviceDeco
 	for index := range next.layers {
 		oldLayer := &previous.layers[index]
 		newLayer := &next.layers[index]
-		if newLayer.cache.borrowsPagesFrom(oldLayer.cache) {
+		if oldLayer.cache.ownsAnyPages() && newLayer.cache.borrowsPagesFrom(oldLayer.cache) {
 			if err := oldLayer.cache.transferPagesTo(newLayer.cache); err != nil {
+				return err
+			}
+		} else if oldLayer.cache.ownsAnyPages() && newLayer.cache.sharesPagesFrom(oldLayer.cache) {
+			if err := oldLayer.cache.transferSharedPagesTo(newLayer.cache); err != nil {
 				return err
 			}
 		} else if err := oldLayer.cache.Close(); err != nil {
@@ -273,6 +277,13 @@ func (state *hipGemma4Q4DeviceDecodeState) layerCache(index int) *rocmDeviceKVCa
 		return nil
 	}
 	return state.layers[index].cache
+}
+
+func (state *hipGemma4Q4DeviceDecodeState) layerDescriptorTable(index int) *rocmDeviceKVDescriptorTable {
+	if state == nil || index < 0 || index >= len(state.layers) {
+		return nil
+	}
+	return state.layers[index].descriptorTable
 }
 
 func (state *hipGemma4Q4DeviceDecodeState) LayerTokenCounts() []int {

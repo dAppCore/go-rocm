@@ -125,7 +125,7 @@ func TestOpenAI_NewOpenAIServiceMux_Good_MountsServiceEndpoints(t *testing.T) {
 	}
 }
 
-func TestOpenAI_NewOpenAIServiceMux_Bad_RejectsBlankChatMessages(t *testing.T) {
+func TestOpenAI_NewOpenAIServiceMux_Good_DelegatesBlankChatMessagesToModel(t *testing.T) {
 	model := &openAITestModel{tokens: []inference.Token{{Text: "ok"}}}
 	mux := NewOpenAIServiceMux(openaicompat.NewStaticResolver(map[string]inference.TextModel{"qwen": model}))
 	req := httptest.NewRequest(http.MethodPost, openaicompat.DefaultChatCompletionsPath, strings.NewReader(`{"model":"qwen","messages":[{"role":"user","content":"   "}]}`))
@@ -133,12 +133,12 @@ func TestOpenAI_NewOpenAIServiceMux_Bad_RejectsBlankChatMessages(t *testing.T) {
 
 	mux.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "at least one message must contain content") {
-		t.Fatalf("status = %d body=%s, want blank chat messages rejected", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "ok") {
+		t.Fatalf("status = %d body=%s, want canonical OpenAI handler to delegate blank content", rec.Code, rec.Body.String())
 	}
 }
 
-func TestOpenAI_NewOpenAIServiceMux_Bad_RejectsBlankEmbeddingInput(t *testing.T) {
+func TestOpenAI_NewOpenAIServiceMux_Bad_GenericModelWithBlankEmbeddingInputReportsUnsupported(t *testing.T) {
 	model := &openAITestModel{tokens: []inference.Token{{Text: "ok"}}}
 	mux := NewOpenAIServiceMux(openaicompat.NewStaticResolver(map[string]inference.TextModel{"qwen": model}))
 	req := httptest.NewRequest(http.MethodPost, openaicompat.DefaultEmbeddingsPath, strings.NewReader(`{"model":"qwen","input":["hello","   "]}`))
@@ -146,12 +146,12 @@ func TestOpenAI_NewOpenAIServiceMux_Bad_RejectsBlankEmbeddingInput(t *testing.T)
 
 	mux.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "input 1 is empty") {
-		t.Fatalf("status = %d body=%s, want blank embedding input rejected", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotImplemented || !strings.Contains(rec.Body.String(), "does not support embeddings") {
+		t.Fatalf("status = %d body=%s, want canonical unsupported-embedding response", rec.Code, rec.Body.String())
 	}
 }
 
-func TestOpenAI_NewOpenAIServiceMux_Bad_RejectsBlankRerankDocument(t *testing.T) {
+func TestOpenAI_NewOpenAIServiceMux_Bad_GenericModelWithBlankRerankDocumentReportsUnsupported(t *testing.T) {
 	model := &openAITestModel{tokens: []inference.Token{{Text: "ok"}}}
 	mux := NewOpenAIServiceMux(openaicompat.NewStaticResolver(map[string]inference.TextModel{"qwen": model}))
 	req := httptest.NewRequest(http.MethodPost, openaicompat.DefaultRerankPath, strings.NewReader(`{"model":"qwen","query":"core","documents":["doc","   "]}`))
@@ -159,8 +159,8 @@ func TestOpenAI_NewOpenAIServiceMux_Bad_RejectsBlankRerankDocument(t *testing.T)
 
 	mux.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "document 1 is empty") {
-		t.Fatalf("status = %d body=%s, want blank rerank document rejected", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotImplemented || !strings.Contains(rec.Body.String(), "does not support rerank") {
+		t.Fatalf("status = %d body=%s, want canonical unsupported-rerank response", rec.Code, rec.Body.String())
 	}
 }
 
@@ -206,7 +206,6 @@ func (model *openAITestModel) stream(ctx context.Context, opts ...inference.Gene
 			limit = cfg.MaxTokens
 		}
 		tokens := append([]inference.Token(nil), model.tokens[:limit]...)
-		tokens = openAITestApplyStopSequences(tokens, cfg.StopSequences)
 		for i := range tokens {
 			if ctx != nil {
 				select {
@@ -227,33 +226,6 @@ func (model *openAITestModel) stream(ctx context.Context, opts ...inference.Gene
 		model.err = nil
 		model.mu.Unlock()
 	}
-}
-
-func openAITestApplyStopSequences(tokens []inference.Token, stops []string) []inference.Token {
-	if len(tokens) == 0 || len(stops) == 0 {
-		return tokens
-	}
-	text := ""
-	for _, token := range tokens {
-		text += token.Text
-	}
-	cut := -1
-	for _, stop := range stops {
-		if stop == "" {
-			continue
-		}
-		index := strings.Index(text, stop)
-		if index >= 0 && (cut < 0 || index < cut) {
-			cut = index
-		}
-	}
-	if cut < 0 {
-		return tokens
-	}
-	if cut == 0 {
-		return nil
-	}
-	return []inference.Token{{Text: text[:cut]}}
 }
 
 func (model *openAITestModel) Classify(context.Context, []string, ...inference.GenerateOption) ([]inference.ClassifyResult, error) {

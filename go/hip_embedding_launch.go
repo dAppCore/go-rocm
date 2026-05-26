@@ -271,7 +271,7 @@ func (args hipEmbeddingMeanPoolLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, core.E("rocm.hip.EmbeddingMeanPoolLaunch", "output byte count", err)
 	}
-	payload := make([]byte, hipEmbeddingMeanPoolLaunchArgsBytes)
+	payload := hipBorrowLaunchPacket(hipEmbeddingMeanPoolLaunchArgsBytes)
 	binary.LittleEndian.PutUint32(payload[0:], hipEmbeddingMeanPoolLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.TokenPointer))
@@ -587,7 +587,7 @@ func (args hipEmbeddingLookupLaunchArgs) Binary() ([]byte, error) {
 	if args.OutputBytes != outputBytes {
 		return nil, core.E("rocm.hip.EmbeddingLookupLaunch", "output byte count mismatch", nil)
 	}
-	payload := make([]byte, hipEmbeddingLookupLaunchArgsBytes)
+	payload := hipBorrowLaunchPacket(hipEmbeddingLookupLaunchArgsBytes)
 	binary.LittleEndian.PutUint32(payload[0:], hipEmbeddingLookupLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.TokenPointer))
@@ -674,6 +674,15 @@ func hipRunEmbeddingLookupKernel(ctx context.Context, driver nativeHIPDriver, re
 }
 
 func hipRunEmbeddingLookupKernelWithDeviceTable(ctx context.Context, driver nativeHIPDriver, tokenIDs []int32, cfg hipDeviceEmbeddingLookupConfig) ([]float32, error) {
+	output, err := hipRunEmbeddingLookupKernelWithDeviceTableBuffer(ctx, driver, tokenIDs, cfg)
+	if err != nil {
+		return nil, err
+	}
+	defer output.Close()
+	return (&hipEmbeddingLookupDeviceBuffers{Output: output, TokenCount: len(tokenIDs), HiddenSize: cfg.HiddenSize}).ReadOutput()
+}
+
+func hipRunEmbeddingLookupKernelWithDeviceTableBuffer(ctx context.Context, driver nativeHIPDriver, tokenIDs []int32, cfg hipDeviceEmbeddingLookupConfig) (*hipDeviceByteBuffer, error) {
 	if err := hipContextErr(ctx); err != nil {
 		return nil, err
 	}
@@ -692,7 +701,12 @@ func hipRunEmbeddingLookupKernelWithDeviceTable(ctx context.Context, driver nati
 	if err != nil {
 		return nil, err
 	}
-	defer output.Close()
+	success := false
+	defer func() {
+		if !success {
+			_ = output.Close()
+		}
+	}()
 	launchBytes, err := (hipEmbeddingLookupLaunchArgs{
 		TokenPointer:     tokens.Pointer(),
 		EmbeddingPointer: cfg.EmbeddingPointer,
@@ -720,7 +734,8 @@ func hipRunEmbeddingLookupKernelWithDeviceTable(ctx context.Context, driver nati
 	if err := hipLaunchKernel(driver, config); err != nil {
 		return nil, err
 	}
-	return (&hipEmbeddingLookupDeviceBuffers{Output: output, TokenCount: len(tokenIDs), HiddenSize: cfg.HiddenSize}).ReadOutput()
+	success = true
+	return output, nil
 }
 
 func hipEmbeddingLookupEncoding(req hipEmbeddingLookupRequest) (uint32, error) {
@@ -837,7 +852,7 @@ func (args hipRerankCosineLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, core.E("rocm.hip.RerankCosineLaunch", "output byte count", err)
 	}
-	payload := make([]byte, hipRerankCosineLaunchArgsBytes)
+	payload := hipBorrowLaunchPacket(hipRerankCosineLaunchArgsBytes)
 	binary.LittleEndian.PutUint32(payload[0:], hipRerankCosineLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.QueryPointer))

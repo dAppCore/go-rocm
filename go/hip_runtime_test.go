@@ -10,6 +10,7 @@ import (
 	"errors"
 	"math"
 	"testing"
+	"unsafe"
 
 	core "dappco.re/go"
 	"dappco.re/go/inference"
@@ -2162,6 +2163,8 @@ type fakeHIPDriver struct {
 	copyErr                  error
 	copyErrAt                int
 	copyHostErrAfterLaunches int
+	pinnedCopies             int
+	memsets                  []uint64
 	launchErr                error
 }
 
@@ -2197,6 +2200,22 @@ func (driver *fakeHIPDriver) CopyHostToDevice(pointer nativeDevicePointer, data 
 	}
 	return nil
 }
+func (driver *fakeHIPDriver) CopyPinnedHostToDevice(pointer nativeDevicePointer, host unsafe.Pointer, sizeBytes int) error {
+	driver.pinnedCopies++
+	if sizeBytes <= 0 {
+		driver.copies = append(driver.copies, 0)
+		return nil
+	}
+	data := unsafe.Slice((*byte)(host), sizeBytes)
+	driver.copies = append(driver.copies, uint64(len(data)))
+	if driver.shouldFailCopy(true) {
+		return driver.copyErr
+	}
+	if target, offset, ok := driver.memoryForPointer(pointer, len(data)); ok {
+		copy(target[offset:], data)
+	}
+	return nil
+}
 func (driver *fakeHIPDriver) CopyDeviceToHost(pointer nativeDevicePointer, data []byte) error {
 	driver.copies = append(driver.copies, uint64(len(data)))
 	if driver.shouldFailCopy(false) {
@@ -2219,6 +2238,23 @@ func (driver *fakeHIPDriver) shouldFailCopy(hostToDevice bool) bool {
 	}
 	return driver.copyErrAt == 0 && driver.copyHostErrAfterLaunches == 0
 }
+func (driver *fakeHIPDriver) MemsetAsync(pointer nativeDevicePointer, value byte, size uint64) error {
+	driver.memsets = append(driver.memsets, size)
+	if size == 0 {
+		return nil
+	}
+	if size > uint64(int(^uint(0)>>1)) {
+		return core.E("rocm.hip.FakeMemset", "memset size is out of range", nil)
+	}
+	target, offset, ok := driver.memoryForPointer(pointer, int(size))
+	if !ok {
+		return core.E("rocm.hip.FakeMemset", "memset buffer is missing", nil)
+	}
+	for index := 0; index < int(size); index++ {
+		target[offset+index] = value
+	}
+	return nil
+}
 func (driver *fakeHIPDriver) LaunchKernel(config hipKernelLaunchConfig) error {
 	copied := config
 	copied.Args = append([]byte(nil), config.Args...)
@@ -2231,24 +2267,66 @@ func (driver *fakeHIPDriver) LaunchKernel(config hipKernelLaunchConfig) error {
 		return driver.launchPrefill(config.Args)
 	case hipKernelNameDecode:
 		return driver.launchDecode(config.Args)
+	case hipKernelNameKVEncodeToken:
+		return driver.launchKVEncodeToken(config.Args)
+	case hipKernelNameKVDescriptorAppend:
+		return driver.launchKVDescriptorAppend(config.Args)
 	case hipKernelNameProjection:
 		return driver.launchProjection(config.Args)
+	case hipKernelNameProjectionBatch:
+		return driver.launchProjectionBatch(config.Args)
 	case hipKernelNameMLXQ4Proj:
 		return driver.launchMLXQ4Projection(config.Args)
+	case hipKernelNameMLXQ4ProjBatch:
+		return driver.launchMLXQ4ProjectionBatch(config.Args)
+	case hipKernelNameMLXQ4ProjGreedy:
+		return driver.launchMLXQ4ProjectionGreedy(config.Args)
+	case hipKernelNameMLXQ4TripleProj:
+		return driver.launchMLXQ4TripleProjection(config.Args)
+	case hipKernelNameMLXQ4GELUTanhMul:
+		return driver.launchMLXQ4GELUTanhMultiply(config.Args)
+	case hipKernelNameMLXQ4GELUTanhMulBatch:
+		return driver.launchMLXQ4GELUTanhMultiplyBatch(config.Args)
+	case hipKernelNameMLXQ4GELUTanhProj:
+		return driver.launchMLXQ4GELUTanhProjection(config.Args)
+	case hipKernelNameMLXQ4GELUTanhProjBatch:
+		return driver.launchMLXQ4GELUTanhProjectionBatch(config.Args)
 	case hipKernelNameRMSNorm:
 		return driver.launchRMSNorm(config.Args)
+	case hipKernelNameRMSNormResidualAdd:
+		return driver.launchRMSNormResidualAdd(config.Args)
+	case hipKernelNameRMSNormResAddNorm:
+		return driver.launchRMSNormResidualAddNorm(config.Args)
+	case hipKernelNameRMSNormHeads:
+		return driver.launchRMSNormHeads(config.Args)
+	case hipKernelNameRMSNormRoPEHeads:
+		return driver.launchRMSNormRoPEHeads(config.Args)
+	case hipKernelNameRMSNormRoPEHeadsBatch:
+		return driver.launchRMSNormRoPEHeadsBatch(config.Args)
 	case hipKernelNameRoPE:
 		return driver.launchRoPE(config.Args)
+	case hipKernelNameRoPEHeads:
+		return driver.launchRoPEHeads(config.Args)
 	case hipKernelNameGreedy:
 		return driver.launchGreedySample(config.Args)
+	case hipKernelNameSoftcapGreedy:
+		return driver.launchSoftcapGreedySample(config.Args)
 	case hipKernelNameAttention:
 		return driver.launchAttention(config.Args)
+	case hipKernelNameAttentionHeads:
+		return driver.launchAttentionHeads(config.Args)
+	case hipKernelNameAttentionHeadsBatchCausal:
+		return driver.launchAttentionHeadsBatchCausal(config.Args)
 	case hipKernelNameVectorAdd:
 		return driver.launchVectorAdd(config.Args)
 	case hipKernelNameVectorScale:
 		return driver.launchVectorScale(config.Args)
+	case hipKernelNamePerLayerInputTranspose:
+		return driver.launchPerLayerInputTranspose(config.Args)
 	case hipKernelNameSwiGLU:
 		return driver.launchSwiGLU(config.Args)
+	case hipKernelNameGELUTanhMul:
+		return driver.launchGELUTanhMultiply(config.Args)
 	case hipKernelNameMoERouter:
 		return driver.launchMoERouter(config.Args)
 	case hipKernelNameMoELazy:
@@ -2715,6 +2793,104 @@ func (driver *fakeHIPDriver) launchProjection(args []byte) error {
 	return nil
 }
 
+func (driver *fakeHIPDriver) launchProjectionBatch(args []byte) error {
+	if len(args) != hipProjectionBatchLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "projection batch launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipProjectionBatchLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipProjectionBatchLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "projection batch launch header mismatch", nil)
+	}
+	inputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	weightPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	weightBytes := int(binary.LittleEndian.Uint64(args[24:]))
+	biasPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[32:]))
+	biasBytes := int(binary.LittleEndian.Uint64(args[40:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[48:]))
+	outputBytes := int(binary.LittleEndian.Uint64(args[56:]))
+	rows := int(binary.LittleEndian.Uint32(args[64:]))
+	cols := int(binary.LittleEndian.Uint32(args[68:]))
+	batch := int(binary.LittleEndian.Uint32(args[72:]))
+	encoding := binary.LittleEndian.Uint32(args[76:])
+	flags := binary.LittleEndian.Uint32(args[80:])
+	q8Scale := math.Float32frombits(binary.LittleEndian.Uint32(args[84:]))
+	inputBytes := int(binary.LittleEndian.Uint64(args[88:]))
+	if rows <= 0 || cols <= 0 || batch <= 0 || inputBytes != batch*cols*4 || outputBytes != batch*rows*4 {
+		return core.E("rocm.hip.FakeLaunch", "projection batch shape metadata mismatch", nil)
+	}
+	inputData, inputOffset, ok := driver.memoryForPointer(inputPointer, inputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "projection batch input buffer is missing", nil)
+	}
+	weightData, weightOffset, ok := driver.memoryForPointer(weightPointer, weightBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "projection batch weight buffer is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "projection batch output buffer is missing", nil)
+	}
+	input, err := hipFloat32PayloadValues(inputData[inputOffset : inputOffset+inputBytes])
+	if err != nil {
+		return err
+	}
+	var bias []float32
+	if flags&hipProjectionLaunchFlagBias != 0 {
+		biasData, biasOffset, ok := driver.memoryForPointer(biasPointer, biasBytes)
+		if !ok {
+			return core.E("rocm.hip.FakeLaunch", "projection batch bias buffer is missing", nil)
+		}
+		bias, err = hipFloat32PayloadValues(biasData[biasOffset : biasOffset+biasBytes])
+		if err != nil {
+			return err
+		}
+	}
+	output := make([]float32, 0, batch*rows)
+	for item := 0; item < batch; item++ {
+		start := item * cols
+		end := start + cols
+		var projected []float32
+		switch encoding {
+		case hipProjectionWeightEncodingFP16:
+			weights := make([]uint16, weightBytes/2)
+			for index := range weights {
+				weights[index] = binary.LittleEndian.Uint16(weightData[weightOffset+index*2:])
+			}
+			projected, err = hipReferenceFP16Projection(input[start:end], weights, rows, cols, bias)
+		case hipProjectionWeightEncodingBF16:
+			weights := make([]uint16, weightBytes/2)
+			for index := range weights {
+				weights[index] = binary.LittleEndian.Uint16(weightData[weightOffset+index*2:])
+			}
+			projected, err = hipReferenceBF16Projection(input[start:end], weights, rows, cols, bias)
+		case hipProjectionWeightEncodingQ8:
+			weights := make([]int8, weightBytes)
+			for index := range weights {
+				weights[index] = int8(weightData[weightOffset+index])
+			}
+			projected, err = hipReferenceQ8Projection(input[start:end], weights, q8Scale, rows, cols, bias)
+		case hipProjectionWeightEncodingF32:
+			weights, decodeErr := hipFloat32PayloadValues(weightData[weightOffset : weightOffset+weightBytes])
+			if decodeErr != nil {
+				return decodeErr
+			}
+			projected, err = hipReferenceF32Projection(input[start:end], weights, rows, cols, bias)
+		default:
+			err = core.E("rocm.hip.FakeLaunch", "unsupported projection batch encoding", nil)
+		}
+		if err != nil {
+			return err
+		}
+		output = append(output, projected...)
+	}
+	payload, err := hipFloat32Payload(output)
+	if err != nil {
+		return err
+	}
+	copy(outputData[outputOffset:outputOffset+outputBytes], payload)
+	return nil
+}
+
 func (driver *fakeHIPDriver) launchMLXQ4Projection(args []byte) error {
 	if len(args) != hipMLXQ4ProjectionLaunchArgsBytes {
 		return core.E("rocm.hip.FakeLaunch", "MLX q4 projection launch args size mismatch", nil)
@@ -2788,6 +2964,713 @@ func (driver *fakeHIPDriver) launchMLXQ4Projection(args []byte) error {
 		return err
 	}
 	copy(outputData[outputOffset:outputOffset+outputBytes], payload)
+	return nil
+}
+
+func (driver *fakeHIPDriver) launchMLXQ4ProjectionBatch(args []byte) error {
+	if len(args) != hipMLXQ4ProjectionBatchLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 projection batch launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipMLXQ4ProjectionBatchLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipMLXQ4ProjectionBatchLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 projection batch launch header mismatch", nil)
+	}
+	inputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	weightPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	scalePointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[24:]))
+	biasPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[32:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[40:]))
+	rows := int(binary.LittleEndian.Uint32(args[48:]))
+	cols := int(binary.LittleEndian.Uint32(args[52:]))
+	batch := int(binary.LittleEndian.Uint32(args[56:]))
+	groupSize := int(binary.LittleEndian.Uint32(args[60:]))
+	bits := int(binary.LittleEndian.Uint32(args[64:]))
+	inputBytes := int(binary.LittleEndian.Uint32(args[68:]))
+	weightBytes := int(binary.LittleEndian.Uint32(args[72:]))
+	scaleBytes := int(binary.LittleEndian.Uint32(args[76:]))
+	biasBytes := int(binary.LittleEndian.Uint32(args[80:]))
+	outputBytes := int(binary.LittleEndian.Uint32(args[84:]))
+	if bits != hipMLXQ4ProjectionBits ||
+		batch <= 0 ||
+		validateHIPMLXQ4ProjectionShape(cols, weightBytes/4, scaleBytes/2, biasBytes/2, rows, cols, groupSize) != nil ||
+		inputBytes != batch*cols*4 ||
+		outputBytes != batch*rows*4 {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 projection batch shape metadata mismatch", nil)
+	}
+	inputData, inputOffset, ok := driver.memoryForPointer(inputPointer, inputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 projection batch input buffer is missing", nil)
+	}
+	weightData, weightOffset, ok := driver.memoryForPointer(weightPointer, weightBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 projection batch packed weight buffer is missing", nil)
+	}
+	scaleData, scaleOffset, ok := driver.memoryForPointer(scalePointer, scaleBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 projection batch scale buffer is missing", nil)
+	}
+	biasData, biasOffset, ok := driver.memoryForPointer(biasPointer, biasBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 projection batch bias buffer is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 projection batch output buffer is missing", nil)
+	}
+	input, err := hipFloat32PayloadValues(inputData[inputOffset : inputOffset+inputBytes])
+	if err != nil {
+		return err
+	}
+	weights := make([]uint32, weightBytes/4)
+	for index := range weights {
+		weights[index] = binary.LittleEndian.Uint32(weightData[weightOffset+index*4:])
+	}
+	scales := make([]uint16, scaleBytes/2)
+	for index := range scales {
+		scales[index] = binary.LittleEndian.Uint16(scaleData[scaleOffset+index*2:])
+	}
+	biases := make([]uint16, biasBytes/2)
+	for index := range biases {
+		biases[index] = binary.LittleEndian.Uint16(biasData[biasOffset+index*2:])
+	}
+	output := make([]float32, 0, batch*rows)
+	for batchIndex := 0; batchIndex < batch; batchIndex++ {
+		start := batchIndex * cols
+		projected, err := hipReferenceMLXQ4Projection(input[start:start+cols], weights, scales, biases, rows, cols, groupSize)
+		if err != nil {
+			return err
+		}
+		output = append(output, projected...)
+	}
+	payload, err := hipFloat32Payload(output)
+	if err != nil {
+		return err
+	}
+	copy(outputData[outputOffset:outputOffset+outputBytes], payload)
+	return nil
+}
+
+func (driver *fakeHIPDriver) launchMLXQ4TripleProjection(args []byte) error {
+	if len(args) != hipMLXQ4TripleProjLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 triple projection launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipMLXQ4TripleProjLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipMLXQ4TripleProjLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 triple projection launch header mismatch", nil)
+	}
+	inputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	weightPointers := [3]nativeDevicePointer{
+		nativeDevicePointer(binary.LittleEndian.Uint64(args[24:])),
+		nativeDevicePointer(binary.LittleEndian.Uint64(args[48:])),
+		nativeDevicePointer(binary.LittleEndian.Uint64(args[72:])),
+	}
+	scalePointers := [3]nativeDevicePointer{
+		nativeDevicePointer(binary.LittleEndian.Uint64(args[32:])),
+		nativeDevicePointer(binary.LittleEndian.Uint64(args[56:])),
+		nativeDevicePointer(binary.LittleEndian.Uint64(args[80:])),
+	}
+	biasPointers := [3]nativeDevicePointer{
+		nativeDevicePointer(binary.LittleEndian.Uint64(args[40:])),
+		nativeDevicePointer(binary.LittleEndian.Uint64(args[64:])),
+		nativeDevicePointer(binary.LittleEndian.Uint64(args[88:])),
+	}
+	rows := [3]int{
+		int(binary.LittleEndian.Uint32(args[96:])),
+		int(binary.LittleEndian.Uint32(args[100:])),
+		int(binary.LittleEndian.Uint32(args[104:])),
+	}
+	cols := int(binary.LittleEndian.Uint32(args[108:]))
+	groupSize := int(binary.LittleEndian.Uint32(args[112:]))
+	bits := int(binary.LittleEndian.Uint32(args[116:]))
+	inputBytes := int(binary.LittleEndian.Uint32(args[120:]))
+	outputBytes := int(binary.LittleEndian.Uint32(args[124:]))
+	weightBytes := [3]int{
+		int(binary.LittleEndian.Uint32(args[128:])),
+		int(binary.LittleEndian.Uint32(args[140:])),
+		int(binary.LittleEndian.Uint32(args[152:])),
+	}
+	scaleBytes := [3]int{
+		int(binary.LittleEndian.Uint32(args[132:])),
+		int(binary.LittleEndian.Uint32(args[144:])),
+		int(binary.LittleEndian.Uint32(args[156:])),
+	}
+	biasBytes := [3]int{
+		int(binary.LittleEndian.Uint32(args[136:])),
+		int(binary.LittleEndian.Uint32(args[148:])),
+		int(binary.LittleEndian.Uint32(args[160:])),
+	}
+	totalRows := rows[0] + rows[1] + rows[2]
+	if bits != hipMLXQ4ProjectionBits || inputBytes != cols*4 || outputBytes != totalRows*4 {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 triple projection shape metadata mismatch", nil)
+	}
+	inputData, inputOffset, ok := driver.memoryForPointer(inputPointer, inputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 triple projection input buffer is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 triple projection output buffer is missing", nil)
+	}
+	input, err := hipFloat32PayloadValues(inputData[inputOffset : inputOffset+inputBytes])
+	if err != nil {
+		return err
+	}
+	combined := make([]float32, 0, totalRows)
+	for index := 0; index < 3; index++ {
+		if validateHIPMLXQ4ProjectionShape(cols, weightBytes[index]/4, scaleBytes[index]/2, biasBytes[index]/2, rows[index], cols, groupSize) != nil {
+			return core.E("rocm.hip.FakeLaunch", "MLX q4 triple projection shape metadata mismatch", nil)
+		}
+		weightData, weightOffset, ok := driver.memoryForPointer(weightPointers[index], weightBytes[index])
+		if !ok {
+			return core.E("rocm.hip.FakeLaunch", "MLX q4 triple projection packed weight buffer is missing", nil)
+		}
+		scaleData, scaleOffset, ok := driver.memoryForPointer(scalePointers[index], scaleBytes[index])
+		if !ok {
+			return core.E("rocm.hip.FakeLaunch", "MLX q4 triple projection scale buffer is missing", nil)
+		}
+		biasData, biasOffset, ok := driver.memoryForPointer(biasPointers[index], biasBytes[index])
+		if !ok {
+			return core.E("rocm.hip.FakeLaunch", "MLX q4 triple projection bias buffer is missing", nil)
+		}
+		weights := make([]uint32, weightBytes[index]/4)
+		for weightIndex := range weights {
+			weights[weightIndex] = binary.LittleEndian.Uint32(weightData[weightOffset+weightIndex*4:])
+		}
+		scales := make([]uint16, scaleBytes[index]/2)
+		for scaleIndex := range scales {
+			scales[scaleIndex] = binary.LittleEndian.Uint16(scaleData[scaleOffset+scaleIndex*2:])
+		}
+		biases := make([]uint16, biasBytes[index]/2)
+		for biasIndex := range biases {
+			biases[biasIndex] = binary.LittleEndian.Uint16(biasData[biasOffset+biasIndex*2:])
+		}
+		output, err := hipReferenceMLXQ4Projection(input, weights, scales, biases, rows[index], cols, groupSize)
+		if err != nil {
+			return err
+		}
+		combined = append(combined, output...)
+	}
+	payload, err := hipFloat32Payload(combined)
+	if err != nil {
+		return err
+	}
+	copy(outputData[outputOffset:outputOffset+outputBytes], payload)
+	return nil
+}
+
+func (driver *fakeHIPDriver) launchMLXQ4GELUTanhMultiply(args []byte) error {
+	if len(args) != hipMLXQ4GELUTanhMulLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh multiply launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipMLXQ4GELUTanhMulLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipMLXQ4GELUTanhMulLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh multiply launch header mismatch", nil)
+	}
+	inputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	gateWeightPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	gateScalePointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[24:]))
+	gateBiasPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[32:]))
+	upWeightPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[40:]))
+	upScalePointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[48:]))
+	upBiasPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[56:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[64:]))
+	rows := int(binary.LittleEndian.Uint32(args[72:]))
+	cols := int(binary.LittleEndian.Uint32(args[76:]))
+	groupSize := int(binary.LittleEndian.Uint32(args[80:]))
+	bits := int(binary.LittleEndian.Uint32(args[84:]))
+	inputBytes := int(binary.LittleEndian.Uint32(args[88:]))
+	gateWeightBytes := int(binary.LittleEndian.Uint32(args[92:]))
+	gateScaleBytes := int(binary.LittleEndian.Uint32(args[96:]))
+	gateBiasBytes := int(binary.LittleEndian.Uint32(args[100:]))
+	upWeightBytes := int(binary.LittleEndian.Uint32(args[104:]))
+	upScaleBytes := int(binary.LittleEndian.Uint32(args[108:]))
+	upBiasBytes := int(binary.LittleEndian.Uint32(args[112:]))
+	outputBytes := int(binary.LittleEndian.Uint32(args[116:]))
+	if bits != hipMLXQ4ProjectionBits ||
+		validateHIPMLXQ4ProjectionShape(cols, gateWeightBytes/4, gateScaleBytes/2, gateBiasBytes/2, rows, cols, groupSize) != nil ||
+		validateHIPMLXQ4ProjectionShape(cols, upWeightBytes/4, upScaleBytes/2, upBiasBytes/2, rows, cols, groupSize) != nil ||
+		inputBytes != cols*4 ||
+		outputBytes != rows*4 {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh multiply shape metadata mismatch", nil)
+	}
+	inputData, inputOffset, ok := driver.memoryForPointer(inputPointer, inputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh multiply input buffer is missing", nil)
+	}
+	gateWeightData, gateWeightOffset, ok := driver.memoryForPointer(gateWeightPointer, gateWeightBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh multiply gate packed weight buffer is missing", nil)
+	}
+	gateScaleData, gateScaleOffset, ok := driver.memoryForPointer(gateScalePointer, gateScaleBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh multiply gate scale buffer is missing", nil)
+	}
+	gateBiasData, gateBiasOffset, ok := driver.memoryForPointer(gateBiasPointer, gateBiasBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh multiply gate bias buffer is missing", nil)
+	}
+	upWeightData, upWeightOffset, ok := driver.memoryForPointer(upWeightPointer, upWeightBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh multiply up packed weight buffer is missing", nil)
+	}
+	upScaleData, upScaleOffset, ok := driver.memoryForPointer(upScalePointer, upScaleBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh multiply up scale buffer is missing", nil)
+	}
+	upBiasData, upBiasOffset, ok := driver.memoryForPointer(upBiasPointer, upBiasBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh multiply up bias buffer is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh multiply output buffer is missing", nil)
+	}
+	input, err := hipFloat32PayloadValues(inputData[inputOffset : inputOffset+inputBytes])
+	if err != nil {
+		return err
+	}
+	gateWeights := make([]uint32, gateWeightBytes/4)
+	for index := range gateWeights {
+		gateWeights[index] = binary.LittleEndian.Uint32(gateWeightData[gateWeightOffset+index*4:])
+	}
+	gateScales := make([]uint16, gateScaleBytes/2)
+	for index := range gateScales {
+		gateScales[index] = binary.LittleEndian.Uint16(gateScaleData[gateScaleOffset+index*2:])
+	}
+	gateBiases := make([]uint16, gateBiasBytes/2)
+	for index := range gateBiases {
+		gateBiases[index] = binary.LittleEndian.Uint16(gateBiasData[gateBiasOffset+index*2:])
+	}
+	upWeights := make([]uint32, upWeightBytes/4)
+	for index := range upWeights {
+		upWeights[index] = binary.LittleEndian.Uint32(upWeightData[upWeightOffset+index*4:])
+	}
+	upScales := make([]uint16, upScaleBytes/2)
+	for index := range upScales {
+		upScales[index] = binary.LittleEndian.Uint16(upScaleData[upScaleOffset+index*2:])
+	}
+	upBiases := make([]uint16, upBiasBytes/2)
+	for index := range upBiases {
+		upBiases[index] = binary.LittleEndian.Uint16(upBiasData[upBiasOffset+index*2:])
+	}
+	gate, err := hipReferenceMLXQ4Projection(input, gateWeights, gateScales, gateBiases, rows, cols, groupSize)
+	if err != nil {
+		return err
+	}
+	up, err := hipReferenceMLXQ4Projection(input, upWeights, upScales, upBiases, rows, cols, groupSize)
+	if err != nil {
+		return err
+	}
+	out := make([]float32, rows)
+	const sqrt2OverPi = 0.7978845608028654
+	const coeff = 0.044715
+	for index := range out {
+		value := float64(gate[index])
+		gelu := 0.5 * value * (1 + math.Tanh(sqrt2OverPi*(value+coeff*value*value*value)))
+		out[index] = float32(gelu) * up[index]
+	}
+	payload, err := hipFloat32Payload(out)
+	if err != nil {
+		return err
+	}
+	copy(outputData[outputOffset:outputOffset+outputBytes], payload)
+	return nil
+}
+
+func (driver *fakeHIPDriver) launchMLXQ4GELUTanhMultiplyBatch(args []byte) error {
+	if len(args) != hipMLXQ4GELUTanhMulBatchLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh multiply batch launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipMLXQ4GELUTanhMulBatchLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipMLXQ4GELUTanhMulBatchLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh multiply batch launch header mismatch", nil)
+	}
+	inputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	gateWeightPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	gateScalePointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[24:]))
+	gateBiasPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[32:]))
+	upWeightPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[40:]))
+	upScalePointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[48:]))
+	upBiasPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[56:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[64:]))
+	rows := int(binary.LittleEndian.Uint32(args[72:]))
+	cols := int(binary.LittleEndian.Uint32(args[76:]))
+	groupSize := int(binary.LittleEndian.Uint32(args[80:]))
+	bits := int(binary.LittleEndian.Uint32(args[84:]))
+	inputBytes := int(binary.LittleEndian.Uint32(args[88:]))
+	gateWeightBytes := int(binary.LittleEndian.Uint32(args[92:]))
+	gateScaleBytes := int(binary.LittleEndian.Uint32(args[96:]))
+	gateBiasBytes := int(binary.LittleEndian.Uint32(args[100:]))
+	upWeightBytes := int(binary.LittleEndian.Uint32(args[104:]))
+	upScaleBytes := int(binary.LittleEndian.Uint32(args[108:]))
+	upBiasBytes := int(binary.LittleEndian.Uint32(args[112:]))
+	outputBytes := int(binary.LittleEndian.Uint32(args[116:]))
+	batch := int(binary.LittleEndian.Uint32(args[120:]))
+	if bits != hipMLXQ4ProjectionBits ||
+		batch <= 0 ||
+		validateHIPMLXQ4ProjectionShape(cols, gateWeightBytes/4, gateScaleBytes/2, gateBiasBytes/2, rows, cols, groupSize) != nil ||
+		validateHIPMLXQ4ProjectionShape(cols, upWeightBytes/4, upScaleBytes/2, upBiasBytes/2, rows, cols, groupSize) != nil ||
+		inputBytes != batch*cols*4 ||
+		outputBytes != batch*rows*4 {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh multiply batch shape metadata mismatch", nil)
+	}
+	inputData, inputOffset, ok := driver.memoryForPointer(inputPointer, inputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh multiply batch input buffer is missing", nil)
+	}
+	gateWeightData, gateWeightOffset, ok := driver.memoryForPointer(gateWeightPointer, gateWeightBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh multiply batch gate packed weight buffer is missing", nil)
+	}
+	gateScaleData, gateScaleOffset, ok := driver.memoryForPointer(gateScalePointer, gateScaleBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh multiply batch gate scale buffer is missing", nil)
+	}
+	gateBiasData, gateBiasOffset, ok := driver.memoryForPointer(gateBiasPointer, gateBiasBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh multiply batch gate bias buffer is missing", nil)
+	}
+	upWeightData, upWeightOffset, ok := driver.memoryForPointer(upWeightPointer, upWeightBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh multiply batch up packed weight buffer is missing", nil)
+	}
+	upScaleData, upScaleOffset, ok := driver.memoryForPointer(upScalePointer, upScaleBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh multiply batch up scale buffer is missing", nil)
+	}
+	upBiasData, upBiasOffset, ok := driver.memoryForPointer(upBiasPointer, upBiasBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh multiply batch up bias buffer is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh multiply batch output buffer is missing", nil)
+	}
+	input, err := hipFloat32PayloadValues(inputData[inputOffset : inputOffset+inputBytes])
+	if err != nil {
+		return err
+	}
+	gateWeights := make([]uint32, gateWeightBytes/4)
+	for index := range gateWeights {
+		gateWeights[index] = binary.LittleEndian.Uint32(gateWeightData[gateWeightOffset+index*4:])
+	}
+	gateScales := make([]uint16, gateScaleBytes/2)
+	for index := range gateScales {
+		gateScales[index] = binary.LittleEndian.Uint16(gateScaleData[gateScaleOffset+index*2:])
+	}
+	gateBiases := make([]uint16, gateBiasBytes/2)
+	for index := range gateBiases {
+		gateBiases[index] = binary.LittleEndian.Uint16(gateBiasData[gateBiasOffset+index*2:])
+	}
+	upWeights := make([]uint32, upWeightBytes/4)
+	for index := range upWeights {
+		upWeights[index] = binary.LittleEndian.Uint32(upWeightData[upWeightOffset+index*4:])
+	}
+	upScales := make([]uint16, upScaleBytes/2)
+	for index := range upScales {
+		upScales[index] = binary.LittleEndian.Uint16(upScaleData[upScaleOffset+index*2:])
+	}
+	upBiases := make([]uint16, upBiasBytes/2)
+	for index := range upBiases {
+		upBiases[index] = binary.LittleEndian.Uint16(upBiasData[upBiasOffset+index*2:])
+	}
+	out := make([]float32, 0, batch*rows)
+	const sqrt2OverPi = 0.7978845608028654
+	const coeff = 0.044715
+	for batchIndex := 0; batchIndex < batch; batchIndex++ {
+		start := batchIndex * cols
+		gate, err := hipReferenceMLXQ4Projection(input[start:start+cols], gateWeights, gateScales, gateBiases, rows, cols, groupSize)
+		if err != nil {
+			return err
+		}
+		up, err := hipReferenceMLXQ4Projection(input[start:start+cols], upWeights, upScales, upBiases, rows, cols, groupSize)
+		if err != nil {
+			return err
+		}
+		for index := range gate {
+			value := float64(gate[index])
+			gelu := 0.5 * value * (1 + math.Tanh(sqrt2OverPi*(value+coeff*value*value*value)))
+			out = append(out, float32(gelu)*up[index])
+		}
+	}
+	payload, err := hipFloat32Payload(out)
+	if err != nil {
+		return err
+	}
+	copy(outputData[outputOffset:outputOffset+outputBytes], payload)
+	return nil
+}
+
+func (driver *fakeHIPDriver) launchMLXQ4GELUTanhProjection(args []byte) error {
+	if len(args) != hipMLXQ4GELUTanhProjLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh projection launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipMLXQ4GELUTanhProjLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipMLXQ4GELUTanhProjLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh projection launch header mismatch", nil)
+	}
+	inputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	weightPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	scalePointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[24:]))
+	biasPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[32:]))
+	multiplierPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[40:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[48:]))
+	rows := int(binary.LittleEndian.Uint32(args[56:]))
+	cols := int(binary.LittleEndian.Uint32(args[60:]))
+	groupSize := int(binary.LittleEndian.Uint32(args[64:]))
+	bits := int(binary.LittleEndian.Uint32(args[68:]))
+	inputBytes := int(binary.LittleEndian.Uint32(args[72:]))
+	weightBytes := int(binary.LittleEndian.Uint32(args[76:]))
+	scaleBytes := int(binary.LittleEndian.Uint32(args[80:]))
+	biasBytes := int(binary.LittleEndian.Uint32(args[84:]))
+	multiplierBytes := int(binary.LittleEndian.Uint32(args[88:]))
+	outputBytes := int(binary.LittleEndian.Uint32(args[92:]))
+	if bits != hipMLXQ4ProjectionBits ||
+		validateHIPMLXQ4ProjectionShape(cols, weightBytes/4, scaleBytes/2, biasBytes/2, rows, cols, groupSize) != nil ||
+		inputBytes != cols*4 ||
+		multiplierBytes != rows*4 ||
+		outputBytes != rows*4 {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh projection shape metadata mismatch", nil)
+	}
+	inputData, inputOffset, ok := driver.memoryForPointer(inputPointer, inputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh projection input buffer is missing", nil)
+	}
+	weightData, weightOffset, ok := driver.memoryForPointer(weightPointer, weightBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh projection packed weight buffer is missing", nil)
+	}
+	scaleData, scaleOffset, ok := driver.memoryForPointer(scalePointer, scaleBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh projection scale buffer is missing", nil)
+	}
+	biasData, biasOffset, ok := driver.memoryForPointer(biasPointer, biasBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh projection bias buffer is missing", nil)
+	}
+	multiplierData, multiplierOffset, ok := driver.memoryForPointer(multiplierPointer, multiplierBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh projection multiplier buffer is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh projection output buffer is missing", nil)
+	}
+	input, err := hipFloat32PayloadValues(inputData[inputOffset : inputOffset+inputBytes])
+	if err != nil {
+		return err
+	}
+	weights := make([]uint32, weightBytes/4)
+	for index := range weights {
+		weights[index] = binary.LittleEndian.Uint32(weightData[weightOffset+index*4:])
+	}
+	scales := make([]uint16, scaleBytes/2)
+	for index := range scales {
+		scales[index] = binary.LittleEndian.Uint16(scaleData[scaleOffset+index*2:])
+	}
+	biases := make([]uint16, biasBytes/2)
+	for index := range biases {
+		biases[index] = binary.LittleEndian.Uint16(biasData[biasOffset+index*2:])
+	}
+	multiplier, err := hipFloat32PayloadValues(multiplierData[multiplierOffset : multiplierOffset+multiplierBytes])
+	if err != nil {
+		return err
+	}
+	projected, err := hipReferenceMLXQ4Projection(input, weights, scales, biases, rows, cols, groupSize)
+	if err != nil {
+		return err
+	}
+	out := make([]float32, rows)
+	const sqrt2OverPi = 0.7978845608028654
+	const coeff = 0.044715
+	for index := range out {
+		value := float64(projected[index])
+		gelu := 0.5 * value * (1 + math.Tanh(sqrt2OverPi*(value+coeff*value*value*value)))
+		out[index] = float32(gelu) * multiplier[index]
+	}
+	payload, err := hipFloat32Payload(out)
+	if err != nil {
+		return err
+	}
+	copy(outputData[outputOffset:outputOffset+outputBytes], payload)
+	return nil
+}
+
+func (driver *fakeHIPDriver) launchMLXQ4GELUTanhProjectionBatch(args []byte) error {
+	if len(args) != hipMLXQ4GELUTanhProjBatchLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh projection batch launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipMLXQ4GELUTanhProjBatchLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipMLXQ4GELUTanhProjBatchLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh projection batch launch header mismatch", nil)
+	}
+	inputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	weightPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	scalePointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[24:]))
+	biasPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[32:]))
+	multiplierPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[40:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[48:]))
+	rows := int(binary.LittleEndian.Uint32(args[56:]))
+	cols := int(binary.LittleEndian.Uint32(args[60:]))
+	batch := int(binary.LittleEndian.Uint32(args[64:]))
+	groupSize := int(binary.LittleEndian.Uint32(args[68:]))
+	bits := int(binary.LittleEndian.Uint32(args[72:]))
+	inputBytes := int(binary.LittleEndian.Uint32(args[76:]))
+	weightBytes := int(binary.LittleEndian.Uint32(args[80:]))
+	scaleBytes := int(binary.LittleEndian.Uint32(args[84:]))
+	biasBytes := int(binary.LittleEndian.Uint32(args[88:]))
+	multiplierBytes := int(binary.LittleEndian.Uint32(args[92:]))
+	outputBytes := int(binary.LittleEndian.Uint32(args[96:]))
+	if bits != hipMLXQ4ProjectionBits ||
+		validateHIPMLXQ4ProjectionShape(cols, weightBytes/4, scaleBytes/2, biasBytes/2, rows, cols, groupSize) != nil ||
+		batch <= 0 ||
+		inputBytes != batch*cols*4 ||
+		multiplierBytes != batch*rows*4 ||
+		outputBytes != batch*rows*4 {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh projection batch shape metadata mismatch", nil)
+	}
+	inputData, inputOffset, ok := driver.memoryForPointer(inputPointer, inputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh projection batch input buffer is missing", nil)
+	}
+	weightData, weightOffset, ok := driver.memoryForPointer(weightPointer, weightBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh projection batch packed weight buffer is missing", nil)
+	}
+	scaleData, scaleOffset, ok := driver.memoryForPointer(scalePointer, scaleBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh projection batch scale buffer is missing", nil)
+	}
+	biasData, biasOffset, ok := driver.memoryForPointer(biasPointer, biasBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh projection batch bias buffer is missing", nil)
+	}
+	multiplierData, multiplierOffset, ok := driver.memoryForPointer(multiplierPointer, multiplierBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh projection batch multiplier buffer is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 GELU tanh projection batch output buffer is missing", nil)
+	}
+	input, err := hipFloat32PayloadValues(inputData[inputOffset : inputOffset+inputBytes])
+	if err != nil {
+		return err
+	}
+	weights := make([]uint32, weightBytes/4)
+	for index := range weights {
+		weights[index] = binary.LittleEndian.Uint32(weightData[weightOffset+index*4:])
+	}
+	scales := make([]uint16, scaleBytes/2)
+	for index := range scales {
+		scales[index] = binary.LittleEndian.Uint16(scaleData[scaleOffset+index*2:])
+	}
+	biases := make([]uint16, biasBytes/2)
+	for index := range biases {
+		biases[index] = binary.LittleEndian.Uint16(biasData[biasOffset+index*2:])
+	}
+	multiplier, err := hipFloat32PayloadValues(multiplierData[multiplierOffset : multiplierOffset+multiplierBytes])
+	if err != nil {
+		return err
+	}
+	out := make([]float32, 0, batch*rows)
+	const sqrt2OverPi = 0.7978845608028654
+	const coeff = 0.044715
+	for batchIndex := 0; batchIndex < batch; batchIndex++ {
+		inputStart := batchIndex * cols
+		projected, err := hipReferenceMLXQ4Projection(input[inputStart:inputStart+cols], weights, scales, biases, rows, cols, groupSize)
+		if err != nil {
+			return err
+		}
+		multiplierStart := batchIndex * rows
+		for index := range projected {
+			value := float64(projected[index])
+			gelu := 0.5 * value * (1 + math.Tanh(sqrt2OverPi*(value+coeff*value*value*value)))
+			out = append(out, float32(gelu)*multiplier[multiplierStart+index])
+		}
+	}
+	payload, err := hipFloat32Payload(out)
+	if err != nil {
+		return err
+	}
+	copy(outputData[outputOffset:outputOffset+outputBytes], payload)
+	return nil
+}
+
+func (driver *fakeHIPDriver) launchMLXQ4ProjectionGreedy(args []byte) error {
+	if len(args) != hipMLXQ4ProjectionLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 greedy projection launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipMLXQ4ProjectionLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipMLXQ4ProjectionLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 greedy projection launch header mismatch", nil)
+	}
+	inputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	weightPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	scalePointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[24:]))
+	biasPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[32:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[40:]))
+	rows := int(binary.LittleEndian.Uint32(args[48:]))
+	cols := int(binary.LittleEndian.Uint32(args[52:]))
+	groupSize := int(binary.LittleEndian.Uint32(args[56:]))
+	bits := int(binary.LittleEndian.Uint32(args[60:]))
+	inputBytes := int(binary.LittleEndian.Uint32(args[64:]))
+	weightBytes := int(binary.LittleEndian.Uint32(args[68:]))
+	scaleBytes := int(binary.LittleEndian.Uint32(args[72:]))
+	biasBytes := int(binary.LittleEndian.Uint32(args[76:]))
+	outputBytes := int(binary.LittleEndian.Uint32(args[80:]))
+	if bits != hipMLXQ4ProjectionBits ||
+		validateHIPMLXQ4ProjectionShape(cols, weightBytes/4, scaleBytes/2, biasBytes/2, rows, cols, groupSize) != nil ||
+		inputBytes != cols*4 ||
+		outputBytes != hipMLXQ4ProjectionBestBytes {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 greedy projection shape metadata mismatch", nil)
+	}
+	inputData, inputOffset, ok := driver.memoryForPointer(inputPointer, inputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 greedy projection input buffer is missing", nil)
+	}
+	weightData, weightOffset, ok := driver.memoryForPointer(weightPointer, weightBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 greedy projection packed weight buffer is missing", nil)
+	}
+	scaleData, scaleOffset, ok := driver.memoryForPointer(scalePointer, scaleBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 greedy projection scale buffer is missing", nil)
+	}
+	biasData, biasOffset, ok := driver.memoryForPointer(biasPointer, biasBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 greedy projection bias buffer is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 greedy projection output buffer is missing", nil)
+	}
+	input, err := hipFloat32PayloadValues(inputData[inputOffset : inputOffset+inputBytes])
+	if err != nil {
+		return err
+	}
+	weights := make([]uint32, weightBytes/4)
+	for index := range weights {
+		weights[index] = binary.LittleEndian.Uint32(weightData[weightOffset+index*4:])
+	}
+	scales := make([]uint16, scaleBytes/2)
+	for index := range scales {
+		scales[index] = binary.LittleEndian.Uint16(scaleData[scaleOffset+index*2:])
+	}
+	biases := make([]uint16, biasBytes/2)
+	for index := range biases {
+		biases[index] = binary.LittleEndian.Uint16(biasData[biasOffset+index*2:])
+	}
+	output, err := hipReferenceMLXQ4Projection(input, weights, scales, biases, rows, cols, groupSize)
+	if err != nil {
+		return err
+	}
+	bestIndex, bestScore, err := hipReferenceGreedySample(output)
+	if err != nil {
+		return err
+	}
+	binary.LittleEndian.PutUint64(outputData[outputOffset:outputOffset+outputBytes], hipPackGreedyBest(bestScore, bestIndex))
 	return nil
 }
 
@@ -3222,9 +4105,6 @@ func (driver *fakeHIPDriver) launchRMSNorm(args []byte) error {
 	epsilon := math.Float32frombits(binary.LittleEndian.Uint32(args[48:]))
 	encoding := binary.LittleEndian.Uint32(args[52:])
 	flags := binary.LittleEndian.Uint32(args[56:])
-	if encoding == 0 {
-		encoding = hipRMSNormWeightEncodingF32
-	}
 	if count <= 0 || inputBytes != count*4 || outputBytes != count*4 {
 		return core.E("rocm.hip.FakeLaunch", "rms norm shape metadata mismatch", nil)
 	}
@@ -3232,12 +4112,16 @@ func (driver *fakeHIPDriver) launchRMSNorm(args []byte) error {
 		return core.E("rocm.hip.FakeLaunch", "unsupported rms norm flags", nil)
 	}
 	switch encoding {
+	case hipRMSNormWeightEncodingNone:
+		if weightPointer != 0 || weightBytes != 0 || flags != 0 {
+			return core.E("rocm.hip.FakeLaunch", "rms norm unit weight metadata mismatch", nil)
+		}
 	case hipRMSNormWeightEncodingF32:
-		if weightBytes != count*4 {
+		if weightPointer == 0 || weightBytes != count*4 {
 			return core.E("rocm.hip.FakeLaunch", "rms norm f32 weight byte count mismatch", nil)
 		}
 	case hipRMSNormWeightEncodingBF16:
-		if weightBytes != count*2 {
+		if weightPointer == 0 || weightBytes != count*2 {
 			return core.E("rocm.hip.FakeLaunch", "rms norm bf16 weight byte count mismatch", nil)
 		}
 	default:
@@ -3246,10 +4130,6 @@ func (driver *fakeHIPDriver) launchRMSNorm(args []byte) error {
 	inputData, inputOffset, ok := driver.memoryForPointer(inputPointer, inputBytes)
 	if !ok {
 		return core.E("rocm.hip.FakeLaunch", "rms norm input buffer is missing", nil)
-	}
-	weightData, weightOffset, ok := driver.memoryForPointer(weightPointer, weightBytes)
-	if !ok {
-		return core.E("rocm.hip.FakeLaunch", "rms norm weight buffer is missing", nil)
 	}
 	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
 	if !ok {
@@ -3261,12 +4141,24 @@ func (driver *fakeHIPDriver) launchRMSNorm(args []byte) error {
 	}
 	weight := make([]float32, count)
 	switch encoding {
+	case hipRMSNormWeightEncodingNone:
+		for index := range weight {
+			weight[index] = 1
+		}
 	case hipRMSNormWeightEncodingF32:
+		weightData, weightOffset, ok := driver.memoryForPointer(weightPointer, weightBytes)
+		if !ok {
+			return core.E("rocm.hip.FakeLaunch", "rms norm weight buffer is missing", nil)
+		}
 		weight, err = hipFloat32PayloadValues(weightData[weightOffset : weightOffset+weightBytes])
 		if err != nil {
 			return err
 		}
 	case hipRMSNormWeightEncodingBF16:
+		weightData, weightOffset, ok := driver.memoryForPointer(weightPointer, weightBytes)
+		if !ok {
+			return core.E("rocm.hip.FakeLaunch", "rms norm weight buffer is missing", nil)
+		}
 		for index := range weight {
 			weight[index] = hipBFloat16ToFloat32(binary.LittleEndian.Uint16(weightData[weightOffset+index*2:]))
 		}
@@ -3279,6 +4171,626 @@ func (driver *fakeHIPDriver) launchRMSNorm(args []byte) error {
 	output, err := hipReferenceRMSNorm(input, weight, epsilon)
 	if err != nil {
 		return err
+	}
+	payload, err := hipFloat32Payload(output)
+	if err != nil {
+		return err
+	}
+	copy(outputData[outputOffset:outputOffset+outputBytes], payload)
+	return nil
+}
+
+func (driver *fakeHIPDriver) launchRMSNormResidualAdd(args []byte) error {
+	if len(args) != hipRMSNormResidualAddArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "rms norm residual-add launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipRMSNormResidualAddArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipRMSNormResidualAddArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "rms norm residual-add launch header mismatch", nil)
+	}
+	inputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	weightPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	residualPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[24:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[32:]))
+	count := int(binary.LittleEndian.Uint32(args[40:]))
+	inputBytes := int(binary.LittleEndian.Uint32(args[44:]))
+	weightBytes := int(binary.LittleEndian.Uint32(args[48:]))
+	residualBytes := int(binary.LittleEndian.Uint32(args[52:]))
+	outputBytes := int(binary.LittleEndian.Uint32(args[56:]))
+	epsilon := math.Float32frombits(binary.LittleEndian.Uint32(args[60:]))
+	encoding := binary.LittleEndian.Uint32(args[64:])
+	flags := binary.LittleEndian.Uint32(args[68:])
+	outputScale := float32(1)
+	if bits := binary.LittleEndian.Uint32(args[72:]); bits != 0 {
+		outputScale = math.Float32frombits(bits)
+	}
+	if count <= 0 || inputBytes != count*4 || residualBytes != count*4 || outputBytes != count*4 {
+		return core.E("rocm.hip.FakeLaunch", "rms norm residual-add shape metadata mismatch", nil)
+	}
+	if math.IsNaN(float64(outputScale)) || math.IsInf(float64(outputScale), 0) {
+		return core.E("rocm.hip.FakeLaunch", "rms norm residual-add output scale must be finite", nil)
+	}
+	if flags&^hipRMSNormLaunchFlagAddUnitWeight != 0 {
+		return core.E("rocm.hip.FakeLaunch", "unsupported rms norm residual-add flags", nil)
+	}
+	switch encoding {
+	case hipRMSNormWeightEncodingNone:
+		if weightPointer != 0 || weightBytes != 0 || flags != 0 {
+			return core.E("rocm.hip.FakeLaunch", "rms norm residual-add unit weight metadata mismatch", nil)
+		}
+	case hipRMSNormWeightEncodingF32:
+		if weightPointer == 0 || weightBytes != count*4 {
+			return core.E("rocm.hip.FakeLaunch", "rms norm residual-add f32 weight byte count mismatch", nil)
+		}
+	case hipRMSNormWeightEncodingBF16:
+		if weightPointer == 0 || weightBytes != count*2 {
+			return core.E("rocm.hip.FakeLaunch", "rms norm residual-add bf16 weight byte count mismatch", nil)
+		}
+	default:
+		return core.E("rocm.hip.FakeLaunch", "unsupported rms norm residual-add weight encoding", nil)
+	}
+	inputData, inputOffset, ok := driver.memoryForPointer(inputPointer, inputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "rms norm residual-add input buffer is missing", nil)
+	}
+	residualData, residualOffset, ok := driver.memoryForPointer(residualPointer, residualBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "rms norm residual-add residual buffer is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "rms norm residual-add output buffer is missing", nil)
+	}
+	input, err := hipFloat32PayloadValues(inputData[inputOffset : inputOffset+inputBytes])
+	if err != nil {
+		return err
+	}
+	residual, err := hipFloat32PayloadValues(residualData[residualOffset : residualOffset+residualBytes])
+	if err != nil {
+		return err
+	}
+	weight := make([]float32, count)
+	switch encoding {
+	case hipRMSNormWeightEncodingNone:
+		for index := range weight {
+			weight[index] = 1
+		}
+	case hipRMSNormWeightEncodingF32:
+		weightData, weightOffset, ok := driver.memoryForPointer(weightPointer, weightBytes)
+		if !ok {
+			return core.E("rocm.hip.FakeLaunch", "rms norm residual-add weight buffer is missing", nil)
+		}
+		weight, err = hipFloat32PayloadValues(weightData[weightOffset : weightOffset+weightBytes])
+		if err != nil {
+			return err
+		}
+	case hipRMSNormWeightEncodingBF16:
+		weightData, weightOffset, ok := driver.memoryForPointer(weightPointer, weightBytes)
+		if !ok {
+			return core.E("rocm.hip.FakeLaunch", "rms norm residual-add weight buffer is missing", nil)
+		}
+		for index := range weight {
+			weight[index] = hipBFloat16ToFloat32(binary.LittleEndian.Uint16(weightData[weightOffset+index*2:]))
+		}
+	}
+	if flags&hipRMSNormLaunchFlagAddUnitWeight != 0 {
+		for index := range weight {
+			weight[index] += 1
+		}
+	}
+	normalized, err := hipReferenceRMSNorm(input, weight, epsilon)
+	if err != nil {
+		return err
+	}
+	for index := range normalized {
+		normalized[index] = (normalized[index] + residual[index]) * outputScale
+	}
+	payload, err := hipFloat32Payload(normalized)
+	if err != nil {
+		return err
+	}
+	copy(outputData[outputOffset:outputOffset+outputBytes], payload)
+	return nil
+}
+
+func (driver *fakeHIPDriver) launchRMSNormResidualAddNorm(args []byte) error {
+	if len(args) != hipRMSNormResAddNormArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "rms norm residual-add-norm launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipRMSNormResAddNormArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipRMSNormResAddNormArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "rms norm residual-add-norm launch header mismatch", nil)
+	}
+	inputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	weightPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	residualPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[24:]))
+	residualOutputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[32:]))
+	normWeightPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[40:]))
+	normOutputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[48:]))
+	count := int(binary.LittleEndian.Uint32(args[56:]))
+	inputBytes := int(binary.LittleEndian.Uint32(args[60:]))
+	weightBytes := int(binary.LittleEndian.Uint32(args[64:]))
+	residualBytes := int(binary.LittleEndian.Uint32(args[68:]))
+	residualOutputBytes := int(binary.LittleEndian.Uint32(args[72:]))
+	normWeightBytes := int(binary.LittleEndian.Uint32(args[76:]))
+	normOutputBytes := int(binary.LittleEndian.Uint32(args[80:]))
+	epsilon := math.Float32frombits(binary.LittleEndian.Uint32(args[84:]))
+	encoding := binary.LittleEndian.Uint32(args[88:])
+	flags := binary.LittleEndian.Uint32(args[92:])
+	normEpsilon := math.Float32frombits(binary.LittleEndian.Uint32(args[96:]))
+	normEncoding := binary.LittleEndian.Uint32(args[100:])
+	normFlags := binary.LittleEndian.Uint32(args[104:])
+	outputScale := float32(1)
+	if bits := binary.LittleEndian.Uint32(args[108:]); bits != 0 {
+		outputScale = math.Float32frombits(bits)
+	}
+	if count <= 0 || inputBytes != count*4 || residualBytes != count*4 ||
+		residualOutputBytes != count*4 || normOutputBytes != count*4 {
+		return core.E("rocm.hip.FakeLaunch", "rms norm residual-add-norm shape metadata mismatch", nil)
+	}
+	if math.IsNaN(float64(outputScale)) || math.IsInf(float64(outputScale), 0) {
+		return core.E("rocm.hip.FakeLaunch", "rms norm residual-add-norm output scale must be finite", nil)
+	}
+	inputData, inputOffset, ok := driver.memoryForPointer(inputPointer, inputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "rms norm residual-add-norm input buffer is missing", nil)
+	}
+	residualData, residualOffset, ok := driver.memoryForPointer(residualPointer, residualBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "rms norm residual-add-norm residual buffer is missing", nil)
+	}
+	residualOutputData, residualOutputOffset, ok := driver.memoryForPointer(residualOutputPointer, residualOutputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "rms norm residual-add-norm residual output buffer is missing", nil)
+	}
+	normOutputData, normOutputOffset, ok := driver.memoryForPointer(normOutputPointer, normOutputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "rms norm residual-add-norm norm output buffer is missing", nil)
+	}
+	input, err := hipFloat32PayloadValues(inputData[inputOffset : inputOffset+inputBytes])
+	if err != nil {
+		return err
+	}
+	residual, err := hipFloat32PayloadValues(residualData[residualOffset : residualOffset+residualBytes])
+	if err != nil {
+		return err
+	}
+	weight, err := driver.rmsNormWeightValues(weightPointer, weightBytes, count, encoding, flags, "rms norm residual-add-norm weight")
+	if err != nil {
+		return err
+	}
+	normWeight, err := driver.rmsNormWeightValues(normWeightPointer, normWeightBytes, count, normEncoding, normFlags, "rms norm residual-add-norm norm weight")
+	if err != nil {
+		return err
+	}
+	normalized, err := hipReferenceRMSNorm(input, weight, epsilon)
+	if err != nil {
+		return err
+	}
+	for index := range normalized {
+		normalized[index] = (normalized[index] + residual[index]) * outputScale
+	}
+	residualPayload, err := hipFloat32Payload(normalized)
+	if err != nil {
+		return err
+	}
+	copy(residualOutputData[residualOutputOffset:residualOutputOffset+residualOutputBytes], residualPayload)
+	normOutput, err := hipReferenceRMSNorm(normalized, normWeight, normEpsilon)
+	if err != nil {
+		return err
+	}
+	normPayload, err := hipFloat32Payload(normOutput)
+	if err != nil {
+		return err
+	}
+	copy(normOutputData[normOutputOffset:normOutputOffset+normOutputBytes], normPayload)
+	return nil
+}
+
+func (driver *fakeHIPDriver) rmsNormWeightValues(pointer nativeDevicePointer, bytes, count int, encoding, flags uint32, label string) ([]float32, error) {
+	if flags&^hipRMSNormLaunchFlagAddUnitWeight != 0 {
+		return nil, core.E("rocm.hip.FakeLaunch", "unsupported "+label+" flags", nil)
+	}
+	weight := make([]float32, count)
+	switch encoding {
+	case hipRMSNormWeightEncodingNone:
+		if pointer != 0 || bytes != 0 || flags != 0 {
+			return nil, core.E("rocm.hip.FakeLaunch", label+" unit metadata mismatch", nil)
+		}
+		for index := range weight {
+			weight[index] = 1
+		}
+	case hipRMSNormWeightEncodingF32:
+		if pointer == 0 || bytes != count*4 {
+			return nil, core.E("rocm.hip.FakeLaunch", label+" f32 byte count mismatch", nil)
+		}
+		weightData, weightOffset, ok := driver.memoryForPointer(pointer, bytes)
+		if !ok {
+			return nil, core.E("rocm.hip.FakeLaunch", label+" buffer is missing", nil)
+		}
+		values, err := hipFloat32PayloadValues(weightData[weightOffset : weightOffset+bytes])
+		if err != nil {
+			return nil, err
+		}
+		weight = values
+	case hipRMSNormWeightEncodingBF16:
+		if pointer == 0 || bytes != count*2 {
+			return nil, core.E("rocm.hip.FakeLaunch", label+" bf16 byte count mismatch", nil)
+		}
+		weightData, weightOffset, ok := driver.memoryForPointer(pointer, bytes)
+		if !ok {
+			return nil, core.E("rocm.hip.FakeLaunch", label+" buffer is missing", nil)
+		}
+		for index := range weight {
+			weight[index] = hipBFloat16ToFloat32(binary.LittleEndian.Uint16(weightData[weightOffset+index*2:]))
+		}
+	default:
+		return nil, core.E("rocm.hip.FakeLaunch", "unsupported "+label+" encoding", nil)
+	}
+	if flags&hipRMSNormLaunchFlagAddUnitWeight != 0 {
+		for index := range weight {
+			weight[index] += 1
+		}
+	}
+	return weight, nil
+}
+
+func (driver *fakeHIPDriver) launchRMSNormHeads(args []byte) error {
+	if len(args) != hipRMSNormHeadsLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "rms norm heads launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipRMSNormHeadsLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipRMSNormHeadsLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "rms norm heads launch header mismatch", nil)
+	}
+	inputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	weightPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[24:]))
+	headDim := int(binary.LittleEndian.Uint32(args[32:]))
+	headCount := int(binary.LittleEndian.Uint32(args[36:]))
+	inputBytes := int(binary.LittleEndian.Uint32(args[40:]))
+	weightBytes := int(binary.LittleEndian.Uint32(args[44:]))
+	outputBytes := int(binary.LittleEndian.Uint32(args[48:]))
+	epsilon := math.Float32frombits(binary.LittleEndian.Uint32(args[52:]))
+	encoding := binary.LittleEndian.Uint32(args[56:])
+	flags := binary.LittleEndian.Uint32(args[60:])
+	totalCount := headDim * headCount
+	if headDim <= 0 || headCount <= 0 || inputBytes != totalCount*4 || outputBytes != totalCount*4 {
+		return core.E("rocm.hip.FakeLaunch", "rms norm heads shape metadata mismatch", nil)
+	}
+	if flags&^hipRMSNormLaunchFlagAddUnitWeight != 0 {
+		return core.E("rocm.hip.FakeLaunch", "unsupported rms norm heads flags", nil)
+	}
+	switch encoding {
+	case hipRMSNormWeightEncodingNone:
+		if weightPointer != 0 || weightBytes != 0 || flags != 0 {
+			return core.E("rocm.hip.FakeLaunch", "rms norm heads unit weight metadata mismatch", nil)
+		}
+	case hipRMSNormWeightEncodingF32:
+		if weightPointer == 0 || weightBytes != headDim*4 {
+			return core.E("rocm.hip.FakeLaunch", "rms norm heads f32 weight byte count mismatch", nil)
+		}
+	case hipRMSNormWeightEncodingBF16:
+		if weightPointer == 0 || weightBytes != headDim*2 {
+			return core.E("rocm.hip.FakeLaunch", "rms norm heads bf16 weight byte count mismatch", nil)
+		}
+	default:
+		return core.E("rocm.hip.FakeLaunch", "unsupported rms norm heads weight encoding", nil)
+	}
+	inputData, inputOffset, ok := driver.memoryForPointer(inputPointer, inputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "rms norm heads input buffer is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "rms norm heads output buffer is missing", nil)
+	}
+	input, err := hipFloat32PayloadValues(inputData[inputOffset : inputOffset+inputBytes])
+	if err != nil {
+		return err
+	}
+	weight := make([]float32, headDim)
+	switch encoding {
+	case hipRMSNormWeightEncodingNone:
+		for index := range weight {
+			weight[index] = 1
+		}
+	case hipRMSNormWeightEncodingF32:
+		weightData, weightOffset, ok := driver.memoryForPointer(weightPointer, weightBytes)
+		if !ok {
+			return core.E("rocm.hip.FakeLaunch", "rms norm heads weight buffer is missing", nil)
+		}
+		weight, err = hipFloat32PayloadValues(weightData[weightOffset : weightOffset+weightBytes])
+		if err != nil {
+			return err
+		}
+	case hipRMSNormWeightEncodingBF16:
+		weightData, weightOffset, ok := driver.memoryForPointer(weightPointer, weightBytes)
+		if !ok {
+			return core.E("rocm.hip.FakeLaunch", "rms norm heads weight buffer is missing", nil)
+		}
+		for index := range weight {
+			weight[index] = hipBFloat16ToFloat32(binary.LittleEndian.Uint16(weightData[weightOffset+index*2:]))
+		}
+	}
+	if flags&hipRMSNormLaunchFlagAddUnitWeight != 0 {
+		for index := range weight {
+			weight[index] += 1
+		}
+	}
+	output := make([]float32, 0, totalCount)
+	for head := 0; head < headCount; head++ {
+		start := head * headDim
+		normalized, err := hipReferenceRMSNorm(input[start:start+headDim], weight, epsilon)
+		if err != nil {
+			return err
+		}
+		output = append(output, normalized...)
+	}
+	payload, err := hipFloat32Payload(output)
+	if err != nil {
+		return err
+	}
+	copy(outputData[outputOffset:outputOffset+outputBytes], payload)
+	return nil
+}
+
+func (driver *fakeHIPDriver) launchRMSNormRoPEHeads(args []byte) error {
+	if len(args) != hipRMSNormRoPEHeadsLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "rms norm rope heads launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipRMSNormRoPEHeadsLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipRMSNormRoPEHeadsLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "rms norm rope heads launch header mismatch", nil)
+	}
+	inputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	weightPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[24:]))
+	headDim := int(binary.LittleEndian.Uint32(args[32:]))
+	headCount := int(binary.LittleEndian.Uint32(args[36:]))
+	inputBytes := int(binary.LittleEndian.Uint32(args[40:]))
+	weightBytes := int(binary.LittleEndian.Uint32(args[44:]))
+	outputBytes := int(binary.LittleEndian.Uint32(args[48:]))
+	epsilon := math.Float32frombits(binary.LittleEndian.Uint32(args[52:]))
+	encoding := binary.LittleEndian.Uint32(args[56:])
+	flags := binary.LittleEndian.Uint32(args[60:])
+	position := int(binary.LittleEndian.Uint32(args[64:]))
+	base := math.Float32frombits(binary.LittleEndian.Uint32(args[68:]))
+	frequencyDim := int(binary.LittleEndian.Uint32(args[72:]))
+	rotaryCount := int(binary.LittleEndian.Uint32(args[76:]))
+	totalCount := headDim * headCount
+	if headDim <= 0 || headDim%2 != 0 || headCount <= 0 || inputBytes != totalCount*4 || outputBytes != totalCount*4 {
+		return core.E("rocm.hip.FakeLaunch", "rms norm rope heads shape metadata mismatch", nil)
+	}
+	if frequencyDim > 0 && frequencyDim < headDim {
+		return core.E("rocm.hip.FakeLaunch", "rms norm rope heads frequency dimension mismatch", nil)
+	}
+	if rotaryCount < 0 || rotaryCount > headDim || rotaryCount%2 != 0 {
+		return core.E("rocm.hip.FakeLaunch", "rms norm rope heads rotary count mismatch", nil)
+	}
+	if rotaryCount == 0 {
+		rotaryCount = headDim
+	}
+	effectiveFrequencyDim := frequencyDim
+	if effectiveFrequencyDim == 0 {
+		effectiveFrequencyDim = headDim
+	}
+	if flags&^hipRMSNormLaunchFlagMask != 0 {
+		return core.E("rocm.hip.FakeLaunch", "unsupported rms norm rope heads flags", nil)
+	}
+	switch encoding {
+	case hipRMSNormWeightEncodingNone:
+		if weightPointer != 0 || weightBytes != 0 || flags&hipRMSNormLaunchFlagAddUnitWeight != 0 {
+			return core.E("rocm.hip.FakeLaunch", "rms norm rope heads unit weight metadata mismatch", nil)
+		}
+	case hipRMSNormWeightEncodingF32:
+		if weightPointer == 0 || weightBytes != headDim*4 {
+			return core.E("rocm.hip.FakeLaunch", "rms norm rope heads f32 weight byte count mismatch", nil)
+		}
+	case hipRMSNormWeightEncodingBF16:
+		if weightPointer == 0 || weightBytes != headDim*2 {
+			return core.E("rocm.hip.FakeLaunch", "rms norm rope heads bf16 weight byte count mismatch", nil)
+		}
+	default:
+		return core.E("rocm.hip.FakeLaunch", "unsupported rms norm rope heads weight encoding", nil)
+	}
+	inputData, inputOffset, ok := driver.memoryForPointer(inputPointer, inputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "rms norm rope heads input buffer is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "rms norm rope heads output buffer is missing", nil)
+	}
+	input, err := hipFloat32PayloadValues(inputData[inputOffset : inputOffset+inputBytes])
+	if err != nil {
+		return err
+	}
+	weight := make([]float32, headDim)
+	switch encoding {
+	case hipRMSNormWeightEncodingNone:
+		for index := range weight {
+			weight[index] = 1
+		}
+	case hipRMSNormWeightEncodingF32:
+		weightData, weightOffset, ok := driver.memoryForPointer(weightPointer, weightBytes)
+		if !ok {
+			return core.E("rocm.hip.FakeLaunch", "rms norm rope heads weight buffer is missing", nil)
+		}
+		weight, err = hipFloat32PayloadValues(weightData[weightOffset : weightOffset+weightBytes])
+		if err != nil {
+			return err
+		}
+	case hipRMSNormWeightEncodingBF16:
+		weightData, weightOffset, ok := driver.memoryForPointer(weightPointer, weightBytes)
+		if !ok {
+			return core.E("rocm.hip.FakeLaunch", "rms norm rope heads weight buffer is missing", nil)
+		}
+		for index := range weight {
+			weight[index] = hipBFloat16ToFloat32(binary.LittleEndian.Uint16(weightData[weightOffset+index*2:]))
+		}
+	}
+	if flags&hipRMSNormLaunchFlagAddUnitWeight != 0 {
+		for index := range weight {
+			weight[index] += 1
+		}
+	}
+	output := make([]float32, 0, totalCount)
+	for head := 0; head < headCount; head++ {
+		start := head * headDim
+		normalized, err := hipReferenceRMSNorm(input[start:start+headDim], weight, epsilon)
+		if err != nil {
+			return err
+		}
+		var rotated []float32
+		if flags&hipRMSNormLaunchFlagRoPENeoX != 0 {
+			rotated, err = hipReferenceRoPENeoXWithFrequencyDim(normalized, position, float64(base), effectiveFrequencyDim, rotaryCount)
+		} else {
+			rotated = append([]float32(nil), normalized...)
+			var rotary []float32
+			rotary, err = hipReferenceRoPEWithFrequencyDim(normalized[:rotaryCount], position, float64(base), effectiveFrequencyDim)
+			if err == nil {
+				copy(rotated[:rotaryCount], rotary)
+			}
+		}
+		if err != nil {
+			return err
+		}
+		output = append(output, rotated...)
+	}
+	payload, err := hipFloat32Payload(output)
+	if err != nil {
+		return err
+	}
+	copy(outputData[outputOffset:outputOffset+outputBytes], payload)
+	return nil
+}
+
+func (driver *fakeHIPDriver) launchRMSNormRoPEHeadsBatch(args []byte) error {
+	if len(args) != hipRMSNormRoPEHeadsBatchLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "rms norm rope heads batch launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipRMSNormRoPEHeadsBatchLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipRMSNormRoPEHeadsBatchLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "rms norm rope heads batch launch header mismatch", nil)
+	}
+	inputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	weightPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[24:]))
+	headDim := int(binary.LittleEndian.Uint32(args[32:]))
+	headCount := int(binary.LittleEndian.Uint32(args[36:]))
+	batch := int(binary.LittleEndian.Uint32(args[40:]))
+	inputBytes := int(binary.LittleEndian.Uint32(args[44:]))
+	weightBytes := int(binary.LittleEndian.Uint32(args[48:]))
+	outputBytes := int(binary.LittleEndian.Uint32(args[52:]))
+	epsilon := math.Float32frombits(binary.LittleEndian.Uint32(args[56:]))
+	encoding := binary.LittleEndian.Uint32(args[60:])
+	flags := binary.LittleEndian.Uint32(args[64:])
+	startPosition := int(binary.LittleEndian.Uint32(args[68:]))
+	base := math.Float32frombits(binary.LittleEndian.Uint32(args[72:]))
+	frequencyDim := int(binary.LittleEndian.Uint32(args[76:]))
+	rotaryCount := int(binary.LittleEndian.Uint32(args[80:]))
+	totalCount := headDim * headCount * batch
+	if headDim <= 0 || headDim%2 != 0 || headCount <= 0 || batch <= 0 || inputBytes != totalCount*4 || outputBytes != totalCount*4 {
+		return core.E("rocm.hip.FakeLaunch", "rms norm rope heads batch shape metadata mismatch", nil)
+	}
+	if frequencyDim > 0 && frequencyDim < headDim {
+		return core.E("rocm.hip.FakeLaunch", "rms norm rope heads batch frequency dimension mismatch", nil)
+	}
+	if rotaryCount < 0 || rotaryCount > headDim || rotaryCount%2 != 0 {
+		return core.E("rocm.hip.FakeLaunch", "rms norm rope heads batch rotary count mismatch", nil)
+	}
+	if rotaryCount == 0 {
+		rotaryCount = headDim
+	}
+	effectiveFrequencyDim := frequencyDim
+	if effectiveFrequencyDim == 0 {
+		effectiveFrequencyDim = headDim
+	}
+	if flags&^hipRMSNormLaunchFlagMask != 0 {
+		return core.E("rocm.hip.FakeLaunch", "unsupported rms norm rope heads batch flags", nil)
+	}
+	switch encoding {
+	case hipRMSNormWeightEncodingNone:
+		if weightPointer != 0 || weightBytes != 0 || flags&hipRMSNormLaunchFlagAddUnitWeight != 0 {
+			return core.E("rocm.hip.FakeLaunch", "rms norm rope heads batch unit weight metadata mismatch", nil)
+		}
+	case hipRMSNormWeightEncodingF32:
+		if weightPointer == 0 || weightBytes != headDim*4 {
+			return core.E("rocm.hip.FakeLaunch", "rms norm rope heads batch f32 weight byte count mismatch", nil)
+		}
+	case hipRMSNormWeightEncodingBF16:
+		if weightPointer == 0 || weightBytes != headDim*2 {
+			return core.E("rocm.hip.FakeLaunch", "rms norm rope heads batch bf16 weight byte count mismatch", nil)
+		}
+	default:
+		return core.E("rocm.hip.FakeLaunch", "unsupported rms norm rope heads batch weight encoding", nil)
+	}
+	inputData, inputOffset, ok := driver.memoryForPointer(inputPointer, inputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "rms norm rope heads batch input buffer is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "rms norm rope heads batch output buffer is missing", nil)
+	}
+	input, err := hipFloat32PayloadValues(inputData[inputOffset : inputOffset+inputBytes])
+	if err != nil {
+		return err
+	}
+	weight := make([]float32, headDim)
+	switch encoding {
+	case hipRMSNormWeightEncodingNone:
+		for index := range weight {
+			weight[index] = 1
+		}
+	case hipRMSNormWeightEncodingF32:
+		weightData, weightOffset, ok := driver.memoryForPointer(weightPointer, weightBytes)
+		if !ok {
+			return core.E("rocm.hip.FakeLaunch", "rms norm rope heads batch weight buffer is missing", nil)
+		}
+		weight, err = hipFloat32PayloadValues(weightData[weightOffset : weightOffset+weightBytes])
+		if err != nil {
+			return err
+		}
+	case hipRMSNormWeightEncodingBF16:
+		weightData, weightOffset, ok := driver.memoryForPointer(weightPointer, weightBytes)
+		if !ok {
+			return core.E("rocm.hip.FakeLaunch", "rms norm rope heads batch weight buffer is missing", nil)
+		}
+		for index := range weight {
+			weight[index] = hipBFloat16ToFloat32(binary.LittleEndian.Uint16(weightData[weightOffset+index*2:]))
+		}
+	}
+	if flags&hipRMSNormLaunchFlagAddUnitWeight != 0 {
+		for index := range weight {
+			weight[index] += 1
+		}
+	}
+	output := make([]float32, 0, totalCount)
+	for batchIndex := 0; batchIndex < batch; batchIndex++ {
+		for head := 0; head < headCount; head++ {
+			start := (batchIndex*headCount + head) * headDim
+			normalized, err := hipReferenceRMSNorm(input[start:start+headDim], weight, epsilon)
+			if err != nil {
+				return err
+			}
+			var rotated []float32
+			if flags&hipRMSNormLaunchFlagRoPENeoX != 0 {
+				rotated, err = hipReferenceRoPENeoXWithFrequencyDim(normalized, startPosition+batchIndex, float64(base), effectiveFrequencyDim, rotaryCount)
+			} else {
+				rotated = append([]float32(nil), normalized...)
+				var rotary []float32
+				rotary, err = hipReferenceRoPEWithFrequencyDim(normalized[:rotaryCount], startPosition+batchIndex, float64(base), effectiveFrequencyDim)
+				if err == nil {
+					copy(rotated[:rotaryCount], rotary)
+				}
+			}
+			if err != nil {
+				return err
+			}
+			output = append(output, rotated...)
+		}
 	}
 	payload, err := hipFloat32Payload(output)
 	if err != nil {
@@ -3304,11 +4816,15 @@ func (driver *fakeHIPDriver) launchRoPE(args []byte) error {
 	position := int(binary.LittleEndian.Uint32(args[36:]))
 	base := math.Float32frombits(binary.LittleEndian.Uint32(args[40:]))
 	frequencyDim := int(binary.LittleEndian.Uint32(args[44:]))
+	rotaryCount := int(binary.LittleEndian.Uint32(args[48:]))
 	if count <= 0 || count%2 != 0 || inputBytes != count*4 || outputBytes != count*4 {
 		return core.E("rocm.hip.FakeLaunch", "rope shape metadata mismatch", nil)
 	}
 	if frequencyDim > 0 && frequencyDim < count {
 		return core.E("rocm.hip.FakeLaunch", "rope frequency dimension mismatch", nil)
+	}
+	if rotaryCount < 0 || rotaryCount > count || rotaryCount%2 != 0 {
+		return core.E("rocm.hip.FakeLaunch", "rope rotary count mismatch", nil)
 	}
 	inputData, inputOffset, ok := driver.memoryForPointer(inputPointer, inputBytes)
 	if !ok {
@@ -3322,9 +4838,78 @@ func (driver *fakeHIPDriver) launchRoPE(args []byte) error {
 	if err != nil {
 		return err
 	}
-	output, err := hipReferenceRoPEWithFrequencyDim(input, position, float64(base), frequencyDim)
+	if rotaryCount == 0 {
+		rotaryCount = count
+	}
+	output := append([]float32(nil), input...)
+	rotated, err := hipReferenceRoPEWithFrequencyDim(input[:rotaryCount], position, float64(base), frequencyDim)
 	if err != nil {
 		return err
+	}
+	copy(output[:rotaryCount], rotated)
+	payload, err := hipFloat32Payload(output)
+	if err != nil {
+		return err
+	}
+	copy(outputData[outputOffset:outputOffset+outputBytes], payload)
+	return nil
+}
+
+func (driver *fakeHIPDriver) launchRoPEHeads(args []byte) error {
+	if len(args) != hipRoPEHeadsLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "rope heads launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipRoPEHeadsLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipRoPEHeadsLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "rope heads launch header mismatch", nil)
+	}
+	inputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	headDim := int(binary.LittleEndian.Uint32(args[24:]))
+	headCount := int(binary.LittleEndian.Uint32(args[28:]))
+	inputBytes := int(binary.LittleEndian.Uint32(args[32:]))
+	outputBytes := int(binary.LittleEndian.Uint32(args[36:]))
+	position := int(binary.LittleEndian.Uint32(args[40:]))
+	base := math.Float32frombits(binary.LittleEndian.Uint32(args[44:]))
+	frequencyDim := int(binary.LittleEndian.Uint32(args[48:]))
+	rotaryCount := int(binary.LittleEndian.Uint32(args[52:]))
+	totalCount := headDim * headCount
+	if headDim <= 0 || headDim%2 != 0 || headCount <= 0 || inputBytes != totalCount*4 || outputBytes != totalCount*4 {
+		return core.E("rocm.hip.FakeLaunch", "rope heads shape metadata mismatch", nil)
+	}
+	if frequencyDim > 0 && frequencyDim < headDim {
+		return core.E("rocm.hip.FakeLaunch", "rope heads frequency dimension mismatch", nil)
+	}
+	if rotaryCount < 0 || rotaryCount > headDim || rotaryCount%2 != 0 {
+		return core.E("rocm.hip.FakeLaunch", "rope heads rotary count mismatch", nil)
+	}
+	inputData, inputOffset, ok := driver.memoryForPointer(inputPointer, inputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "rope heads input buffer is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "rope heads output buffer is missing", nil)
+	}
+	input, err := hipFloat32PayloadValues(inputData[inputOffset : inputOffset+inputBytes])
+	if err != nil {
+		return err
+	}
+	if rotaryCount == 0 {
+		rotaryCount = headDim
+	}
+	effectiveFrequencyDim := frequencyDim
+	if effectiveFrequencyDim == 0 {
+		effectiveFrequencyDim = headDim
+	}
+	output := append([]float32(nil), input...)
+	for head := 0; head < headCount; head++ {
+		start := head * headDim
+		rotated, err := hipReferenceRoPEWithFrequencyDim(input[start:start+rotaryCount], position, float64(base), effectiveFrequencyDim)
+		if err != nil {
+			return err
+		}
+		copy(output[start:start+rotaryCount], rotated)
 	}
 	payload, err := hipFloat32Payload(output)
 	if err != nil {
@@ -3365,6 +4950,48 @@ func (driver *fakeHIPDriver) launchGreedySample(args []byte) error {
 	index, score, err := hipReferenceGreedySample(logits)
 	if err != nil {
 		return err
+	}
+	binary.LittleEndian.PutUint32(outputData[outputOffset:], uint32(int32(index)))
+	binary.LittleEndian.PutUint32(outputData[outputOffset+4:], math.Float32bits(score))
+	return nil
+}
+
+func (driver *fakeHIPDriver) launchSoftcapGreedySample(args []byte) error {
+	if len(args) != hipSoftcapGreedyLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "softcap greedy launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipSoftcapGreedyLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipSoftcapGreedyLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "softcap greedy launch header mismatch", nil)
+	}
+	logitsPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	count := int(binary.LittleEndian.Uint32(args[24:]))
+	logitsBytes := int(binary.LittleEndian.Uint32(args[28:]))
+	outputBytes := int(binary.LittleEndian.Uint32(args[32:]))
+	softcap := math.Float32frombits(binary.LittleEndian.Uint32(args[36:]))
+	if count <= 0 || logitsBytes != count*4 || outputBytes != hipGreedyResultBytes ||
+		softcap < 0 || math.IsNaN(float64(softcap)) || math.IsInf(float64(softcap), 0) {
+		return core.E("rocm.hip.FakeLaunch", "softcap greedy shape metadata mismatch", nil)
+	}
+	logitsData, logitsOffset, ok := driver.memoryForPointer(logitsPointer, logitsBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "softcap greedy logits buffer is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "softcap greedy output buffer is missing", nil)
+	}
+	logits, err := hipFloat32PayloadValues(logitsData[logitsOffset : logitsOffset+logitsBytes])
+	if err != nil {
+		return err
+	}
+	index, score, err := hipReferenceGreedySample(logits)
+	if err != nil {
+		return err
+	}
+	if softcap > 0 {
+		score = float32(math.Tanh(float64(score/softcap))) * softcap
 	}
 	binary.LittleEndian.PutUint32(outputData[outputOffset:], uint32(int32(index)))
 	binary.LittleEndian.PutUint32(outputData[outputOffset+4:], math.Float32bits(score))
@@ -3473,6 +5100,455 @@ func (driver *fakeHIPDriver) launchAttention(args []byte) error {
 	}
 	copy(outputData[outputOffset:outputOffset+outputBytes], outputPayload)
 	copy(weightData[weightOffset:weightOffset+weightBytes], weightPayload)
+	return nil
+}
+
+func (driver *fakeHIPDriver) launchAttentionHeads(args []byte) error {
+	if len(args) != hipAttentionHeadsLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "attention heads launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipAttentionHeadsLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipAttentionHeadsLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "attention heads launch header mismatch", nil)
+	}
+	queryPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	keyPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	valuePointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[24:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[32:]))
+	weightPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[40:]))
+	dim := int(binary.LittleEndian.Uint32(args[48:]))
+	tokenCount := int(binary.LittleEndian.Uint32(args[52:]))
+	headCount := int(binary.LittleEndian.Uint32(args[56:]))
+	queryBytes := int(binary.LittleEndian.Uint32(args[60:]))
+	keyBytes := int(binary.LittleEndian.Uint32(args[64:]))
+	valueBytes := int(binary.LittleEndian.Uint32(args[68:]))
+	outputBytes := int(binary.LittleEndian.Uint32(args[72:]))
+	weightBytes := int(binary.LittleEndian.Uint32(args[76:]))
+	kvSource := binary.LittleEndian.Uint32(args[80:])
+	scale := math.Float32frombits(binary.LittleEndian.Uint32(args[84:]))
+	descriptorPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[88:]))
+	descriptorBytes := int(binary.LittleEndian.Uint64(args[96:]))
+	if dim <= 0 || tokenCount <= 0 || headCount <= 0 ||
+		queryBytes != headCount*dim*4 ||
+		outputBytes != headCount*dim*4 {
+		return core.E("rocm.hip.FakeLaunch", "attention heads shape metadata mismatch", nil)
+	}
+	useSharedWeights := weightPointer == 0
+	if useSharedWeights {
+		if weightBytes != 0 || tokenCount > hipAttentionHeadsSharedMaxTokens {
+			return core.E("rocm.hip.FakeLaunch", "attention heads shared weight metadata mismatch", nil)
+		}
+	} else if weightBytes != headCount*tokenCount*4 {
+		return core.E("rocm.hip.FakeLaunch", "attention heads weight metadata mismatch", nil)
+	}
+	if scale < 0 || math.IsNaN(float64(scale)) || math.IsInf(float64(scale), 0) {
+		return core.E("rocm.hip.FakeLaunch", "attention heads scale is invalid", nil)
+	}
+	queryData, queryOffset, ok := driver.memoryForPointer(queryPointer, queryBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "attention heads query buffer is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "attention heads output buffer is missing", nil)
+	}
+	var weightData []byte
+	var weightOffset int
+	if !useSharedWeights {
+		var ok bool
+		weightData, weightOffset, ok = driver.memoryForPointer(weightPointer, weightBytes)
+		if !ok {
+			return core.E("rocm.hip.FakeLaunch", "attention heads weight buffer is missing", nil)
+		}
+	}
+	var keyFlat []float32
+	var valueFlat []float32
+	var err error
+	switch kvSource {
+	case hipAttentionKVSourceContiguous:
+		if keyBytes != dim*tokenCount*4 || valueBytes != dim*tokenCount*4 {
+			return core.E("rocm.hip.FakeLaunch", "attention heads shape metadata mismatch", nil)
+		}
+		keyData, keyOffset, ok := driver.memoryForPointer(keyPointer, keyBytes)
+		if !ok {
+			return core.E("rocm.hip.FakeLaunch", "attention heads key buffer is missing", nil)
+		}
+		valueData, valueOffset, ok := driver.memoryForPointer(valuePointer, valueBytes)
+		if !ok {
+			return core.E("rocm.hip.FakeLaunch", "attention heads value buffer is missing", nil)
+		}
+		keyFlat, err = hipFloat32PayloadValues(keyData[keyOffset : keyOffset+keyBytes])
+		if err != nil {
+			return err
+		}
+		valueFlat, err = hipFloat32PayloadValues(valueData[valueOffset : valueOffset+valueBytes])
+		if err != nil {
+			return err
+		}
+	case hipAttentionKVSourceDevice:
+		if keyPointer != 0 || valuePointer != 0 || keyBytes != 0 || valueBytes != 0 {
+			return core.E("rocm.hip.FakeLaunch", "attention heads device KV source must not include contiguous KV buffers", nil)
+		}
+		keyFlat, valueFlat, err = driver.readDeviceKVDescriptorForAttention(descriptorPointer, descriptorBytes, tokenCount, dim)
+		if err != nil {
+			return err
+		}
+	default:
+		return core.E("rocm.hip.FakeLaunch", "attention heads KV source is unsupported", nil)
+	}
+	keys, err := splitHIPReferenceVectors(keyFlat, dim)
+	if err != nil {
+		return err
+	}
+	values, err := splitHIPReferenceVectors(valueFlat, dim)
+	if err != nil {
+		return err
+	}
+	for head := 0; head < headCount; head++ {
+		queryStart := queryOffset + head*dim*4
+		query, err := hipFloat32PayloadValues(queryData[queryStart : queryStart+dim*4])
+		if err != nil {
+			return err
+		}
+		output, weights, err := hipReferenceSingleHeadAttentionWithScale(query, keys, values, scale)
+		if err != nil {
+			return err
+		}
+		outputPayload, err := hipFloat32Payload(output)
+		if err != nil {
+			return err
+		}
+		copy(outputData[outputOffset+head*dim*4:outputOffset+(head+1)*dim*4], outputPayload)
+		if !useSharedWeights {
+			weightPayload, err := hipFloat32Payload(weights)
+			if err != nil {
+				return err
+			}
+			copy(weightData[weightOffset+head*tokenCount*4:weightOffset+(head+1)*tokenCount*4], weightPayload)
+		}
+	}
+	return nil
+}
+
+func (driver *fakeHIPDriver) launchAttentionHeadsBatchCausal(args []byte) error {
+	if len(args) != hipAttentionHeadsBatchCausalLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "attention heads batch causal launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipAttentionHeadsBatchCausalLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipAttentionHeadsBatchCausalLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "attention heads batch causal launch header mismatch", nil)
+	}
+	queryPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	keyPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	valuePointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[24:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[32:]))
+	weightPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[40:]))
+	dim := int(binary.LittleEndian.Uint32(args[48:]))
+	tokenCount := int(binary.LittleEndian.Uint32(args[52:]))
+	headCount := int(binary.LittleEndian.Uint32(args[56:]))
+	queryCount := int(binary.LittleEndian.Uint32(args[60:]))
+	queryStartToken := int(binary.LittleEndian.Uint32(args[64:]))
+	queryBytes := int(binary.LittleEndian.Uint32(args[68:]))
+	keyBytes := int(binary.LittleEndian.Uint32(args[72:]))
+	valueBytes := int(binary.LittleEndian.Uint32(args[76:]))
+	outputBytes := int(binary.LittleEndian.Uint32(args[80:]))
+	weightBytes := int(binary.LittleEndian.Uint32(args[84:]))
+	kvSource := binary.LittleEndian.Uint32(args[88:])
+	scale := math.Float32frombits(binary.LittleEndian.Uint32(args[92:]))
+	descriptorPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[96:]))
+	descriptorBytes := int(binary.LittleEndian.Uint64(args[104:]))
+	if dim <= 0 || tokenCount <= 0 || headCount <= 0 || queryCount <= 0 ||
+		queryStartToken < 0 || uint64(queryStartToken)+uint64(queryCount) > uint64(tokenCount) ||
+		queryBytes != queryCount*headCount*dim*4 ||
+		outputBytes != queryCount*headCount*dim*4 {
+		return core.E("rocm.hip.FakeLaunch", "attention heads batch causal shape metadata mismatch", nil)
+	}
+	useSharedWeights := weightPointer == 0
+	if useSharedWeights {
+		if weightBytes != 0 || tokenCount > hipAttentionHeadsSharedMaxTokens {
+			return core.E("rocm.hip.FakeLaunch", "attention heads batch causal shared weight metadata mismatch", nil)
+		}
+	} else if weightBytes != queryCount*headCount*tokenCount*4 {
+		return core.E("rocm.hip.FakeLaunch", "attention heads batch causal weight metadata mismatch", nil)
+	}
+	if scale < 0 || math.IsNaN(float64(scale)) || math.IsInf(float64(scale), 0) {
+		return core.E("rocm.hip.FakeLaunch", "attention heads batch causal scale is invalid", nil)
+	}
+	queryData, queryOffset, ok := driver.memoryForPointer(queryPointer, queryBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "attention heads batch causal query buffer is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "attention heads batch causal output buffer is missing", nil)
+	}
+	var weightData []byte
+	var weightOffset int
+	if !useSharedWeights {
+		var ok bool
+		weightData, weightOffset, ok = driver.memoryForPointer(weightPointer, weightBytes)
+		if !ok {
+			return core.E("rocm.hip.FakeLaunch", "attention heads batch causal weight buffer is missing", nil)
+		}
+	}
+	var keyFlat []float32
+	var valueFlat []float32
+	var err error
+	switch kvSource {
+	case hipAttentionKVSourceContiguous:
+		if keyBytes != dim*tokenCount*4 || valueBytes != dim*tokenCount*4 {
+			return core.E("rocm.hip.FakeLaunch", "attention heads batch causal shape metadata mismatch", nil)
+		}
+		keyData, keyOffset, ok := driver.memoryForPointer(keyPointer, keyBytes)
+		if !ok {
+			return core.E("rocm.hip.FakeLaunch", "attention heads batch causal key buffer is missing", nil)
+		}
+		valueData, valueOffset, ok := driver.memoryForPointer(valuePointer, valueBytes)
+		if !ok {
+			return core.E("rocm.hip.FakeLaunch", "attention heads batch causal value buffer is missing", nil)
+		}
+		keyFlat, err = hipFloat32PayloadValues(keyData[keyOffset : keyOffset+keyBytes])
+		if err != nil {
+			return err
+		}
+		valueFlat, err = hipFloat32PayloadValues(valueData[valueOffset : valueOffset+valueBytes])
+		if err != nil {
+			return err
+		}
+	case hipAttentionKVSourceDevice:
+		if keyPointer != 0 || valuePointer != 0 || keyBytes != 0 || valueBytes != 0 {
+			return core.E("rocm.hip.FakeLaunch", "attention heads batch causal device KV source must not include contiguous KV buffers", nil)
+		}
+		keyFlat, valueFlat, err = driver.readDeviceKVDescriptorForAttention(descriptorPointer, descriptorBytes, tokenCount, dim)
+		if err != nil {
+			return err
+		}
+	default:
+		return core.E("rocm.hip.FakeLaunch", "attention heads batch causal KV source is unsupported", nil)
+	}
+	keys, err := splitHIPReferenceVectors(keyFlat, dim)
+	if err != nil {
+		return err
+	}
+	values, err := splitHIPReferenceVectors(valueFlat, dim)
+	if err != nil {
+		return err
+	}
+	for queryIndex := 0; queryIndex < queryCount; queryIndex++ {
+		visibleTokens := queryStartToken + queryIndex + 1
+		for head := 0; head < headCount; head++ {
+			baseIndex := queryIndex*headCount + head
+			queryStart := queryOffset + baseIndex*dim*4
+			query, err := hipFloat32PayloadValues(queryData[queryStart : queryStart+dim*4])
+			if err != nil {
+				return err
+			}
+			output, weights, err := hipReferenceSingleHeadAttentionWithScale(query, keys[:visibleTokens], values[:visibleTokens], scale)
+			if err != nil {
+				return err
+			}
+			outputPayload, err := hipFloat32Payload(output)
+			if err != nil {
+				return err
+			}
+			copy(outputData[outputOffset+baseIndex*dim*4:outputOffset+(baseIndex+1)*dim*4], outputPayload)
+			if !useSharedWeights {
+				weightPayload, err := hipFloat32Payload(weights)
+				if err != nil {
+					return err
+				}
+				weightStart := weightOffset + baseIndex*tokenCount*4
+				copy(weightData[weightStart:weightStart+visibleTokens*4], weightPayload)
+			}
+		}
+	}
+	return nil
+}
+
+func (driver *fakeHIPDriver) launchKVEncodeToken(args []byte) error {
+	if len(args) != hipKVEncodeTokenLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "KV encode token launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipKVEncodeTokenLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipKVEncodeTokenLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "KV encode token launch header mismatch", nil)
+	}
+	keyInputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	valueInputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	keyOutputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[24:]))
+	valueOutputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[32:]))
+	keyCount := int(binary.LittleEndian.Uint32(args[40:]))
+	valueCount := int(binary.LittleEndian.Uint32(args[44:]))
+	keyInputBytes := int(binary.LittleEndian.Uint32(args[48:]))
+	valueInputBytes := int(binary.LittleEndian.Uint32(args[52:]))
+	keyOutputBytes := int(binary.LittleEndian.Uint32(args[56:]))
+	valueOutputBytes := int(binary.LittleEndian.Uint32(args[60:]))
+	keyEncoding := fakeROCmKVEncoding(binary.LittleEndian.Uint32(args[64:]))
+	valueEncoding := fakeROCmKVEncoding(binary.LittleEndian.Uint32(args[68:]))
+	if keyCount <= 0 || valueCount <= 0 || keyInputBytes != keyCount*4 || valueInputBytes != valueCount*4 || keyEncoding == "" || valueEncoding == "" {
+		return core.E("rocm.hip.FakeLaunch", "KV encode token shape metadata mismatch", nil)
+	}
+	expectedKeyOutputBytes, err := rocmKVTensorDeviceByteCount(keyEncoding, keyCount)
+	if err != nil {
+		return err
+	}
+	expectedValueOutputBytes, err := rocmKVTensorDeviceByteCount(valueEncoding, valueCount)
+	if err != nil {
+		return err
+	}
+	if uint64(keyOutputBytes) != expectedKeyOutputBytes || uint64(valueOutputBytes) != expectedValueOutputBytes {
+		return core.E("rocm.hip.FakeLaunch", "KV encode token output byte count mismatch", nil)
+	}
+	keyInputData, keyInputOffset, ok := driver.memoryForPointer(keyInputPointer, keyInputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "KV encode key input buffer is missing", nil)
+	}
+	valueInputData, valueInputOffset, ok := driver.memoryForPointer(valueInputPointer, valueInputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "KV encode value input buffer is missing", nil)
+	}
+	keyOutputData, keyOutputOffset, ok := driver.memoryForPointer(keyOutputPointer, keyOutputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "KV encode key output buffer is missing", nil)
+	}
+	valueOutputData, valueOutputOffset, ok := driver.memoryForPointer(valueOutputPointer, valueOutputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "KV encode value output buffer is missing", nil)
+	}
+	keyValues, err := hipFloat32PayloadValues(keyInputData[keyInputOffset : keyInputOffset+keyInputBytes])
+	if err != nil {
+		return err
+	}
+	valueValues, err := hipFloat32PayloadValues(valueInputData[valueInputOffset : valueInputOffset+valueInputBytes])
+	if err != nil {
+		return err
+	}
+	keyTensor, err := encodeROCmKVTensor(keyEncoding, keyValues)
+	if err != nil {
+		return err
+	}
+	keyPayload, err := keyTensor.deviceBytes()
+	if err != nil {
+		return err
+	}
+	valueTensor, err := encodeROCmKVTensor(valueEncoding, valueValues)
+	if err != nil {
+		return err
+	}
+	valuePayload, err := valueTensor.deviceBytes()
+	if err != nil {
+		return err
+	}
+	copy(keyOutputData[keyOutputOffset:keyOutputOffset+keyOutputBytes], keyPayload)
+	copy(valueOutputData[valueOutputOffset:valueOutputOffset+valueOutputBytes], valuePayload)
+	return nil
+}
+
+func (driver *fakeHIPDriver) launchKVDescriptorAppend(args []byte) error {
+	if len(args) != hipKVDescriptorAppendLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "KV descriptor append launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipKVDescriptorAppendLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipKVDescriptorAppendLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "KV descriptor append launch header mismatch", nil)
+	}
+	previousPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	newKeyPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[24:]))
+	newValuePointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[32:]))
+	previousBytes := int(binary.LittleEndian.Uint64(args[40:]))
+	outputBytes := int(binary.LittleEndian.Uint64(args[48:]))
+	newKeyBytes := uint64(binary.LittleEndian.Uint64(args[56:]))
+	newValueBytes := uint64(binary.LittleEndian.Uint64(args[64:]))
+	modeCode := binary.LittleEndian.Uint32(args[72:])
+	blockSize := int(binary.LittleEndian.Uint32(args[76:]))
+	outputPageCount := int(binary.LittleEndian.Uint32(args[80:]))
+	outputTokenCount := int(binary.LittleEndian.Uint32(args[84:]))
+	keyWidth := int(binary.LittleEndian.Uint32(args[88:]))
+	valueWidth := int(binary.LittleEndian.Uint32(args[92:]))
+	keyEncodingCode := binary.LittleEndian.Uint32(args[96:])
+	valueEncodingCode := binary.LittleEndian.Uint32(args[100:])
+	trimStart := int(binary.LittleEndian.Uint64(args[104:]))
+	if previousBytes < rocmDeviceKVDescriptorHeaderBytes || outputBytes != rocmDeviceKVDescriptorHeaderBytes+outputPageCount*rocmDeviceKVDescriptorPageBytes ||
+		outputPageCount <= 0 || outputTokenCount <= 0 || blockSize <= 0 || keyWidth <= 0 || valueWidth <= 0 ||
+		fakeROCmKVEncoding(keyEncodingCode) == "" || fakeROCmKVEncoding(valueEncodingCode) == "" {
+		return core.E("rocm.hip.FakeLaunch", "KV descriptor append shape metadata mismatch", nil)
+	}
+	expectedKeyBytes, err := rocmKVTensorDeviceByteCount(fakeROCmKVEncoding(keyEncodingCode), keyWidth)
+	if err != nil {
+		return err
+	}
+	expectedValueBytes, err := rocmKVTensorDeviceByteCount(fakeROCmKVEncoding(valueEncodingCode), valueWidth)
+	if err != nil {
+		return err
+	}
+	if newKeyBytes != expectedKeyBytes || newValueBytes != expectedValueBytes || newKeyPointer == 0 || newValuePointer == 0 {
+		return core.E("rocm.hip.FakeLaunch", "KV descriptor append new page metadata mismatch", nil)
+	}
+	previousData, previousOffset, ok := driver.memoryForPointer(previousPointer, previousBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "KV descriptor append previous descriptor is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "KV descriptor append output descriptor is missing", nil)
+	}
+	previous := previousData[previousOffset : previousOffset+previousBytes]
+	if binary.LittleEndian.Uint32(previous[0:]) != rocmDeviceKVDescriptorVersion ||
+		int(binary.LittleEndian.Uint32(previous[4:])) != rocmDeviceKVDescriptorHeaderBytes ||
+		int(binary.LittleEndian.Uint32(previous[8:])) != rocmDeviceKVDescriptorPageBytes ||
+		binary.LittleEndian.Uint32(previous[12:]) != modeCode ||
+		int(binary.LittleEndian.Uint32(previous[20:])) != blockSize {
+		return core.E("rocm.hip.FakeLaunch", "KV descriptor append previous descriptor header mismatch", nil)
+	}
+	previousPageCount := int(binary.LittleEndian.Uint32(previous[16:]))
+	previousTokenCount := int(binary.LittleEndian.Uint64(previous[24:]))
+	if previousBytes != rocmDeviceKVDescriptorHeaderBytes+previousPageCount*rocmDeviceKVDescriptorPageBytes ||
+		trimStart+outputTokenCount != previousTokenCount+1 {
+		return core.E("rocm.hip.FakeLaunch", "KV descriptor append previous descriptor size mismatch", nil)
+	}
+	output := outputData[outputOffset : outputOffset+outputBytes]
+	for index := range output {
+		output[index] = 0
+	}
+	outputIndex := 0
+	for pageIndex := 0; pageIndex < previousPageCount; pageIndex++ {
+		pageOffset := rocmDeviceKVDescriptorHeaderBytes + pageIndex*rocmDeviceKVDescriptorPageBytes
+		page := previous[pageOffset : pageOffset+rocmDeviceKVDescriptorPageBytes]
+		tokenStart := int(binary.LittleEndian.Uint64(page[0:]))
+		tokenCount := int(binary.LittleEndian.Uint64(page[8:]))
+		if tokenStart+tokenCount <= trimStart {
+			continue
+		}
+		if tokenStart < trimStart || outputIndex+1 >= outputPageCount {
+			return core.E("rocm.hip.FakeLaunch", "KV descriptor append retained page mismatch", nil)
+		}
+		outOffset := rocmDeviceKVDescriptorHeaderBytes + outputIndex*rocmDeviceKVDescriptorPageBytes
+		copy(output[outOffset:outOffset+rocmDeviceKVDescriptorPageBytes], page)
+		binary.LittleEndian.PutUint64(output[outOffset:], uint64(tokenStart-trimStart))
+		outputIndex++
+	}
+	if outputIndex+1 != outputPageCount {
+		return core.E("rocm.hip.FakeLaunch", "KV descriptor append output page count mismatch", nil)
+	}
+	newOffset := rocmDeviceKVDescriptorHeaderBytes + outputIndex*rocmDeviceKVDescriptorPageBytes
+	binary.LittleEndian.PutUint64(output[newOffset:], uint64(outputTokenCount-1))
+	binary.LittleEndian.PutUint64(output[newOffset+8:], 1)
+	binary.LittleEndian.PutUint32(output[newOffset+16:], uint32(keyWidth))
+	binary.LittleEndian.PutUint32(output[newOffset+20:], uint32(valueWidth))
+	binary.LittleEndian.PutUint32(output[newOffset+24:], keyEncodingCode)
+	binary.LittleEndian.PutUint32(output[newOffset+28:], valueEncodingCode)
+	binary.LittleEndian.PutUint64(output[newOffset+32:], uint64(newKeyPointer))
+	binary.LittleEndian.PutUint64(output[newOffset+40:], uint64(newValuePointer))
+	binary.LittleEndian.PutUint64(output[newOffset+48:], newKeyBytes)
+	binary.LittleEndian.PutUint64(output[newOffset+56:], newValueBytes)
+	binary.LittleEndian.PutUint32(output[0:], rocmDeviceKVDescriptorVersion)
+	binary.LittleEndian.PutUint32(output[4:], uint32(rocmDeviceKVDescriptorHeaderBytes))
+	binary.LittleEndian.PutUint32(output[8:], uint32(rocmDeviceKVDescriptorPageBytes))
+	binary.LittleEndian.PutUint32(output[12:], modeCode)
+	binary.LittleEndian.PutUint32(output[16:], uint32(outputPageCount))
+	binary.LittleEndian.PutUint32(output[20:], uint32(blockSize))
+	binary.LittleEndian.PutUint64(output[24:], uint64(outputTokenCount))
 	return nil
 }
 
@@ -3644,6 +5720,45 @@ func (driver *fakeHIPDriver) launchVectorScale(args []byte) error {
 	return nil
 }
 
+func (driver *fakeHIPDriver) launchPerLayerInputTranspose(args []byte) error {
+	if len(args) != hipPerLayerInputTransposeLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "per-layer input transpose launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipPerLayerInputTransposeLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipPerLayerInputTransposeLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "per-layer input transpose launch header mismatch", nil)
+	}
+	inputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	inputBytes := int(binary.LittleEndian.Uint64(args[24:]))
+	outputBytes := int(binary.LittleEndian.Uint64(args[32:]))
+	batch := int(binary.LittleEndian.Uint32(args[40:]))
+	layerCount := int(binary.LittleEndian.Uint32(args[44:]))
+	inputSize := int(binary.LittleEndian.Uint32(args[48:]))
+	count := batch * layerCount * inputSize
+	if batch <= 0 || layerCount <= 0 || inputSize <= 0 || inputBytes != count*4 || outputBytes != count*4 {
+		return core.E("rocm.hip.FakeLaunch", "per-layer input transpose shape metadata mismatch", nil)
+	}
+	inputData, inputOffset, ok := driver.memoryForPointer(inputPointer, inputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "per-layer input transpose input buffer is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "per-layer input transpose output buffer is missing", nil)
+	}
+	for token := 0; token < batch; token++ {
+		for layer := 0; layer < layerCount; layer++ {
+			for item := 0; item < inputSize; item++ {
+				src := ((token*layerCount+layer)*inputSize + item) * 4
+				dst := ((layer*batch+token)*inputSize + item) * 4
+				copy(outputData[outputOffset+dst:outputOffset+dst+4], inputData[inputOffset+src:inputOffset+src+4])
+			}
+		}
+	}
+	return nil
+}
+
 func (driver *fakeHIPDriver) launchSwiGLU(args []byte) error {
 	if len(args) != hipSwiGLULaunchArgsBytes {
 		return core.E("rocm.hip.FakeLaunch", "swiglu launch args size mismatch", nil)
@@ -3685,6 +5800,60 @@ func (driver *fakeHIPDriver) launchSwiGLU(args []byte) error {
 	out := make([]float32, count)
 	for index := range out {
 		out[index] = gate[index] / (1 + float32(math.Exp(float64(-gate[index])))) * up[index]
+	}
+	payload, err := hipFloat32Payload(out)
+	if err != nil {
+		return err
+	}
+	copy(outputData[outputOffset:outputOffset+outputBytes], payload)
+	return nil
+}
+
+func (driver *fakeHIPDriver) launchGELUTanhMultiply(args []byte) error {
+	if len(args) != hipGELUTanhMulLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "GELU tanh multiply launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipGELUTanhMulLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipGELUTanhMulLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "GELU tanh multiply launch header mismatch", nil)
+	}
+	gatePointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	upPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[24:]))
+	count := int(binary.LittleEndian.Uint32(args[32:]))
+	gateBytes := int(binary.LittleEndian.Uint32(args[36:]))
+	upBytes := int(binary.LittleEndian.Uint32(args[40:]))
+	outputBytes := int(binary.LittleEndian.Uint32(args[44:]))
+	if count <= 0 || gateBytes != count*4 || upBytes != count*4 || outputBytes != count*4 {
+		return core.E("rocm.hip.FakeLaunch", "GELU tanh multiply shape metadata mismatch", nil)
+	}
+	gateData, gateOffset, ok := driver.memoryForPointer(gatePointer, gateBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "GELU tanh multiply gate buffer is missing", nil)
+	}
+	upData, upOffset, ok := driver.memoryForPointer(upPointer, upBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "GELU tanh multiply up buffer is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "GELU tanh multiply output buffer is missing", nil)
+	}
+	gate, err := hipFloat32PayloadValues(gateData[gateOffset : gateOffset+gateBytes])
+	if err != nil {
+		return err
+	}
+	up, err := hipFloat32PayloadValues(upData[upOffset : upOffset+upBytes])
+	if err != nil {
+		return err
+	}
+	out := make([]float32, count)
+	const sqrt2OverPi = 0.7978845608028654
+	const coeff = 0.044715
+	for index := range out {
+		value := float64(gate[index])
+		gelu := 0.5 * value * (1 + math.Tanh(sqrt2OverPi*(value+coeff*value*value*value)))
+		out[index] = float32(gelu) * up[index]
 	}
 	payload, err := hipFloat32Payload(out)
 	if err != nil {

@@ -484,9 +484,6 @@ func generateOptionsFromSampler(cfg inference.SamplerConfig) []inference.Generat
 	if len(cfg.StopTokens) > 0 {
 		opts = append(opts, inference.WithStopTokens(cfg.StopTokens...))
 	}
-	if len(cfg.StopSequences) > 0 {
-		opts = append(opts, inference.WithStopSequences(cfg.StopSequences...))
-	}
 	if cfg.ReturnLogits {
 		opts = append(opts, inference.WithLogits())
 	}

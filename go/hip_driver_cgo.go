@@ -16,11 +16,22 @@ typedef int (*hipMemGetInfo_t)(size_t*, size_t*);
 typedef int (*hipRuntimeGetVersion_t)(int*);
 typedef int (*hipMalloc_t)(void**, size_t);
 typedef int (*hipFree_t)(void*);
+typedef int (*hipFreeAsync_t)(void*, void*);
 typedef int (*hipMemcpy_t)(void*, const void*, size_t, int);
+typedef int (*hipMemcpyAsync_t)(void*, const void*, size_t, int, void*);
+typedef int (*hipMemsetAsync_t)(void*, int, size_t, void*);
 typedef int (*hipModuleLoadData_t)(void**, const void*);
 typedef int (*hipModuleUnload_t)(void*);
 typedef int (*hipModuleGetFunction_t)(void**, void*, const char*);
 typedef int (*hipModuleLaunchKernel_t)(void*, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, void*, void**, void**);
+typedef int (*hipDeviceSynchronize_t)(void);
+typedef int (*hipHostMalloc_t)(void**, size_t, unsigned int);
+typedef int (*hipHostGetDevicePointer_t)(void**, void*, unsigned int);
+typedef int (*hipHostFree_t)(void*);
+typedef int (*hipEventCreateWithFlags_t)(void**, unsigned int);
+typedef int (*hipEventRecord_t)(void*, void*);
+typedef int (*hipEventSynchronize_t)(void*);
+typedef int (*hipEventDestroy_t)(void*);
 
 static void* core_rocm_hip_lib = NULL;
 
@@ -103,6 +114,14 @@ static int core_rocm_hip_free(uintptr_t ptr) {
 	return fn((void*)ptr);
 }
 
+static int core_rocm_hip_free_async(uintptr_t ptr) {
+	hipFreeAsync_t fn = (hipFreeAsync_t)core_rocm_hip_symbol("hipFreeAsync");
+	if (fn == NULL) {
+		return -100020;
+	}
+	return fn((void*)ptr, NULL);
+}
+
 static int core_rocm_hip_memcpy_htod(uintptr_t dst, void* src, size_t size) {
 	hipMemcpy_t fn = (hipMemcpy_t)core_rocm_hip_symbol("hipMemcpy");
 	if (fn == NULL) {
@@ -117,6 +136,22 @@ static int core_rocm_hip_memcpy_dtoh(void* dst, uintptr_t src, size_t size) {
 		return -100012;
 	}
 	return fn(dst, (void*)src, size, 2);
+}
+
+static int core_rocm_hip_memcpy_htod_async(uintptr_t dst, void* src, size_t size) {
+	hipMemcpyAsync_t fn = (hipMemcpyAsync_t)core_rocm_hip_symbol("hipMemcpyAsync");
+	if (fn == NULL) {
+		return -100015;
+	}
+	return fn((void*)dst, src, size, 1, NULL);
+}
+
+static int core_rocm_hip_memset_async(uintptr_t dst, int value, size_t size) {
+	hipMemsetAsync_t fn = (hipMemsetAsync_t)core_rocm_hip_symbol("hipMemsetAsync");
+	if (fn == NULL) {
+		return -100019;
+	}
+	return fn((void*)dst, value, size, NULL);
 }
 
 static int core_rocm_hip_module_load_data(uintptr_t* out, void* image) {
@@ -168,28 +203,209 @@ static int core_rocm_hip_module_launch_kernel(
 	void* kernel_params[] = { &arg_ptr };
 	return fn((void*)function, grid_x, grid_y, grid_z, block_x, block_y, block_z, shared_mem_bytes, NULL, kernel_params, NULL);
 }
+
+static int core_rocm_hip_device_synchronize() {
+	hipDeviceSynchronize_t fn = (hipDeviceSynchronize_t)core_rocm_hip_symbol("hipDeviceSynchronize");
+	if (fn == NULL) {
+		return -100021;
+	}
+	return fn();
+}
+
+static int core_rocm_hip_host_malloc_mapped(uintptr_t* host_out, uintptr_t* device_out, size_t size) {
+	hipHostMalloc_t malloc_fn = (hipHostMalloc_t)core_rocm_hip_symbol("hipHostMalloc");
+	hipHostGetDevicePointer_t pointer_fn = (hipHostGetDevicePointer_t)core_rocm_hip_symbol("hipHostGetDevicePointer");
+	hipHostFree_t free_fn = (hipHostFree_t)core_rocm_hip_symbol("hipHostFree");
+	if (malloc_fn == NULL || pointer_fn == NULL || free_fn == NULL) {
+		return -100013;
+	}
+	void* host = NULL;
+	int rc = malloc_fn(&host, size, 0x40000002);
+	if (rc != 0) {
+		return rc;
+	}
+	void* device = NULL;
+	rc = pointer_fn(&device, host, 0);
+	if (rc != 0) {
+		free_fn(host);
+		return rc;
+	}
+	*host_out = (uintptr_t)host;
+	*device_out = (uintptr_t)device;
+	return 0;
+}
+
+static int core_rocm_hip_host_free(uintptr_t host) {
+	hipHostFree_t fn = (hipHostFree_t)core_rocm_hip_symbol("hipHostFree");
+	if (fn == NULL) {
+		return -100014;
+	}
+	return fn((void*)host);
+}
+
+static int core_rocm_hip_host_malloc_pinned(uintptr_t* host_out, size_t size) {
+	hipHostMalloc_t malloc_fn = (hipHostMalloc_t)core_rocm_hip_symbol("hipHostMalloc");
+	if (malloc_fn == NULL) {
+		return -100016;
+	}
+	void* host = NULL;
+	int rc = malloc_fn(&host, size, 0);
+	if (rc != 0) {
+		return rc;
+	}
+	*host_out = (uintptr_t)host;
+	return 0;
+}
+
+static int core_rocm_hip_event_create(uintptr_t* out) {
+	hipEventCreateWithFlags_t fn = (hipEventCreateWithFlags_t)core_rocm_hip_symbol("hipEventCreateWithFlags");
+	if (fn == NULL) {
+		return -100017;
+	}
+	void* event = NULL;
+	int rc = fn(&event, 0x2);
+	*out = (uintptr_t)event;
+	return rc;
+}
+
+static int core_rocm_hip_event_record(uintptr_t event) {
+	hipEventRecord_t fn = (hipEventRecord_t)core_rocm_hip_symbol("hipEventRecord");
+	if (fn == NULL) {
+		return -100018;
+	}
+	return fn((void*)event, NULL);
+}
+
+static int core_rocm_hip_event_synchronize(uintptr_t event) {
+	hipEventSynchronize_t fn = (hipEventSynchronize_t)core_rocm_hip_symbol("hipEventSynchronize");
+	if (fn == NULL) {
+		return -100019;
+	}
+	return fn((void*)event);
+}
+
+static int core_rocm_hip_event_destroy(uintptr_t event) {
+	hipEventDestroy_t fn = (hipEventDestroy_t)core_rocm_hip_symbol("hipEventDestroy");
+	if (fn == NULL) {
+		return -100020;
+	}
+	return fn((void*)event);
+}
 */
 import "C"
 
 import (
 	"os"
+	"runtime"
+	"sync"
 	"unsafe"
 
 	core "dappco.re/go"
+	corecgo "dappco.re/go/cgo"
 )
 
 type cgoHIPDriver struct{}
+
+const rocmHIPPinnedHostCopySupported = true
+
+var cgoHIPAvailability = struct {
+	sync.Once
+	available bool
+}{}
+
+const (
+	cgoHIPPoolMaxBufferBytes = 8 << 20
+	cgoHIPPoolMaxTotalBytes  = 512 << 20
+	cgoHIPPoolMaxPerSize     = 512
+	cgoHIPLaunchArgRingSize  = 8192
+	cgoHIPAsyncCopyRingSize  = 8192
+	cgoHIPAsyncCopyMaxBytes  = 1 << 20
+)
+
+type cgoHIPCachedModule struct {
+	module    C.uintptr_t
+	image     []byte
+	scope     *corecgo.Scope
+	functions map[string]C.uintptr_t
+}
+
+var cgoHIPModuleCache = struct {
+	sync.Mutex
+	modules map[string]*cgoHIPCachedModule
+}{
+	modules: map[string]*cgoHIPCachedModule{},
+}
+
+var cgoHIPLaunchArgBuffer = struct {
+	sync.Mutex
+	pointer nativeDevicePointer
+	host    unsafe.Pointer
+	bytes   uint64
+	mapped  bool
+}{}
+
+type cgoHIPLaunchArgSlot struct {
+	pointer  nativeDevicePointer
+	host     unsafe.Pointer
+	event    C.uintptr_t
+	bytes    uint64
+	mapped   bool
+	recorded bool
+}
+
+type cgoHIPLaunchArgLease struct {
+	pointer    nativeDevicePointer
+	syncBuffer bool
+	asyncSlot  *cgoHIPLaunchArgSlot
+	noEvent    bool
+}
+
+var cgoHIPLaunchArgRing = struct {
+	sync.Mutex
+	next    int
+	wrapped bool
+	slots   []cgoHIPLaunchArgSlot
+}{
+	slots: make([]cgoHIPLaunchArgSlot, cgoHIPLaunchArgRingSize),
+}
+
+type cgoHIPAsyncCopySlot struct {
+	host     unsafe.Pointer
+	event    C.uintptr_t
+	bytes    uint64
+	recorded bool
+}
+
+var cgoHIPAsyncCopyRing = struct {
+	sync.Mutex
+	next  int
+	slots []cgoHIPAsyncCopySlot
+}{
+	slots: make([]cgoHIPAsyncCopySlot, cgoHIPAsyncCopyRingSize),
+}
+
+var cgoHIPMemoryPool = struct {
+	sync.Mutex
+	live      map[nativeDevicePointer]uint64
+	free      map[uint64][]nativeDevicePointer
+	freeBytes uint64
+}{
+	live: map[nativeDevicePointer]uint64{},
+	free: map[uint64][]nativeDevicePointer{},
+}
 
 func newSystemHIPDriver() nativeHIPDriver {
 	return cgoHIPDriver{}
 }
 
 func (cgoHIPDriver) Available() bool {
-	var count C.int
-	if rc := C.core_rocm_hip_device_count(&count); rc != 0 {
-		return false
-	}
-	return count > 0
+	cgoHIPAvailability.Do(func() {
+		var count C.int
+		if rc := C.core_rocm_hip_device_count(&count); rc == 0 && count > 0 {
+			cgoHIPAvailability.available = true
+		}
+	})
+	return cgoHIPAvailability.available
 }
 
 func (driver cgoHIPDriver) DeviceInfo() nativeDeviceInfo {
@@ -215,16 +431,53 @@ func (driver cgoHIPDriver) DeviceInfo() nativeDeviceInfo {
 }
 
 func (cgoHIPDriver) Malloc(size uint64) (nativeDevicePointer, error) {
+	if size <= cgoHIPPoolMaxBufferBytes {
+		cgoHIPMemoryPool.Lock()
+		free := cgoHIPMemoryPool.free[size]
+		if len(free) > 0 {
+			pointer := free[len(free)-1]
+			cgoHIPMemoryPool.free[size] = free[:len(free)-1]
+			cgoHIPMemoryPool.live[pointer] = size
+			cgoHIPMemoryPool.freeBytes -= size
+			cgoHIPMemoryPool.Unlock()
+			return pointer, nil
+		}
+		cgoHIPMemoryPool.Unlock()
+	}
 	var ptr C.uintptr_t
 	if rc := C.core_rocm_hip_malloc(&ptr, C.size_t(size)); rc != 0 {
 		return 0, hipReturnError("hipMalloc", int(rc))
 	}
-	return nativeDevicePointer(ptr), nil
+	pointer := nativeDevicePointer(ptr)
+	cgoHIPMemoryPool.Lock()
+	cgoHIPMemoryPool.live[pointer] = size
+	cgoHIPMemoryPool.Unlock()
+	return pointer, nil
 }
 
 func (cgoHIPDriver) Free(pointer nativeDevicePointer) error {
 	if pointer == 0 {
 		return nil
+	}
+	cgoHIPMemoryPool.Lock()
+	size, tracked := cgoHIPMemoryPool.live[pointer]
+	if tracked {
+		delete(cgoHIPMemoryPool.live, pointer)
+	}
+	if tracked &&
+		size <= cgoHIPPoolMaxBufferBytes &&
+		cgoHIPMemoryPool.freeBytes+size <= cgoHIPPoolMaxTotalBytes &&
+		len(cgoHIPMemoryPool.free[size]) < cgoHIPPoolMaxPerSize {
+		cgoHIPMemoryPool.free[size] = append(cgoHIPMemoryPool.free[size], pointer)
+		cgoHIPMemoryPool.freeBytes += size
+		cgoHIPMemoryPool.Unlock()
+		return nil
+	}
+	cgoHIPMemoryPool.Unlock()
+	if os.Getenv("GO_ROCM_DISABLE_ASYNC_FREE") == "" {
+		if rc := C.core_rocm_hip_free_async(C.uintptr_t(pointer)); rc == 0 {
+			return nil
+		}
 	}
 	if rc := C.core_rocm_hip_free(C.uintptr_t(pointer)); rc != 0 {
 		return hipReturnError("hipFree", int(rc))
@@ -238,6 +491,111 @@ func (cgoHIPDriver) CopyHostToDevice(pointer nativeDevicePointer, data []byte) e
 	}
 	if rc := C.core_rocm_hip_memcpy_htod(C.uintptr_t(pointer), unsafe.Pointer(&data[0]), C.size_t(len(data))); rc != 0 {
 		return hipReturnError("hipMemcpyHostToDevice", int(rc))
+	}
+	return nil
+}
+
+type nativeHIPPinnedHostToDevice interface {
+	CopyPinnedHostToDevice(pointer nativeDevicePointer, host unsafe.Pointer, sizeBytes int) error
+}
+
+func hipCopyPinnedHostToDevice(driver nativeHIPDriver, pointer nativeDevicePointer, data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	if pointer == 0 {
+		return core.E("rocm.hip.CopyPinnedHostToDevice", "device pointer is nil", nil)
+	}
+	pinned, ok := driver.(nativeHIPPinnedHostToDevice)
+	if !ok {
+		return hipCopyHostToDevice(driver, pointer, data)
+	}
+	scope := corecgo.NewScope()
+	defer scope.FreeAll()
+	host, sizeBytes := cgoHIPPinnedBytes(scope, data)
+	if err := pinned.CopyPinnedHostToDevice(pointer, host, sizeBytes); err != nil {
+		return err
+	}
+	runtime.KeepAlive(data)
+	return nil
+}
+
+func (cgoHIPDriver) CopyPinnedHostToDevice(pointer nativeDevicePointer, host unsafe.Pointer, sizeBytes int) error {
+	if sizeBytes == 0 {
+		return nil
+	}
+	if pointer == 0 {
+		return core.E("rocm.hip.CopyPinnedHostToDevice", "device pointer is nil", nil)
+	}
+	if host == nil {
+		return core.E("rocm.hip.CopyPinnedHostToDevice", "host pointer is nil", nil)
+	}
+	if rc := C.core_rocm_hip_memcpy_htod(C.uintptr_t(pointer), host, C.size_t(sizeBytes)); rc != 0 {
+		return hipReturnError("hipMemcpyHostToDevice", int(rc))
+	}
+	return nil
+}
+
+func cgoHIPPinnedBytes(scope *corecgo.Scope, data []byte) (host unsafe.Pointer, sizeBytes int) {
+	if len(data) == 0 {
+		return nil, 0
+	}
+	defer func() {
+		if recover() != nil {
+			host = unsafe.Pointer(&data[0])
+			sizeBytes = len(data)
+		}
+	}()
+	view := corecgo.PinIn(scope, data)
+	return view.Ptr(), view.Bytes()
+}
+
+func (driver cgoHIPDriver) CopyHostToDeviceAsync(pointer nativeDevicePointer, data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	if pointer == 0 {
+		return core.E("rocm.hip.CopyHostToDeviceAsync", "device pointer is nil", nil)
+	}
+	if os.Getenv("GO_ROCM_DISABLE_ASYNC_H2D") != "" || len(data) > cgoHIPAsyncCopyMaxBytes {
+		return driver.CopyHostToDevice(pointer, data)
+	}
+	cgoHIPAsyncCopyRing.Lock()
+	defer cgoHIPAsyncCopyRing.Unlock()
+	slotIndex := cgoHIPAsyncCopyRing.next
+	cgoHIPAsyncCopyRing.next = (cgoHIPAsyncCopyRing.next + 1) % len(cgoHIPAsyncCopyRing.slots)
+	slot := &cgoHIPAsyncCopyRing.slots[slotIndex]
+	if slot.recorded {
+		if rc := C.core_rocm_hip_event_synchronize(slot.event); rc != 0 {
+			return hipReturnError("hipEventSynchronize", int(rc))
+		}
+		slot.recorded = false
+	}
+	if slot.host == nil || slot.bytes < uint64(len(data)) {
+		if err := driver.resizeAsyncCopySlot(slot, uint64(len(data))); err != nil {
+			return core.E("rocm.hip.CopyHostToDeviceAsync", "allocate async copy staging slot", err)
+		}
+	}
+	copy(unsafe.Slice((*byte)(slot.host), int(slot.bytes)), data)
+	if rc := C.core_rocm_hip_memcpy_htod_async(C.uintptr_t(pointer), slot.host, C.size_t(len(data))); rc != 0 {
+		return hipReturnError("hipMemcpyHostToDeviceAsync", int(rc))
+	}
+	if rc := C.core_rocm_hip_event_record(slot.event); rc != 0 {
+		return hipReturnError("hipEventRecord", int(rc))
+	}
+	slot.recorded = true
+	return nil
+}
+
+func (cgoHIPDriver) MemsetAsync(pointer nativeDevicePointer, value byte, size uint64) error {
+	if size == 0 {
+		return nil
+	}
+	if pointer == 0 {
+		return core.E("rocm.hip.MemsetAsync", "device pointer is nil", nil)
+	}
+	if rc := C.core_rocm_hip_memset_async(C.uintptr_t(pointer), C.int(value), C.size_t(size)); rc != 0 {
+		return hipReturnError("hipMemsetAsync", int(rc))
 	}
 	return nil
 }
@@ -263,36 +621,15 @@ func (driver cgoHIPDriver) LaunchKernel(config hipKernelLaunchConfig) error {
 	if modulePath == "" {
 		return core.E("rocm.hip.LaunchKernel", "GO_ROCM_KERNEL_HSACO is not set; native HIP kernels are not linked yet", nil)
 	}
-	image, err := os.ReadFile(modulePath)
+	function, err := cgoHIPCachedFunction(modulePath, config.Name)
 	if err != nil {
-		return core.E("rocm.hip.LaunchKernel", "read kernel module "+modulePath, err)
-	}
-	if len(image) == 0 {
-		return core.E("rocm.hip.LaunchKernel", "kernel module is empty "+modulePath, nil)
-	}
-	cImage := C.CBytes(image)
-	defer C.free(cImage)
-
-	var module C.uintptr_t
-	if rc := C.core_rocm_hip_module_load_data(&module, cImage); rc != 0 {
-		return hipReturnError("hipModuleLoadData", int(rc))
-	}
-	defer C.core_rocm_hip_module_unload(module)
-
-	cName := C.CString(config.Name)
-	defer C.free(unsafe.Pointer(cName))
-	var function C.uintptr_t
-	if rc := C.core_rocm_hip_module_get_function(&function, module, cName); rc != 0 {
-		return hipReturnError("hipModuleGetFunction", int(rc))
+		return err
 	}
 
-	args, err := driver.Malloc(uint64(len(config.Args)))
+	args, err := driver.launchArgPointer(config.Args)
+	hipReleaseLaunchPacket(config.Args)
 	if err != nil {
-		return core.E("rocm.hip.LaunchKernel", "allocate kernel argument packet", err)
-	}
-	defer driver.Free(args)
-	if err := driver.CopyHostToDevice(args, config.Args); err != nil {
-		return core.E("rocm.hip.LaunchKernel", "copy kernel argument packet", err)
+		return err
 	}
 	if rc := C.core_rocm_hip_module_launch_kernel(
 		function,
@@ -303,11 +640,351 @@ func (driver cgoHIPDriver) LaunchKernel(config hipKernelLaunchConfig) error {
 		C.uint(config.BlockY),
 		C.uint(config.BlockZ),
 		C.uint(config.SharedMemBytes),
-		C.uintptr_t(args),
+		C.uintptr_t(args.pointer),
 	); rc != 0 {
+		_ = args.finish(false)
 		return hipReturnError("hipModuleLaunchKernel", int(rc))
 	}
+	if err := args.finish(true); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (driver cgoHIPDriver) launchArgPointer(args []byte) (cgoHIPLaunchArgLease, error) {
+	if os.Getenv("GO_ROCM_DISABLE_ASYNC_LAUNCH_ARGS") == "" || os.Getenv("GO_ROCM_ENABLE_MAPPED_LAUNCH_ARGS") != "" {
+		return driver.launchArgPointerAsync(args)
+	}
+	return driver.launchArgPointerSync(args)
+}
+
+func (driver cgoHIPDriver) launchArgPointerSync(args []byte) (cgoHIPLaunchArgLease, error) {
+	cgoHIPLaunchArgBuffer.Lock()
+	want := uint64(len(args))
+	if want < 256 {
+		want = 256
+	}
+	if cgoHIPLaunchArgBuffer.pointer == 0 || cgoHIPLaunchArgBuffer.bytes < want {
+		host, pointer, mapped, err := driver.allocateLaunchArgBuffer(want)
+		if err != nil {
+			cgoHIPLaunchArgBuffer.Unlock()
+			return cgoHIPLaunchArgLease{}, core.E("rocm.hip.LaunchKernel", "allocate kernel argument packet", err)
+		}
+		previous := cgoHIPLaunchArgBuffer.pointer
+		previousHost := cgoHIPLaunchArgBuffer.host
+		previousMapped := cgoHIPLaunchArgBuffer.mapped
+		cgoHIPLaunchArgBuffer.pointer = pointer
+		cgoHIPLaunchArgBuffer.host = host
+		cgoHIPLaunchArgBuffer.bytes = want
+		cgoHIPLaunchArgBuffer.mapped = mapped
+		if previous != 0 {
+			_ = driver.freeLaunchArgBuffer(previousHost, previous, previousMapped)
+		}
+	}
+	if cgoHIPLaunchArgBuffer.mapped {
+		copy(unsafe.Slice((*byte)(cgoHIPLaunchArgBuffer.host), int(cgoHIPLaunchArgBuffer.bytes)), args)
+	} else {
+		if err := driver.CopyHostToDevice(cgoHIPLaunchArgBuffer.pointer, args); err != nil {
+			cgoHIPLaunchArgBuffer.Unlock()
+			return cgoHIPLaunchArgLease{}, core.E("rocm.hip.LaunchKernel", "copy kernel argument packet", err)
+		}
+	}
+	return cgoHIPLaunchArgLease{pointer: cgoHIPLaunchArgBuffer.pointer, syncBuffer: true}, nil
+}
+
+func (driver cgoHIPDriver) launchArgPointerAsync(args []byte) (cgoHIPLaunchArgLease, error) {
+	cgoHIPLaunchArgRing.Lock()
+	syncOnWrap := os.Getenv("GO_ROCM_ENABLE_LAUNCH_ARG_EVENTS") == ""
+	slotIndex := cgoHIPLaunchArgRing.next
+	cgoHIPLaunchArgRing.next = (cgoHIPLaunchArgRing.next + 1) % len(cgoHIPLaunchArgRing.slots)
+	if cgoHIPLaunchArgRing.next == 0 {
+		cgoHIPLaunchArgRing.wrapped = true
+	}
+	if syncOnWrap && cgoHIPLaunchArgRing.wrapped && slotIndex == 0 {
+		if rc := C.core_rocm_hip_device_synchronize(); rc != 0 {
+			cgoHIPLaunchArgRing.Unlock()
+			return cgoHIPLaunchArgLease{}, hipReturnError("hipDeviceSynchronize", int(rc))
+		}
+		for index := range cgoHIPLaunchArgRing.slots {
+			cgoHIPLaunchArgRing.slots[index].recorded = false
+		}
+	}
+	slot := &cgoHIPLaunchArgRing.slots[slotIndex]
+	if !syncOnWrap && slot.recorded {
+		if rc := C.core_rocm_hip_event_synchronize(slot.event); rc != 0 {
+			cgoHIPLaunchArgRing.Unlock()
+			return cgoHIPLaunchArgLease{}, hipReturnError("hipEventSynchronize", int(rc))
+		}
+		slot.recorded = false
+	}
+	want := uint64(len(args))
+	if want < 256 {
+		want = 256
+	}
+	if slot.pointer == 0 || slot.bytes < want {
+		if err := driver.resizeLaunchArgSlot(slot, want); err != nil {
+			cgoHIPLaunchArgRing.Unlock()
+			return cgoHIPLaunchArgLease{}, core.E("rocm.hip.LaunchKernel", "allocate async kernel argument packet", err)
+		}
+	}
+	hostBytes := unsafe.Slice((*byte)(slot.host), int(slot.bytes))
+	copy(hostBytes, args)
+	clear(hostBytes[len(args):want])
+	if !slot.mapped {
+		if rc := C.core_rocm_hip_memcpy_htod_async(C.uintptr_t(slot.pointer), slot.host, C.size_t(len(args))); rc != 0 {
+			cgoHIPLaunchArgRing.Unlock()
+			return cgoHIPLaunchArgLease{}, hipReturnError("hipMemcpyHostToDeviceAsync", int(rc))
+		}
+	}
+	return cgoHIPLaunchArgLease{pointer: slot.pointer, asyncSlot: slot, noEvent: syncOnWrap}, nil
+}
+
+func (lease cgoHIPLaunchArgLease) finish(success bool) error {
+	if lease.asyncSlot != nil {
+		defer cgoHIPLaunchArgRing.Unlock()
+		if !success || lease.noEvent || lease.asyncSlot.event == 0 {
+			return nil
+		}
+		if rc := C.core_rocm_hip_event_record(lease.asyncSlot.event); rc != 0 {
+			return hipReturnError("hipEventRecord", int(rc))
+		}
+		lease.asyncSlot.recorded = true
+		return nil
+	}
+	if lease.syncBuffer {
+		defer cgoHIPLaunchArgBuffer.Unlock()
+		if success {
+			if rc := C.core_rocm_hip_device_synchronize(); rc != 0 {
+				return hipReturnError("hipDeviceSynchronize", int(rc))
+			}
+		}
+	}
+	return nil
+}
+
+func (driver cgoHIPDriver) allocateLaunchArgBuffer(size uint64) (unsafe.Pointer, nativeDevicePointer, bool, error) {
+	if os.Getenv("GO_ROCM_DISABLE_MAPPED_LAUNCH_ARGS") == "" {
+		var host C.uintptr_t
+		var device C.uintptr_t
+		if rc := C.core_rocm_hip_host_malloc_mapped(&host, &device, C.size_t(size)); rc == 0 {
+			return unsafe.Pointer(uintptr(host)), nativeDevicePointer(device), true, nil
+		}
+	}
+	pointer, err := driver.Malloc(size)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	return nil, pointer, false, nil
+}
+
+func (driver cgoHIPDriver) resizeLaunchArgSlot(slot *cgoHIPLaunchArgSlot, size uint64) error {
+	if slot == nil {
+		return core.E("rocm.hip.LaunchKernel", "launch argument slot is nil", nil)
+	}
+	if slot.recorded {
+		if rc := C.core_rocm_hip_event_synchronize(slot.event); rc != 0 {
+			return hipReturnError("hipEventSynchronize", int(rc))
+		}
+		slot.recorded = false
+	}
+	if err := driver.freeLaunchArgSlot(slot); err != nil {
+		return err
+	}
+	if os.Getenv("GO_ROCM_DISABLE_MAPPED_LAUNCH_ARGS") == "" {
+		var host C.uintptr_t
+		var device C.uintptr_t
+		if rc := C.core_rocm_hip_host_malloc_mapped(&host, &device, C.size_t(size)); rc == 0 {
+			var event C.uintptr_t
+			if eventRC := C.core_rocm_hip_event_create(&event); eventRC != 0 {
+				_ = C.core_rocm_hip_host_free(host)
+				return hipReturnError("hipEventCreateWithFlags", int(eventRC))
+			}
+			slot.host = unsafe.Pointer(uintptr(host))
+			slot.pointer = nativeDevicePointer(device)
+			slot.event = event
+			slot.bytes = size
+			slot.mapped = true
+			return nil
+		}
+	}
+	var host C.uintptr_t
+	if rc := C.core_rocm_hip_host_malloc_pinned(&host, C.size_t(size)); rc != 0 {
+		return hipReturnError("hipHostMalloc", int(rc))
+	}
+	pointer, err := driver.Malloc(size)
+	if err != nil {
+		_ = C.core_rocm_hip_host_free(host)
+		return err
+	}
+	var event C.uintptr_t
+	if rc := C.core_rocm_hip_event_create(&event); rc != 0 {
+		_ = C.core_rocm_hip_host_free(host)
+		_ = driver.Free(pointer)
+		return hipReturnError("hipEventCreateWithFlags", int(rc))
+	}
+	slot.host = unsafe.Pointer(uintptr(host))
+	slot.pointer = pointer
+	slot.event = event
+	slot.bytes = size
+	slot.mapped = false
+	return nil
+}
+
+func (driver cgoHIPDriver) freeLaunchArgSlot(slot *cgoHIPLaunchArgSlot) error {
+	if slot == nil {
+		return nil
+	}
+	var lastErr error
+	if slot.recorded && slot.event != 0 {
+		if rc := C.core_rocm_hip_event_synchronize(slot.event); rc != 0 {
+			lastErr = hipReturnError("hipEventSynchronize", int(rc))
+		}
+		slot.recorded = false
+	}
+	if slot.event != 0 {
+		if rc := C.core_rocm_hip_event_destroy(slot.event); rc != 0 {
+			lastErr = hipReturnError("hipEventDestroy", int(rc))
+		}
+		slot.event = 0
+	}
+	if slot.host != nil {
+		if rc := C.core_rocm_hip_host_free(C.uintptr_t(uintptr(slot.host))); rc != 0 {
+			lastErr = hipReturnError("hipHostFree", int(rc))
+		}
+		slot.host = nil
+	}
+	if slot.pointer != 0 && !slot.mapped {
+		if err := driver.Free(slot.pointer); err != nil {
+			lastErr = err
+		}
+	}
+	slot.pointer = 0
+	slot.mapped = false
+	slot.bytes = 0
+	return lastErr
+}
+
+func (driver cgoHIPDriver) resizeAsyncCopySlot(slot *cgoHIPAsyncCopySlot, size uint64) error {
+	if slot == nil {
+		return core.E("rocm.hip.CopyHostToDeviceAsync", "async copy slot is nil", nil)
+	}
+	if slot.recorded {
+		if rc := C.core_rocm_hip_event_synchronize(slot.event); rc != 0 {
+			return hipReturnError("hipEventSynchronize", int(rc))
+		}
+		slot.recorded = false
+	}
+	if err := driver.freeAsyncCopySlot(slot); err != nil {
+		return err
+	}
+	var host C.uintptr_t
+	if rc := C.core_rocm_hip_host_malloc_pinned(&host, C.size_t(size)); rc != 0 {
+		return hipReturnError("hipHostMalloc", int(rc))
+	}
+	var event C.uintptr_t
+	if rc := C.core_rocm_hip_event_create(&event); rc != 0 {
+		_ = C.core_rocm_hip_host_free(host)
+		return hipReturnError("hipEventCreateWithFlags", int(rc))
+	}
+	slot.host = unsafe.Pointer(uintptr(host))
+	slot.event = event
+	slot.bytes = size
+	return nil
+}
+
+func (driver cgoHIPDriver) freeAsyncCopySlot(slot *cgoHIPAsyncCopySlot) error {
+	if slot == nil {
+		return nil
+	}
+	var lastErr error
+	if slot.recorded && slot.event != 0 {
+		if rc := C.core_rocm_hip_event_synchronize(slot.event); rc != 0 {
+			lastErr = hipReturnError("hipEventSynchronize", int(rc))
+		}
+		slot.recorded = false
+	}
+	if slot.event != 0 {
+		if rc := C.core_rocm_hip_event_destroy(slot.event); rc != 0 {
+			lastErr = hipReturnError("hipEventDestroy", int(rc))
+		}
+		slot.event = 0
+	}
+	if slot.host != nil {
+		if rc := C.core_rocm_hip_host_free(C.uintptr_t(uintptr(slot.host))); rc != 0 {
+			lastErr = hipReturnError("hipHostFree", int(rc))
+		}
+		slot.host = nil
+	}
+	slot.bytes = 0
+	return lastErr
+}
+
+func (driver cgoHIPDriver) freeLaunchArgBuffer(host unsafe.Pointer, pointer nativeDevicePointer, mapped bool) error {
+	if pointer == 0 {
+		return nil
+	}
+	if mapped {
+		if host == nil {
+			return nil
+		}
+		if rc := C.core_rocm_hip_host_free(C.uintptr_t(uintptr(host))); rc != 0 {
+			return hipReturnError("hipHostFree", int(rc))
+		}
+		return nil
+	}
+	return driver.Free(pointer)
+}
+
+func cgoHIPCachedFunction(modulePath, kernelName string) (C.uintptr_t, error) {
+	cgoHIPModuleCache.Lock()
+	defer cgoHIPModuleCache.Unlock()
+	module := cgoHIPModuleCache.modules[modulePath]
+	if module == nil {
+		loaded, err := cgoHIPLoadModule(modulePath)
+		if err != nil {
+			return 0, err
+		}
+		module = loaded
+		cgoHIPModuleCache.modules[modulePath] = module
+	}
+	if function, ok := module.functions[kernelName]; ok {
+		return function, nil
+	}
+	function, err := cgoHIPModuleFunction(module.module, kernelName)
+	if err != nil {
+		return 0, err
+	}
+	module.functions[kernelName] = function
+	return function, nil
+}
+
+func cgoHIPLoadModule(modulePath string) (*cgoHIPCachedModule, error) {
+	image, err := os.ReadFile(modulePath)
+	if err != nil {
+		return nil, core.E("rocm.hip.LaunchKernel", "read kernel module "+modulePath, err)
+	}
+	if len(image) == 0 {
+		return nil, core.E("rocm.hip.LaunchKernel", "kernel module is empty "+modulePath, nil)
+	}
+	scope := corecgo.NewScope()
+	imageView := corecgo.PinIn(scope, image)
+
+	var module C.uintptr_t
+	if rc := C.core_rocm_hip_module_load_data(&module, imageView.Ptr()); rc != 0 {
+		scope.FreeAll()
+		return nil, hipReturnError("hipModuleLoadData", int(rc))
+	}
+	return &cgoHIPCachedModule{module: module, image: image, scope: scope, functions: map[string]C.uintptr_t{}}, nil
+}
+
+func cgoHIPModuleFunction(module C.uintptr_t, kernelName string) (C.uintptr_t, error) {
+	cName := corecgo.CStringPtr(kernelName)
+	defer corecgo.Free(cName)
+	var function C.uintptr_t
+	if rc := C.core_rocm_hip_module_get_function(&function, module, (*C.char)(cName)); rc != 0 {
+		return 0, hipReturnError("hipModuleGetFunction", int(rc))
+	}
+	return function, nil
 }
 
 func hipReturnError(op string, code int) error {

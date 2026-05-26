@@ -82,16 +82,22 @@ func TestHIPGemma4Q4Layer0_Good(t *testing.T) {
 	core.AssertContains(t, joined, hipKernelNameVectorScale)
 	core.AssertContains(t, joined, hipKernelNameRMSNorm)
 	core.AssertContains(t, joined, hipKernelNameMLXQ4Proj)
-	core.AssertContains(t, joined, hipKernelNameRoPE)
-	core.AssertContains(t, joined, hipKernelNameAttention)
-	core.AssertContains(t, joined, hipKernelNameVectorAdd)
+	core.AssertContains(t, joined, hipKernelNameRMSNormRoPEHeads)
+	core.AssertContains(t, joined, hipKernelNameAttentionHeads)
+	core.AssertContains(t, joined, hipKernelNameRMSNormResidualAdd)
+	core.AssertContains(t, joined, hipKernelNameMLXQ4GELUTanhMul)
 	core.AssertContains(t, joined, hipKernelNameGreedy)
 	core.AssertContains(t, got.Labels["decode_primitives"], "gelu_tanh_mlp")
+	core.AssertEqual(t, "device_gelu_tanh_multiply", got.Labels["gemma4_mlp_activation"])
 	attentionScales := 0
 	for _, launch := range driver.launches {
-		if launch.Name == hipKernelNameAttention {
+		if launch.Name == hipKernelNameAttentionHeads {
 			attentionScales++
-			assertFloat32Near(t, 1, math.Float32frombits(binary.LittleEndian.Uint32(launch.Args[80:])))
+			tokenCount := binary.LittleEndian.Uint32(launch.Args[52:])
+			core.AssertEqual(t, uint64(0), binary.LittleEndian.Uint64(launch.Args[40:]))
+			core.AssertEqual(t, uint32(0), binary.LittleEndian.Uint32(launch.Args[76:]))
+			core.AssertEqual(t, tokenCount*4, launch.SharedMemBytes)
+			assertFloat32Near(t, 1, math.Float32frombits(binary.LittleEndian.Uint32(launch.Args[84:])))
 		}
 	}
 	if attentionScales == 0 {
@@ -137,9 +143,10 @@ func TestHIPGemma4Q4Layer0_Good(t *testing.T) {
 	core.RequireNoError(t, err)
 	partialRoPELaunches := 0
 	for _, launch := range driver.launches[partialRoPEStart:] {
-		if launch.Name == hipKernelNameRoPE {
+		if launch.Name == hipKernelNameRMSNormRoPEHeads {
 			partialRoPELaunches++
-			core.AssertEqual(t, uint32(cfg.HeadDim), binary.LittleEndian.Uint32(launch.Args[44:]))
+			core.AssertEqual(t, uint32(cfg.HeadDim), binary.LittleEndian.Uint32(launch.Args[72:]))
+			core.AssertEqual(t, uint32(cfg.HeadDim/2), binary.LittleEndian.Uint32(launch.Args[76:]))
 		}
 	}
 	if partialRoPELaunches == 0 {
@@ -154,13 +161,19 @@ func TestHIPGemma4Q4Layer0_Good(t *testing.T) {
 	})
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, cfg.HiddenSize, len(perLayerLayer.FinalHidden))
-	perLayerQ4Launches := 0
+	perLayerQ4Ops := 0
+	perLayerTripleQ4Launches := 0
 	for _, launch := range driver.launches[perLayerStart:] {
-		if launch.Name == hipKernelNameMLXQ4Proj {
-			perLayerQ4Launches++
+		switch launch.Name {
+		case hipKernelNameMLXQ4Proj:
+			perLayerQ4Ops++
+		case hipKernelNameMLXQ4TripleProj:
+			perLayerQ4Ops += 3
+			perLayerTripleQ4Launches++
 		}
 	}
-	core.AssertEqual(t, 9, perLayerQ4Launches)
+	core.AssertEqual(t, 6, perLayerQ4Ops)
+	core.AssertEqual(t, 1, perLayerTripleQ4Launches)
 
 	variable, variableCleanup := hipGemma4Q4FixtureConfig(t, driver, 1, 4, 2, 16)
 	variable.RoPEBase = 1000000
@@ -323,6 +336,7 @@ func TestHIPGemma4Q4Layer0_Good(t *testing.T) {
 	core.RequireNoError(t, streamErr())
 	core.AssertEqual(t, 2, len(generated))
 	core.AssertEqual(t, 3, countEmbeddingLaunches(launchStart))
+	core.AssertEqual(t, 6, countKVEncodeTokenLaunches(driver.launches[launchStart:]))
 	if countDeviceAttentionLaunches(driver.launches[launchStart:]) == 0 {
 		t.Fatalf("Gemma4 q4 public generate launched no descriptor-backed attention kernels")
 	}
@@ -367,27 +381,27 @@ func TestHIPGemma4Q4Layer0_Good(t *testing.T) {
 		specialText: map[string]int32{"<eos>": 1},
 		unknownID:   19,
 		hasUnknown:  true,
-		}
-		core.AssertEqual(t, []int32{12, 15, 1}, tokenText.Encode("he z<eos>"))
-		bosTokenText := &hipTokenTextDecoder{
-			vocab: map[string]int32{
-				"<bos>": 2,
-				"h":     10,
-				"e":     11,
-				"he":    12,
-			},
-			pieces:      map[int32]string{2: "<bos>", 10: "h", 11: "e", 12: "he"},
-			mergeRanks:  map[string]int{"h e": 0},
-			special:     map[int32]bool{2: true},
-			specialText: map[string]int32{"<bos>": 2},
-			bosID:       2,
-			hasBOS:      true,
-		}
-		core.AssertEqual(t, []int32{2, 12}, bosTokenText.Encode("he"))
-		core.AssertEqual(t, []int32{2, 12}, bosTokenText.Encode("<bos>he"))
-		textPromptTokens, textPrompt, err := hipGemma4Q4TextPromptIDs("text:he z", &hipLoadedModel{tokenText: tokenText})
-		core.RequireNoError(t, err)
-		core.AssertEqual(t, true, textPrompt)
+	}
+	core.AssertEqual(t, []int32{12, 15, 1}, tokenText.Encode("he z<eos>"))
+	bosTokenText := &hipTokenTextDecoder{
+		vocab: map[string]int32{
+			"<bos>": 2,
+			"h":     10,
+			"e":     11,
+			"he":    12,
+		},
+		pieces:      map[int32]string{2: "<bos>", 10: "h", 11: "e", 12: "he"},
+		mergeRanks:  map[string]int{"h e": 0},
+		special:     map[int32]bool{2: true},
+		specialText: map[string]int32{"<bos>": 2},
+		bosID:       2,
+		hasBOS:      true,
+	}
+	core.AssertEqual(t, []int32{2, 12}, bosTokenText.Encode("he"))
+	core.AssertEqual(t, []int32{2, 12}, bosTokenText.Encode("<bos>he"))
+	textPromptTokens, textPrompt, err := hipGemma4Q4TextPromptIDs("text:he z", &hipLoadedModel{tokenText: tokenText})
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, true, textPrompt)
 	core.AssertEqual(t, []int32{12, 15}, textPromptTokens)
 	_, textPrompt, err = hipGemma4Q4TextPromptIDs("he z", &hipLoadedModel{
 		modelInfo: inference.ModelInfo{Architecture: "gemma4", QuantBits: 4},
@@ -441,12 +455,1171 @@ func TestHIPGemma4Q4Layer0_Good(t *testing.T) {
 	core.RequireNoError(t, streamErr())
 	core.AssertEqual(t, 1, len(generated))
 	core.AssertEqual(t, 2, countEmbeddingLaunches(launchStart))
+	core.AssertEqual(t, 4, countKVEncodeTokenLaunches(driver.launches[launchStart:]))
 	if countDeviceAttentionLaunches(driver.launches[launchStart:]) == 0 {
 		t.Fatalf("Gemma4 q4 early-stopped public generate launched no descriptor-backed attention kernels")
 	}
 	if len(driver.frees) == freeStart {
 		t.Fatalf("Gemma4 q4 early-stopped public generate freed no device KV allocations")
 	}
+}
+
+func TestHIPGemma4Q4EffectiveSlidingWindow_Good(t *testing.T) {
+	core.AssertEqual(t, 512, hipGemma4Q4EffectiveSlidingWindow(256, 0))
+	core.AssertEqual(t, 128, hipGemma4Q4EffectiveSlidingWindow(256, 128))
+	core.AssertEqual(t, 512, hipGemma4Q4EffectiveSlidingWindow(256, 2048))
+	core.AssertEqual(t, 0, hipGemma4Q4EffectiveSlidingWindow(512, 128))
+}
+
+func TestHIPGemma4Q4ChunkedAttentionEnabled_Good(t *testing.T) {
+	t.Setenv("GO_ROCM_GEMMA4_Q4_CHUNKED_ATTENTION", "")
+	core.AssertEqual(t, true, hipGemma4Q4ChunkedAttentionEnabled(1))
+	core.AssertEqual(t, true, hipGemma4Q4ChunkedAttentionEnabled(4000))
+
+	t.Setenv("GO_ROCM_GEMMA4_Q4_CHUNKED_ATTENTION", "auto")
+	core.AssertEqual(t, false, hipGemma4Q4ChunkedAttentionEnabled(2000))
+	core.AssertEqual(t, true, hipGemma4Q4ChunkedAttentionEnabled(4000))
+
+	t.Setenv("GO_ROCM_GEMMA4_Q4_CHUNKED_ATTENTION", "0")
+	core.AssertEqual(t, false, hipGemma4Q4ChunkedAttentionEnabled(48000))
+
+	t.Setenv("GO_ROCM_GEMMA4_Q4_CHUNKED_ATTENTION", "1")
+	core.AssertEqual(t, true, hipGemma4Q4ChunkedAttentionEnabled(1))
+}
+
+func TestHIPGemma4Q4DeviceKVBlockSize_Good(t *testing.T) {
+	t.Setenv("GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE", "")
+	core.AssertEqual(t, rocmGemma4Q4DeviceKVBlockSize, hipGemma4Q4DeviceKVBlockSize())
+
+	t.Setenv("GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE", "16")
+	core.AssertEqual(t, 16, hipGemma4Q4DeviceKVBlockSize())
+
+	t.Setenv("GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE", "bad")
+	core.AssertEqual(t, rocmGemma4Q4DeviceKVBlockSize, hipGemma4Q4DeviceKVBlockSize())
+}
+
+func TestHIPGemma4Q4PrefillPlan_Good(t *testing.T) {
+	t.Setenv(hipGemma4Q4PrefillUBatchEnv, "")
+	ubatchTokens, err := hipGemma4Q4PrefillUBatchTokens()
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipGemma4Q4PrefillDefaultUBatchTokens, ubatchTokens)
+
+	t.Setenv(hipGemma4Q4PrefillUBatchEnv, "2")
+	ubatchTokens, err = hipGemma4Q4PrefillUBatchTokens()
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 2, ubatchTokens)
+
+	plan, err := hipGemma4Q4PlanPromptPrefill([]int32{2, 10979, 2, 10979, 2}, 7, ubatchTokens)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 5, plan.PromptTokens)
+	core.AssertEqual(t, 7, plan.StartPos)
+	core.AssertEqual(t, 2, plan.UBatchTokens)
+	core.AssertEqual(t, 1, plan.OutputTokens)
+	core.AssertEqual(t, 12, plan.NextPosition())
+	core.AssertEqual(t, 3, len(plan.Batches))
+	core.AssertEqual(t, []int32{2, 10979}, plan.Batches[0].Tokens)
+	core.AssertEqual(t, []bool{false, false}, plan.Batches[0].OutputTokens)
+	core.AssertEqual(t, 0, plan.Batches[0].Start)
+	core.AssertEqual(t, 2, plan.Batches[0].End)
+	core.AssertEqual(t, 7, plan.Batches[0].Position)
+	core.AssertEqual(t, []int32{2}, plan.Batches[2].Tokens)
+	core.AssertEqual(t, []bool{true}, plan.Batches[2].OutputTokens)
+	core.AssertEqual(t, 4, plan.Batches[2].Start)
+	core.AssertEqual(t, 5, plan.Batches[2].End)
+	core.AssertEqual(t, 11, plan.Batches[2].Position)
+}
+
+func TestHIPGemma4Q4PrefillPlan_Bad(t *testing.T) {
+	t.Setenv(hipGemma4Q4PrefillUBatchEnv, "nope")
+	if _, err := hipGemma4Q4PrefillUBatchTokens(); err == nil {
+		t.Fatalf("hipGemma4Q4PrefillUBatchTokens succeeded, want invalid env error")
+	}
+	if _, err := hipGemma4Q4PlanPromptPrefill(nil, 0, 512); err == nil {
+		t.Fatalf("hipGemma4Q4PlanPromptPrefill succeeded with empty prompt")
+	}
+	if _, err := hipGemma4Q4PlanPromptPrefill([]int32{1}, -1, 512); err == nil {
+		t.Fatalf("hipGemma4Q4PlanPromptPrefill succeeded with negative start position")
+	}
+	if _, err := hipGemma4Q4PlanPromptPrefill([]int32{1}, 0, 0); err == nil {
+		t.Fatalf("hipGemma4Q4PlanPromptPrefill succeeded with zero ubatch size")
+	}
+}
+
+func TestHIPGemma4Q4PrefillEmbeddingBatch_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4Layer0FixtureConfig(t, driver)
+	defer cleanup()
+
+	tokens := []int32{1, 0, 1}
+	start := len(driver.launches)
+	output, err := hipRunGemma4Q4PrefillEmbeddingBatch(context.Background(), driver, cfg, tokens)
+	core.RequireNoError(t, err)
+	defer output.Close()
+
+	wantCount := len(tokens) * cfg.HiddenSize
+	core.AssertEqual(t, wantCount, output.Count())
+	core.AssertEqual(t, uint64(wantCount*4), output.SizeBytes())
+
+	launches := driver.launches[start:]
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameEmbedLookup))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameVectorScale))
+	for _, launch := range launches {
+		switch launch.Name {
+		case hipKernelNameEmbedLookup:
+			core.AssertEqual(t, uint32(len(tokens)), binary.LittleEndian.Uint32(launch.Args[32:]))
+			core.AssertEqual(t, uint32(cfg.HiddenSize), binary.LittleEndian.Uint32(launch.Args[40:]))
+			core.AssertEqual(t, uint64(wantCount*4), binary.LittleEndian.Uint64(launch.Args[56:]))
+		case hipKernelNameVectorScale:
+			core.AssertEqual(t, uint32(wantCount), binary.LittleEndian.Uint32(launch.Args[24:]))
+			core.AssertEqual(t, uint32(wantCount*4), binary.LittleEndian.Uint32(launch.Args[28:]))
+			core.AssertEqual(t, uint32(wantCount*4), binary.LittleEndian.Uint32(launch.Args[32:]))
+			assertFloat32Near(t, float32(math.Sqrt(float64(cfg.HiddenSize))), math.Float32frombits(binary.LittleEndian.Uint32(launch.Args[36:])))
+		}
+	}
+}
+
+func TestHIPGemma4Q4PrefillEmbeddingBatch_Bad(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4Layer0FixtureConfig(t, driver)
+	defer cleanup()
+
+	if _, err := hipRunGemma4Q4PrefillEmbeddingBatch(context.Background(), driver, cfg, nil); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillEmbeddingBatch succeeded with empty tokens")
+	}
+	core.AssertEqual(t, 0, len(driver.launches))
+
+	unavailable := &fakeHIPDriver{available: false}
+	if _, err := hipRunGemma4Q4PrefillEmbeddingBatch(context.Background(), unavailable, cfg, []int32{1}); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillEmbeddingBatch succeeded with unavailable driver")
+	}
+	core.AssertEqual(t, 0, len(unavailable.launches))
+}
+
+func TestHIPGemma4Q4PrefillInputNormBatch_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4Layer0FixtureConfig(t, driver)
+	defer cleanup()
+
+	tokenCount := 3
+	inputValues := make([]float32, tokenCount*cfg.HiddenSize)
+	for index := range inputValues {
+		inputValues[index] = float32(index%cfg.HiddenSize + 1)
+	}
+	payload, err := hipFloat32Payload(inputValues)
+	core.RequireNoError(t, err)
+	input, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill input norm fixture", payload, len(inputValues))
+	core.RequireNoError(t, err)
+	defer input.Close()
+
+	start := len(driver.launches)
+	output, err := hipRunGemma4Q4PrefillInputNormBatch(context.Background(), driver, cfg, input, tokenCount)
+	core.RequireNoError(t, err)
+	defer output.Close()
+
+	wantCount := tokenCount * cfg.HiddenSize
+	core.AssertEqual(t, wantCount, output.Count())
+	core.AssertEqual(t, uint64(wantCount*4), output.SizeBytes())
+
+	launches := driver.launches[start:]
+	core.AssertEqual(t, 1, len(launches))
+	launch := launches[0]
+	core.AssertEqual(t, hipKernelNameRMSNormHeads, launch.Name)
+	core.AssertEqual(t, uint32(tokenCount), launch.GridX)
+	core.AssertEqual(t, uint32(cfg.HiddenSize), binary.LittleEndian.Uint32(launch.Args[32:]))
+	core.AssertEqual(t, uint32(tokenCount), binary.LittleEndian.Uint32(launch.Args[36:]))
+	core.AssertEqual(t, uint32(wantCount*4), binary.LittleEndian.Uint32(launch.Args[40:]))
+	core.AssertEqual(t, uint32(wantCount*4), binary.LittleEndian.Uint32(launch.Args[48:]))
+	assertFloat32Near(t, cfg.InputNorm.Epsilon, math.Float32frombits(binary.LittleEndian.Uint32(launch.Args[52:])))
+	core.AssertEqual(t, hipRMSNormWeightEncodingBF16, binary.LittleEndian.Uint32(launch.Args[56:]))
+}
+
+func TestHIPGemma4Q4PrefillInputNormBatch_Bad(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4Layer0FixtureConfig(t, driver)
+	defer cleanup()
+
+	inputValues := make([]float32, cfg.HiddenSize)
+	for index := range inputValues {
+		inputValues[index] = float32(index + 1)
+	}
+	payload, err := hipFloat32Payload(inputValues)
+	core.RequireNoError(t, err)
+	input, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill input norm bad fixture", payload, len(inputValues))
+	core.RequireNoError(t, err)
+	defer input.Close()
+	start := len(driver.launches)
+
+	if _, err := hipRunGemma4Q4PrefillInputNormBatch(context.Background(), driver, cfg, input, 0); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillInputNormBatch succeeded with zero token count")
+	}
+	if _, err := hipRunGemma4Q4PrefillInputNormBatch(context.Background(), driver, cfg, input, 2); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillInputNormBatch succeeded with mismatched token count")
+	}
+	core.AssertEqual(t, start, len(driver.launches))
+}
+
+func TestHIPGemma4Q4PrefillQKVProjectionBatch_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4Layer0FixtureConfig(t, driver)
+	defer cleanup()
+
+	tokenCount := 2
+	inputValues := make([]float32, tokenCount*cfg.HiddenSize)
+	for index := range inputValues {
+		inputValues[index] = float32(index%cfg.HiddenSize + 1)
+	}
+	payload, err := hipFloat32Payload(inputValues)
+	core.RequireNoError(t, err)
+	input, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill QKV fixture", payload, len(inputValues))
+	core.RequireNoError(t, err)
+	defer input.Close()
+
+	start := len(driver.launches)
+	qkv, err := hipRunGemma4Q4PrefillQKVProjectionBatch(context.Background(), driver, cfg, input, tokenCount)
+	core.RequireNoError(t, err)
+	defer qkv.Close()
+
+	core.AssertEqual(t, tokenCount*cfg.QueryProjection.Rows, qkv.Query.Count())
+	core.AssertEqual(t, tokenCount*cfg.KeyProjection.Rows, qkv.Key.Count())
+	core.AssertEqual(t, tokenCount*cfg.ValueProjection.Rows, qkv.Value.Count())
+	launches := driver.launches[start:]
+	core.AssertEqual(t, 3, countLaunchName(launches, hipKernelNameMLXQ4ProjBatch))
+	wantRows := []int{cfg.QueryProjection.Rows, cfg.KeyProjection.Rows, cfg.ValueProjection.Rows}
+	for index, launch := range launches {
+		core.AssertEqual(t, hipKernelNameMLXQ4ProjBatch, launch.Name)
+		core.AssertEqual(t, uint32((tokenCount+hipMLXQ4ProjectionBatchTokensPerBlock-1)/hipMLXQ4ProjectionBatchTokensPerBlock), launch.GridY)
+		core.AssertEqual(t, uint32(wantRows[index]), binary.LittleEndian.Uint32(launch.Args[48:]))
+		core.AssertEqual(t, uint32(cfg.HiddenSize), binary.LittleEndian.Uint32(launch.Args[52:]))
+		core.AssertEqual(t, uint32(tokenCount), binary.LittleEndian.Uint32(launch.Args[56:]))
+	}
+}
+
+func TestHIPGemma4Q4PrefillQKVProjectionBatch_Bad(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4Layer0FixtureConfig(t, driver)
+	defer cleanup()
+
+	inputValues := make([]float32, cfg.HiddenSize)
+	for index := range inputValues {
+		inputValues[index] = float32(index + 1)
+	}
+	payload, err := hipFloat32Payload(inputValues)
+	core.RequireNoError(t, err)
+	input, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill QKV bad fixture", payload, len(inputValues))
+	core.RequireNoError(t, err)
+	defer input.Close()
+	start := len(driver.launches)
+
+	if _, err := hipRunGemma4Q4PrefillQKVProjectionBatch(context.Background(), driver, cfg, input, 0); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillQKVProjectionBatch succeeded with zero token count")
+	}
+	if _, err := hipRunGemma4Q4PrefillQKVProjectionBatch(context.Background(), driver, cfg, input, 2); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillQKVProjectionBatch succeeded with mismatched token count")
+	}
+	core.AssertEqual(t, start, len(driver.launches))
+}
+
+func TestHIPGemma4Q4PrefillQKNormRoPEBatch_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup()
+	cfg.RoPERotaryDim = 2
+
+	tokenCount := 2
+	queryValues := make([]float32, tokenCount*cfg.QueryHeads*cfg.HeadDim)
+	for index := range queryValues {
+		queryValues[index] = float32(index%cfg.HeadDim + 1)
+	}
+	keyValues := make([]float32, tokenCount*cfg.HeadDim)
+	for index := range keyValues {
+		keyValues[index] = float32(index%cfg.HeadDim + 1)
+	}
+	queryPayload, err := hipFloat32Payload(queryValues)
+	core.RequireNoError(t, err)
+	query, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill Q/K RoPE query fixture", queryPayload, len(queryValues))
+	core.RequireNoError(t, err)
+	defer query.Close()
+	keyPayload, err := hipFloat32Payload(keyValues)
+	core.RequireNoError(t, err)
+	key, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill Q/K RoPE key fixture", keyPayload, len(keyValues))
+	core.RequireNoError(t, err)
+	defer key.Close()
+	qkv := &hipGemma4Q4PrefillQKVBatch{Query: query, Key: key}
+
+	start := len(driver.launches)
+	output, err := hipRunGemma4Q4PrefillQKNormRoPEBatch(context.Background(), driver, cfg, qkv, tokenCount, 5, 1e-6)
+	core.RequireNoError(t, err)
+	defer output.Close()
+
+	core.AssertEqual(t, tokenCount*cfg.QueryHeads*cfg.HeadDim, output.Query.Count())
+	core.AssertEqual(t, tokenCount*cfg.HeadDim, output.Key.Count())
+	launches := driver.launches[start:]
+	core.AssertEqual(t, 2, len(launches))
+	core.AssertEqual(t, hipKernelNameRMSNormRoPEHeadsBatch, launches[0].Name)
+	core.AssertEqual(t, hipKernelNameRMSNormRoPEHeadsBatch, launches[1].Name)
+	core.AssertEqual(t, uint32(cfg.QueryHeads), launches[0].GridX)
+	core.AssertEqual(t, uint32(tokenCount), launches[0].GridY)
+	core.AssertEqual(t, uint32(1), launches[1].GridX)
+	core.AssertEqual(t, uint32(tokenCount), launches[1].GridY)
+	for index, launch := range launches {
+		wantHeads := cfg.QueryHeads
+		if index == 1 {
+			wantHeads = 1
+		}
+		core.AssertEqual(t, uint32(cfg.HeadDim), binary.LittleEndian.Uint32(launch.Args[32:]))
+		core.AssertEqual(t, uint32(wantHeads), binary.LittleEndian.Uint32(launch.Args[36:]))
+		core.AssertEqual(t, uint32(tokenCount), binary.LittleEndian.Uint32(launch.Args[40:]))
+		assertFloat32Near(t, 1e-6, math.Float32frombits(binary.LittleEndian.Uint32(launch.Args[56:])))
+		core.AssertEqual(t, hipRMSNormWeightEncodingBF16, binary.LittleEndian.Uint32(launch.Args[60:]))
+		core.AssertEqual(t, uint32(5), binary.LittleEndian.Uint32(launch.Args[68:]))
+		core.AssertEqual(t, uint32(cfg.HeadDim), binary.LittleEndian.Uint32(launch.Args[76:]))
+		core.AssertEqual(t, uint32(cfg.RoPERotaryDim), binary.LittleEndian.Uint32(launch.Args[80:]))
+	}
+}
+
+func TestHIPGemma4Q4PrefillQKNormRoPEBatch_Bad(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup()
+
+	tokenCount := 1
+	queryPayload, err := hipFloat32Payload(make([]float32, tokenCount*cfg.QueryHeads*cfg.HeadDim))
+	core.RequireNoError(t, err)
+	query, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill Q/K RoPE bad query fixture", queryPayload, tokenCount*cfg.QueryHeads*cfg.HeadDim)
+	core.RequireNoError(t, err)
+	defer query.Close()
+	keyPayload, err := hipFloat32Payload(make([]float32, tokenCount*cfg.HeadDim))
+	core.RequireNoError(t, err)
+	key, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill Q/K RoPE bad key fixture", keyPayload, tokenCount*cfg.HeadDim)
+	core.RequireNoError(t, err)
+	defer key.Close()
+	qkv := &hipGemma4Q4PrefillQKVBatch{Query: query, Key: key}
+	start := len(driver.launches)
+
+	if _, err := hipRunGemma4Q4PrefillQKNormRoPEBatch(context.Background(), driver, cfg, qkv, 0, 0, 1e-6); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillQKNormRoPEBatch succeeded with zero token count")
+	}
+	if _, err := hipRunGemma4Q4PrefillQKNormRoPEBatch(context.Background(), driver, cfg, qkv, 2, 0, 1e-6); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillQKNormRoPEBatch succeeded with mismatched token count")
+	}
+	cfg.RoPERotaryDim = 3
+	if _, err := hipRunGemma4Q4PrefillQKNormRoPEBatch(context.Background(), driver, cfg, qkv, tokenCount, 0, 1e-6); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillQKNormRoPEBatch succeeded with odd rotary dimension")
+	}
+	core.AssertEqual(t, start, len(driver.launches))
+}
+
+func TestHIPGemma4Q4PrefillValueNormBatch_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup()
+
+	tokenCount := 2
+	valueValues := []float32{
+		1, 0, 3, 4,
+		0, 2, 5, 12,
+	}
+	valuePayload, err := hipFloat32Payload(valueValues)
+	core.RequireNoError(t, err)
+	value, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill value norm fixture", valuePayload, len(valueValues))
+	core.RequireNoError(t, err)
+	defer value.Close()
+	qkv := &hipGemma4Q4PrefillQKVBatch{Value: value}
+
+	start := len(driver.launches)
+	output, err := hipRunGemma4Q4PrefillValueNormBatch(context.Background(), driver, cfg, qkv, tokenCount, 1e-6)
+	core.RequireNoError(t, err)
+	defer output.Close()
+	values, err := hipReadFloat32DeviceOutput(output, hipGemma4Q4Layer0Operation, "prefill value norm output", len(valueValues))
+	core.RequireNoError(t, err)
+
+	var want []float32
+	unitWeight := []float32{1, 1, 1, 1}
+	for token := 0; token < tokenCount; token++ {
+		offset := token * cfg.HeadDim
+		normalized, err := hipReferenceRMSNorm(valueValues[offset:offset+cfg.HeadDim], unitWeight, 1e-6)
+		core.RequireNoError(t, err)
+		want = append(want, normalized...)
+	}
+	assertFloat32SlicesNear(t, want, values, 0.0001)
+
+	launches := driver.launches[start:]
+	core.AssertEqual(t, 1, len(launches))
+	core.AssertEqual(t, hipKernelNameRMSNormHeads, launches[0].Name)
+	core.AssertEqual(t, uint32(tokenCount), launches[0].GridX)
+	core.AssertEqual(t, uint32(cfg.HeadDim), binary.LittleEndian.Uint32(launches[0].Args[32:]))
+	core.AssertEqual(t, uint32(tokenCount), binary.LittleEndian.Uint32(launches[0].Args[36:]))
+	core.AssertEqual(t, hipRMSNormWeightEncodingNone, binary.LittleEndian.Uint32(launches[0].Args[56:]))
+}
+
+func TestHIPGemma4Q4PrefillValueNormBatch_Bad(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup()
+
+	valuePayload, err := hipFloat32Payload(make([]float32, cfg.HeadDim))
+	core.RequireNoError(t, err)
+	value, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill value norm bad fixture", valuePayload, cfg.HeadDim)
+	core.RequireNoError(t, err)
+	defer value.Close()
+	qkv := &hipGemma4Q4PrefillQKVBatch{Value: value}
+	start := len(driver.launches)
+
+	if _, err := hipRunGemma4Q4PrefillValueNormBatch(context.Background(), driver, cfg, qkv, 0, 1e-6); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillValueNormBatch succeeded with zero token count")
+	}
+	if _, err := hipRunGemma4Q4PrefillValueNormBatch(context.Background(), driver, cfg, qkv, 2, 1e-6); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillValueNormBatch succeeded with mismatched token count")
+	}
+	if _, err := hipRunGemma4Q4PrefillValueNormBatch(context.Background(), driver, cfg, &hipGemma4Q4PrefillQKVBatch{}, 1, 1e-6); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillValueNormBatch succeeded with missing value buffer")
+	}
+	core.AssertEqual(t, start, len(driver.launches))
+}
+
+func TestHIPGemma4Q4PrefillDeviceKVBatch_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup()
+
+	tokenCount := 3
+	keyRows := []float32{
+		1, 0, 0, 1,
+		0, 1, 1, 0,
+		-1, 1, 0.5, -0.5,
+	}
+	valueRows := []float32{
+		2, 0, 0, 2,
+		0, 2, 2, 0,
+		3, -3, 1, -1,
+	}
+	keyPayload, err := hipFloat32Payload(keyRows)
+	core.RequireNoError(t, err)
+	key, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill device KV key fixture", keyPayload, len(keyRows))
+	core.RequireNoError(t, err)
+	defer key.Close()
+	valuePayload, err := hipFloat32Payload(valueRows)
+	core.RequireNoError(t, err)
+	value, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill device KV value fixture", valuePayload, len(valueRows))
+	core.RequireNoError(t, err)
+	defer value.Close()
+	qk := &hipGemma4Q4PrefillRoPEQKBatch{Key: key}
+
+	start := len(driver.launches)
+	deviceKV, err := hipRunGemma4Q4PrefillDeviceKVBatch(context.Background(), driver, cfg, qk, value, tokenCount, rocmKVCacheModeKQ8VQ4)
+	core.RequireNoError(t, err)
+	defer deviceKV.Close()
+
+	core.AssertEqual(t, 1, countLaunchName(driver.launches[start:], hipKernelNameKVEncodeToken))
+	core.AssertEqual(t, tokenCount, deviceKV.Cache.TokenCount())
+	core.AssertEqual(t, 1, deviceKV.Cache.PageCount())
+	core.AssertEqual(t, tokenCount, deviceKV.Cache.pages[0].tokenCount)
+	core.AssertEqual(t, cfg.HeadDim, deviceKV.Launch.KeyWidth)
+	core.AssertEqual(t, cfg.HeadDim, deviceKV.Launch.ValueWidth)
+	core.AssertEqual(t, tokenCount, deviceKV.Launch.TokenCount)
+	core.AssertEqual(t, rocmKVCacheModeKQ8VQ4, deviceKV.Launch.Mode)
+
+	descriptorPayload := make([]byte, deviceKV.DescriptorTable.SizeBytes())
+	core.RequireNoError(t, driver.CopyDeviceToHost(deviceKV.DescriptorTable.Pointer(), descriptorPayload))
+	core.AssertEqual(t, uint64(tokenCount), binary.LittleEndian.Uint64(descriptorPayload[24:]))
+	pageOffset := rocmDeviceKVDescriptorHeaderBytes
+	core.AssertEqual(t, uint64(0), binary.LittleEndian.Uint64(descriptorPayload[pageOffset:]))
+	core.AssertEqual(t, uint64(tokenCount), binary.LittleEndian.Uint64(descriptorPayload[pageOffset+8:]))
+	core.AssertEqual(t, uint32(cfg.HeadDim), binary.LittleEndian.Uint32(descriptorPayload[pageOffset+16:]))
+	core.AssertEqual(t, uint32(cfg.HeadDim), binary.LittleEndian.Uint32(descriptorPayload[pageOffset+20:]))
+}
+
+func TestHIPGemma4Q4PrefillDeviceKVBatch_Bad(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup()
+
+	keyPayload, err := hipFloat32Payload(make([]float32, cfg.HeadDim))
+	core.RequireNoError(t, err)
+	key, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill device KV bad key fixture", keyPayload, cfg.HeadDim)
+	core.RequireNoError(t, err)
+	defer key.Close()
+	valuePayload, err := hipFloat32Payload(make([]float32, cfg.HeadDim))
+	core.RequireNoError(t, err)
+	value, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill device KV bad value fixture", valuePayload, cfg.HeadDim)
+	core.RequireNoError(t, err)
+	defer value.Close()
+	qk := &hipGemma4Q4PrefillRoPEQKBatch{Key: key}
+	start := len(driver.launches)
+
+	if _, err := hipRunGemma4Q4PrefillDeviceKVBatch(context.Background(), driver, cfg, qk, value, 0, rocmKVCacheModeKQ8VQ4); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillDeviceKVBatch succeeded with zero token count")
+	}
+	if _, err := hipRunGemma4Q4PrefillDeviceKVBatch(context.Background(), driver, cfg, qk, value, 2, rocmKVCacheModeKQ8VQ4); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillDeviceKVBatch succeeded with mismatched key/value rows")
+	}
+	if _, err := hipRunGemma4Q4PrefillDeviceKVBatch(context.Background(), driver, cfg, &hipGemma4Q4PrefillRoPEQKBatch{}, value, 1, rocmKVCacheModeKQ8VQ4); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillDeviceKVBatch succeeded with missing key buffer")
+	}
+	core.AssertEqual(t, start, len(driver.launches))
+}
+
+func TestHIPGemma4Q4PrefillLayerKVBatch_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup()
+	cfg.RoPERotaryDim = 2
+
+	tokenCount := 3
+	inputValues := make([]float32, tokenCount*cfg.HiddenSize)
+	for index := range inputValues {
+		inputValues[index] = float32(index%cfg.HiddenSize + 1)
+	}
+	payload, err := hipFloat32Payload(inputValues)
+	core.RequireNoError(t, err)
+	input, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill layer KV input fixture", payload, len(inputValues))
+	core.RequireNoError(t, err)
+	defer input.Close()
+
+	start := len(driver.launches)
+	layer, err := hipRunGemma4Q4PrefillLayerKVBatch(context.Background(), driver, cfg, input, tokenCount, 7, 1e-6, rocmKVCacheModeKQ8VQ4)
+	core.RequireNoError(t, err)
+	defer layer.Close()
+
+	core.AssertEqual(t, tokenCount*cfg.HiddenSize, layer.InputNorm.Count())
+	core.AssertEqual(t, tokenCount*cfg.QueryProjection.Rows, layer.QKV.Query.Count())
+	core.AssertEqual(t, tokenCount*cfg.HeadDim, layer.QK.Key.Count())
+	core.AssertEqual(t, tokenCount*cfg.HeadDim, layer.Value.Count())
+	core.AssertEqual(t, tokenCount, layer.DeviceKV.Cache.TokenCount())
+	core.AssertEqual(t, 1, layer.DeviceKV.Cache.PageCount())
+
+	launches := driver.launches[start:]
+	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameRMSNormHeads))
+	core.AssertEqual(t, 3, countLaunchName(launches, hipKernelNameMLXQ4ProjBatch))
+	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameRMSNormRoPEHeadsBatch))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameKVEncodeToken))
+	core.AssertEqual(t, tokenCount, layer.DeviceKV.Launch.TokenCount)
+	core.AssertEqual(t, cfg.HeadDim, layer.DeviceKV.Launch.KeyWidth)
+	core.AssertEqual(t, cfg.HeadDim, layer.DeviceKV.Launch.ValueWidth)
+}
+
+func TestHIPGemma4Q4PrefillAttentionBatch_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup()
+	cfg.RoPERotaryDim = 2
+
+	tokenCount := 3
+	inputValues := make([]float32, tokenCount*cfg.HiddenSize)
+	for index := range inputValues {
+		inputValues[index] = float32(index%cfg.HiddenSize + 1)
+	}
+	payload, err := hipFloat32Payload(inputValues)
+	core.RequireNoError(t, err)
+	input, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill attention input fixture", payload, len(inputValues))
+	core.RequireNoError(t, err)
+	defer input.Close()
+
+	layer, err := hipRunGemma4Q4PrefillLayerKVBatch(context.Background(), driver, cfg, input, tokenCount, 0, 1e-6, rocmKVCacheModeKQ8VQ4)
+	core.RequireNoError(t, err)
+	defer layer.Close()
+	start := len(driver.launches)
+	output, err := hipRunGemma4Q4PrefillAttentionBatch(context.Background(), driver, cfg, layer, tokenCount, 0)
+	core.RequireNoError(t, err)
+	defer output.Close()
+
+	core.AssertEqual(t, tokenCount*cfg.QueryHeads*cfg.HeadDim, output.Count())
+	launches := driver.launches[start:]
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameAttentionHeadsBatchCausal))
+	core.AssertEqual(t, uint32(cfg.QueryHeads), launches[0].GridX)
+	core.AssertEqual(t, uint32(tokenCount), launches[0].GridY)
+	core.AssertEqual(t, hipAttentionHeadsBatchCausalLaunchArgsBytes, len(launches[0].Args))
+	core.AssertEqual(t, uint32(tokenCount), binary.LittleEndian.Uint32(launches[0].Args[52:]))
+	core.AssertEqual(t, uint32(cfg.QueryHeads), binary.LittleEndian.Uint32(launches[0].Args[56:]))
+	core.AssertEqual(t, uint32(tokenCount), binary.LittleEndian.Uint32(launches[0].Args[60:]))
+	core.AssertEqual(t, uint32(0), binary.LittleEndian.Uint32(launches[0].Args[64:]))
+	core.AssertEqual(t, hipAttentionKVSourceContiguous, binary.LittleEndian.Uint32(launches[0].Args[88:]))
+
+	sharedLayer := &hipGemma4Q4PrefillLayerKVBatch{
+		QK:        &hipGemma4Q4PrefillRoPEQKBatch{Query: layer.QK.Query},
+		DeviceKV:  layer.DeviceKV,
+		SharedKey: layer.QK.Key,
+		SharedVal: layer.Value,
+	}
+	start = len(driver.launches)
+	sharedOutput, err := hipRunGemma4Q4PrefillAttentionBatch(context.Background(), driver, cfg, sharedLayer, tokenCount, 0)
+	core.RequireNoError(t, err)
+	defer sharedOutput.Close()
+	sharedLaunches := driver.launches[start:]
+	core.AssertEqual(t, 1, countLaunchName(sharedLaunches, hipKernelNameAttentionHeadsBatchCausal))
+	core.AssertEqual(t, hipAttentionKVSourceContiguous, binary.LittleEndian.Uint32(sharedLaunches[0].Args[88:]))
+}
+
+func TestHIPGemma4Q4PrefillAttentionBatch_Bad(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup()
+	start := len(driver.launches)
+
+	if _, err := hipRunGemma4Q4PrefillAttentionBatch(context.Background(), driver, cfg, nil, 0, 0); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillAttentionBatch succeeded with zero token count")
+	}
+	if _, err := hipRunGemma4Q4PrefillAttentionBatch(context.Background(), driver, cfg, nil, 1, -1); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillAttentionBatch succeeded with negative query start")
+	}
+	if _, err := hipRunGemma4Q4PrefillAttentionBatch(context.Background(), driver, cfg, nil, 1, 0); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillAttentionBatch succeeded with missing layer")
+	}
+	core.AssertEqual(t, start, len(driver.launches))
+}
+
+func TestHIPGemma4Q4PrefillLayerBodyBatch_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup()
+	cfg.RoPERotaryDim = 2
+
+	tokenCount := 3
+	inputValues := make([]float32, tokenCount*cfg.HiddenSize)
+	for index := range inputValues {
+		inputValues[index] = float32(index%cfg.HiddenSize + 1)
+	}
+	payload, err := hipFloat32Payload(inputValues)
+	core.RequireNoError(t, err)
+	input, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill layer body input fixture", payload, len(inputValues))
+	core.RequireNoError(t, err)
+	defer input.Close()
+
+	layer, err := hipRunGemma4Q4PrefillLayerKVBatch(context.Background(), driver, cfg, input, tokenCount, 0, 1e-6, rocmKVCacheModeKQ8VQ4)
+	core.RequireNoError(t, err)
+	defer layer.Close()
+	start := len(driver.launches)
+	body, err := hipRunGemma4Q4PrefillLayerBodyBatch(context.Background(), driver, cfg, input, layer, tokenCount, 0, 1e-6)
+	core.RequireNoError(t, err)
+	defer body.Close()
+
+	core.AssertEqual(t, tokenCount*cfg.QueryHeads*cfg.HeadDim, body.AttentionOutput.Count())
+	core.AssertEqual(t, tokenCount*cfg.HiddenSize, body.AttentionProjection.Count())
+	core.AssertEqual(t, tokenCount*cfg.HiddenSize, body.AttentionResidual.Count())
+	core.AssertEqual(t, tokenCount*cfg.HiddenSize, body.PreFeedForward.Count())
+	core.AssertEqual(t, tokenCount*cfg.HiddenSize, body.MLPOutput.Count())
+	core.AssertEqual(t, tokenCount*cfg.HiddenSize, body.FinalHidden.Count())
+	finalHidden, err := hipReadFloat32DeviceOutput(body.FinalHidden, hipGemma4Q4Layer0Operation, "prefill layer body final hidden", len(inputValues))
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, inputValues, finalHidden, 0.0001)
+
+	launches := driver.launches[start:]
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameAttentionHeadsBatchCausal))
+	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameMLXQ4ProjBatch))
+	core.AssertEqual(t, 3, countLaunchName(launches, hipKernelNameRMSNormHeads))
+	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameVectorAdd))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameMLXQ4GELUTanhMulBatch))
+}
+
+func TestHIPGemma4Q4PrefillLayerBodyBatchWithPerLayerInput_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup()
+	cfg.RoPERotaryDim = 2
+
+	tokenCount := 3
+	inputValues := make([]float32, tokenCount*cfg.HiddenSize)
+	for index := range inputValues {
+		inputValues[index] = float32(index%cfg.HiddenSize + 1)
+	}
+	payload, err := hipFloat32Payload(inputValues)
+	core.RequireNoError(t, err)
+	input, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill layer body per-layer input fixture", payload, len(inputValues))
+	core.RequireNoError(t, err)
+	defer input.Close()
+
+	perLayerValues := make([]float32, tokenCount*cfg.PerLayerInput.InputSize)
+	for index := range perLayerValues {
+		perLayerValues[index] = float32(index%cfg.PerLayerInput.InputSize + 1)
+	}
+	perLayerPayload, err := hipFloat32Payload(perLayerValues)
+	core.RequireNoError(t, err)
+	perLayerInput, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill layer body per-layer input multiplier", perLayerPayload, len(perLayerValues))
+	core.RequireNoError(t, err)
+	defer perLayerInput.Close()
+
+	layer, err := hipRunGemma4Q4PrefillLayerKVBatch(context.Background(), driver, cfg, input, tokenCount, 0, 1e-6, rocmKVCacheModeKQ8VQ4)
+	core.RequireNoError(t, err)
+	defer layer.Close()
+	start := len(driver.launches)
+	body, err := hipRunGemma4Q4PrefillLayerBodyBatchWithPerLayerInput(context.Background(), driver, cfg, input, layer, perLayerInput, tokenCount, 0, 1e-6)
+	core.RequireNoError(t, err)
+	defer body.Close()
+
+	core.AssertEqual(t, tokenCount*cfg.QueryHeads*cfg.HeadDim, body.AttentionOutput.Count())
+	core.AssertEqual(t, tokenCount*cfg.HiddenSize, body.PostFeedForward.Count())
+	core.AssertEqual(t, tokenCount*cfg.HiddenSize, body.PerLayerProjection.Count())
+	core.AssertEqual(t, tokenCount*cfg.HiddenSize, body.FinalHidden.Count())
+	finalHidden, err := hipReadFloat32DeviceOutput(body.FinalHidden, hipGemma4Q4Layer0Operation, "prefill layer body per-layer final hidden", len(inputValues))
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, inputValues, finalHidden, 0.0001)
+
+	launches := driver.launches[start:]
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameAttentionHeadsBatchCausal))
+	core.AssertEqual(t, 3, countLaunchName(launches, hipKernelNameMLXQ4ProjBatch))
+	core.AssertEqual(t, 4, countLaunchName(launches, hipKernelNameRMSNormHeads))
+	core.AssertEqual(t, 3, countLaunchName(launches, hipKernelNameVectorAdd))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameMLXQ4GELUTanhMulBatch))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameMLXQ4GELUTanhProjBatch))
+	core.AssertEqual(t, 0, countLaunchName(launches, hipKernelNameVectorScale))
+}
+
+func TestHIPGemma4Q4PrefillFinalGreedyForRow_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup()
+
+	tokenCount := 3
+	hiddenValues := make([]float32, tokenCount*cfg.HiddenSize)
+	for index := range hiddenValues {
+		hiddenValues[index] = float32(index%cfg.HiddenSize + 1)
+	}
+	payload, err := hipFloat32Payload(hiddenValues)
+	core.RequireNoError(t, err)
+	hidden, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill final greedy hidden fixture", payload, len(hiddenValues))
+	core.RequireNoError(t, err)
+	defer hidden.Close()
+	start := len(driver.launches)
+
+	greedy, err := hipRunGemma4Q4PrefillFinalGreedyForRow(context.Background(), driver, cfg, hidden, tokenCount, tokenCount-1, 1e-6, nil)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 0, greedy.TokenID)
+
+	launches := driver.launches[start:]
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameRMSNorm))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameMLXQ4ProjGreedy))
+}
+
+func TestHIPGemma4Q4PrefillForwardBatch_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup0()
+	layer1, cleanup1 := hipGemma4Q4FixtureConfig(t, driver, 1, 4, 2, 8)
+	defer cleanup1()
+	embeddingWeightsPayload, err := hipUint32Payload(make([]uint32, layer0.VocabSize*(layer0.HiddenSize/layer0.GroupSize)))
+	core.RequireNoError(t, err)
+	embeddingWeights, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill forward nonzero embedding weights", embeddingWeightsPayload, layer0.VocabSize*(layer0.HiddenSize/layer0.GroupSize))
+	core.RequireNoError(t, err)
+	defer embeddingWeights.Close()
+	embeddingScalesPayload, err := hipUint16Payload([]uint16{0x3f80, 0x3f80})
+	core.RequireNoError(t, err)
+	embeddingScales, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill forward nonzero embedding scales", embeddingScalesPayload, layer0.VocabSize*(layer0.HiddenSize/layer0.GroupSize))
+	core.RequireNoError(t, err)
+	defer embeddingScales.Close()
+	embeddingBiasesPayload, err := hipUint16Payload([]uint16{0x3f80, 0x3f80})
+	core.RequireNoError(t, err)
+	embeddingBiases, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill forward nonzero embedding biases", embeddingBiasesPayload, layer0.VocabSize*(layer0.HiddenSize/layer0.GroupSize))
+	core.RequireNoError(t, err)
+	defer embeddingBiases.Close()
+	layer0.Embedding = hipDeviceEmbeddingLookupConfig{
+		EmbeddingPointer: embeddingWeights.Pointer(),
+		EmbeddingBytes:   embeddingWeights.SizeBytes(),
+		TableEncoding:    hipEmbeddingTableEncodingMLXQ4,
+		VocabSize:        layer0.VocabSize,
+		HiddenSize:       layer0.HiddenSize,
+		GroupSize:        layer0.GroupSize,
+		ScalePointer:     embeddingScales.Pointer(),
+		BiasPointer:      embeddingBiases.Pointer(),
+		ScaleBytes:       embeddingScales.SizeBytes(),
+		BiasBytes:        embeddingBiases.SizeBytes(),
+	}
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0, layer1}}
+	tokens := []int32{0, 1, 0}
+	perLayerInputs := make([]*hipDeviceByteBuffer, len(cfg.Layers))
+	for layerIndex, layer := range cfg.Layers {
+		values := make([]float32, len(tokens)*layer.PerLayerInput.InputSize)
+		for index := range values {
+			values[index] = float32(layerIndex + 1)
+		}
+		payload, err := hipFloat32Payload(values)
+		core.RequireNoError(t, err)
+		buffer, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill forward per-layer input fixture", payload, len(values))
+		core.RequireNoError(t, err)
+		defer buffer.Close()
+		perLayerInputs[layerIndex] = buffer
+	}
+	start := len(driver.launches)
+	forward, err := hipRunGemma4Q4PrefillForwardBatch(context.Background(), driver, cfg, tokens, 0, 1e-6, rocmKVCacheModeKQ8VQ4, perLayerInputs, nil, nil)
+	core.RequireNoError(t, err)
+	defer forward.Close()
+
+	core.AssertEqual(t, len(tokens)*layer0.HiddenSize, forward.Embedding.Count())
+	core.AssertEqual(t, 2, len(forward.Layers))
+	core.AssertEqual(t, len(tokens)*layer0.HiddenSize, forward.FinalHidden.Count())
+	core.AssertEqual(t, 0, len(forward.Greedy))
+	finalHidden, err := hipReadFloat32DeviceOutput(forward.FinalHidden, hipGemma4Q4Layer0Operation, "prefill forward final hidden", len(tokens)*layer0.HiddenSize)
+	core.RequireNoError(t, err)
+	expectedHidden := make([]float32, len(tokens)*layer0.HiddenSize)
+	for index := range expectedHidden {
+		expectedHidden[index] = float32(math.Sqrt(float64(layer0.HiddenSize)))
+	}
+	assertFloat32SlicesNear(t, expectedHidden, finalHidden, 0.0001)
+
+	launches := driver.launches[start:]
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameEmbedLookup))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameVectorScale))
+	core.AssertEqual(t, 12, countLaunchName(launches, hipKernelNameMLXQ4ProjBatch))
+	core.AssertEqual(t, 12, countLaunchName(launches, hipKernelNameRMSNormHeads))
+	core.AssertEqual(t, 4, countLaunchName(launches, hipKernelNameRMSNormRoPEHeadsBatch))
+	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameKVEncodeToken))
+	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameAttentionHeadsBatchCausal))
+	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameMLXQ4GELUTanhMulBatch))
+	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameMLXQ4GELUTanhProjBatch))
+	core.AssertEqual(t, 6, countLaunchName(launches, hipKernelNameVectorAdd))
+	core.AssertEqual(t, 0, countLaunchName(launches, hipKernelNameRMSNorm))
+	core.AssertEqual(t, 0, countLaunchName(launches, hipKernelNameMLXQ4ProjGreedy))
+}
+
+func TestHIPGemma4Q4PrefillForwardBatchWithPrior_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup0()
+	layer1, cleanup1 := hipGemma4Q4FixtureConfig(t, driver, 1, 4, 2, 8)
+	defer cleanup1()
+	embeddingWeightsPayload, err := hipUint32Payload(make([]uint32, layer0.VocabSize*(layer0.HiddenSize/layer0.GroupSize)))
+	core.RequireNoError(t, err)
+	embeddingWeights, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill forward prior nonzero embedding weights", embeddingWeightsPayload, layer0.VocabSize*(layer0.HiddenSize/layer0.GroupSize))
+	core.RequireNoError(t, err)
+	defer embeddingWeights.Close()
+	embeddingScalesPayload, err := hipUint16Payload([]uint16{0x3f80, 0x3f80})
+	core.RequireNoError(t, err)
+	embeddingScales, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill forward prior nonzero embedding scales", embeddingScalesPayload, layer0.VocabSize*(layer0.HiddenSize/layer0.GroupSize))
+	core.RequireNoError(t, err)
+	defer embeddingScales.Close()
+	embeddingBiasesPayload, err := hipUint16Payload([]uint16{0x3f80, 0x3f80})
+	core.RequireNoError(t, err)
+	embeddingBiases, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill forward prior nonzero embedding biases", embeddingBiasesPayload, layer0.VocabSize*(layer0.HiddenSize/layer0.GroupSize))
+	core.RequireNoError(t, err)
+	defer embeddingBiases.Close()
+	layer0.Embedding = hipDeviceEmbeddingLookupConfig{
+		EmbeddingPointer: embeddingWeights.Pointer(),
+		EmbeddingBytes:   embeddingWeights.SizeBytes(),
+		TableEncoding:    hipEmbeddingTableEncodingMLXQ4,
+		VocabSize:        layer0.VocabSize,
+		HiddenSize:       layer0.HiddenSize,
+		GroupSize:        layer0.GroupSize,
+		ScalePointer:     embeddingScales.Pointer(),
+		BiasPointer:      embeddingBiases.Pointer(),
+		ScaleBytes:       embeddingScales.SizeBytes(),
+		BiasBytes:        embeddingBiases.SizeBytes(),
+	}
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0, layer1}}
+	tokens := []int32{0, 1}
+	makePerLayerInputs := func(label string) []*hipDeviceByteBuffer {
+		t.Helper()
+		perLayerInputs := make([]*hipDeviceByteBuffer, len(cfg.Layers))
+		for layerIndex, layer := range cfg.Layers {
+			values := make([]float32, len(tokens)*layer.PerLayerInput.InputSize)
+			for index := range values {
+				values[index] = float32(layerIndex + 1)
+			}
+			payload, err := hipFloat32Payload(values)
+			core.RequireNoError(t, err)
+			buffer, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, label, payload, len(values))
+			core.RequireNoError(t, err)
+			buf := buffer
+			t.Cleanup(func() {
+				_ = buf.Close()
+			})
+			perLayerInputs[layerIndex] = buffer
+		}
+		return perLayerInputs
+	}
+
+	first, err := hipRunGemma4Q4PrefillForwardBatch(context.Background(), driver, cfg, tokens, 0, 1e-6, rocmKVCacheModeKQ8VQ4, makePerLayerInputs("prefill forward prior first per-layer input"), nil, nil)
+	core.RequireNoError(t, err)
+	defer first.Close()
+	prior := []*rocmDeviceKVCache{
+		first.Layers[0].KV.DeviceKV.Cache,
+		first.Layers[1].KV.DeviceKV.Cache,
+	}
+
+	start := len(driver.launches)
+	second, err := hipRunGemma4Q4PrefillForwardBatchWithPrior(context.Background(), driver, cfg, tokens, len(tokens), 1e-6, rocmKVCacheModeKQ8VQ4, prior, makePerLayerInputs("prefill forward prior second per-layer input"), nil, nil)
+	core.RequireNoError(t, err)
+	defer second.Close()
+
+	core.AssertEqual(t, 2, len(second.Layers))
+	for index := range second.Layers {
+		core.AssertEqual(t, len(tokens)*2, second.Layers[index].KV.DeviceKV.Cache.TokenCount())
+	}
+
+	launches := driver.launches[start:]
+	var attentionLaunches []hipKernelLaunchConfig
+	for _, launch := range launches {
+		if launch.Name == hipKernelNameAttentionHeadsBatchCausal {
+			attentionLaunches = append(attentionLaunches, launch)
+		}
+	}
+	core.AssertEqual(t, 2, len(attentionLaunches))
+	for _, launch := range attentionLaunches {
+		core.AssertEqual(t, uint32(len(tokens)*2), binary.LittleEndian.Uint32(launch.Args[52:]))
+		core.AssertEqual(t, uint32(len(tokens)), binary.LittleEndian.Uint32(launch.Args[60:]))
+		core.AssertEqual(t, uint32(len(tokens)), binary.LittleEndian.Uint32(launch.Args[64:]))
+	}
+	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameKVEncodeToken))
+}
+
+func TestHIPGemma4Q4PrefillForwardBatchWithGeneratedPerLayerInput_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup0()
+	layer1, cleanup1 := hipGemma4Q4FixtureConfig(t, driver, 1, 4, 2, 8)
+	defer cleanup1()
+	embeddingWeightsPayload, err := hipUint32Payload(make([]uint32, layer0.VocabSize*(layer0.HiddenSize/layer0.GroupSize)))
+	core.RequireNoError(t, err)
+	embeddingWeights, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill generated input nonzero embedding weights", embeddingWeightsPayload, layer0.VocabSize*(layer0.HiddenSize/layer0.GroupSize))
+	core.RequireNoError(t, err)
+	defer embeddingWeights.Close()
+	embeddingScalesPayload, err := hipUint16Payload([]uint16{0x3f80, 0x3f80})
+	core.RequireNoError(t, err)
+	embeddingScales, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill generated input nonzero embedding scales", embeddingScalesPayload, layer0.VocabSize*(layer0.HiddenSize/layer0.GroupSize))
+	core.RequireNoError(t, err)
+	defer embeddingScales.Close()
+	embeddingBiasesPayload, err := hipUint16Payload([]uint16{0x3f80, 0x3f80})
+	core.RequireNoError(t, err)
+	embeddingBiases, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill generated input nonzero embedding biases", embeddingBiasesPayload, layer0.VocabSize*(layer0.HiddenSize/layer0.GroupSize))
+	core.RequireNoError(t, err)
+	defer embeddingBiases.Close()
+	layer0.Embedding = hipDeviceEmbeddingLookupConfig{
+		EmbeddingPointer: embeddingWeights.Pointer(),
+		EmbeddingBytes:   embeddingWeights.SizeBytes(),
+		TableEncoding:    hipEmbeddingTableEncodingMLXQ4,
+		VocabSize:        layer0.VocabSize,
+		HiddenSize:       layer0.HiddenSize,
+		GroupSize:        layer0.GroupSize,
+		ScalePointer:     embeddingScales.Pointer(),
+		BiasPointer:      embeddingBiases.Pointer(),
+		ScaleBytes:       embeddingScales.SizeBytes(),
+		BiasBytes:        embeddingBiases.SizeBytes(),
+	}
+
+	layerCount := 2
+	inputSize := layer0.PerLayerInput.InputSize
+	globalRows := layerCount * inputSize
+	globalWeightsPayload, err := hipUint32Payload(make([]uint32, layer0.VocabSize*(globalRows/layer0.GroupSize)))
+	core.RequireNoError(t, err)
+	globalWeights, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill generated per-layer embedding weights", globalWeightsPayload, layer0.VocabSize*(globalRows/layer0.GroupSize))
+	core.RequireNoError(t, err)
+	defer globalWeights.Close()
+	globalScalesPayload, err := hipUint16Payload([]uint16{0x3f80, 0x3f80, 0x3f80, 0x3f80})
+	core.RequireNoError(t, err)
+	globalScales, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill generated per-layer embedding scales", globalScalesPayload, layer0.VocabSize*(globalRows/layer0.GroupSize))
+	core.RequireNoError(t, err)
+	defer globalScales.Close()
+	globalBiasesPayload, err := hipUint16Payload([]uint16{0x3f80, 0x3f80, 0x3f80, 0x3f80})
+	core.RequireNoError(t, err)
+	globalBiases, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill generated per-layer embedding biases", globalBiasesPayload, layer0.VocabSize*(globalRows/layer0.GroupSize))
+	core.RequireNoError(t, err)
+	defer globalBiases.Close()
+	modelProjectionPayload, err := hipUint16Payload(repeatUint16(0x3f80, globalRows*layer0.HiddenSize))
+	core.RequireNoError(t, err)
+	modelProjection, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill generated model projection", modelProjectionPayload, globalRows*layer0.HiddenSize)
+	core.RequireNoError(t, err)
+	defer modelProjection.Close()
+	projectionNormPayload, err := hipUint16Payload(repeatUint16(0x3f80, inputSize))
+	core.RequireNoError(t, err)
+	projectionNorm, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill generated projection norm", projectionNormPayload, inputSize)
+	core.RequireNoError(t, err)
+	defer projectionNorm.Close()
+	layer0.PerLayerInput.Embedding = hipDeviceEmbeddingLookupConfig{
+		EmbeddingPointer: globalWeights.Pointer(),
+		EmbeddingBytes:   globalWeights.SizeBytes(),
+		TableEncoding:    hipEmbeddingTableEncodingMLXQ4,
+		VocabSize:        layer0.VocabSize,
+		HiddenSize:       globalRows,
+		GroupSize:        layer0.GroupSize,
+		ScalePointer:     globalScales.Pointer(),
+		BiasPointer:      globalBiases.Pointer(),
+		ScaleBytes:       globalScales.SizeBytes(),
+		BiasBytes:        globalBiases.SizeBytes(),
+	}
+	layer0.PerLayerInput.ModelProjection = hipBF16DeviceWeightConfig{
+		WeightPointer: modelProjection.Pointer(),
+		WeightBytes:   modelProjection.SizeBytes(),
+		Rows:          globalRows,
+		Cols:          layer0.HiddenSize,
+	}
+	layer0.PerLayerInput.ProjectionNorm = hipRMSNormDeviceWeightConfig{
+		WeightPointer:  projectionNorm.Pointer(),
+		WeightBytes:    projectionNorm.SizeBytes(),
+		Count:          inputSize,
+		WeightEncoding: hipRMSNormWeightEncodingBF16,
+	}
+
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0, layer1}}
+	tokens := []int32{0, 1}
+	start := len(driver.launches)
+	forward, err := hipRunGemma4Q4PrefillForwardBatch(context.Background(), driver, cfg, tokens, 0, 1e-6, rocmKVCacheModeKQ8VQ4, nil, nil, nil)
+	core.RequireNoError(t, err)
+	defer forward.Close()
+
+	core.AssertEqual(t, len(tokens)*layer0.HiddenSize, forward.FinalHidden.Count())
+	launches := driver.launches[start:]
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameProjectionBatch))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNamePerLayerInputTranspose))
+	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameMLXQ4GELUTanhProjBatch))
+}
+
+func TestHIPGemma4Q4PrefillLayerBodyBatch_Bad(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup()
+
+	inputValues := make([]float32, cfg.HiddenSize)
+	payload, err := hipFloat32Payload(inputValues)
+	core.RequireNoError(t, err)
+	input, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill layer body bad input fixture", payload, len(inputValues))
+	core.RequireNoError(t, err)
+	defer input.Close()
+	start := len(driver.launches)
+
+	if _, err := hipRunGemma4Q4PrefillLayerBodyBatch(context.Background(), driver, cfg, input, nil, 0, 0, 1e-6); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillLayerBodyBatch succeeded with zero token count")
+	}
+	if _, err := hipRunGemma4Q4PrefillLayerBodyBatch(context.Background(), driver, cfg, input, nil, 1, -1, 1e-6); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillLayerBodyBatch succeeded with negative query start")
+	}
+	if _, err := hipRunGemma4Q4PrefillLayerBodyBatch(context.Background(), driver, cfg, input, nil, 2, 0, 1e-6); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillLayerBodyBatch succeeded with mismatched input shape")
+	}
+	if _, err := hipRunGemma4Q4PrefillLayerBodyBatch(context.Background(), driver, cfg, input, nil, 1, 0, 1e-6); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillLayerBodyBatch succeeded with missing layer")
+	}
+	badPerLayerPayload, err := hipFloat32Payload([]float32{1})
+	core.RequireNoError(t, err)
+	badPerLayer, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill layer body bad per-layer input fixture", badPerLayerPayload, 1)
+	core.RequireNoError(t, err)
+	defer badPerLayer.Close()
+	if _, err := hipRunGemma4Q4PrefillLayerBodyBatchWithPerLayerInput(context.Background(), driver, cfg, input, nil, badPerLayer, 1, 0, 1e-6); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillLayerBodyBatchWithPerLayerInput succeeded with mismatched per-layer input")
+	}
+	if _, err := hipRunGemma4Q4PrefillFinalGreedyForRow(context.Background(), driver, cfg, input, 1, 1, 1e-6, nil); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillFinalGreedyForRow succeeded with row outside token batch")
+	}
+	if _, err := hipRunGemma4Q4PrefillFinalGreedyForRow(context.Background(), driver, cfg, input, 2, 0, 1e-6, nil); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillFinalGreedyForRow succeeded with mismatched hidden batch shape")
+	}
+	forwardCfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{cfg}}
+	if _, err := hipRunGemma4Q4PrefillForwardBatch(context.Background(), driver, forwardCfg, []int32{0}, 1, 1e-6, rocmKVCacheModeKQ8VQ4, nil, nil, nil); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillForwardBatch succeeded with nonzero start position")
+	}
+	prior := &rocmDeviceKVCache{driver: driver, mode: rocmKVCacheModeKQ8VQ4, blockSize: defaultROCmKVBlockSize, tokenCount: 2}
+	if _, err := hipRunGemma4Q4PrefillForwardBatchWithPrior(context.Background(), driver, forwardCfg, []int32{0}, 0, 1e-6, rocmKVCacheModeKQ8VQ4, []*rocmDeviceKVCache{prior}, nil, nil, nil); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillForwardBatchWithPrior succeeded with prior at start position 0")
+	}
+	if _, err := hipRunGemma4Q4PrefillForwardBatchWithPrior(context.Background(), driver, forwardCfg, []int32{0}, 1, 1e-6, rocmKVCacheModeKQ8VQ4, []*rocmDeviceKVCache{prior}, nil, nil, nil); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillForwardBatchWithPrior succeeded with mismatched prior token count")
+	}
+	if _, err := hipRunGemma4Q4PrefillForwardBatch(context.Background(), driver, forwardCfg, []int32{0}, 0, 1e-6, rocmKVCacheModeKQ8VQ4, nil, nil, nil); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillForwardBatch succeeded without required per-layer inputs")
+	}
+	if _, err := hipRunGemma4Q4PrefillForwardBatch(context.Background(), driver, forwardCfg, []int32{0}, 0, 1e-6, rocmKVCacheModeKQ8VQ4, []*hipDeviceByteBuffer{badPerLayer}, []bool{true, false}, nil); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillForwardBatch succeeded with mismatched output mask")
+	}
+	core.AssertEqual(t, start, len(driver.launches))
+}
+
+func TestHIPGemma4Q4PrefillLayerKVBatch_Bad(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup()
+
+	inputValues := make([]float32, cfg.HiddenSize)
+	payload, err := hipFloat32Payload(inputValues)
+	core.RequireNoError(t, err)
+	input, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill layer KV bad input fixture", payload, len(inputValues))
+	core.RequireNoError(t, err)
+	defer input.Close()
+	start := len(driver.launches)
+
+	if _, err := hipRunGemma4Q4PrefillLayerKVBatch(context.Background(), driver, cfg, input, 0, 0, 1e-6, rocmKVCacheModeKQ8VQ4); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillLayerKVBatch succeeded with zero token count")
+	}
+	if _, err := hipRunGemma4Q4PrefillLayerKVBatch(context.Background(), driver, cfg, input, 2, 0, 1e-6, rocmKVCacheModeKQ8VQ4); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillLayerKVBatch succeeded with mismatched input shape")
+	}
+	if _, err := hipRunGemma4Q4PrefillLayerKVBatch(context.Background(), driver, cfg, input, 1, -1, 1e-6, rocmKVCacheModeKQ8VQ4); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillLayerKVBatch succeeded with negative start position")
+	}
+	prior := &rocmDeviceKVCache{driver: driver, mode: rocmKVCacheModeKQ8VQ4, blockSize: defaultROCmKVBlockSize, tokenCount: 2}
+	if _, err := hipRunGemma4Q4PrefillLayerKVBatchWithPrior(context.Background(), driver, cfg, input, prior, 1, 1, 1e-6, rocmKVCacheModeKQ8VQ4); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillLayerKVBatchWithPrior succeeded with mismatched prior token count")
+	}
+	core.AssertEqual(t, start, len(driver.launches))
+}
+
+func TestHIPGemma4Q4PrefillMLPBatch_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4Layer0FixtureConfig(t, driver)
+	defer cleanup()
+
+	tokenCount := 2
+	inputValues := make([]float32, tokenCount*cfg.HiddenSize)
+	for index := range inputValues {
+		inputValues[index] = float32(index%cfg.HiddenSize + 1)
+	}
+	payload, err := hipFloat32Payload(inputValues)
+	core.RequireNoError(t, err)
+	input, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill MLP fixture", payload, len(inputValues))
+	core.RequireNoError(t, err)
+	defer input.Close()
+
+	start := len(driver.launches)
+	output, err := hipRunGemma4Q4PrefillMLPBatch(context.Background(), driver, cfg, input, tokenCount)
+	core.RequireNoError(t, err)
+	defer output.Close()
+
+	core.AssertEqual(t, tokenCount*cfg.DownProjection.Rows, output.Count())
+	launches := driver.launches[start:]
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameMLXQ4GELUTanhMulBatch))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameMLXQ4ProjBatch))
+	for _, launch := range launches {
+		core.AssertEqual(t, uint32((tokenCount+hipMLXQ4ProjectionBatchTokensPerBlock-1)/hipMLXQ4ProjectionBatchTokensPerBlock), launch.GridY)
+	}
+}
+
+func TestHIPGemma4Q4PrefillMLPBatch_Bad(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4Layer0FixtureConfig(t, driver)
+	defer cleanup()
+
+	inputValues := make([]float32, cfg.HiddenSize)
+	for index := range inputValues {
+		inputValues[index] = float32(index + 1)
+	}
+	payload, err := hipFloat32Payload(inputValues)
+	core.RequireNoError(t, err)
+	input, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill MLP bad fixture", payload, len(inputValues))
+	core.RequireNoError(t, err)
+	defer input.Close()
+	start := len(driver.launches)
+
+	if _, err := hipRunGemma4Q4PrefillMLPBatch(context.Background(), driver, cfg, input, 0); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillMLPBatch succeeded with zero token count")
+	}
+	if _, err := hipRunGemma4Q4PrefillMLPBatch(context.Background(), driver, cfg, input, 2); err == nil {
+		t.Fatalf("hipRunGemma4Q4PrefillMLPBatch succeeded with mismatched token count")
+	}
+	core.AssertEqual(t, start, len(driver.launches))
+}
+
+func TestHIPGemma4Q4GenerateTokenSeq_BadPrefillUBatchEnv(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4Layer0FixtureConfig(t, driver)
+	defer cleanup()
+
+	t.Setenv(hipGemma4Q4PrefillUBatchEnv, "nope")
+	stream, streamErr := hipGemma4Q4GenerateTokenSeq(context.Background(), &hipLoadedModel{driver: driver}, hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{cfg}}, []int32{1}, inference.GenerateConfig{MaxTokens: 1})
+	for range stream {
+		t.Fatalf("hipGemma4Q4GenerateTokenSeq yielded token, want prefill ubatch env error")
+	}
+	err := streamErr()
+	if err == nil {
+		t.Fatalf("hipGemma4Q4GenerateTokenSeq succeeded, want prefill ubatch env error")
+	}
+	core.AssertContains(t, err.Error(), hipGemma4Q4PrefillUBatchEnv)
+	core.AssertEqual(t, 0, len(driver.launches))
 }
 
 func TestHIPGemma4Q4PerLayerInputPrecompute_Good(t *testing.T) {
@@ -517,13 +1690,102 @@ func TestHIPGemma4Q4SharedKV_Good(t *testing.T) {
 	core.AssertEqual(t, layer0.HeadDim, len(forward.LayerResults[2].UpdatedKeys))
 	core.AssertEqual(t, layer1.HeadDim, len(forward.LayerResults[3].UpdatedKeys))
 
-	q4Launches := 0
+	q4Ops := 0
+	tripleQ4Launches := 0
 	for _, launch := range driver.launches[start:] {
-		if launch.Name == hipKernelNameMLXQ4Proj {
-			q4Launches++
+		switch launch.Name {
+		case hipKernelNameMLXQ4Proj:
+			q4Ops++
+		case hipKernelNameMLXQ4TripleProj:
+			q4Ops += 3
+			tripleQ4Launches++
 		}
 	}
-	core.AssertEqual(t, 25, q4Launches)
+	core.AssertEqual(t, 17, q4Ops)
+	core.AssertEqual(t, 2, tripleQ4Launches)
+}
+
+func TestHIPGemma4Q4SharedDeviceKV_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 8, 1, 8)
+	defer cleanup0()
+	layer1, cleanup1 := hipGemma4Q4FixtureConfig(t, driver, 1, 4, 2, 8)
+	defer cleanup1()
+	layer2, cleanup2 := hipGemma4Q4FixtureConfig(t, driver, 2, 8, 1, 8)
+	defer cleanup2()
+	layer3, cleanup3 := hipGemma4Q4FixtureConfig(t, driver, 3, 4, 2, 8)
+	defer cleanup3()
+	layer0.LayerType = "sliding_attention"
+	layer0.SlidingWindow = 1
+	layer1.LayerType = "full_attention"
+	layer1.SlidingWindow = 0
+	layer2.LayerType = "sliding_attention"
+	layer2.SlidingWindow = 1
+	layer3.LayerType = "full_attention"
+	layer3.SlidingWindow = 0
+	cfg := hipGemma4Q4ForwardConfig{
+		Layers:         []hipGemma4Q4Layer0Config{layer0, layer1, layer2, layer3},
+		KVSharedLayers: 2,
+	}
+
+	launchStart := len(driver.launches)
+	first, firstState, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(context.Background(), driver, cfg, hipGemma4Q4DecodeState{}, hipGemma4Q4ForwardRequest{
+		TokenID:           1,
+		Position:          0,
+		Epsilon:           1e-6,
+		DeviceKVAttention: true,
+		DeviceKVMode:      rocmKVCacheModeKQ8VQ4,
+		ReturnDeviceState: true,
+		DeviceFinalSample: true,
+		OmitDebugTensors:  true,
+	}, false)
+	core.RequireNoError(t, err)
+	if first.DeviceState == nil {
+		t.Fatal("first forward device state is nil")
+	}
+	core.AssertEqual(t, []int{1, 1, 1, 1}, first.DeviceState.LayerTokenCounts())
+	core.AssertEqual(t, "0", first.Labels["attention_kv_remirror_layers"])
+	core.AssertEqual(t, "2", first.Labels["attention_kv_shared_device_layers"])
+	core.AssertEqual(t, "2", first.Labels["gemma4_q4_device_kv_shared_layers"])
+	core.AssertEqual(t, 2, countKVEncodeTokenLaunches(driver.launches[launchStart:]))
+	for index, layer := range firstState.Layers {
+		if len(layer.Keys) != 0 || len(layer.Values) != 0 {
+			t.Fatalf("first host state layer %d retained host KV in device-only generation path", index)
+		}
+	}
+
+	priorDeviceState := first.DeviceState
+	first.DeviceState = nil
+	second, secondState, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(context.Background(), driver, cfg, firstState, hipGemma4Q4ForwardRequest{
+		TokenID:           int32(first.Greedy.TokenID),
+		Position:          1,
+		Epsilon:           1e-6,
+		DeviceKVAttention: true,
+		DeviceKVMode:      rocmKVCacheModeKQ8VQ4,
+		PriorDeviceState:  priorDeviceState,
+		ReturnDeviceState: true,
+		DeviceFinalSample: true,
+		OmitDebugTensors:  true,
+	}, false)
+	if err != nil {
+		_ = priorDeviceState.Close()
+	}
+	core.RequireNoError(t, err)
+	defer second.DeviceState.Close()
+	core.AssertEqual(t, true, priorDeviceState.closed)
+	core.AssertEqual(t, []int{1, 2, 1, 2}, second.DeviceState.LayerTokenCounts())
+	core.AssertEqual(t, "2", second.Labels["attention_kv_append_layers"])
+	core.AssertEqual(t, "0", second.Labels["attention_kv_remirror_layers"])
+	core.AssertEqual(t, "2", second.Labels["attention_kv_shared_device_layers"])
+	core.AssertEqual(t, "2", second.Labels["gemma4_q4_device_kv_shared_layers"])
+	for index, layer := range secondState.Layers {
+		if len(layer.Keys) != 0 || len(layer.Values) != 0 {
+			t.Fatalf("second host state layer %d retained host KV in device-only generation path", index)
+		}
+	}
+	if countDeviceAttentionLaunches(driver.launches[launchStart:]) == 0 {
+		t.Fatalf("Gemma4 q4 shared-device forward launched no descriptor-backed attention kernels")
+	}
 }
 
 func TestHIPGemma4Q4PackagePrefillDecode_Good(t *testing.T) {
@@ -659,6 +1921,50 @@ func assertFloat32SlicesNearRelative(t *testing.T, want, got []float32, absolute
 	}
 }
 
+func TestHIPGemma4Q4SkipFinalSample_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 8, 1, 8)
+	defer cleanup0()
+	layer1, cleanup1 := hipGemma4Q4FixtureConfig(t, driver, 1, 4, 2, 8)
+	defer cleanup1()
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0, layer1}}
+
+	launchStart := len(driver.launches)
+	forward, state, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(context.Background(), driver, cfg, hipGemma4Q4DecodeState{}, hipGemma4Q4ForwardRequest{
+		TokenID:           1,
+		Position:          0,
+		Epsilon:           1e-6,
+		DeviceKVAttention: true,
+		DeviceKVMode:      rocmKVCacheModeKQ8VQ4,
+		ReturnDeviceState: true,
+		SkipFinalSample:   true,
+		OmitDebugTensors:  true,
+	}, false)
+	core.RequireNoError(t, err)
+	defer forward.DeviceState.Close()
+
+	core.AssertEqual(t, 0, len(forward.Logits))
+	core.AssertEqual(t, 0, forward.Greedy.TokenID)
+	assertFloat32Near(t, 0, forward.Greedy.Score)
+	core.AssertEqual(t, "skipped", forward.Labels["gemma4_q4_final_sample"])
+	core.AssertEqual(t, []int{1, 1}, forward.DeviceState.LayerTokenCounts())
+	for index, layer := range state.Layers {
+		if len(layer.Keys) != 0 || len(layer.Values) != 0 {
+			t.Fatalf("skip-final forward host state layer %d retained host KV in device-only path", index)
+		}
+	}
+	launches := driver.launches[launchStart:]
+	if countLaunchName(launches, hipKernelNameMLXQ4ProjGreedy) != 0 {
+		t.Fatalf("skip-final forward launched fused LM-head greedy projection")
+	}
+	if countLaunchName(launches, hipKernelNameGreedy) != 0 {
+		t.Fatalf("skip-final forward launched host greedy sampling")
+	}
+	if countLaunchName(launches, hipKernelNameMLXQ4Proj) == 0 {
+		t.Fatalf("skip-final forward did not run decoder q4 projections")
+	}
+}
+
 func countDeviceAttentionLaunches(launches []hipKernelLaunchConfig) int {
 	var count int
 	for _, launch := range launches {
@@ -667,8 +1973,66 @@ func countDeviceAttentionLaunches(launches []hipKernelLaunchConfig) int {
 			binary.LittleEndian.Uint32(launch.Args[76:]) == hipAttentionKVSourceDevice {
 			count++
 		}
+		if launch.Name == hipKernelNameAttentionHeads &&
+			len(launch.Args) >= hipAttentionHeadsLaunchArgsBytes &&
+			binary.LittleEndian.Uint32(launch.Args[80:]) == hipAttentionKVSourceDevice {
+			count++
+		}
 	}
 	return count
+}
+
+func countLaunchName(launches []hipKernelLaunchConfig, name string) int {
+	var count int
+	for _, launch := range launches {
+		if launch.Name == name {
+			count++
+		}
+	}
+	return count
+}
+
+func countKVEncodeTokenLaunches(launches []hipKernelLaunchConfig) int {
+	var count int
+	for _, launch := range launches {
+		if launch.Name == hipKernelNameKVEncodeToken {
+			count++
+		}
+	}
+	return count
+}
+
+func repeatUint16(value uint16, count int) []uint16 {
+	values := make([]uint16, count)
+	for index := range values {
+		values[index] = value
+	}
+	return values
+}
+
+func TestHIPAttentionHeadsBlockSize_Good(t *testing.T) {
+	core.AssertEqual(t, uint32(256), hipAttentionHeadsBlockSize(1))
+	core.AssertEqual(t, uint32(256), hipAttentionHeadsBlockSize(15))
+	core.AssertEqual(t, uint32(512), hipAttentionHeadsBlockSize(16))
+	core.AssertEqual(t, uint32(512), hipAttentionHeadsBlockSize(511))
+	core.AssertEqual(t, uint32(512), hipAttentionHeadsBlockSize(512))
+	core.AssertEqual(t, uint32(512), hipAttentionHeadsBlockSize(1023))
+	core.AssertEqual(t, uint32(512), hipAttentionHeadsBlockSize(1024))
+	core.AssertEqual(t, uint32(512), hipAttentionHeadsBlockSize(2000))
+}
+
+func TestHIPAttentionHeadsSharedMemBytes_Good(t *testing.T) {
+	plain, err := hipAttentionHeadsSharedMemBytes(2000, false)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, uint32(8000), plain)
+
+	shortDevice, err := hipAttentionHeadsSharedMemBytes(511, true)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, uint32(8180), shortDevice)
+
+	longDevice, err := hipAttentionHeadsSharedMemBytes(2000, true)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, uint32(32000), longDevice)
 }
 
 func assertGemma4Q4DeviceStateMatchesQuantizedHost(t *testing.T, cfg hipGemma4Q4ForwardConfig, hostState, restoredState hipGemma4Q4DecodeState, deviceState *hipGemma4Q4DeviceDecodeState, mode string) {

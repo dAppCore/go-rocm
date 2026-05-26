@@ -8,6 +8,7 @@ use (
 	.
 	./go
 	./external/go
+	./external/go-cgo/go
 	./external/go-inference/go
 	./external/go-log/go
 )

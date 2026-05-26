@@ -34,6 +34,14 @@ func TestCoverage_NativeFallbackHelpers_Good(t *testing.T) {
 		{Role: "user", Content: "hello"},
 		{Role: "assistant", Content: "ok"},
 	}))
+	core.AssertEqual(t, "<bos><|turn>user\nhello<turn|>\n<|turn>model\n", formatGemma4ChatTemplate([]inference.Message{
+		{Role: "user", Content: " hello "},
+	}))
+	core.AssertEqual(t, "<bos><|turn>system\nbe concise<turn|>\n<|turn>user\nhello<turn|>\n<|turn>model\n", formatGemma4ChatTemplate([]inference.Message{
+		{Role: "developer", Content: " be concise "},
+		{Role: "user", Content: "hello"},
+	}))
+	core.AssertEqual(t, "visible", stripGemma4ThinkingChannels("visible<|channel>hidden<channel|>"))
 
 	core.AssertEqual(t, "text", sampleText(inference.DatasetSample{Text: "text", Reasoning: "reason"}))
 	core.AssertEqual(t, "prompt response", sampleText(inference.DatasetSample{Prompt: "prompt", Response: "response"}))

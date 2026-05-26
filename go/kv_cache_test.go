@@ -5,6 +5,8 @@
 package rocm
 
 import (
+	"bytes"
+	"context"
 	"encoding/binary"
 	"math"
 	"testing"
@@ -283,6 +285,39 @@ func TestKVCache_Good_MirrorsPagesToHIPDevice(t *testing.T) {
 	core.AssertEqual(t, 3, len(driver.frees))
 }
 
+func TestKVCache_Good_DeviceBorrowedAliasDoesNotOwnSourcePages(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 2)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(
+		0,
+		2,
+		3,
+		[]float32{1, 0.5, -1, 0},
+		[]float32{0.75, -0.5, 0.25, 1, -1, 0.5},
+	))
+	driver := &fakeHIPDriver{available: true}
+	device, err := cache.MirrorToDevice(driver)
+	core.RequireNoError(t, err)
+	defer device.Close()
+
+	alias, err := device.borrowedAlias()
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, true, alias.borrowed)
+	core.AssertEqual(t, device.PageCount(), alias.PageCount())
+	core.AssertEqual(t, device.TokenCount(), alias.TokenCount())
+	core.AssertEqual(t, device.pages[0].key.pointer, alias.pages[0].key.pointer)
+	core.AssertEqual(t, device.pages[0].value.pointer, alias.pages[0].value.pointer)
+	core.AssertEqual(t, false, alias.ownsAnyPages())
+	core.AssertEqual(t, true, alias.borrowsPagesFrom(device))
+
+	core.RequireNoError(t, alias.Close())
+	core.AssertEqual(t, 0, len(driver.frees))
+	_, err = device.KernelDescriptor()
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, device.Close())
+	core.AssertEqual(t, 2, len(driver.frees))
+}
+
 func TestKVCache_Good_DeviceMirrorSnapshotsFromHIPMemory(t *testing.T) {
 	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 2)
 	core.RequireNoError(t, err)
@@ -345,6 +380,215 @@ func TestKVCache_Good_DeviceMirrorAppendsDecodeTokenIncrementally(t *testing.T) 
 	core.RequireNoError(t, next.Close())
 	core.AssertEqual(t, 1, sourcePageCount)
 	core.AssertEqual(t, 5, len(driver.frees))
+}
+
+func TestKVCache_Good_KVEncodeTokenKernelEncodesDeviceToken(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	keyInput, err := hipUploadByteBuffer(driver, "rocm.KVCache.Test", "key token", mustHIPFloat32Payload(t, []float32{1, -0.5, 0.25}), 3)
+	core.RequireNoError(t, err)
+	defer keyInput.Close()
+	valueInput, err := hipUploadByteBuffer(driver, "rocm.KVCache.Test", "value token", mustHIPFloat32Payload(t, []float32{0.75, -0.75, 0.25}), 3)
+	core.RequireNoError(t, err)
+	defer valueInput.Close()
+
+	key, value, err := hipRunKVEncodeTokenKernel(context.Background(), driver, keyInput, valueInput, rocmKVCacheModeKQ8VQ4)
+	core.RequireNoError(t, err)
+	defer driver.Free(key.pointer)
+	defer driver.Free(value.pointer)
+
+	core.AssertEqual(t, rocmKVEncodingQ8, key.encoding)
+	core.AssertEqual(t, rocmKVEncodingQ4, value.encoding)
+	core.AssertEqual(t, uint64(7), key.sizeBytes)
+	core.AssertEqual(t, uint64(6), value.sizeBytes)
+	keyDecoded, err := copyROCmDeviceKVTensorToHost(driver, key, 3)
+	core.RequireNoError(t, err)
+	valueDecoded, err := copyROCmDeviceKVTensorToHost(driver, value, 3)
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{1, -0.5, 0.25}, keyDecoded.decode(), 0.01)
+	assertFloat32SlicesNear(t, []float32{0.75, -0.75, 0.25}, valueDecoded.decode(), 0.12)
+	core.AssertEqual(t, hipKernelNameKVEncodeToken, driver.launches[len(driver.launches)-1].Name)
+}
+
+func TestKVCache_Good_DeviceMirrorAppendsDeviceRowsWindow(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	keyRows := []float32{
+		1, 0,
+		0, 1,
+		-1, 1,
+	}
+	valueRows := []float32{
+		2, 0,
+		0, 2,
+		3, -3,
+	}
+	keyInput, err := hipUploadByteBuffer(driver, "rocm.KVCache.Test", "key rows", mustHIPFloat32Payload(t, keyRows), len(keyRows))
+	core.RequireNoError(t, err)
+	defer keyInput.Close()
+	valueInput, err := hipUploadByteBuffer(driver, "rocm.KVCache.Test", "value rows", mustHIPFloat32Payload(t, valueRows), len(valueRows))
+	core.RequireNoError(t, err)
+	defer valueInput.Close()
+
+	cache := &rocmDeviceKVCache{driver: driver, mode: rocmKVCacheModeKQ8VQ4, blockSize: 2}
+	next, err := cache.withAppendedDeviceRowsWindow(context.Background(), keyInput, valueInput, 2, 2, 3, 0)
+	core.RequireNoError(t, err)
+	defer next.Close()
+
+	core.AssertEqual(t, 3, next.TokenCount())
+	core.AssertEqual(t, 2, next.PageCount())
+	core.AssertEqual(t, 2, next.pages[0].tokenCount)
+	core.AssertEqual(t, 1, next.pages[1].tokenCount)
+	core.AssertEqual(t, 0, next.pages[0].tokenStart)
+	core.AssertEqual(t, 2, next.pages[1].tokenStart)
+	core.AssertEqual(t, 2, countLaunchName(driver.launches, hipKernelNameKVEncodeToken))
+
+	payload, err := next.Snapshot()
+	core.RequireNoError(t, err)
+	restored, err := newROCmKVCacheFromSnapshot(payload)
+	core.RequireNoError(t, err)
+	keys, values, err := restored.Restore(0, 3)
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, keyRows, keys, 0.02)
+	assertFloat32SlicesNear(t, valueRows, values, 0.20)
+
+	descriptor, err := next.KernelDescriptor()
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 2, len(descriptor.Pages))
+	core.AssertEqual(t, 2, descriptor.Pages[0].TokenCount)
+	core.AssertEqual(t, 1, descriptor.Pages[1].TokenCount)
+}
+
+func TestKVCache_Bad_DeviceMirrorAppendsDeviceRowsWindow(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	keyInput, err := hipUploadByteBuffer(driver, "rocm.KVCache.Test", "bad key rows", mustHIPFloat32Payload(t, []float32{1, 0}), 2)
+	core.RequireNoError(t, err)
+	defer keyInput.Close()
+	valueInput, err := hipUploadByteBuffer(driver, "rocm.KVCache.Test", "bad value rows", mustHIPFloat32Payload(t, []float32{1, 0}), 2)
+	core.RequireNoError(t, err)
+	defer valueInput.Close()
+	cache := &rocmDeviceKVCache{driver: driver, mode: rocmKVCacheModeKQ8VQ4, blockSize: 2}
+
+	if _, err := cache.withAppendedDeviceRowsWindow(context.Background(), keyInput, valueInput, 2, 2, 0, 0); err == nil {
+		t.Fatalf("withAppendedDeviceRowsWindow succeeded with zero token count")
+	}
+	if _, err := cache.withAppendedDeviceRowsWindow(context.Background(), keyInput, valueInput, 2, 2, 2, 0); err == nil {
+		t.Fatalf("withAppendedDeviceRowsWindow succeeded with mismatched row shape")
+	}
+	if _, err := newROCmDeviceKVCacheFromDeviceRows(context.Background(), &fakeHIPDriver{available: false}, rocmKVCacheModeKQ8VQ4, 2, keyInput, valueInput, 2, 2, 1, 0); err == nil {
+		t.Fatalf("newROCmDeviceKVCacheFromDeviceRows succeeded with unavailable driver")
+	}
+	core.AssertEqual(t, 0, len(driver.launches))
+}
+
+func TestKVCache_Good_DeviceMirrorAppendsDeviceTokenWindow(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 1)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(0, 2, 2,
+		[]float32{1, 0, 0, 1},
+		[]float32{2, 0, 0, 2},
+	))
+	driver := &fakeHIPDriver{available: true}
+	device, err := cache.MirrorToDevice(driver)
+	core.RequireNoError(t, err)
+	keyInput, err := hipUploadByteBuffer(driver, "rocm.KVCache.Test", "key token", mustHIPFloat32Payload(t, []float32{-1, 1}), 2)
+	core.RequireNoError(t, err)
+	defer keyInput.Close()
+	valueInput, err := hipUploadByteBuffer(driver, "rocm.KVCache.Test", "value token", mustHIPFloat32Payload(t, []float32{3, -3}), 2)
+	core.RequireNoError(t, err)
+	defer valueInput.Close()
+
+	next, err := device.withAppendedDeviceTokenWindow(context.Background(), keyInput, valueInput, 2)
+	core.RequireNoError(t, err)
+
+	core.AssertEqual(t, 2, next.TokenCount())
+	core.AssertEqual(t, 2, next.PageCount())
+	core.AssertEqual(t, rocmKVEncodingQ8, next.pages[1].key.encoding)
+	core.AssertEqual(t, rocmKVEncodingQ4, next.pages[1].value.encoding)
+	payload, err := next.Snapshot()
+	core.RequireNoError(t, err)
+	restored, err := newROCmKVCacheFromSnapshot(payload)
+	core.RequireNoError(t, err)
+	keys, values, err := restored.Restore(0, 2)
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{0, 1, -1, 1}, keys, 0.01)
+	assertFloat32SlicesNear(t, []float32{0, 2, 3, -3}, values, 0.15)
+	core.RequireNoError(t, device.transferSharedPagesTo(next))
+	core.RequireNoError(t, next.Close())
+	core.AssertEqual(t, true, device.closed)
+}
+
+func TestKVCache_Good_DeviceDescriptorAppendBuildsTableOnDevice(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 1)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(0, 2, 2,
+		[]float32{1, 0, 0, 1},
+		[]float32{2, 0, 0, 2},
+	))
+	driver := &fakeHIPDriver{available: true}
+	device, err := cache.MirrorToDevice(driver)
+	core.RequireNoError(t, err)
+	previousTable, err := device.KernelDescriptorTable()
+	core.RequireNoError(t, err)
+	defer previousTable.Close()
+	keyInput, err := hipUploadByteBuffer(driver, "rocm.KVCache.Test", "key token", mustHIPFloat32Payload(t, []float32{-1, 1}), 2)
+	core.RequireNoError(t, err)
+	defer keyInput.Close()
+	valueInput, err := hipUploadByteBuffer(driver, "rocm.KVCache.Test", "value token", mustHIPFloat32Payload(t, []float32{3, -3}), 2)
+	core.RequireNoError(t, err)
+	defer valueInput.Close()
+	next, err := device.withAppendedDeviceTokenWindow(context.Background(), keyInput, valueInput, 2)
+	core.RequireNoError(t, err)
+
+	table, err := next.KernelDescriptorTableFromAppendedToken(context.Background(), device, previousTable)
+	core.RequireNoError(t, err)
+	defer table.Close()
+
+	core.RequireNoError(t, table.CompatibleWith(next))
+	got := make([]byte, table.SizeBytes())
+	core.RequireNoError(t, driver.CopyDeviceToHost(table.Pointer(), got))
+	want, err := next.KernelDescriptorBytes()
+	core.RequireNoError(t, err)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("device-built descriptor = %v, want %v", got, want)
+	}
+	core.AssertEqual(t, hipKernelNameKVDescriptorAppend, driver.launches[len(driver.launches)-1].Name)
+	core.RequireNoError(t, device.transferSharedPagesTo(next))
+	core.RequireNoError(t, next.Close())
+	core.AssertEqual(t, true, device.closed)
+}
+
+func TestKVCache_Good_DeviceMirrorWindowAppendTrimsAndTransfersPages(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeQ8, 1)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(0, 2, 2,
+		[]float32{1, 0, 0, 1},
+		[]float32{2, 0, 0, 2},
+	))
+	driver := &fakeHIPDriver{available: true}
+	device, err := cache.MirrorToDevice(driver)
+	core.RequireNoError(t, err)
+
+	next, err := device.withAppendedTokenWindow([]float32{-1, 1}, []float32{3, -3}, 2)
+	core.RequireNoError(t, err)
+	table, err := next.KernelDescriptorTable()
+	core.RequireNoError(t, err)
+	defer table.Close()
+
+	core.AssertEqual(t, 2, next.TokenCount())
+	core.AssertEqual(t, 2, next.PageCount())
+	core.AssertEqual(t, 0, next.pages[0].tokenStart)
+	core.AssertEqual(t, 1, next.pages[1].tokenStart)
+	core.RequireNoError(t, device.transferSharedPagesTo(next))
+	core.AssertEqual(t, true, device.closed)
+
+	payload, err := next.Snapshot()
+	core.RequireNoError(t, err)
+	restored, err := newROCmKVCacheFromSnapshot(payload)
+	core.RequireNoError(t, err)
+	keys, values, err := restored.Restore(0, 2)
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{0, 1, -1, 1}, keys, 0.01)
+	assertFloat32SlicesNear(t, []float32{0, 2, 3, -3}, values, 0.03)
+	core.RequireNoError(t, next.Close())
 }
 
 func TestKVCache_Bad_DeviceMirrorAppendRollbackOnDescriptorFailure(t *testing.T) {
@@ -523,6 +767,15 @@ func TestKVCache_Bad_DeviceDescriptorTableRollbackOnCopyFailure(t *testing.T) {
 	core.AssertContains(t, err.Error(), "HIP driver is nil")
 }
 
+func TestKVCache_DevicePageSliceCapacity_Good(t *testing.T) {
+	core.AssertEqual(t, 0, rocmDeviceKVPageSliceCapacity(0))
+	core.AssertEqual(t, rocmDeviceKVHotPageCapacity, rocmDeviceKVPageSliceCapacity(1))
+	core.AssertEqual(t, rocmDeviceKVHotPageCapacity, rocmDeviceKVPageSliceCapacity(rocmDeviceKVHotPageCapacity))
+	core.AssertEqual(t, rocmDeviceKVHotPageCapacity*2, rocmDeviceKVPageSliceCapacity(rocmDeviceKVHotPageCapacity+1))
+	core.AssertEqual(t, rocmDeviceKVPagePoolMaxCapacity, rocmDeviceKVPageSliceCapacity(rocmDeviceKVPagePoolMaxCapacity-1))
+	core.AssertEqual(t, rocmDeviceKVPagePoolMaxCapacity+1, rocmDeviceKVPageSliceCapacity(rocmDeviceKVPagePoolMaxCapacity+1))
+}
+
 func TestKVCache_Bad_DeviceDescriptorBytesRejectUnsupportedABIValues(t *testing.T) {
 	validPage := rocmDeviceKVPageDescriptor{
 		TokenStart:    0,
@@ -646,6 +899,78 @@ func TestKVCache_Bad_DeviceDescriptorBytesRejectUnsupportedABIValues(t *testing.
 	core.AssertContains(t, err.Error(), "key width")
 }
 
+func BenchmarkROCmKVCacheBlockFromRawPayload_KQ8VQ4Page(b *testing.B) {
+	payload := benchmarkROCmKVRawPayload(b)
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		block, err := rocmKVCacheBlockFromRawPayload(payload)
+		if err != nil {
+			b.Fatalf("decode raw KV block: %v", err)
+		}
+		if block.tokenCount != 512 || block.keyWidth != 128 || block.valueWidth != 128 {
+			b.Fatalf("decoded block metadata = tokens:%d key:%d value:%d", block.tokenCount, block.keyWidth, block.valueWidth)
+		}
+	}
+}
+
+func BenchmarkROCmDeviceKVPageFromRawPayload_KQ8VQ4PinnedCopy(b *testing.B) {
+	payload := benchmarkROCmKVRawPayload(b)
+	driver := &fakeHIPDriver{available: true}
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		page, err := rocmDeviceKVPageFromRawPayload(driver, payload)
+		if err != nil {
+			b.Fatalf("restore raw KV block to device: %v", err)
+		}
+		if page.tokenCount != 512 || page.keyWidth != 128 || page.valueWidth != 128 {
+			b.Fatalf("device page metadata = tokens:%d key:%d value:%d", page.tokenCount, page.keyWidth, page.valueWidth)
+		}
+		cache := &rocmDeviceKVCache{
+			driver:     driver,
+			mode:       rocmKVCacheModeKQ8VQ4,
+			blockSize:  page.tokenCount,
+			pages:      []rocmDeviceKVPage{page},
+			tokenCount: page.tokenCount,
+		}
+		if err := cache.Close(); err != nil {
+			b.Fatalf("close restored device page: %v", err)
+		}
+	}
+}
+
+func benchmarkROCmKVRawPayload(tb testing.TB) []byte {
+	tb.Helper()
+	const (
+		tokens     = 512
+		keyWidth   = 128
+		valueWidth = 128
+	)
+	keys := make([]float32, tokens*keyWidth)
+	values := make([]float32, tokens*valueWidth)
+	for index := range keys {
+		keys[index] = float32((index%251)-125) / 125.0
+	}
+	for index := range values {
+		values[index] = float32((index%197)-98) / 98.0
+	}
+	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, tokens)
+	if err != nil {
+		tb.Fatalf("create KV cache: %v", err)
+	}
+	if err := cache.AppendVectors(0, keyWidth, valueWidth, keys, values); err != nil {
+		tb.Fatalf("append KV vectors: %v", err)
+	}
+	payload, err := cache.rawBlock(cache.blocks[0])
+	if err != nil {
+		tb.Fatalf("encode raw KV block: %v", err)
+	}
+	return payload
+}
+
 func assertFloat32SlicesNear(t *testing.T, want, got []float32, tolerance float32) {
 	t.Helper()
 	if len(got) != len(want) {
@@ -656,4 +981,11 @@ func assertFloat32SlicesNear(t *testing.T, want, got []float32, tolerance float3
 			t.Fatalf("slice[%d] = %f, want %f within %f; got %+v", i, got[i], want[i], tolerance, got)
 		}
 	}
+}
+
+func mustHIPFloat32Payload(t *testing.T, values []float32) []byte {
+	t.Helper()
+	payload, err := hipFloat32Payload(values)
+	core.RequireNoError(t, err)
+	return payload
 }

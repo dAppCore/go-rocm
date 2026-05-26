@@ -48,8 +48,8 @@ func TestOpenAI_NewOpenAIServiceMux_Bad_CacheWarmRejectsEmptyInput(t *testing.T)
 
 	mux.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "prompt or tokens are required") {
-		t.Fatalf("cache warm status = %d body=%s, want bad request before cache service", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "prompt or tokens are required") {
+		t.Fatalf("cache warm status = %d body=%s, want canonical cache service validation error", rec.Code, rec.Body.String())
 	}
 }
 

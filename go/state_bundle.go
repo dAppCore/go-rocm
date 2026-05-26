@@ -111,7 +111,6 @@ func rocmSamplerConfig(cfg inference.GenerateConfig) inference.SamplerConfig {
 		TopP:          cfg.TopP,
 		RepeatPenalty: cfg.RepeatPenalty,
 		StopTokens:    append([]int32(nil), cfg.StopTokens...),
-		StopSequences: append([]string(nil), cfg.StopSequences...),
 		ReturnLogits:  cfg.ReturnLogits,
 	}
 }

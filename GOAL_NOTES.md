@@ -1,5 +1,538 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-26 Full-Chapter Book and Long-Attention Pass
+
+- The 512-token chapter cap is invalid for the book acceptance workload. The
+  retained book benchmark now treats omitted `GO_ROCM_BOOK_CHAPTER_TOKENS` or
+  `GO_ROCM_BOOK_CHAPTER_TOKENS=0` as full-chapter mode, using only a large
+  context-derived safety cap. For the 48k/10-turn run this cap is `4390`
+  tokens/chapter, and the benchmark records per-turn generated tokens plus
+  cap-hit status.
+- Rebuilt and rechecked forced chunked attention after fixing the stage-2 launch
+  packet lifetime bug. Direct HIP hardware tests pass for 256- and 512-wide
+  direct-token KQ8/VQ4 heads, and deterministic greedy output now matches the
+  non-chunked path at 320 and 4096 tokens. It is still not production-worthy:
+  4096 generated tokens measured `58.24 tok/s` chunked versus `69.05 tok/s`
+  non-chunked, and the 10-turn retained book run measured `87.59s` wall,
+  `44.56 tok/s` average, and `30.64 tok/s` on turn 10.
+- Rejected a metadata-only shared-memory path for direct-token K/V value
+  pointers/scales after attention weights spill to global memory. The 64 KiB
+  version hit `HSA_STATUS_ERROR_INVALID_ALLOCATION` and timed out; the `.err`
+  file captured the runtime failure. A 48 KiB guard avoided stderr but changed
+  deterministic output enough to fail chapter-10 arc retention and took
+  `114.36s` wall.
+- Long single-stream diagnostic: `GO_ROCM_BENCH_TOKENS=4096`,
+  `GO_ROCM_BENCH_CONTEXT_LEN=8192`, chapter prompt, real RX 7800 XT, empty
+  stderr, `59315672504 ns/op`, `69.05 tok/s`, `715310248 B/op`,
+  `6833978 allocs/op`. This confirms decode bends once the full-attention
+  layers grow beyond the 2048-token shared-weight threshold, even without
+  multi-turn retained state.
+- `rocprof --stats` on that 4096-token shape puts `rocm_attention_heads` at
+  `46.48%` of GPU kernel time (`22.203s`, `143325` launches), followed by
+  `rocm_mlx_q4_projection` at `17.67%`. The next useful optimization needs a
+  better long full-attention kernel layout; Go-side launch/metadata tweaks are
+  not enough.
+- Checked the local Gemma4-E2B q4 config and go-mlx dev implementation. The
+  model text config has `sliding_window: 512`, so the ROCm 512-token local ring
+  is correct for this E2B target. The go-mlx `buildGemma4CacheLayout` uses the
+  same last-20-by-attention-type shared-KV owner mapping as ROCm, so the shared
+  source map should not be changed without new model evidence.
+
+## 2026-05-26 Gemma4 Chat Template and Suppression Pass
+
+- Verified the Gemma4 chat envelope against the local HF tokenizer. The prompt
+  `<bos><|turn>user\nHi<turn|>\n<|turn>model\n` encodes as
+  `[2 105 2364 107 10979 106 107 105 4368 107]`, so the template shape and
+  final assistant newline are correct. The `text:` prompt parser now preserves
+  that final newline instead of trimming it away.
+- Added Gemma4 q4 suppress-token handling aligned with the go-mlx control-token
+  list. The fast device greedy path still runs first; if its winner is a
+  suppressed control token, the experimental path falls back to a full-logits
+  host readback and picks the best unsuppressed token. This is a correctness
+  probe, not the production endpoint; the suppression mask must move into the
+  device greedy kernel before this can be considered hot-path final.
+- Added Gemma4 default stop-token IDs and used them as extra suppression only
+  when the caller did not provide explicit stop tokens. Explicit caller stop
+  tokens are now checked before yield in the q4 generation loop so stop controls
+  are not returned as visible text.
+- Real RX 7800 XT smoke:
+  `ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85`, model
+  `/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit`, prompt `text:Hi`,
+  `GO_ROCM_GEMMA4_Q4_GENERATE_TOKENS=8` passed. The prompt tokens were
+  `[2 10979]`, generated tokens were
+  `[236764 236777 61475 236764 3307 236764 3307 236764]`, and
+  `q4-text-hi-smoke-suppress-stops.err` was empty.
+- Real RX 7800 XT chat-control smoke also passed for the explicit Gemma4
+  envelope, with empty `chat-template-public-smoke-suppress-stops.err`. The old
+  `<token:105>` sentinel loop is gone, but output quality is still poor:
+  `["\n" "Attend" "\n" "<unused2099>" "\n" " краёўцаў" "\n" "ساس"]`.
+- Retained book smoke with 10 turns, 16 generated tokens per turn,
+  4096 context, and 16-token prefill ubatches completed without ROCm stderr:
+  `23.32s` wall, `13.22s` prefill, `10.07s` decode, `6.861 tok/s`,
+  `160` generated tokens. The output is not coherent and has zero chapter-10
+  arc-anchor hits; after turn controls are masked, the q4 logits repeatedly
+  prefer visible `"model"` and `"end"` tokens. This confirms the remaining
+  blocker is q4 forward/logit correctness or ranking, not the chat template.
+
+## 2026-05-16/17 ROCm q4 Deep Pass After Fresh Quota
+
+- Rebuilt the gfx1100 HSACO and kept all live runs pinned to
+  `ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85` so the RX 7800 XT was used rather
+  than the onboard GPU.
+- Kept a q8 key-dot unroll in `rocm_attention_device_kv_dot_from_page`: the
+  default `k-q8-v-q4` attention path now consumes four packed q8 words per loop
+  iteration when aligned. Q4 smoke still generated `[236764 3307]`, 512 tokens
+  measured `65.40 tok/s`, and the 2000-token endpoint improved to
+  `60.12 tok/s`. The stricter 2048-token check measured `60.06 tok/s`. A
+  mid-run `rocm-smi` sample showed the RX 7800 XT at `97%` busy and the onboard
+  GPU at `0%`.
+- Kept a direct q4 value-accumulation branch in `rocm_attention_heads` for the
+  default direct `k-q8-v-q4` descriptor layout. It uses the cached q4 value
+  pointer/scale table without rechecking the generic fallback on every token.
+  Q4 smoke remained unchanged, 512 tokens measured `65.46 tok/s`, 2000 tokens
+  measured `60.79 tok/s`, and 2048 tokens measured `60.62 tok/s`.
+- Fresh post-`58 tok/s` verification still confirms the benchmark is not hiding
+  Metal-class speed. After the latest kept attention patches, normal `go test
+  ./...`, linux/no-cgo `go test ./...`, and legacy-server `go test ./...` all
+  passed. A direct 512-token run measured `7834757484 ns/op` at `65.35 tok/s`,
+  and a direct 2048-token run measured `33742782570 ns/op` at `60.69 tok/s`.
+  A 512-token `rocprof --stats` run measured `rocm_attention_heads` at
+  `42.62%` of kernel time, q4 projection at `18.55%`, q4 GELU/multiply at
+  `10.87%`, RMSNorm/residual kernels at about `11.99%` combined, descriptor
+  append at `1.05%`, and copy kernels at only `0.18%`.
+- Kept a driver launch-path allocation cleanup. `go/hip_driver_cgo.go` now
+  caches HIP availability for the process, reuses HSACO modules by path without
+  per-launch `os.Stat`/key rebuilding, and uses a value launch-argument lease
+  instead of allocating a finish closure per launch. Launch config helpers now
+  pass the freshly-built argument payload through instead of copying it again.
+  Q4 smoke still generated `[236764 3307]`. The same 512-token benchmark moved
+  from `7830473823 ns/op`, `65.39 tok/s`, `214653840 B/op`,
+  `4462638 allocs/op` to `7799788531 ns/op`, `65.64 tok/s`,
+  `74929800 B/op`, `787760 allocs/op`. The long checks measured:
+  - 2000 tokens: `32768500713 ns/op`, `61.03 tok/s`, `258035584 B/op`, `2988572 allocs/op`.
+  - 2048 tokens: `33646087144 ns/op`, `60.87 tok/s`, `264818936 B/op`, `3059627 allocs/op`.
+  This is worth keeping for allocation pressure, but the endpoint is still
+  kernel/graph-bound and far below `100 tok/s`.
+- Ran a fresh current-source `rocprof --stats` after that launch cleanup. The
+  512-token profiled run measured `60.29 tok/s` under profiler overhead, with
+  kernel time split as `rocm_attention_heads` `42.59%`,
+  `rocm_mlx_q4_projection` `18.47%`, q4 GELU/multiply `10.89%`,
+  RMSNorm/residual kernels about `12.04%`, descriptor append `1.06%`, and copy
+  kernels only `0.19%`.
+- Checked the RX 7800 XT runner clocks. The card was in manual DPM at idle, and
+  under load it climbed into the ~1.6-1.9GHz SCLK range. Forcing high/manual
+  masks did not materially move throughput: the default path measured
+  `7814954298 ns/op`, `65.52 tok/s` for 512 tokens and
+  `32762598372 ns/op`, `61.05 tok/s` for 2000 tokens. This keeps the diagnosis
+  on kernel/graph shape rather than wrong GPU or a hidden timing bug.
+- Found and fixed a driver correctness bug in the opt-in
+  `GO_ROCM_DISABLE_ASYNC_LAUNCH_ARGS=1` path. It reused one launch-argument
+  packet before queued kernels had consumed it and reproduced as HIP error
+  `700`; the single-packet path now calls `hipDeviceSynchronize` before reuse.
+  A live q4 smoke under that env passed with prompt tokens `[2 10979]` and
+  generated token `[236764]`. The default async launch-argument ring remains
+  the endpoint path.
+- Rejected a guarded group-64 q4 projection/GELU group-index shift branch. It
+  preserved q4 smoke with generated tokens `[236764 3307]`, but two 512-token
+  checks regressed to `62.98 tok/s` and `62.93 tok/s`. After reverting and
+  rebuilding the HSACO, the same check returned to `65.50 tok/s`.
+- Rejected query-head RMSNorm+RoPE fusion. The fused kernel passed live q4
+  smoke with generated tokens `[236764 3307]` and measured `65.53 tok/s` at
+  512 tokens, but repeat 2000-token endpoint checks regressed to `58.78 tok/s`
+  and `58.73 tok/s`. After reverting the fusion and rebuilding the `gfx1100`
+  HSACO, the 2000-token check returned to `32737071937 ns/op`, `61.09 tok/s`,
+  `258238264 B/op`, `2988563 allocs/op`.
+- Kept group-tiled affine scale/bias loading for the MLX q4 projection-family
+  row sum (`rocm_mlx_q4_projection`, triple projection, final
+  projection+greedy, and q4 GELU projection). Q4 smoke stayed stable with
+  generated tokens `[236764 3307]`; final kept checks measured
+  `7785336740 ns/op`, `65.76 tok/s`, `74929832 B/op`, `787765 allocs/op` at
+  512 tokens and `32642251550 ns/op`, `61.27 tok/s`, `258875656 B/op`,
+  `2988551 allocs/op` at 2000 tokens. The stricter 2048-token check measured
+  `33542086457 ns/op`, `61.06 tok/s`, `264819224 B/op`, `3059631 allocs/op`.
+  A fresh 512-token `rocprof --stats` run on the kept source measured
+  `60.38 tok/s` under profiler overhead and split kernel time as
+  `rocm_attention_heads` `42.93%`, q4 projection `17.85%`, q4 GELU/multiply
+  `10.90%`, RMSNorm/residual `12.10%`, q4 final projection+greedy `5.26%`,
+  and copies `0.20%`.
+- Rejected applying that same grouped scale/bias loop to the paired q4 gate/up
+  GELU multiply kernel. It preserved q4 smoke but regressed the 512-token check
+  to `8157714213 ns/op`, `62.76 tok/s`, so it was reverted.
+- Rejected retuning the q4 projection-family launch to 16 rows per
+  256-thread block after adding the grouped row-sum helper. Q4 smoke stayed
+  stable, but the 512-token check regressed to `7960843350 ns/op`,
+  `64.31 tok/s`, so the source was restored to 8 rows per block.
+- Rejected a dedicated small-column q4 projection kernel for the 256/512-column
+  attention-output projections. Live q4 smoke stayed stable with generated
+  tokens `[236764 3307]`, but 512 tokens measured `7815026708 ns/op`,
+  `65.51 tok/s`, and the 2000-token endpoint regressed to `32820868597 ns/op`,
+  `60.94 tok/s`, below the kept `65.76`/`61.27 tok/s` source.
+- Kept `rocm_rms_norm_residual_add_norm`, a fused post-attention
+  residual-add plus pre-FFN RMSNorm kernel. It preserves the residual output
+  for the later layer path while producing the MLP input in the same launch.
+  Focused tests, live q4 smoke, the broader Go gates, and the Codecov-filtered
+  coverage gate passed (`90.6%`). Live q4 smoke still generated
+  `[236764 3307]`. The measured checks were:
+  - 512 tokens: `7684228195 ns/op`, `66.63 tok/s`, `74649224 B/op`, `769797 allocs/op`.
+  - 2000 tokens: `32170028940 ns/op`, `62.17 tok/s`, `257342976 B/op`, `2918526 allocs/op`.
+  - 2048 tokens: `32973719595 ns/op`, `62.11 tok/s`, `263898288 B/op`, `2987923 allocs/op`.
+  A fresh 512-token `rocprof --stats` run on the fused source measured
+  `61.83 tok/s` under profiler overhead and split kernel time as
+  `rocm_attention_heads` `43.14%`, q4 projection `17.93%`, q4 GELU/multiply
+  `10.93%`, RMSNorm/residual `11.83%`, q4 final projection+greedy `5.26%`,
+  descriptor append `1.07%`, and copies `0.19%`. The endpoint is now
+  `62.17 tok/s`, so this remains far below the `100+ tok/s` goal.
+- Kept cross-layer input-norm precompute plus wave-shuffle max/sum reductions
+  in token-parallel attention. The q4 generation loop now asks each non-final
+  layer to produce the next layer's input RMSNorm output while writing its final
+  hidden state, then passes that buffer into the next layer so the separate
+  input-norm launch is skipped. Q4 smoke stayed stable with generated tokens
+  `[236764 3307]`, and the BF16 layer-0 tied LM-head smoke on
+  `/data/lem/models/gemma4/LEM-Gemma4-E2B` still reported token `158750`.
+  The measured checks were:
+  - 512 tokens: `7505556636 ns/op`, `68.22 tok/s`, `75411088 B/op`, `769926 allocs/op`.
+  - 2000 tokens: `31411112083 ns/op`, `63.67 tok/s`, `259325968 B/op`, `2920163 allocs/op`.
+  - 2048 tokens: `32356592135 ns/op`, `63.29 tok/s`, `265920536 B/op`, `2989574 allocs/op`.
+  A fresh 512-token `rocprof --stats` run measured `63.71 tok/s` under
+  profiler overhead. Kernel time was still dominated by
+  `rocm_attention_heads` `43.38%`, q4 projection `18.05%`, q4 GELU/multiply
+  `11.02%`, RMSNorm/residual-family kernels about `11.18%`, q4 final
+  projection+greedy `5.31%`, descriptor append `1.07%`, and copies `0.20%`.
+  Normal, no-cgo, legacy, BF16/q4 hardware smokes, and Codecov-filtered
+  coverage (`90.6%`) passed. The endpoint is now `63.67 tok/s`, still far
+  below the `100+ tok/s` goal.
+- Rejected unrolling the direct q4 attention value token loop by two. Q4 smoke
+  still passed and 512 tokens measured `65.40 tok/s`, but 2048 tokens measured
+  `60.67 tok/s`, effectively neutral/slightly below the current kept path, so
+  the simpler direct q4 value branch was restored.
+- Rejected pre-scaling normalized direct q4 attention weights by cached q4 value
+  scale before paired value accumulation. An initial run looked promising
+  (`60.88 tok/s` at 2048 and `60.97 tok/s` at 2000), but the guarded exact path
+  measured `60.68 tok/s` at 2000 and `60.54 tok/s` at 2048, so it was removed.
+- Rejected an opt-in split-score attention experiment that computed raw q8
+  attention scores in a separate multi-block kernel before the existing
+  softmax/value kernel. It preserved q4 smoke, but 512 tokens measured only
+  `65.26 tok/s` and 2048 tokens regressed to `53.76 tok/s`, with higher
+  allocation churn, so the experiment was removed.
+- Rejected deferring softmax normalization in `rocm_attention_heads` into the
+  value accumulation phase. Q4 smoke still passed and 512 tokens measured
+  `64.21 tok/s`, but the 2000-token endpoint regressed to `56.33 tok/s`, so the
+  separate normalized-weight pass was restored.
+- Rejected a fast-math attention softmax experiment (`expf` to `__expf`): the
+  512-token benchmark was neutral (`64.19 tok/s`) and the 2k endpoint regressed
+  to `58.08 tok/s`.
+- Rejected a fast q4 GELU tanh approximation: q4 smoke still passed, but the
+  public generated token changed, the 512-token benchmark was effectively
+  neutral (`64.44 tok/s`), and the 2048-token endpoint regressed to
+  `58.38 tok/s`.
+- Rejected changing the attention q4 value-metadata cache threshold from
+  `>=512` to `>512`: q4 smoke passed, but 512 tokens regressed to
+  `64.17 tok/s` and 2048 tokens regressed to `55.94 tok/s`.
+- Changed shared-device-KV borrowed aliases to share the source page slice
+  without owning or freeing source pages, then pooled hot-path copied KV page
+  metadata slices. This cut generation allocation substantially while keeping
+  ownership transfer semantics intact.
+- Latest q4 benchmark evidence after that metadata cleanup:
+  - 2000 tokens: `34170996556 ns/op`, `58.53 tok/s`, `802486024 B/op`, `17323617 allocs/op`.
+  - 512 tokens: `7959242091 ns/op`, `64.33 tok/s`, `214885656 B/op`, `4462676 allocs/op`.
+  - 2048 tokens: `34952296158 ns/op`, `58.59 tok/s`, `822547632 B/op`, `17738577 allocs/op`.
+  The endpoint remains below `100 tok/s`; the remaining work is kernel/graph
+  fusion, not Go-side KV page metadata allocation.
+- Rebuilt the normal `gfx1100 -O2` HSACO from the reverted source after the
+  latest rejected kernel experiments. Q4 smoke still passed for prompt
+  `text:Hi`, and the fresh checks measured:
+  - 512 tokens: `8069296382 ns/op`, `63.45 tok/s`, `214434344 B/op`, `4462654 allocs/op`.
+  - 2000 tokens: `34126497340 ns/op`, `58.61 tok/s`, `803767264 B/op`, `17323657 allocs/op`.
+  A mid-run `rocm-smi` sample showed the RX 7800 XT at `98%` busy and the
+  onboard GPU at `0%`.
+- Re-ran the BF16 correctness anchor after the q4 pass:
+  `Gemma4 BF16 layer0 tied LM-head greedy token=158750 score=28.510630`.
+- Rejected `GO_ROCM_GEMMA4_Q4_DEVICE_KV_MODE=fp16` and `q8` as shortcuts. Both
+  modes failed the public q4 smoke on the second generated token, so
+  `k-q8-v-q4` remains the default.
+- Rejected a group-64 q4 scale/bias projection layout. It passed q4 smoke, but
+  512 tokens regressed to `8565962892 ns/op` at `59.77 tok/s`, versus the kept
+  reverted source at `8020751101 ns/op` and `63.83 tok/s` in the same pass.
+- Checked `GO_ROCM_ENABLE_ASYNC_H2D=1`; it was effectively neutral at
+  `7962300096 ns/op` and `64.30 tok/s` for 512 tokens, so it was not made the
+  default.
+- Rejected `gfx1100 -O2 -ffast-math`. It passed q4 smoke, but regressed the
+  512-token benchmark to `8119939325 ns/op` and `63.05 tok/s`.
+- Rejected q4 projection/GELU `__restrict__` pointer hints. They passed q4
+  smoke, but measured `7960924883 ns/op` and `64.31 tok/s` at 512 tokens, then
+  `34199034901 ns/op` and `58.48 tok/s` at 2000 tokens, neutral/slightly worse
+  than the kept source.
+- Rejected a q4-generation temporary device-buffer arena around
+  `hipAllocateByteBuffer`. It preserved q4 smoke, but measured
+  `7974959729 ns/op` and `64.20 tok/s` at 512 tokens versus
+  `7982520499 ns/op` and `64.14 tok/s` with the arena disabled, while
+  increasing Go allocations from `4462661` to `5175655`. The 2000-token check
+  regressed to `34285922892 ns/op`, `58.33 tok/s`, `858412056 B/op`, and
+  `20103444 allocs/op`, so the arena code was removed. Device allocation reuse
+  by itself is not an endpoint fix.
+- Implemented device-side q4 KV token encoding with `rocm_kv_encode_token`.
+  Appended K/V token vectors no longer need to be copied back to Go only to be
+  packed into q4 KV pages and uploaded again.
+- Implemented GPU-side KV descriptor append with `rocm_kv_descriptor_append`.
+  The hot path now builds the next descriptor table from the previous descriptor
+  and appended K/V page on device, including sliding-window trim handling.
+- Moved the partial-RoPE/global-attention q4 branch onto device buffers for
+  Q/K/V projection, per-head norm, partial RoPE, and device KV append. The RoPE
+  launch packet now carries `RotaryCount`, and the kernel copies the non-rotary
+  tail through unchanged.
+- Let shared-KV layers borrow the source layer's device descriptor table instead
+  of rebuilding and uploading identical descriptors for every shared layer.
+- Replaced the single-thread RMSNorm/RoPE hot-path behavior with parallel HIP
+  kernels: RMSNorm now uses a block reduction/writeback and RoPE maps rotary
+  pairs across the launch grid.
+- Added a token-parallel path in `rocm_attention_heads` for longer contexts so
+  score generation no longer synchronizes every token through one head block.
+- Tuned the MLX q4 projection row block size. 64 threads was the best measured
+  setting among 32/64/128/256 on the 64-token benchmark.
+- Fused the final q4 LM-head projection with softcap greedy sampling so public
+  q4 generation reads back only the packed best token/score instead of a full
+  logits vector, then grouped four q4 projection rows per block for better
+  occupancy on small projections.
+- Let `rocm_attention_heads` use dynamic shared memory for per-head weights
+  through 2048 tokens. This removes the per-layer global attention weights
+  allocation from the 2k benchmark path, but it is only an incremental gain.
+- Added a native HIP device-memset path and switched the final q4
+  projection+greedy result clear from an 8-byte host-to-device copy to queued
+  `hipMemsetAsync`. This removes one synchronous host clear from each generated
+  token, but it is still only an incremental gain because the final readback
+  must synchronize the queued GPU graph.
+- Reused one final q4 greedy result device buffer across the public q4
+  generation stream instead of allocating and closing that 8-byte buffer every
+  token. This trims allocation churn, but the 2k throughput remains effectively
+  unchanged.
+- Replaced the q4 projection scalar-column loop with a packed-word loop for
+  group sizes divisible by eight. Each packed U32 q4 word now feeds eight input
+  values, and the affine scale/bias is applied once per packed word through
+  separate `q*input` and `input` sums. Retuning after that change found eight
+  rows per 256-thread block best; four rows reached `33.62 tok/s` at 64 tokens,
+  eight rows reached `34.07 tok/s`, and sixteen rows regressed to `33.41 tok/s`.
+- Batched q4 query-head RMSNorm and RoPE into `rocm_rms_norm_heads` and
+  `rocm_rope_heads` for the generate path, then batched Gemma4 per-layer input
+  precompute so all layer slices are borrowed from one device-resident backing
+  buffer.
+- Added two q4 local MLP fusions:
+  `rocm_mlx_q4_gelu_tanh_multiply` fuses gate/up q4 projection plus GELU
+  multiply, and `rocm_mlx_q4_gelu_tanh_projection` fuses the per-layer input
+  gate q4 projection plus GELU/multiplier. These cut launch and allocation
+  churn but do not solve the larger unfused layer graph.
+- Added `rocm_rms_norm_residual_add` and wired the q4 decoder layer's
+  post-attention, post-MLP, and per-layer-input residual paths through it. This
+  removes three vector-add launches and three temporary buffers per full
+  decoder layer.
+- Hoisted q8/q4 scale decoding out of the per-dimension device-KV key
+  dot-product path. Attention now loads the selected key page scale once per
+  token score instead of once for every key dimension.
+- Added local device-KV value page/scale reuse in token-parallel attention.
+  Each worker thread now resolves the page and q4/q8 scale once for the token
+  and reuses it across the two possible output dimensions it owns, avoiding the
+  barrier-heavy shared variant that regressed.
+- Removed the dummy host query vector allocation from the device-query attention
+  path. The request now carries an explicit query dimension when query values
+  already live in a device buffer, trimming per-layer/per-token Go allocation
+  churn without changing generated tokens.
+- Tested a shared-input q4 projection variant that loaded each eight-float input
+  chunk into block shared memory. After fixing an unsafe `__syncthreads()` branch
+  shape, it passed the q4 smoke but regressed the 64-token benchmark to
+  `2237533888 ns/op` at `28.60 tok/s`, so the experiment was reverted.
+- Tested separate row-block shapes for the final q4 projection+greedy kernel
+  after the RMSNorm/residual pass. Greedy-only 16 rows per block passed smoke
+  but measured `56.08 tok/s` at 64 tokens, and greedy-only 4 rows per block
+  measured `55.85 tok/s`, both below the baseline before the later attention
+  scale hoist, so the specialization was reverted.
+- Tested a device-KV value-side cache path for token-parallel attention that
+  resolved the value page/scale once per token and shared it across the block.
+  The extra per-token barriers cost more than the reduced descriptor/scale
+  reads: 64 tokens regressed to `1059598493 ns/op` at `60.40 tok/s`, and
+  512 tokens regressed to `16390670357 ns/op` at `31.24 tok/s`. The experiment
+  was reverted.
+- Tested a two-stage final q4 projection+greedy path for large vocab projections
+  to avoid atomically updating one global best value from every vocab row. The
+  extra block-best buffer and reduction launch cost more than the atomics saved:
+  64 tokens regressed to `1028223887 ns/op` at `62.24 tok/s`, and 512 tokens
+  regressed to `14646161725 ns/op` at `34.96 tok/s`. The experiment was
+  reverted.
+- Tested caching device-KV descriptor header/base pointers inside
+  token-parallel attention. It passed focused correctness and q4 smoke, but the
+  extra register/control pressure regressed 64 tokens to `1021493012 ns/op` at
+  `62.65 tok/s` and 512 tokens to `14693344949 ns/op` at `34.85 tok/s`, so the
+  experiment was reverted.
+- Tested caching the per-head query vector in the existing 256-float shared
+  scratch inside token-parallel attention. The first version exposed a real
+  barrier bug by reusing scratch before every worker had finished reading the
+  cached query; after adding the required barrier, the 64-token benchmark was
+  neutral/slightly worse at `990222987 ns/op` and `64.63 tok/s`, so the
+  experiment was reverted.
+- Checked HIP codegen/target variants. `gfx1101` compiles but fails
+  `hipModuleLoadData` with HIP error `200`; `rocminfo` resolves the selected RX
+  7800 XT UUID to `gfx1100`. `gfx1100 -O3` measured `1875593965 ns/op` at
+  `34.12 tok/s`, matching `gfx1100 -O2`, and `gfx11-generic -O2` measured
+  `1880327157 ns/op` at `34.04 tok/s`.
+- Previous q4 benchmark ladder after device KV/descriptor work:
+  - 64 tokens: `7551867334 ns/op`, `8.475 tok/s`, `73137264 B/op`, `1321653 allocs/op`.
+  - 512 tokens: `73320058318 ns/op`, `6.983 tok/s`, `1003985368 B/op`, `10294629 allocs/op`.
+  - 2000 tokens: `371838641006 ns/op`, `5.379 tok/s`, `7182703848 B/op`, `40270820 allocs/op`.
+- Previous q4 benchmark ladder after packed-word q4 projection:
+  - 64 tokens: `1875609269 ns/op`, `34.12 tok/s`, `72968536 B/op`, `1316130 allocs/op`.
+  - 512 tokens: `22809017763 ns/op`, `22.45 tok/s`, `1001905288 B/op`, `10180966 allocs/op`.
+  - 2000 tokens: `142007905804 ns/op`, `14.08 tok/s`, `7172698912 B/op`, `39620987 allocs/op`.
+- Previous q4 benchmark ladder on Gemma4-E2B 4-bit after batched query/per-layer
+  setup and q4 MLP local fusions:
+  - 64 tokens: `1223892467 ns/op`, `52.29 tok/s`, `48503240 B/op`, `745012 allocs/op`.
+  - 512 tokens: `17538093964 ns/op`, `29.19 tok/s`, `808699528 B/op`, `5674501 allocs/op`.
+  - 2000 tokens: `119662262683 ns/op`, `16.71 tok/s`, `6418807824 B/op`, `22025505 allocs/op`.
+- Previous q4 benchmark ladder on Gemma4-E2B 4-bit after RMSNorm+residual-add
+  fusion:
+  - 1 token: `34607793 ns/op`, `28.90 tok/s`, `4572542 B/op`, `24287 allocs/op`.
+  - 8 tokens: `148062716 ns/op`, `54.03 tok/s`, `8101539 B/op`, `91284 allocs/op`.
+  - 64 tokens: `1136882187 ns/op`, `56.29 tok/s`, `44681336 B/op`, `649458 allocs/op`.
+  - 512 tokens: `16919381071 ns/op`, `30.26 tok/s`, `778538352 B/op`, `4920554 allocs/op`.
+  - 2000 tokens: `117417290830 ns/op`, `17.03 tok/s`, `6301139640 B/op`, `19085556 allocs/op`.
+- Previous q4 benchmark ladder on Gemma4-E2B 4-bit after device-KV key-dot scale
+  hoisting:
+  - 1 token: `30529386 ns/op`, `32.76 tok/s`, `4570808 B/op`, `24215 allocs/op`.
+  - 8 tokens: `130538347 ns/op`, `61.28 tok/s`, `8103945 B/op`, `91153 allocs/op`.
+  - 64 tokens: `1012688129 ns/op`, `63.20 tok/s`, `44675504 B/op`, `649445 allocs/op`.
+  - 512 tokens: `14806875246 ns/op`, `34.58 tok/s`, `778538288 B/op`, `4920555 allocs/op`.
+  - 2000 tokens: `100736540182 ns/op`, `19.85 tok/s`, `6301145240 B/op`, `19085555 allocs/op`.
+- Previous q4 benchmark ladder on Gemma4-E2B 4-bit after local device-KV
+  value-page/scale reuse in token-parallel attention:
+  - 1 token: `30748111 ns/op`, `32.52 tok/s`, `4570611 B/op`, `24214 allocs/op`.
+  - 8 tokens: `129666170 ns/op`, `61.70 tok/s`, `8103189 B/op`, `91156 allocs/op`.
+  - 64 tokens: `1024360039 ns/op`, `62.48 tok/s`, `44688848 B/op`, `649451 allocs/op`.
+  - 512 tokens: `14613206249 ns/op`, `35.04 tok/s`, `778542784 B/op`, `4920565 allocs/op`.
+  - 2000 tokens: `97921265524 ns/op`, `20.42 tok/s`, `6301157384 B/op`, `19085551 allocs/op`.
+- Previous q4 benchmark ladder on Gemma4-E2B 4-bit after replacing the dummy host
+  query vector in the device-query attention path with an explicit query
+  dimension:
+  - 1 token: `31172883 ns/op`, `32.08 tok/s`, `4484072 B/op`, `24144 allocs/op`.
+  - 8 tokens: `130246232 ns/op`, `61.42 tok/s`, `7709432 B/op`, `90839 allocs/op`.
+  - 64 tokens: `1023191242 ns/op`, `62.55 tok/s`, `41893224 B/op`, `647174 allocs/op`.
+  - 512 tokens: `14611411980 ns/op`, `35.04 tok/s`, `756479528 B/op`, `4902607 allocs/op`.
+  - 2000 tokens: `97825149305 ns/op`, `20.44 tok/s`, `6215093488 B/op`, `19015571 allocs/op`.
+- Previous q4 benchmark ladder on Gemma4-E2B 4-bit after q4 projection shuffle
+  reductions, layer-scalar fusion into RMSNorm+residual-add, and inlined q4/q8
+  value loads in token-parallel attention:
+  - 1 token: `29681362 ns/op`, `33.69 tok/s`, `4441919 B/op`, `23154 allocs/op`.
+  - 8 tokens: `126070629 ns/op`, `63.46 tok/s`, `7546088 B/op`, `86434 allocs/op`.
+  - 64 tokens: `990174190 ns/op`, `64.64 tok/s`, `39632972 B/op`, `589064 allocs/op`.
+  - 512 tokens: `14238000565 ns/op`, `35.96 tok/s`, `745887336 B/op`, `4656240 allocs/op`.
+  - 2000 tokens: `96314243796 ns/op`, `20.77 tok/s`, `6174286240 B/op`, `18113302 allocs/op`.
+- Previous q4 benchmark ladder on Gemma4-E2B 4-bit after fusing non-shared q4
+  Q/K/V projections into one HIP launch per decoder layer:
+  - 1 token: `29023005 ns/op`, `34.46 tok/s`, `4426590 B/op`, `22484 allocs/op`.
+  - 8 tokens: `120672226 ns/op`, `66.30 tok/s`, `7480734 B/op`, `83552 allocs/op`.
+  - 64 tokens: `962144028 ns/op`, `66.52 tok/s`, `39138944 B/op`, `567611 allocs/op`.
+  - 512 tokens: `13910662661 ns/op`, `36.81 tok/s`, `741971008 B/op`, `4481810 allocs/op`.
+  - 2000 tokens: `93696267363 ns/op`, `21.35 tok/s`, `6158484288 B/op`, `17373090 allocs/op`.
+- A repeated 64-token profile reported `7540477396 ns/op` at `8.488 tok/s`.
+  Host-to-device time was down to about `0.37s`; the apparent dominant readback
+  was `hipReadGreedyResult` at about `6.74s`, which is the final synchronization
+  point for queued GPU work rather than an 8-byte-copy problem.
+- After the parallel primitive pass, a 64-token profile reported
+  `2892521198 ns/op` at `22.13 tok/s`; the final greedy-result sync dropped to
+  about `2.21s` cumulative, H2D was about `0.47s`, and launch overhead was about
+  `0.51s`.
+- After the fused-greedy/shared-attention pass, a 64-token profile reported
+  `2691962444 ns/op` at `23.77 tok/s`. CPU-visible time still includes about
+  `1.88s` in generation-time H2D copies, mostly acting as synchronization
+  points, and the final q4 projection+greedy path accounts for about `2.0s`
+  cumulative. An 8-row-per-block q4 projection variant built and passed the q4
+  smoke, but regressed the 64-token benchmark to `2720334709 ns/op` at
+  `23.53 tok/s`, so the 4-row/64-thread-per-row shape was the measured best
+  shape before the later packed-word projection pass.
+- A fresh packed-word 64-token profile reported `1858827751 ns/op` at
+  `34.43 tok/s`. `LoadModel` and tokenizer setup appear in the CPU profile, but
+  the benchmark calls `b.ResetTimer()` after model load; the timed generation
+  section is `hipNativeProjectionKernelSet.Generate` at about `1.85s`. The
+  visible host-side generation time is mostly synchronization and cgo around
+  queued GPU work: about `1.18s` in the final q4 projection+greedy result D2H
+  sync, `0.56s` in `cgoHIPDriver.LaunchKernel`, and about `0.55s` across H2D
+  launch/input staging.
+- At that stage, the 2k-token benchmark still took `93.7s`, so the low-double-digit
+  tok/s is not a timing artifact from dividing by load/setup time. It is also
+  not the wrong GPU.
+- Validation after the latest fused local-MLP, attention scale-hoist/value
+  reuse/query-allocation pass, q4 projection shuffle reductions,
+  layer-scalar fusion, value-load inlining, fused Q/K/V projection, attention
+  descriptor/metadata fixes, and KV metadata allocation cleanup:
+  - `rocminfo` with `ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85` reports
+    `gfx1100`, UUID `GPU-880ed6479d653a85`, marketing name
+    `AMD Radeon RX 7800 XT`.
+  - Mid-2k-run `rocm-smi` samples reported the RX 7800 XT at `99%` GPU busy
+    with the onboard GPU at `0%`. `rocm-smi` prints product GFX version
+    `gfx1101`, but `rocminfo` exposes the loadable HIP agent as `gfx1100`.
+  - q4 smoke passed for `GO_ROCM_GEMMA4_Q4_GENERATE_PROMPT='text:Hi'` with
+    prompt tokens `[2 10979]`, generated tokens `[236764 3307]`.
+  - After RMSNorm+residual-add fusion, q4 smoke still passed for the same
+    prompt/tokens and mid-run `rocm-smi` again showed the RX 7800 XT at `99%`
+    with the onboard GPU at `0%`.
+  - After the device-KV key-dot scale hoist, q4 smoke still passed for the same
+    prompt/tokens, the 2k benchmark completed at `19.85 tok/s`, and mid-run
+    `rocm-smi` again showed the RX 7800 XT at `99%` with the onboard GPU at
+    `0%`.
+  - After local device-KV value page/scale reuse, q4 smoke still passed for the
+    same prompt/tokens, the 2k benchmark completed at `20.42 tok/s`, and a
+    mid-run `rocm-smi` sample again showed the RX 7800 XT at `99%` with the
+    onboard GPU at `0%`.
+  - After removing dummy host query vectors from device-query attention, q4
+    smoke still passed for the same prompt/tokens, the 2k benchmark completed at
+    `20.44 tok/s`, and a mid-run `rocm-smi` sample showed the RX 7800 XT at
+    `98%` with the onboard GPU at `0%`.
+  - After q4 projection shuffle reductions, layer-scalar fusion, and inlined
+    q4/q8 attention value loads, q4 package Prefill/Decode still produced
+    decoded token `258073` for prompt token `[0]`, public Generate for
+    `text:Hi` still produced generated tokens `[236764 3307]`, the 2k benchmark
+    completed at `20.77 tok/s`, and a mid-run `rocm-smi` sample showed the RX
+    7800 XT at `98%` with the onboard GPU at `0%`.
+  - After reverting the neutral query-cache experiment and rebuilding the final
+    gfx1100 HSACO, q4 smoke still passed with the same package/public generated
+    token IDs, and a fresh 64-token speed check measured `980716023 ns/op` at
+    `65.26 tok/s`.
+  - After adding `rocm_mlx_q4_triple_projection` for non-shared q4 Q/K/V
+    projection, q4 smoke still passed with the same package/public generated
+    token IDs, the 2k benchmark completed at `21.35 tok/s`, and a mid-run
+    `rocm-smi` sample showed the RX 7800 XT at `100%` with the onboard GPU at
+    `0%`.
+  - ABI/unit checks passed for the new q4 fused kernels, and
+    `hipcc --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip` rebuilt
+    `/tmp/go-rocm-kernels-gfx1100.hsaco`.
+  - After the borrowed-alias and page-slice-pool cleanup, focused KV ownership
+    tests passed, `go test ./go -count=1` passed, a 512-token benchmark measured
+    `64.33 tok/s`, a 2000-token benchmark measured `58.53 tok/s`, and a
+    2048-token benchmark measured `58.59 tok/s`.
+  - Earlier in this pass, BF16 smoke passed with layer-0 tied LM-head greedy
+    token `158750`, score `28.510630`; the current edits are q4-only and keep
+    the q4 smoke stable.
+- Remaining 100+ tok/s blockers:
+  - The q4 layer is still a graph of many small primitive launches instead of a
+    fused resident decode layer. The non-shared Q/K/V projection subgraph is now
+    one launch, but the rest of the layer remains decomposed into primitives.
+  - RMSNorm/RoPE are now parallel, and the three q4 RMSNorm+residual-add paths
+    are fused with Gemma4 layer-scalar handling, but the remaining norm/RoPE work
+    still sits in separate primitive launches that should be fused into a
+    resident layer kernel.
+  - `rocm_mlx_q4_projection` is improved, grouped, and fused with final greedy
+    sampling for the LM head, but it is still a naive q4 GEMV, not a tiled
+    production projection kernel.
+  - The decode attention primitive has a token-parallel long-context path and
+    no longer reloads the key scale on every key dimension and now locally
+    reuses value page/scale state for the two output dimensions owned by each
+    thread, but the value/output side is still tied to one descriptor/page per
+    token and the kernel still needs a production layout that keeps
+    scores/probabilities and KV reads efficiently device-resident.
+  - Device KV still uses one appended K/V page and one descriptor-table entry
+    per token. The descriptor append is now on-device, but long-context
+    attention still pointer-chases that layout. Descriptor header/base caching
+    inside the attention kernel was tried and reverted because it slowed 512-token
+    generation.
+  - A planned q4 decode workspace/arena is still needed to avoid per-token
+    primitive allocation churn.
+
 ## 2026-05-11 Baseline
 
 - Starting branch: `dev` tracking `origin/dev`.
@@ -4630,7 +5163,7 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
 ok dappco.re/go/rocm 0.104s
 
 go test -tags rocm_legacy_server ./go -count=1
-ok dappco.re/go/rocm 0.010s
+ok dappco.re/go/rocm 0.011s
 
 go test ./... -count=1
 ok dappco.re/go/rocm/workspace 0.612s
@@ -5074,6 +5607,20 @@ ok dappco.re/go/rocm 0.105s
 
 go test -tags rocm_legacy_server ./go -count=1
 ok dappco.re/go/rocm 0.010s
+
+go test ./... -count=1
+ok dappco.re/go/rocm/workspace 0.659s
+
+CGO_ENABLED=0 go test ./... -count=1
+? dappco.re/go/rocm/workspace [no test files]
+
+go test -tags rocm_legacy_server ./... -count=1
+ok dappco.re/go/rocm/workspace 0.185s
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_MODEL_TESTS=1 GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE=1 GO_ROCM_GEMMA4_Q4_GENERATE_PROMPT='text:Hi' go test ./go -run 'TestNativeDecodeSmokeKernelStatus_Good' -count=1 -v
+Gemma4 q4 public Generate prompt="text:Hi" prompt_tokens=[2 10979] generated tokens=[236764 3307] text=["," "my"]
+PASS
+ok dappco.re/go/rocm 16.693s
 ```
 
 Latest focused verification after extending the BF16 Gemma4 smoke through q/k RoPE, 8-head one-token GQA attention, and `o_proj` from the attention concat, plus confirming the faster q4 development loop:
@@ -7884,9 +8431,103 @@ ok dappco.re/go/rocm/workspace 0.184s
 
 git diff --check && git -C external/go-inference diff --check
 (no output)
+
+go test ./... -count=1
+ok dappco.re/go/rocm/workspace 0.629s
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./... -count=1
+? dappco.re/go/rocm/workspace [no test files]
+
+go test -tags rocm_legacy_server ./... -count=1
+ok dappco.re/go/rocm/workspace 0.196s
+
+(cd external/go-inference/go && go test ./... -count=1)
+ok dappco.re/go/inference/state/filestore 0.004s
 ```
 
-Latest follow-up at EOF after Gemma4 q4 BOS parity:
+Latest follow-up after moving final q4 generation sampling onto device:
+
+- Added a new `rocm_softcap_greedy_sample` HIP kernel and Go launch ABI. It scans
+  device-resident logits with a 256-thread block, applies the Gemma4 final
+  logit softcap only to the winning score, and writes the existing 8-byte greedy
+  result layout.
+- Public Gemma4 q4 generation now uses the device final-sampling path, so the
+  hot generation stream no longer reads the full LM-head logits back to Go,
+  softcaps them on CPU, and uploads them again for greedy sampling.
+- Package/classification paths that need logits still keep the existing
+  logits-returning behavior.
+- Also added a device-input RMSNorm helper and wired the generation-only final
+  RMSNorm output directly into the LM-head projection. This removes a small
+  final-norm readback/upload pair, but the measured effect is minor compared
+  with the remaining layer-body transfers.
+- Streaming q4 generation now omits debug-only per-layer result tensors, so it
+  no longer reads back the raw attention concatenation just to populate
+  `AttentionOutput`, and it does not retain `LayerResults` for generated tokens.
+- Real q4 smoke on the RX 7800 XT still matches the accepted output:
+  - package Prefill/Decode: `prompt=[0] next=258073 decoded=258073 text="<unused2161>"`
+  - public Generate `text:Hi`: `prompt_tokens=[2 10979] generated tokens=[236764 3307] text=["," "my"]`
+- Fresh q4 benchmark readings after this change:
+  - 8 tokens: `2956576812 ns/op`, `2.706 tok/s`, `144474512 B/op`, `253281 allocs/op`.
+  - 64 tokens: `22031539496 ns/op`, `2.905 tok/s`, `1160976584 B/op`, `1792276 allocs/op`.
+- This is a useful cleanup but not a structural performance fix. The 64-token
+  profile is still dominated by cgo and per-layer host/device traffic:
+  - `runtime.cgocall`: `85.45%` flat.
+  - `cgoHIPDriver.CopyHostToDevice`: `46.29%` cumulative.
+  - `cgoHIPDriver.CopyDeviceToHost`: `38.73%` cumulative.
+  - `cgoHIPDriver.LaunchKernel`: `38.81%` cumulative.
+  - `hipReadFloat32DeviceOutput`: `39.12%` cumulative.
+- The next real speed target is still the layer body: keep RMSNorm, projection
+  outputs, residual adds, RoPE, attention projection, MLP output, and per-layer
+  input application in a decode workspace instead of repeatedly turning them
+  into Go `[]float32`.
+
+Verification:
+
+```text
+go test ./go -run 'TestHIPKernelSource|TestHIPKernels_(Greedy|SoftcapGreedy|RMSNorm)|TestHIPGemma4Q4Layer0_Good|TestHIPGemma4Q4Generate' -count=1
+ok dappco.re/go/rocm 0.009s
+
+hipcc --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100.hsaco
+(no output)
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_MODEL_TESTS=1 GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE=1 GO_ROCM_GEMMA4_Q4_GENERATE_PROMPT='text:Hi' go test ./go -run 'TestNativeDecodeSmokeKernelStatus_Good' -count=1 -v
+PASS
+ok dappco.re/go/rocm 22.697s
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_BENCHMARKS=1 GO_ROCM_RUN_MODEL_TESTS=1 GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE=1 GO_ROCM_BENCH_TOKENS=8 go test ./go -run '^$' -bench BenchmarkInferenceGemma4Q4Generate -benchmem -count=1
+BenchmarkInferenceGemma4Q4Generate-32 1 2956576812 ns/op 8.000 max_tokens/op 2.706 tok/s 8.000 tokens 144474512 B/op 253281 allocs/op
+PASS
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_BENCHMARKS=1 GO_ROCM_RUN_MODEL_TESTS=1 GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE=1 GO_ROCM_BENCH_TOKENS=64 go test ./go -run '^$' -bench BenchmarkInferenceGemma4Q4Generate -benchmem -count=1
+BenchmarkInferenceGemma4Q4Generate-32 1 22031539496 ns/op 64.00 max_tokens/op 2.905 tok/s 64.00 tokens 1160976584 B/op 1792276 allocs/op
+PASS
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.148s
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.111s
+
+go test -tags rocm_legacy_server ./go -count=1
+ok dappco.re/go/rocm 0.011s
+
+go test ./... -count=1
+ok dappco.re/go/rocm/workspace 0.790s
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./... -count=1
+? dappco.re/go/rocm/workspace [no test files]
+
+go test -tags rocm_legacy_server ./... -count=1
+ok dappco.re/go/rocm/workspace 0.193s
+
+(cd external/go-inference/go && go test ./... -count=1)
+PASS
+
+git diff --check && git -C external/go-inference diff --check
+(no output)
+```
+
+Historical follow-up after Gemma4 q4 BOS parity:
 
 - Used `go-mlx` dev as the e2e reference and matched its BOS behavior for text tokenization.
 - ROCm loaded tokenizers now record `<bos>` and prepend it for normal text prompts unless the prompt already starts with `<bos>`.
@@ -7937,6 +8578,415 @@ git diff --check
 
 (external/go-inference) git diff --check
 (no output)
+```
+
+## 2026-05-16 q4 Driver/HIP Deep Pass
+
+Fresh RX 7800 XT testing confirms the q4 path is not slow because of benchmark
+bookkeeping or the onboard GPU:
+
+- `ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 rocminfo` resolves the selected
+  device to `AMD Radeon RX 7800 XT` / `gfx1100`.
+- During long q4 runs, `rocm-smi` showed the discrete GPU at `100%` busy and the
+  onboard GPU at `0%`.
+- `BenchmarkInferenceGemma4Q4Generate` starts timing after model load. After the
+  q4 projection, host-KV omission, device-KV descriptor fast-path,
+  shared-device-KV, sliding-window device-append, device per-layer input
+  precompute, async launch-argument staging, and unit-weight RMSNorm fixes, the
+  2k run with `GO_ROCM_BENCH_TOKENS=2000` completes at `5.325 tok/s`, not near
+  `100 tok/s`.
+
+Problems found and changes made:
+
+- `rocm_mlx_q4_projection` was a one-thread-per-output-row kernel. Each output
+  row serially walked all columns, so the GPU reported high utilization while
+  doing a naive scalar GEMV. It now launches one 256-thread block per row and
+  reduces partial sums through shared memory.
+- `go/hip_projection_launch.go` now dispatches MLX q4 projection with the
+  row-block launch config instead of the flat one-dimensional launch helper.
+- `rocm_attention_heads` no longer uses a fixed 1024-entry shared weights array
+  for softmax storage, so 2k-token runs do not force the old serial fallback.
+- Query-side input norm, q projection, per-head q norm, and q RoPE now stay on
+  device for full-head rotary layers. This removes the query projection readback,
+  q-head norm readbacks/uploads, RoPE readbacks, and RoPE concat re-upload from
+  the main Gemma4 q4 path while preserving the current host KV state contract.
+- Full-rotary key/value projection, value no-scale norm, key norm/RoPE, and the
+  layer-to-layer final hidden handoff now also stay on device. The current host
+  KV contract still requires reading the final rope key and value vectors.
+- Generation omits host KV mirrors for layers that are not shared-KV sources or
+  debug outputs; those layers append directly from the prior device KV state.
+- Fixed the device-KV descriptor lookup hot path. `rocm_attention_device_kv_page`
+  previously scanned every page descriptor for every key/value element. The
+  common generation layout has one page per token, so the kernel now checks the
+  direct `page[token]` descriptor before falling back to the generic scan.
+- Shared-KV generation layers now borrow the current source layer's device KV
+  cache instead of copying growing host key/value slices. Borrowed alias layers
+  get their own descriptor tables but do not own or free the source pages.
+- Device-only KV appends now respect sliding-window token limits for one-token
+  pages, and ownership transfer handles trimmed suffix pages without double
+  freeing borrowed aliases.
+- Gemma4 per-layer input precompute now has a generation-mode device-buffer
+  path. The precompute and the per-layer GELU projection multiplier no longer
+  need to become Go `[]float32` slices when debug tensors are omitted.
+- HIP launch-argument upload now uses an async pinned-host/device ring. A fresh
+  64-token CPU profile showed `launchArgPointer` fall from roughly `6.9s`
+  cumulative to roughly `0.26s`. Direct mapped-host launch packets were tested
+  and rejected because the model generated token `0`; the mapped path remains
+  opt-in only in this older snapshot; the later endpoint refresh fixed/defaulted
+  it with the synchronized ring. General async small H2D staging was tested
+  separately and defaulted off because it regressed the 64-token benchmark.
+- RMSNormNoScale now uses a unit-weight RMSNorm launch mode instead of uploading
+  a synthetic all-ones weight vector for each value normalization call.
+- A token-parallel attention scoring experiment was tested and rejected: it
+  regressed 8/64-token throughput and was still running after `317s` on a
+  512-token benchmark.
+
+Fresh q4 benchmark ladder using
+`/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit` and
+`/tmp/go-rocm-kernels-gfx1100.hsaco`:
+
+```text
+8 tokens:
+BenchmarkInferenceGemma4Q4Generate-32  1  1076450260 ns/op  7.432 tok/s  26174952 B/op  218629 allocs/op
+
+64 tokens:
+BenchmarkInferenceGemma4Q4Generate-32  1  7925118540 ns/op  8.076 tok/s  180647680 B/op  1393308 allocs/op
+
+512 tokens:
+BenchmarkInferenceGemma4Q4Generate-32  1  75716855758 ns/op  6.762 tok/s  2541431872 B/op  10933834 allocs/op
+
+2000 tokens:
+BenchmarkInferenceGemma4Q4Generate-32  1  375619197263 ns/op  5.325 tok/s  16826757936 B/op  43054536 allocs/op
+PASS
+```
+
+The 2k benchmark now completes, but it is still far below the `100+ tok/s`
+endpoint.
+
+Correctness and fast gates:
+
+```text
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_MODEL_TESTS=1 GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE=1 GO_ROCM_GEMMA4_Q4_GENERATE_PROMPT='text:Hi' go test ./go -run 'TestNativeDecodeSmokeKernelStatus_Good' -count=1 -v
+PASS
+prompt_tokens=[2 10979] generated tokens=[236764 3307] text=["," "my"]
+
+go test ./go -run 'TestHIPKernelSource|TestHIPKernels_Attention|TestHIPGemma4Q4Layer0_Good|TestHIPGemma4Q4Generate' -count=1
+ok dappco.re/go/rocm 0.008s
+
+go test ./go -run 'TestKVCache_Good_DeviceMirror(WindowAppend|AppendsDecodeToken)|TestHIPGemma4Q4SharedDeviceKV_Good|TestHIPGemma4Q4SharedKV_Good' -count=1
+ok dappco.re/go/rocm 0.009s
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.151s
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.111s
+
+go test -tags rocm_legacy_server ./go -count=1
+ok dappco.re/go/rocm 0.011s
+
+git diff --check && git -C external/go-inference diff --check
+(no output)
+
+go test ./... -count=1
+ok dappco.re/go/rocm/workspace 0.641s
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./... -count=1
+? dappco.re/go/rocm/workspace [no test files]
+
+go test -tags rocm_legacy_server ./... -count=1
+ok dappco.re/go/rocm/workspace 0.189s
+
+(cd external/go-inference/go && go test ./... -count=1)
+all packages passed
+```
+
+Remaining blockers for the 100+ tok/s endpoint:
+
+- Full token step is still not device-resident. The query side, full-rotary K/V
+  setup, layer-to-layer hidden handoff, most non-shared generation KV state, and
+  shared-KV generation aliases are now partially device-resident, but
+  remaining partial-rotary/global-attention paths and final K/V vectors required
+  by the current host KV contract still produce host slices.
+- The q4 projection kernel is improved but still naive. It needs a production
+  tiled packed-GEMV path rather than one independent block per output row.
+- Long-context attention is improved but still far from target: the fresh
+  512-token run is `6.762 tok/s` and the completed 2k run is `5.325 tok/s`.
+  The helper kernel remains too barrier-heavy and should be
+  replaced by a real decode attention kernel with device-resident scratch and
+  fused handoff into the output projection.
+
+Latest performance follow-up after the fresh 100 tok/s driver pass:
+
+- Found the concrete HIP correctness bug in the experimental parallel attention
+  path. `rocm_attention_heads` launched with `BlockX: 256`, but the kernel still
+  returned every non-zero thread before calling `rocm_run_single_head_attention_parallel`,
+  which uses `__syncthreads()`. That left only lane 0 participating in block
+  barriers and produced nondeterministic q4 output.
+- Fixed the barrier-participation bug by allowing all threads in the block to
+  enter `rocm_attention_heads`; the parallel helper now falls back to the serial
+  single-head implementation for non-power-of-two block sizes, more than 256
+  threads, or more than 1024 KV tokens.
+- The real q4 smoke is stable again on the RX 7800 XT:
+  - package Prefill/Decode: `prompt=[0] next=258073 decoded=258073 text="<unused2161>"`
+  - public Generate `text:Hi`: `prompt_tokens=[2 10979] generated tokens=[236764 3307] text=["," "my"]`
+- The same q4 smoke passed three consecutive times after the HIP fix, so the
+  nondeterminism observed before the patch is closed.
+- The BF16 anchor still passes: greedy token `158750`, score `28.510628`.
+- `rocminfo` under `ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85` resolves the
+  selected device to `AMD Radeon RX 7800 XT`, UUID `GPU-880ed6479d653a85`,
+  `gfx1100`. `rocm-smi` reports product GFX version `gfx1101`, but a
+  `gfx1101` HSACO failed `hipModuleLoadData` with HIP error `200`; the `gfx1100`
+  HSACO remains the working target.
+- Setting the board to high/compute mode with `sudo rocm-smi --setperflevel high -d 0`
+  and `sudo rocm-smi --setprofile COMPUTE -d 0` did not improve the q4 benchmark,
+  so clocks are not the primary blocker.
+- Fresh q4 benchmark ladder after the attention fix:
+  - 1 token: `714107200 ns/op`, `1.400 tok/s`, `42511756 B/op`, `58858 allocs/op`.
+  - 8 tokens: `3104406559 ns/op`, `2.577 tok/s`, `182394600 B/op`, `248861 allocs/op`.
+  - 64 tokens: `23042303885 ns/op`, `2.778 tok/s`, `1480171840 B/op`, `1764903 allocs/op`.
+  - 512 tokens: `472847717598 ns/op`, `1.083 tok/s`, `22746415544 B/op`, `13935245 allocs/op`.
+- Fresh endpoint attempt: `GO_ROCM_BENCH_TOKENS=2000` was still running after
+  `600s` and was interrupted by timeout (`signal: interrupt`). No benchmark line
+  was produced.
+- A 64-token CPU profile still points at driver/runtime graph shape, not model
+  load or benchmark accounting:
+  - `runtime.cgocall`: `85.16%` flat.
+  - `cgoHIPDriver.CopyDeviceToHost`: `49.50%` cumulative.
+  - `cgoHIPDriver.CopyHostToDevice`: `35.21%` cumulative.
+  - `cgoHIPDriver.LaunchKernel`: `26.74%` cumulative.
+  - `hipReadFloat32DeviceOutput`: `47.00%` cumulative.
+- A 64-token allocation profile still shows the token path materializing large
+  host slices:
+  - `hipReadFloat32DeviceOutput`: `661.49MB` cumulative.
+  - `hipFloat32Payload` and `hipFloat32PayloadValues`: about `702.60MB` combined.
+  - `hipRunGemma4Q4SingleTokenForwardWithStateInternal`: `1448.56MB` cumulative.
+- Public q4 streaming generation now calls the already-existing internal
+  no-repeat-validation path after validating the top-level request. This did not
+  materially improve speed, which confirms validation was secondary to cgo
+  copies, launch count, and host KV/readback churn.
+- The 100+ tok/s endpoint is still open. The next implementation target should
+  be a device-resident token-step workspace/fused layer path that keeps hidden
+  vectors, RMSNorm, q/k/v/o, residuals, MLP, final norm, LM head, softcap, and
+  greedy sampling on device. Host KV state also needs replacement or windowed
+  device-page ownership; the 512-token run allocated `22.7GB/op`, proving the
+  current long-decode path still grows host-side work badly.
+
+Verification:
+
+```text
+hipcc --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100.hsaco
+(no output)
+
+go test ./go -run 'TestHIPKernelSource|TestHIPGemma4Q4Layer0_Good|TestHIPKernels_Attention' -count=1
+ok dappco.re/go/rocm 0.007s
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_MODEL_TESTS=1 GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE=1 GO_ROCM_GEMMA4_Q4_GENERATE_PROMPT='text:Hi' go test ./go -run 'TestNativeDecodeSmokeKernelStatus_Good' -count=3 -v
+PASS
+ok dappco.re/go/rocm 67.130s
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_MODEL_TESTS=1 GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco go test ./go -run TestNativeDecodeSmokeKernelStatus_Good -count=1 -v
+PASS
+ok dappco.re/go/rocm 17.204s
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 rocminfo | rg -n "Name:|Marketing Name|Uuid:|gfx"
+87:  Name:                    gfx1100
+88:  Uuid:                    GPU-880ed6479d653a85
+89:  Marketing Name:          AMD Radeon RX 7800 XT
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 rocm-smi --showuse --showproductname --showuniqueid
+GPU[0]: Unique ID: 0x880ed6479d653a85
+GPU[0]: GPU use (%): 97
+GPU[1]: GPU use (%): 0
+GPU[0]: Card Series: AMD Radeon RX 7800 XT
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_BENCHMARKS=1 GO_ROCM_RUN_MODEL_TESTS=1 GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE=1 GO_ROCM_BENCH_TOKENS=512 go test ./go -run '^$' -bench BenchmarkInferenceGemma4Q4Generate -benchmem -count=1
+BenchmarkInferenceGemma4Q4Generate-32 1 472847717598 ns/op 512.0 max_tokens/op 1.083 tok/s 512.0 tokens 22746415544 B/op 13935245 allocs/op
+PASS
+ok dappco.re/go/rocm 479.495s
+
+timeout -s INT 600s env ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_BENCHMARKS=1 GO_ROCM_RUN_MODEL_TESTS=1 GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE=1 GO_ROCM_BENCH_TOKENS=2000 go test ./go -run '^$' -bench BenchmarkInferenceGemma4Q4Generate -benchmem -count=1
+signal: interrupt
+FAIL dappco.re/go/rocm 599.777s
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.148s
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.112s
+
+go test -tags rocm_legacy_server ./go -count=1
+ok dappco.re/go/rocm 0.011s
+
+go test ./... -count=1
+ok dappco.re/go/rocm/workspace 0.780s
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./... -count=1
+? dappco.re/go/rocm/workspace [no test files]
+
+go test -tags rocm_legacy_server ./... -count=1
+ok dappco.re/go/rocm/workspace 0.194s
+
+(cd external/go-inference/go && go test ./... -count=1)
+PASS
+
+git diff --check && git -C external/go-inference diff --check
+(no output)
+```
+
+2026-05-16T12:30:33Z follow-up while working through `GOAL.md` toward the
+100+ tok/s Gemma4 q4 driver endpoint:
+
+- Added `rocm_gelu_tanh_multiply` and routed Gemma4 q4 MLP activation/multiply
+  through device buffers instead of host `GELU` plus host multiply for the main
+  q4 decode path.
+- Added device-input MLX q4 projection helpers so q4 MLP gate/up/down and
+  attention output projection can chain through device buffers.
+- Changed q4 attention output handling to write q-head outputs into one device
+  concat buffer and feed `o_proj` from that buffer, with only one host readback
+  kept for existing result/test visibility.
+- Added a small cgo HIP device-buffer pool for <=1 MiB temporary buffers. This
+  removed `hipFree` as the dominant short-run profile entry.
+- Batched RoPE query upload per layer and added `rocm_attention_heads`, reducing
+  q attention from eight launches per layer to one launch across query heads.
+- Removed repeated q4 config-validation allocations that constructed throwaway
+  `[]float32` inputs only to validate q4 projection shapes.
+
+Latest live RX 7800 XT evidence with
+`ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85` and rebuilt
+`/tmp/go-rocm-kernels-gfx1100.hsaco`:
+
+```text
+q4 smoke:
+prompt="text:Hi" prompt_tokens=[2 10979] generated tokens=[236764 3307] text=["," "my"]
+PASS in 23.152s
+
+BF16 anchor:
+Gemma4 BF16 layer0 tied LM-head greedy token=158750 score=28.510628
+PASS in 16.964s
+
+BenchmarkInferenceGemma4Q4Generate, GO_ROCM_BENCH_TOKENS=1:
+738894378 ns/op, 1.353 tok/s, 68661432 B/op, 61727 allocs/op
+
+BenchmarkInferenceGemma4Q4Generate, GO_ROCM_BENCH_TOKENS=8:
+4011068954 ns/op, 1.994 tok/s, 182386392 B/op, 248860 allocs/op
+
+BenchmarkInferenceGemma4Q4Generate, GO_ROCM_BENCH_TOKENS=64:
+197371659447 ns/op, 0.3243 tok/s, 1480160960 B/op, 1764878 allocs/op
+```
+
+Conclusion: short q4 decode is now materially faster than the original
+`0.235 tok/s` baseline and the post-launch-cache `0.868/0.691 tok/s` state, but
+the 100+ tok/s endpoint is not close. The 64-token result proves long-context
+decode still collapses. Fresh profile after `rocm_attention_heads` shows
+`cgoHIPDriver.LaunchKernel`/launch-packet host-to-device copies at about `62%`
+cumulative for the 8-token run, while `hipMemcpyDeviceToHost` is down to about
+`15%`. The next required work is a real fused/parallel q4 layer and attention
+kernel, not another host-side benchmark-accounting tweak.
+
+Additional validation-fast-path check: skipping repeated deep q4 config and
+self-generated KV validation inside the internal greedy loop cut the 64-token
+allocation volume from about `2.12 GB` to about `1.48 GB`, but throughput stayed
+flat at about `0.324 tok/s`. That confirms the long-context failure is dominated
+by the serial attention/kernel graph rather than validation overhead.
+
+## 2026-05-16 Fresh Runner And q4 Benchmark Pass
+
+- Rechecked the runner after the `0.235 tok/s` result. `rocm-smi` shows the
+  RX 7800 XT as the active device and the onboard GPU idle during q4 runs.
+- Confirmed the benchmark excludes model load with `b.ResetTimer()` after
+  `LoadModel`.
+- Baseline reruns before optimization:
+  - 1-token q4: `4244871937 ns/op`, `0.2356 tok/s`.
+  - 4-token q4: `12228533217 ns/op`, `0.3271 tok/s`.
+  - 8-token q4: `26421638390 ns/op`, `0.3028 tok/s`.
+- Profile root cause before optimization:
+  - `hipModuleLoadData`: about 29% cumulative CPU.
+  - `hipModuleUnload`: about 10% cumulative CPU.
+  - per-launch `hipFree`: about 42% cumulative CPU.
+- Implemented process-local HSACO module/function caching in the cgo HIP driver.
+- Implemented reusable device launch-argument packet storage.
+- Avoided unused attention-weight readback in the Gemma4 q4 generation path.
+- Fresh benchmark results after the changes:
+  - 1-token q4: `1151848888 ns/op`, `0.8682 tok/s`, `89530672 B/op`, `79132 allocs/op`.
+  - 8-token q4: `11579650685 ns/op`, `0.6909 tok/s`, `369906856 B/op`, `336178 allocs/op`.
+- Remaining bottleneck after these fixes is not wrong-device execution. The
+  profile is dominated by synchronous device-to-host readback:
+  - `hipMemcpyDeviceToHost`: about 75% cumulative CPU.
+  - `hipAttentionDeviceBuffers.ReadOutputOnly`: about 55% cumulative CPU.
+  - q4 still round-trips primitive outputs through Go between attention,
+    projection, norm, vector, logits, and greedy steps.
+- Practical conclusion: getting from sub-1 tok/s to Metal-class throughput needs
+  fused, device-resident q4 decode kernels and buffer reuse, not runner tuning.
+
+Fresh verification:
+
+```text
+go test ./go/... -count=1
+ok dappco.re/go/rocm
+ok dappco.re/go/rocm/internal/gguf
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go/... -count=1
+ok dappco.re/go/rocm
+ok dappco.re/go/rocm/internal/gguf
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 \
+GO_ROCM_RUN_HIP_TESTS=1 \
+GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco \
+go test ./go -run 'TestHIPHardware(AvailabilitySmoke|ProjectionKernelSource|EmbeddingKernelSource|TransformerKernelSource|PrefillDecodeKernelSource)_Good|TestHIPGemma4Q4' -count=1 -v
+PASS
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 \
+GO_ROCM_RUN_MODEL_TESTS=1 \
+GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit \
+GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco \
+GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE=1 \
+GO_ROCM_GEMMA4_Q4_GENERATE_PROMPT='text:Hi' \
+GO_ROCM_GEMMA4_Q4_GENERATE_TOKENS=2 \
+go test ./go -run TestNativeDecodeSmokeKernelStatus_Good -count=1 -v -timeout=10m
+PASS
+Gemma4 q4 public Generate prompt="text:Hi" prompt_tokens=[2 10979] generated tokens=[236764 3307] text=["," "my"]
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 \
+GO_ROCM_RUN_MODEL_TESTS=1 \
+GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B \
+GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco \
+go test ./go -run TestNativeDecodeSmokeKernelStatus_Good -count=1 -v -timeout=10m
+PASS
+Gemma4 BF16 layer0 tied LM-head greedy token=158750 score=28.510628
+
+go test ./go/... -coverpkg=./go/... -coverprofile=/tmp/go-rocm-fresh2.cover -covermode=atomic -count=1
+PASS
+
+go tool cover -func=/tmp/go-rocm-fresh2-codecov.cover | tail -n 1
+total: (statements) 90.6%
+```
+
+2026-05-17T05:20:37Z device-resident q4 Generate bootstrap follow-up:
+
+- Closed the strict device-residency gap in the public Gemma4 q4 Generate path.
+  A fresh sequence previously needed to read the first computed K/V vectors back
+  to host to create the initial device KV cache. The q4 layer now calls
+  `newROCmDeviceKVCacheFromDeviceToken` when `OmitHostKV` is set and no prior
+  device KV cache exists, so the initial cache is encoded from device K/V token
+  buffers through `rocm_kv_encode_token`.
+- Added focused fake-driver coverage to ensure public q4 Generate launches KV
+  encode kernels for the first prompt token as well as later generated tokens.
+- Verification after the change:
+
+```text
+go test ./go -run 'TestHIPGemma4Q4Layer0Forward_Good|TestHIPGemma4Q4EffectiveSlidingWindow_Good|TestKVCache_Good_KVEncodeTokenKernelEncodesDeviceToken|TestKVCache_Good_DeviceMirrorAppendsDeviceTokenWindow' -count=1
+ok dappco.re/go/rocm 0.010s
+
+Q4 live smoke:
+ok dappco.re/go/rocm 13.453s
+generated tokens=[236764 3307] text=["," "my"]
+
+2000-token endpoint:
+BenchmarkInferenceGemma4Q4Generate-32 1 19629810772 ns/op 2000 max_tokens/op 101.9 tok/s 2000 tokens 251745216 B/op 2730011 allocs/op
+
+2048-token endpoint:
+BenchmarkInferenceGemma4Q4Generate-32 1 20156670616 ns/op 2048 max_tokens/op 101.6 tok/s 2048 tokens 258176312 B/op 2795040 allocs/op
 ```
 
 ## 2026-05-13 Coverage, Docs, And Benchmark Audit
@@ -9861,3 +10911,1883 @@ git diff --check
 (external/go-inference) git diff --check
 (no output)
 ```
+
+## 2026-05-16 q4 Driver/HIP Endpoint Refresh
+
+The post-Q/K/V-fusion pass found and kept several more driver/HIP fixes:
+
+- The mapped launch-argument path in `go/hip_driver_cgo.go` was unsafe when it
+  reused one mapped host packet before the GPU had consumed it. The mapped path
+  now uses the same synchronized async slot ring as the pinned-host/device path
+  and is defaulted on unless `GO_ROCM_DISABLE_MAPPED_LAUNCH_ARGS` is set.
+- `rocm_kv_descriptor_append` was still a single-thread descriptor copy in the
+  common no-trim generation path. It now copies previous page descriptors in
+  parallel and lets thread 0 append the new page/header.
+- Long-context `rocm_attention_heads` was still using 256-thread blocks. Moving
+  contexts of at least 512 tokens to 512-thread blocks reduced score-phase work
+  per thread. A 1024-thread experiment regressed the 2k endpoint to
+  `22.77 tok/s` before grouped value accumulation and `24.78 tok/s` after it.
+  Retesting 1024-thread attention after the later descriptor-validation fixes
+  still regressed the 2k endpoint to `57.67 tok/s`, so the kept selector is
+  256 threads below 512 tokens and 512 threads at/above 512 tokens.
+- A previous shared-query cache experiment was rejected before the newer
+  attention shape, but the later scoped variant is now kept. It copies each head
+  query into shared memory for the token-parallel score phase and moved the 2k
+  endpoint from `25.20 tok/s` to `25.30 tok/s` before the later value-side work.
+- The q8 key-dot path now consumes four int8 key values per aligned 32-bit load
+  instead of decoding every q8 key element through the scalar path.
+- The 512-thread attention path initially left extra threads idle during
+  device-KV value accumulation when the head dimension was 256. The kept q4 path
+  pairs even/odd output dimensions, splits token ranges across worker groups,
+  and reduces those partials in shared memory.
+- Long-context attention now caches q4 value page pointers/scales in dynamic
+  shared memory so the value phase can avoid reloading descriptor metadata for
+  the common one-token q4 value pages.
+- `rocm_attention_heads` no longer performs a full device-KV page-table walk in
+  every head block during argument validation. It validates the descriptor
+  header there and leaves full page validation to the dedicated descriptor path.
+- The token-parallel attention helper normalizes softmax weights once before
+  value accumulation and uses direct one-token page addressing in the hot score
+  and value loops.
+- A q8 key-dot specialization that bypassed the generic descriptor helper was
+  rejected because it regressed the 2k endpoint to `58.20 tok/s` versus the kept
+  `58.43 tok/s` path.
+
+Current endpoint ladder on the RX 7800 XT with
+`ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85`,
+`/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit`, and
+`/tmp/go-rocm-kernels-gfx1100.hsaco`:
+
+```text
+1 token:
+24482634 ns/op, 40.85 tok/s, 4414351 B/op, 22246 allocs/op
+
+8 tokens:
+101731908 ns/op, 78.64 tok/s, 7447574 B/op, 83144 allocs/op
+
+64 tokens:
+744144350 ns/op, 86.00 tok/s, 39139076 B/op, 567615 allocs/op
+
+512 tokens:
+7959242091 ns/op, 64.33 tok/s, 214885656 B/op, 4462676 allocs/op
+
+2048 tokens:
+34952296158 ns/op, 58.59 tok/s, 822547632 B/op, 17738577 allocs/op
+```
+
+The 2k benchmark still takes about `35s`, so the slow long-context endpoint is
+real. During long endpoint runs in this pass, `rocm-smi` samples showed the RX
+7800 XT active (`84-99%`) and the onboard GPU at `0%`.
+
+Fresh 512-token `rocprof --stats` after the descriptor-validation, q4 value
+metadata cache, normalized-weight, direct-page attention, q8 key-dot unroll,
+and direct q4 value branch fixes:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32  1  8494141070 ns/op  512.0 max_tokens/op  60.28 tok/s  512.0 tokens  214666072 B/op  4462667 allocs/op
+rocm_attention_heads.kd                17955 calls  2.427815633s  42.62%
+rocm_mlx_q4_projection.kd              64125 calls  1.056868073s  18.55%
+rocm_mlx_q4_gelu_tanh_multiply.kd      17955 calls  0.619429254s  10.87%
+rocm_rms_norm_residual_add.kd          53865 calls  0.389180830s   6.83%
+rocm_rms_norm.kd                       51813 calls  0.293657553s   5.15%
+rocm_mlx_q4_projection_greedy.kd         513 calls  0.282546650s   4.96%
+rocm_mlx_q4_gelu_tanh_projection.kd    17955 calls  0.128886271s   2.26%
+rocm_mlx_q4_triple_projection.kd        7695 calls  0.116857346s   2.05%
+rocm_projection.kd                       513 calls  0.076850519s   1.35%
+rocm_rms_norm_heads.kd                 18468 calls  0.073536231s   1.29%
+rocm_rope_heads.kd                     17955 calls  0.072264286s   1.27%
+rocm_kv_descriptor_append.kd            7680 calls  0.059984795s   1.05%
+rocm_kv_encode_token.kd                 7680 calls  0.037909023s   0.67%
+__amd_rocclr_copyBuffer.kd              2183 calls  0.010323757s   0.18%
+```
+
+Driver copies and descriptor append are no longer large enough to explain the
+gap. `rocm_attention_heads`, q4 projection/MLP work, norm/residual kernels, and
+the per-token primitive graph remain the main suspects. The next driver should
+replace attention with a multi-block/tiled decode path and continue collapsing
+the q4 layer primitive graph into resident kernels.
+
+Live q4 smoke still passes:
+
+```text
+Gemma4 q4 package Prefill/Decode prompt=[0] next=258073 decoded=258073 text="<unused2161>"
+Gemma4 q4 public Generate prompt="text:Hi" prompt_tokens=[2 10979] generated tokens=[236764 3307] text=["," "my"]
+PASS
+```
+
+Fast verification after the borrowed-alias/page-slice-pool code and
+documentation refresh:
+
+```text
+git diff --check
+(no output)
+
+hipcc --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100.hsaco
+(no output)
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.151s
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.114s
+
+go test -tags rocm_legacy_server ./go -count=1
+ok dappco.re/go/rocm 0.010s
+
+go test ./go -run 'TestKVCache_Good_DeviceBorrowedAliasDoesNotOwnSourcePages|TestKVCache_Good_DeviceMirrorAppendsDecodeTokenIncrementally|TestKVCache_Good_DeviceMirrorWindowAppendTrimsAndTransfersPages|TestKVCache_Bad_DeviceMirrorAppendScratchCloseDoesNotFreeSourcePages|TestHIPGemma4Q4SharedDeviceKV_Good' -count=1
+ok dappco.re/go/rocm 0.014s
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 \
+GO_ROCM_RUN_MODEL_TESTS=1 \
+GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit \
+GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco \
+GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE=1 \
+GO_ROCM_GEMMA4_Q4_GENERATE_PROMPT='text:Hi' \
+go test ./go -run 'TestNativeDecodeSmokeKernelStatus_Good' -count=1 -v
+Gemma4 q4 package Prefill/Decode prompt=[0] next=258073 decoded=258073 text="<unused2161>"
+Gemma4 q4 public Generate prompt="text:Hi" prompt_tokens=[2 10979] generated tokens=[236764 3307] text=["," "my"]
+PASS
+ok dappco.re/go/rocm 13.934s
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 \
+GO_ROCM_RUN_BENCHMARKS=1 \
+GO_ROCM_RUN_MODEL_TESTS=1 \
+GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit \
+GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco \
+GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE=1 \
+GO_ROCM_BENCH_TOKENS=2048 \
+go test ./go -run '^$' -bench BenchmarkInferenceGemma4Q4Generate -benchmem -count=1
+BenchmarkInferenceGemma4Q4Generate-32  1  34952296158 ns/op  2048 max_tokens/op  58.59 tok/s  2048 tokens  822547632 B/op  17738577 allocs/op
+PASS
+ok dappco.re/go/rocm 41.795s
+```
+
+2026-05-17T02:55:00Z q4 driver pass toward the 100+ tok/s endpoint:
+
+- Kept final-token final RMSNorm precompute. The last q4 decoder layer now
+  writes the final model RMSNorm output for the LM-head path, removing one
+  standalone `rocm_rms_norm` launch per generated token. A profiled 512-token
+  run showed `rocm_rms_norm.kd` calls drop by 513.
+- Found and fixed a material attention launch-geometry problem. The device-KV
+  q4 attention path used 256-thread blocks until 512 cached tokens, which meant
+  most of the 512-token benchmark missed the paired q4 value accumulation path.
+  `hipAttentionHeadsBlockSize` now switches to 512 threads at 16 tokens.
+- Lowered the q4 value metadata-cache threshold from 512 tokens to 16 tokens so
+  the paired q4 value path can reuse value page pointers/scales for short and
+  medium contexts.
+- Rejected `k-q4-v-q4` device KV mode. It ran, but public q4 smoke changed the
+  generated token and failed the accepted-token check.
+- Rejected q4 projection retunes: 4 rows per 256-thread block failed projection
+  smoke; 16 rows per block preserved q4 smoke but regressed 512 tokens to
+  `87.58 tok/s` versus the kept `90.47 tok/s`.
+
+Kept endpoint checks on the pinned RX 7800 XT:
+
+```text
+q4 smoke:
+generated tokens=[236764 3307] text=["," "my"]
+
+512 tokens:
+BenchmarkInferenceGemma4Q4Generate-32 1 5659309906 ns/op 512.0 max_tokens/op 90.47 tok/s 512.0 tokens 75225224 B/op 769938 allocs/op
+
+2000 tokens:
+BenchmarkInferenceGemma4Q4Generate-32 1 29611416789 ns/op 2000 max_tokens/op 67.54 tok/s 2000 tokens 259603056 B/op 2920165 allocs/op
+
+2048 tokens:
+BenchmarkInferenceGemma4Q4Generate-32 1 30357995463 ns/op 2048 max_tokens/op 67.46 tok/s 2048 tokens 266414472 B/op 2989597 allocs/op
+```
+
+Fresh 512-token `rocprof --stats` for the kept path:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 6195789367 ns/op 512.0 max_tokens/op 82.64 tok/s 512.0 tokens 75226088 B/op 769945 allocs/op
+rocm_mlx_q4_projection.kd              26.5444%
+rocm_attention_heads.kd                17.0842%
+rocm_mlx_q4_gelu_tanh_multiply.kd      16.1673%
+rocm_rms_norm_residual_add_norm.kd     10.9788%
+rocm_mlx_q4_projection_greedy.kd        7.7072%
+rocm_rms_norm_residual_add.kd           3.5560%
+rocm_rms_norm.kd                        1.7629%
+rocm_kv_descriptor_append.kd            1.5590%
+__amd_rocclr_copyBuffer.kd              0.2764%
+```
+
+The endpoint is improved but still open. The current profile no longer points
+at a single attention-only blocker; q4 projection launch volume, q4
+GELU/multiply, residual/norm kernels, and the remaining primitive graph are now
+large enough that the next step should be fused resident q4 decode kernels or a
+real tiled decode attention/projection path, not another host-copy pass.
+
+Final verification for this pass:
+
+```text
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_MODEL_TESTS=1 GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco go test ./go -run TestNativeDecodeSmokeKernelStatus_Good -count=1 -v
+PASS
+Gemma4 BF16 layer0 tied LM-head greedy token=158750 score=28.510630
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.144s
+
+go test ./... -count=1
+ok dappco.re/go/rocm/workspace 0.647s
+
+CGO_ENABLED=0 go test ./... -count=1
+? dappco.re/go/rocm/workspace [no test files]
+
+CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.115s
+
+go test -tags rocm_legacy_server ./... -count=1
+ok dappco.re/go/rocm/workspace 0.169s
+
+go test -tags rocm_legacy_server ./go -count=1
+ok dappco.re/go/rocm 0.010s
+
+go test ./go/... -coverpkg=./go/... -coverprofile=/tmp/go-rocm-attn16.cover -covermode=atomic -count=1
+ok dappco.re/go/rocm 0.223s coverage: 75.2% of statements in ./go/...
+ok dappco.re/go/rocm/internal/gguf 0.011s coverage: 1.0% of statements in ./go/...
+
+awk 'NR==1{print; next} $1 !~ /\/hip_/ && $1 !~ /internal\/gguf/ && $1 !~ /model_pack.go/ && $1 !~ /embedding_model.go/ {print}' /tmp/go-rocm-attn16.cover > /tmp/go-rocm-attn16-codecov.cover
+go tool cover -func=/tmp/go-rocm-attn16-codecov.cover | tail -n 1
+total: (statements) 90.6%
+
+git diff --check
+(no output)
+```
+
+## 2026-05-26 Dependency and Zero-Copy Bridge Refresh
+
+- Refreshed local Core dependencies to the canonical dev baselines: `external/go`
+  at `v0.10.3`, `external/go-inference` at `v0.10.0-178-ge05c165`,
+  `external/go-log` at `v0.10.0-6-g96c2e47`, sibling `go-mlx` at
+  `v0.9.0-1454-ga6bfcc8`, and added `external/go-cgo` at
+  `v0.11.1-3-ge866c96`.
+- Aligned `go-rocm` with the current `go-inference` contracts: generation config
+  no longer carries string stop sequences, OpenAI/service validation follows the
+  canonical handlers, and parser tests now use the current `go-inference/parser`
+  marker set.
+- Switched the cgo HIP module image retention path from `C.CBytes` to
+  Go-owned pinned memory: `cgoHIPLoadModule` now reads the HSACO into a Go byte
+  slice, pins it through `go-cgo`/`core.PinnedView`, passes the stable pointer to
+  `hipModuleLoadData`, and keeps the pin alive in the module cache. Kernel-name
+  lookup now uses `go-cgo` C string ownership helpers.
+- Added the first ROCm state-block parity slice from the `go-mlx` pattern:
+  `SleepState` can now opt into `rocm/kv-cache-block-bundle+json`, which writes
+  raw KV page payloads as State chunks plus a manifest, and `WakeState` restores
+  by walking those block refs. The manifest now records the full `state.ChunkRef`
+  for each block, so wake can call `BorrowRefBytes` and use store-native borrowed
+  storage instead of resolving by URI and copying first.
+- Added direct HIP restore for those block bundles on loaded HIP models. The
+  wake path borrows each raw block, uploads key/value payload slices through
+  `go-cgo`/`core.PinnedView` when the cgo HIP driver is available, installs
+  `rocmDeviceKVCache` pages directly, and labels successful restores as
+  `kv_restore=hip_device_block_stream` with
+  `kv_device_restore_path=borrow_ref_pinned`. The old monolithic snapshot path
+  and JSON block fallback remain available for compatibility.
+- Kept the new state/KV path HIP-generic rather than AMD-specific. If the local
+  toolchain is later configured to target NVIDIA through HIP (`HIP_PLATFORM=nvidia`
+  with a CUDA/NVCC toolchain), the restore layer should carry over because it
+  depends on HIP allocation/copy/descriptor contracts, not AMD-only host logic.
+  ZLUDA is a separate CUDA-on-non-NVIDIA route and is useful for CUDA binary
+  experiments on AMD, but the first-class cross-vendor path for this driver is
+  still HIP source compiled for the selected backend.
+- Rebuilt the HSACO with C++23:
+
+```text
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100.hsaco
+```
+
+- Toolchain note: `hipcc --std=c++23` works, but including `<mdspan>` currently
+  fails with `fatal error: 'mdspan' file not found` under the installed ROCm 7.2
+  host headers. The intended zero-copy shape remains `core.PinnedView` +
+  `go-cgo` scoped pins on the Go side and mdspan-shaped C++ views once the
+  compiler/header stack can provide them.
+- Verification:
+
+```text
+go test ./go -count=1
+PASS
+ok dappco.re/go/rocm 0.154s
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_HIP_TESTS=1 GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco go test ./go -run 'TestHIPHardwareProjectionKernelSource_Good|TestHIPHardwareTransformerKernelSource_Good' -count=1 -v
+PASS
+ok dappco.re/go/rocm 0.059s
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_MODEL_TESTS=1 GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE=1 GO_ROCM_GEMMA4_Q4_GENERATE_PROMPT='text:Hi' go test ./go -run 'TestNativeDecodeSmokeKernelStatus_Good' -count=1 -v
+PASS
+ok dappco.re/go/rocm 14.030s
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_MODEL_TESTS=1 GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco go test ./go -run 'TestNativeDecodeSmokeKernelStatus_Good' -count=1 -v
+PASS
+ok dappco.re/go/rocm 17.323s
+
+go test ./... -count=1
+PASS
+ok dappco.re/go/rocm/workspace 1.232s
+
+go test ./... -count=1  # external/go
+PASS
+ok dappco.re/go 0.284s
+
+go test ./... -count=1  # external/go-inference/go
+PASS
+ok dappco.re/go/inference/...
+
+go test ./... -count=1  # external/go-cgo/go
+PASS
+ok dappco.re/go/cgo 0.003s
+```
+
+2026-05-17 per-layer-input GELU projection batch tile follow-up:
+
+- Extended the same 8-token batch tile to
+  `rocm_mlx_q4_gelu_tanh_projection_batch`, which is the Gemma4 per-layer-input
+  gate primitive. The launch config now schedules token blocks on `GridY` and
+  guards partial token tiles, matching the q4 projection and fused gate/up batch
+  kernels.
+- The live result is mixed but useful for longer prompts: 2k stayed roughly flat
+  to slightly down, while 4k improved from `315.8` to `319.0 prompt_tok/s`.
+  Latest measured runs with the tiled per-layer-input path:
+
+```text
+2k prompt: 5963139198 ns/op, 343.4 prompt_tok/s, 12329936 B/op, 29787 allocs/op
+4k prompt: 12840551074 ns/op, 319.0 prompt_tok/s, 14511024 B/op, 52314 allocs/op
+```
+
+- Verification:
+
+```text
+go test ./go -run 'TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good|TestHIPKernels_MLXQ4GELUTanhProjectionLaunchArgs_Good|TestHIPGemma4Q4PrefillLayerBodyBatchWithPerLayerInput_Good|TestHIPGemma4Q4PrefillForwardBatchWithGeneratedPerLayerInput_Good' -count=1 -v
+PASS
+ok dappco.re/go/rocm 0.012s
+
+hipcc --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100.hsaco
+(no output)
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_HIP_TESTS=1 GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco go test ./go -run 'TestHIPHardwareProjectionKernelSource_Good' -count=1 -v
+PASS
+ok dappco.re/go/rocm 0.042s
+
+go test ./go -count=1
+PASS
+ok dappco.re/go/rocm 0.156s
+
+CGO_ENABLED=0 go test ./go -count=1
+PASS
+ok dappco.re/go/rocm 0.119s
+
+go test -tags rocm_legacy_server ./go -count=1
+PASS
+ok dappco.re/go/rocm 0.011s
+
+go test ./... -count=1
+PASS
+ok dappco.re/go/rocm/workspace 0.712s
+
+CGO_ENABLED=0 go test ./... -count=1
+? dappco.re/go/rocm/workspace [no test files]
+
+go test -tags rocm_legacy_server ./... -count=1
+PASS
+ok dappco.re/go/rocm/workspace 0.196s
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_MODEL_TESTS=1 GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE=1 GO_ROCM_GEMMA4_Q4_GENERATE_PROMPT='text:Hi' go test ./go -run 'TestNativeDecodeSmokeKernelStatus_Good' -count=1 -v
+PASS
+ok dappco.re/go/rocm 13.781s
+
+git diff --check
+(no output)
+```
+
+2026-05-17T03:36:41Z post-fusion driver/HIP audit:
+
+- Rechecked the selected GPU:
+
+```text
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 rocminfo
+Name: gfx1100
+Uuid: GPU-880ed6479d653a85
+Marketing Name: AMD Radeon RX 7800 XT
+```
+
+  `rocm-smi` reports the product GFX version as `gfx1101`, but `rocminfo`
+  exposes the usable HSA ISA as `gfx1100` plus `gfx11-generic`.
+
+- Built and tested alternate HSACOs from the current source:
+
+```text
+hipcc --genco --offload-arch=gfx11-generic -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx11-generic-o2.hsaco
+hipcc --genco --offload-arch=gfx1100 -O3 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-o3.hsaco
+```
+
+  Both preserved q4 smoke with generated tokens `[236764 3307]`.
+
+```text
+gfx11-generic -O2, 512 tokens:
+BenchmarkInferenceGemma4Q4Generate-32 1 5415745630 ns/op 512.0 max_tokens/op 94.54 tok/s 512.0 tokens 73465488 B/op 726181 allocs/op
+
+gfx11-generic -O2, 2000 tokens:
+BenchmarkInferenceGemma4Q4Generate-32 1 28883268209 ns/op 2000 max_tokens/op 69.24 tok/s 2000 tokens 251927648 B/op 2749943 allocs/op
+
+gfx1100 -O3, 512 tokens:
+BenchmarkInferenceGemma4Q4Generate-32 1 5429656599 ns/op 512.0 max_tokens/op 94.30 tok/s 512.0 tokens 73477528 B/op 726206 allocs/op
+```
+
+  The codegen variants are effectively tied with the kept `gfx1100 -O2`
+  endpoint (`69.04 tok/s` at 2000 tokens), so this does not explain the gap to
+  `100+ tok/s`.
+
+- Cross-checked the `go-mlx` Gemma4 decode path. The useful design difference is
+  not a hidden small fusion; it is KV layout. `go-mlx` uses paged decode cache
+  blocks with 256-token pages, while `go-rocm` still appends one encoded device
+  K/V page per generated token and optimizes attention around
+  `page_count == token_count`. That keeps today's direct-token fast path correct
+  but leaves the long-context driver pointer-chasing tiny pages. Updated
+  `GOAL.md` and `doc/inference-benchmark.md` to call out block/page device-KV
+  layout as a concrete endpoint task.
+
+2026-05-17T03:35:00Z q4 driver pass toward the 100+ tok/s endpoint:
+
+- Kept two HIP-side changes:
+  - Replaced shared-memory tree reductions in `rocm_rms_norm`,
+    `rocm_rms_norm_residual_add`, `rocm_rms_norm_residual_add_norm`, and
+    `rocm_rms_norm_heads` with a wave-shuffle block reducer. This is a small
+    but consistent reduction-kernel cleanup.
+  - Added `rocm_rms_norm_rope_heads` and routed q4 query/key vectors through it
+    so query RMSNorm+RoPE and key RMSNorm+RoPE are fused per decoder layer.
+- Q4 public smoke on the pinned RX 7800 XT stayed stable:
+
+```text
+generated tokens=[236764 3307] text=["," "my"]
+```
+
+- Kept endpoint checks:
+
+```text
+512 tokens:
+BenchmarkInferenceGemma4Q4Generate-32 1 5429310468 ns/op 512.0 max_tokens/op 94.30 tok/s 512.0 tokens 73470456 B/op 726184 allocs/op
+
+2000 tokens:
+BenchmarkInferenceGemma4Q4Generate-32 1 28966745166 ns/op 2000 max_tokens/op 69.04 tok/s 2000 tokens 251720040 B/op 2749949 allocs/op
+
+2048 tokens:
+BenchmarkInferenceGemma4Q4Generate-32 1 29755291471 ns/op 2048 max_tokens/op 68.83 tok/s 2048 tokens 258122472 B/op 2815303 allocs/op
+```
+
+- Fresh 512-token `rocprof --stats` after the fused path:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 5922709579 ns/op 512.0 max_tokens/op 86.45 tok/s 512.0 tokens 73477416 B/op 726204 allocs/op
+rocm_mlx_q4_projection.kd              27.2241%
+rocm_attention_heads.kd                17.4800%
+rocm_mlx_q4_gelu_tanh_multiply.kd      16.6255%
+rocm_rms_norm_residual_add_norm.kd     10.7865%
+rocm_mlx_q4_projection_greedy.kd        7.8604%
+rocm_rms_norm_rope_heads.kd             3.6336%
+rocm_rms_norm_residual_add.kd           3.4116%
+rocm_mlx_q4_triple_projection.kd        3.3917%
+__amd_rocclr_copyBuffer.kd              0.2897%
+```
+
+- Rejected in this pass:
+  - q4 shared-input GEMV caching. It preserved q4 smoke but regressed 512 tokens
+    to `6882021118 ns/op`, `74.40 tok/s`, `81611384 B/op`, `798535 allocs/op`.
+  - block-level q4 greedy atomics. It preserved q4 smoke but regressed 512
+    tokens to `5459177986 ns/op`, `93.79 tok/s`, `73477000 B/op`,
+    `726202 allocs/op`, below the kept `94.30 tok/s`.
+
+- Final verification:
+
+```text
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_MODEL_TESTS=1 GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco go test ./go -run TestNativeDecodeSmokeKernelStatus_Good -count=1 -v
+PASS
+Gemma4 BF16 layer0 tied LM-head greedy token=158750 score=28.510630
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.157s
+
+go test ./... -count=1
+ok dappco.re/go/rocm/workspace 0.783s
+
+CGO_ENABLED=0 go test ./... -count=1
+? dappco.re/go/rocm/workspace [no test files]
+
+CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.113s
+
+go test -tags rocm_legacy_server ./... -count=1
+ok dappco.re/go/rocm/workspace 0.174s
+
+go test -tags rocm_legacy_server ./go -count=1
+ok dappco.re/go/rocm 0.011s
+
+go test ./go/... -coverpkg=./go/... -coverprofile=/tmp/go-rocm-fusedrope.cover -covermode=atomic -count=1
+ok dappco.re/go/rocm 0.222s coverage: 75.0% of statements in ./go/...
+ok dappco.re/go/rocm/internal/gguf 0.011s coverage: 0.9% of statements in ./go/...
+
+awk 'NR==1{print; next} $1 !~ /\/hip_/ && $1 !~ /internal\/gguf/ && $1 !~ /model_pack.go/ && $1 !~ /embedding_model.go/ {print}' /tmp/go-rocm-fusedrope.cover > /tmp/go-rocm-fusedrope-codecov.cover
+go tool cover -func=/tmp/go-rocm-fusedrope-codecov.cover | tail -n 1
+total: (statements) 90.6%
+
+git diff --check
+(no output)
+```
+
+2026-05-17T03:48:38Z descriptor-trim deep pass:
+
+- The 2k `rocprof --stats` run after RMSNorm/RoPE fusion showed a different
+  long-context bottleneck than the earlier 512-token profiles. Before this
+  patch, `rocm_kv_descriptor_append` consumed `18.4770%` of profiled GPU time
+  at 2000 tokens because the sliding-window trim path copied retained one-token
+  page descriptors serially.
+- Kept a HIP-side fast path in `rocm_kv_descriptor_append` for the current
+  common generation layout:
+  - `trim_start > 0`,
+  - previous and output descriptors are direct one-token page tables,
+  - output keeps the retained suffix plus the newly appended token.
+  The branch parallel-copies retained page descriptors, rewrites
+  `token_start` to the trimmed output index, then thread 0 writes the appended
+  page and descriptor header.
+- Rebuilt the live `gfx1100 -O2` HSACO at
+  `/tmp/go-rocm-kernels-gfx1100.hsaco`.
+- Q4 public smoke on the pinned RX 7800 XT stayed stable:
+
+```text
+generated tokens=[236764 3307] text=["," "my"]
+```
+
+- Kept endpoint checks:
+
+```text
+512 tokens:
+BenchmarkInferenceGemma4Q4Generate-32 1 5405693975 ns/op 512.0 max_tokens/op 94.71 tok/s 512.0 tokens 73465472 B/op 726181 allocs/op
+
+2000 tokens:
+BenchmarkInferenceGemma4Q4Generate-32 1 25194731733 ns/op 2000 max_tokens/op 79.38 tok/s 2000 tokens 252131160 B/op 2749942 allocs/op
+
+2048 tokens:
+BenchmarkInferenceGemma4Q4Generate-32 1 25883692325 ns/op 2048 max_tokens/op 79.12 tok/s 2048 tokens 259628912 B/op 2815319 allocs/op
+```
+
+- Fresh 2000-token `rocprof --stats` after the descriptor-trim patch:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 27305627596 ns/op 2000 max_tokens/op 73.24 tok/s 2000 tokens 251927936 B/op 2749945 allocs/op
+rocm_attention_heads.kd                70035 calls  5.397124401s  30.8611%
+rocm_mlx_q4_projection.kd             250125 calls  3.946695958s  22.5675%
+rocm_mlx_q4_gelu_tanh_multiply.kd      70035 calls  2.420675285s  13.8416%
+rocm_rms_norm_residual_add_norm.kd    140070 calls  1.589776420s   9.0904%
+rocm_mlx_q4_projection_greedy.kd        2001 calls  1.161366483s   6.6408%
+rocm_rms_norm_rope_heads.kd           100050 calls  0.529659186s   3.0286%
+rocm_rms_norm_residual_add.kd          70035 calls  0.493879348s   2.8240%
+rocm_mlx_q4_triple_projection.kd       30015 calls  0.488432277s   2.7929%
+rocm_mlx_q4_gelu_tanh_projection.kd    70035 calls  0.448307491s   2.5635%
+rocm_kv_descriptor_append.kd           30000 calls  0.312253317s   1.7855%
+__amd_rocclr_copyBuffer.kd              6647 calls  0.034896189s   0.1995%
+```
+
+- The descriptor-trim problem is no longer the endpoint blocker. The remaining
+  profile is mostly real model work plus launch graph shape: attention
+  (`30.86%`), q4 projection (`22.57%`), q4 GELU/multiply (`13.84%`), and
+  RMSNorm/residual/final projection kernels.
+- Structural diagnosis for the next pass: `rocm_attention_heads` still launches
+  one block per query head. Gemma4-E2B has 8 query heads, so each attention
+  dispatch exposes only 8 blocks to the RX 7800 XT. The `go-mlx` dev reference
+  avoids this shape by using 256-token paged decode cache plus fused MLX SDPA;
+  the ROCm path still depends on one-token `page_count == token_count`
+  descriptors with per-token q8/q4 pages. Reaching `100+ tok/s` likely needs a
+  paged/arena KV layout with per-token scales plus a multi-block decode
+  attention kernel or broader fused resident layer kernels.
+- Verification after the descriptor-trim patch and documentation updates:
+
+```text
+git diff --check
+(no output)
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.145s
+
+go test ./... -count=1
+ok dappco.re/go/rocm/workspace 0.666s
+
+CGO_ENABLED=0 go test ./... -count=1
+? dappco.re/go/rocm/workspace [no test files]
+
+CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.122s
+
+go test -tags rocm_legacy_server ./... -count=1
+ok dappco.re/go/rocm/workspace 0.188s
+
+go test -tags rocm_legacy_server ./go -count=1
+ok dappco.re/go/rocm 0.012s
+
+go test ./go/... -coverpkg=./go/... -coverprofile=/tmp/go-rocm-descriptor-trim.cover -covermode=atomic -count=1
+ok dappco.re/go/rocm 0.225s coverage: 75.0% of statements in ./go/...
+ok dappco.re/go/rocm/internal/gguf 0.011s coverage: 0.9% of statements in ./go/...
+
+go tool cover -func=/tmp/go-rocm-descriptor-trim-codecov.cover | tail -n 1
+total: (statements) 90.6%
+
+Q4 live smoke:
+generated tokens=[236764 3307] text=["," "my"]
+
+BF16 live anchor:
+Gemma4 BF16 layer0 tied LM-head greedy token=158750 score=28.510630
+```
+
+2026-05-17T05:07:09Z corrected 100+ tok/s endpoint pass:
+
+- Rebuilt the live `gfx1100` HSACO with the current HIP source and
+  `hipcc --genco --offload-arch=gfx1100 -O3 -ffast-math
+  kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100.hsaco`.
+- Found and fixed a q4 projection launch-geometry correctness/performance bug:
+  `rocm_mlx_q4_projection_greedy` was using the normal projection geometry
+  constants, and the normal projection path had been using the greedy constants.
+  That invalidated the intermediate fused-greedy timing because the final
+  sampler could examine the wrong output geometry. The kept source uses eight
+  rows per block for normal q4 projection and 32 rows per block for final
+  q4 projection+greedy. A source regression test now checks the HIP constants
+  against the Go launch config.
+- Retuned the corrected final greedy geometry. Corrected 512-token checks were:
+  greedy rows 8: `95.97 tok/s`; rows 16: `96.85 tok/s`; rows 32:
+  `97.30 tok/s`; rows 64: `97.17 tok/s`; rows 256: `75.96 tok/s`.
+  The kept value is 32 rows.
+- Kept a small attention softmax cleanup by routing attention exponentials
+  through `rocm_fast_expf`/`__expf`. On the corrected geometry this moved the
+  512-token check from `97.30 tok/s` to `97.59 tok/s` and the 2k check from
+  `79.84 tok/s` to `80.10 tok/s`.
+- Found a driver launch-argument overhead issue. The default launch-argument
+  ring no longer records a HIP event for every packet. It now synchronizes only
+  when the ring wraps before slot 0 reuse; the old event-per-packet behavior is
+  still available with `GO_ROCM_ENABLE_LAUNCH_ARG_EVENTS=1`. The sync-on-wrap
+  path measured `109.4 tok/s` at 512 tokens and `89.21 tok/s` at 2000 tokens
+  before the later context fix.
+- Found the remaining benchmark/driver mismatch: the benchmark loads the model
+  with `inference.WithContextLen(128)`, but Gemma4 q4 layer config was still
+  using the raw Gemma sliding-window value of 512. `hipLoadedModel` now carries
+  `contextSize`, and q4 sliding-window layers use
+  `hipGemma4Q4EffectiveSlidingWindow`; full-attention layers remain at `0`.
+  This makes the 2k benchmark's configured context real instead of silently
+  doing extra sliding-window KV work.
+- Current endpoint checks on the pinned RX 7800 XT with
+  `/tmp/go-rocm-kernels-gfx1100.hsaco`:
+
+```text
+512 tokens:
+BenchmarkInferenceGemma4Q4Generate-32 1 4363243733 ns/op 512 max_tokens/op 117.3 tok/s 512 tokens
+
+2000 tokens:
+BenchmarkInferenceGemma4Q4Generate-32 1 19629810772 ns/op 2000 max_tokens/op 101.9 tok/s 2000 tokens 251745216 B/op 2730011 allocs/op
+
+2048 tokens:
+BenchmarkInferenceGemma4Q4Generate-32 1 20156670616 ns/op 2048 max_tokens/op 101.6 tok/s 2048 tokens 258176312 B/op 2795040 allocs/op
+```
+
+- Q4 live smoke still passes on `text:Hi`: package Prefill/Decode reports
+  `prompt=[0] next=258073 decoded=258073 text="<unused2161>"`, and public
+  `Generate` reports `prompt_tokens=[2 10979] generated tokens=[236764 3307]`
+  with text `["," "my"]`.
+- BF16 live anchor still passes on `/data/lem/models/gemma4/LEM-Gemma4-E2B`:
+  `Gemma4 BF16 layer0 tied LM-head greedy token=158750 score=28.510630`.
+- The chunked attention prototype, generic device buffer pool, and KV tensor
+  pool remain gated/off by default. The latest chunked attention retest passed
+  smoke but measured only `103.6 tok/s` at 512 tokens under the new launch mode,
+  below the default attention path at `117.3 tok/s`.
+- Final verification refresh at 2026-05-17T05:12:41Z:
+
+```text
+git diff --check
+(no output)
+
+go test ./go -run 'TestHIPGemma4Q4EffectiveSlidingWindow_Good|TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good' -count=1
+ok dappco.re/go/rocm 0.007s
+
+Q4 smoke:
+ok dappco.re/go/rocm 13.580s
+generated tokens=[236764 3307] text=["," "my"]
+
+BF16 smoke:
+ok dappco.re/go/rocm 17.183s
+Gemma4 BF16 layer0 tied LM-head greedy token=158750 score=28.510630
+
+2000-token endpoint:
+BenchmarkInferenceGemma4Q4Generate-32 1 19629810772 ns/op 2000 max_tokens/op 101.9 tok/s 2000 tokens 251745216 B/op 2730011 allocs/op
+
+2048-token endpoint:
+BenchmarkInferenceGemma4Q4Generate-32 1 20156670616 ns/op 2048 max_tokens/op 101.6 tok/s 2048 tokens 258176312 B/op 2795040 allocs/op
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.155s
+
+go test ./... -count=1
+ok dappco.re/go/rocm/workspace 0.793s
+
+CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.114s
+
+CGO_ENABLED=0 go test ./... -count=1
+? dappco.re/go/rocm/workspace [no test files]
+
+go test -tags rocm_legacy_server ./go -count=1
+ok dappco.re/go/rocm 0.012s
+
+go test -tags rocm_legacy_server ./... -count=1
+ok dappco.re/go/rocm/workspace 0.187s
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_HIP_TESTS=1 ...
+ok dappco.re/go/rocm 0.138s
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_CACHE_TESTS=1 ...
+ok dappco.re/go/rocm 0.068s
+
+go test ./go/... -coverpkg=./go/... -coverprofile=/tmp/go-rocm-100tok-final.cover -covermode=atomic -count=1
+ok dappco.re/go/rocm 0.223s coverage: 74.1% of statements in ./go/...
+ok dappco.re/go/rocm/internal/gguf 0.011s coverage: 0.9% of statements in ./go/...
+
+go tool cover -func=/tmp/go-rocm-100tok-final-codecov.cover | tail -n 1
+total: (statements) 90.6%
+```
+
+2026-05-17T06:53:00Z actual-load long-prompt pass:
+
+- Added benchmark controls for real prefill/load testing:
+  - `GO_ROCM_BENCH_CONTEXT_LEN` loads Gemma4 q4 with a chosen context length.
+  - `GO_ROCM_BENCH_PROMPT_TOKEN_COUNT` generates large `tokens:` prompts without
+    huge shell env strings.
+  - `GO_ROCM_BENCH_PROMPT_TOKEN_IDS` defaults to `2,10979`.
+  - `GO_ROCM_BENCH_PROMPT_FILE` accepts raw text or already-prefixed
+    `text:`/`tokens:` payloads.
+  - The benchmark now reports `prompt_tok/s`, `total_tok/s`,
+    `prompt_tokens/op`, and `context_len`.
+- Kept a prompt-prefill fast path that skips final RMSNorm/LM-head/greedy for
+  intermediate prompt tokens. Prompt tokens still run the layer stack and update
+  KV state; only the final prompt token samples.
+- Raised the device-KV page metadata pool ceiling to 128k pages, cached
+  `rocmDeviceKVCache.tokenCount`, and added geometric page-slice growth. This
+  removed most host allocation churn in 4k/8k prefill but did not fix runtime.
+- Made chunked attention automatic for prompt loads of at least 4000 tokens,
+  with `GO_ROCM_GEMMA4_Q4_CHUNKED_ATTENTION=0/1` still available as an override.
+- Staged Gemma4-E2B q4 long-prompt runs on the pinned RX 7800 XT with
+  `GO_ROCM_BENCH_CONTEXT_LEN=48000` and `GO_ROCM_BENCH_TOKENS=1`:
+
+```text
+2k prompt:   20962474329 ns/op,    95.41 prompt_tok/s,  251449568 B/op
+4k prompt:   48788445708 ns/op,    81.99 prompt_tok/s,  684743344 B/op
+8k prompt:  123624998497 ns/op,    64.71 prompt_tok/s, 1786065632 B/op
+16k prompt: 349018316246 ns/op,    45.84 prompt_tok/s, 3569176536 B/op
+32k prompt: 1072604641783 ns/op,   29.83 prompt_tok/s, 8239230448 B/op
+```
+
+- A pre-refinement direct 48k prompt attempt was interrupted after `974s`
+  without producing a benchmark line. During the long runs, `rocm-smi` showed
+  the RX 7800 XT busy and the onboard GPU idle, so this is not device-selection
+  confusion.
+- Built upstream llama.cpp locally with HIP for `gfx1100` and downloaded the
+  non-LEM Hugging Face Gemma4 GGUF:
+  `/home/claude/models/hf/unsloth-gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf`.
+  `llama-bench -p 2048,4096,8192,16384,32768 -n 0 -b 2048 -ub 512 -fa 1 -ngl 99`
+  on the same RX 7800 XT reported:
+
+```text
+pp2048   4788.12 tok/s
+pp4096   4519.58 tok/s
+pp8192   4071.68 tok/s
+pp16384  3414.32 tok/s
+pp32768  2580.52 tok/s
+```
+
+- llama.cpp source confirms the missing implementation shape:
+  - `llama_context_default_params` defaults to `n_batch=2048`,
+    `n_ubatch=512`.
+  - `llama_batch_allocr` auto-marks only the last token for logits when
+    `output_all` is false.
+  - `llama_kv_cache_iswa::init_batch` splits prompt inputs into ubatches and
+    prepares both base/full and SWA KV caches before graph execution.
+  - `llama_context::decode` iterates ubatches, builds one graph per ubatch, and
+    only extracts logits/embeddings when outputs are requested.
+  - the HIP/CUDA backend routes prompt attention through `GGML_OP_FLASH_ATTN_EXT`
+    and quantized matmul through MMQ/MMVQ-style kernels rather than serial
+    single-token forwards.
+- Diagnosis: the actual-load endpoint needs a `hipGemma4Q4PrefillBatch` path
+  with contiguous slot KV, separate full/SWA cache handling, batched q4
+  projections/MLP, batched masked attention/fattn, and output flags. More
+  one-token decode tuning will not close a 32k prefill gap from `29.83` to
+  thousands of prompt tokens/sec.
+- Verification after the long-prompt/llama.cpp comparison pass:
+
+```text
+go test ./go -run 'TestInferenceBenchmarkPromptFromEnv|TestHIPGemma4Q4ChunkedAttentionEnabled|TestHIPGemma4Q4SkipFinalSample|TestKVCache_DevicePageSliceCapacity' -count=1
+ok dappco.re/go/rocm 0.008s
+
+git diff --check
+(no output)
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.147s
+
+go test ./... -count=1
+ok dappco.re/go/rocm/workspace 0.655s
+
+CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.116s
+
+CGO_ENABLED=0 go test ./... -count=1
+? dappco.re/go/rocm/workspace [no test files]
+
+go test -tags rocm_legacy_server ./go -count=1
+ok dappco.re/go/rocm 0.012s
+
+go test -tags rocm_legacy_server ./... -count=1
+ok dappco.re/go/rocm/workspace 0.174s
+
+Q4 live smoke:
+Gemma4 q4 public Generate prompt="text:Hi" prompt_tokens=[2 10979] generated tokens=[236764 3307] text=["," "my"]
+```
+
+2026-05-17T07:24:00Z prefill planner integration slice:
+
+- Added `go/hip_gemma4_q4_prefill.go` with a Gemma4 q4 prompt prefill planner:
+  - default ubatch size `512`,
+  - override via `GO_ROCM_GEMMA4_Q4_PREFILL_UBATCH_TOKENS`,
+  - explicit `Start`/`End`/`Position` per ubatch,
+  - copied token spans per ubatch,
+  - output mask that marks only the final prompt token for logits.
+- Wired `hipGemma4Q4GenerateTokenSeq` through the planner while retaining the
+  existing single-token forward implementation inside each ubatch. This is the
+  integration point for the future `hipGemma4Q4PrefillBatch` kernel path; it is
+  not expected to improve long-prompt throughput by itself.
+- Added Good/Bad coverage for planner defaults, env parsing, positions,
+  ubatch splits, output masks, empty prompt, negative start position, and
+  invalid ubatch size. Added an integration bad-path check proving an invalid
+  ubatch env fails before q4 generation launches kernels.
+- Focused verification:
+
+```text
+go test ./go -run 'TestHIPGemma4Q4PrefillPlan|TestHIPGemma4Q4ChunkedAttentionEnabled|TestHIPGemma4Q4SkipFinalSample|TestInferenceBenchmarkPromptFromEnv' -count=1
+ok dappco.re/go/rocm 0.009s
+
+go test ./go -run 'TestHIPGemma4Q4PrefillPlan|TestHIPGemma4Q4GenerateTokenSeq_BadPrefillUBatchEnv' -count=1
+ok dappco.re/go/rocm 0.006s
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.144s
+
+CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.115s
+
+go test -tags rocm_legacy_server ./go -count=1
+ok dappco.re/go/rocm 0.011s
+
+git diff --check
+(no output)
+```
+
+2026-05-17 batched prefill primitive slice:
+
+- Added `hipRunGemma4Q4PrefillEmbeddingBatch`, which accepts a Gemma4 q4 token
+  span, runs the existing multi-token device embedding lookup once, applies the
+  normal `sqrt(hidden)` vector scale over `batch*hidden`, and returns the scaled
+  device buffer for the future batched layer graph.
+- Added `hipRunGemma4Q4PrefillInputNormBatch`, which reuses
+  `rocm_rms_norm_heads` with the prompt token count mapped to `head_count`.
+  This normalizes a `[batch, hidden]` activation buffer in one grid launch.
+- Added `rocm_mlx_q4_projection_batch`, a batched MLX q4 projection kernel that
+  maps prompt rows onto `GridY` and projects `[batch, cols]` activations to
+  `[batch, rows]` in one launch. Added
+  `hipRunGemma4Q4PrefillQKVProjectionBatch` to run Gemma4 q4 Q/K/V projection
+  batches on top of that kernel.
+- Added `rocm_mlx_q4_gelu_tanh_multiply_batch`, a batched fused gate/up q4
+  projection plus GELU multiply kernel that also maps prompt rows onto `GridY`.
+  Added `hipRunGemma4Q4PrefillMLPBatch`, which runs this batch activation and
+  then uses the batched q4 down projection.
+- Added fake-driver coverage proving a three-token span launches one
+  `rocm_embedding_lookup` with token count `3` and one `rocm_vector_scale` with
+  count `3*hidden`, and proving the input-norm batch launch uses one
+  `rocm_rms_norm_heads` grid with `GridX=3`, `HeadDim=hidden`, and
+  `HeadCount=3`. Added raw q4 projection-batch ABI/fake-driver coverage,
+  raw q4 GELU-batch ABI/fake-driver coverage, Gemma4 q4 Q/K/V and MLP batch
+  coverage, and hardware smoke coverage that launches the new batch projection
+  and batch GELU symbols from the rebuilt `gfx1100` HSACO on the pinned RX
+  7800 XT. Added bad-path coverage for empty token spans, unavailable drivers,
+  zero token counts, mismatched input-norm/QKV/MLP matrix shapes, and bad q4
+  projection/GELU batch byte counts.
+- This is not the completed long-prompt prefill path. KV slot updates, wiring
+  the primitives into the prompt layer graph, and batched masked attention
+  remain open.
+- Verification:
+
+```text
+go test ./go -run 'TestHIPGemma4Q4PrefillEmbeddingBatch|TestHIPGemma4Q4PrefillInputNormBatch|TestHIPGemma4Q4PrefillPlan|TestHIPGemma4Q4GenerateTokenSeq_BadPrefillUBatchEnv' -count=1
+ok dappco.re/go/rocm 0.010s
+
+go test ./go -run 'TestHIPKernels_MLXQ4GELUTanhMultiplyLaunchArgs|TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good|TestHIPKernelSource_ABIConstants_Good|TestHIPGemma4Q4PrefillMLPBatch|TestHIPGemma4Q4PrefillQKVProjectionBatch' -count=1
+ok dappco.re/go/rocm 0.012s
+
+hipcc --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100.hsaco
+(no output)
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_HIP_TESTS=1 GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco go test ./go -run 'TestHIPHardwareProjectionKernelSource_Good/mlx-q4-projection' -count=1 -v
+PASS
+ok dappco.re/go/rocm 0.050s
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_MODEL_TESTS=1 GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE=1 GO_ROCM_GEMMA4_Q4_GENERATE_PROMPT='text:Hi' go test ./go -run 'TestNativeDecodeSmokeKernelStatus_Good' -count=1 -v
+Gemma4 q4 public Generate prompt="text:Hi" prompt_tokens=[2 10979] generated tokens=[236764 3307] text=["," "my"]
+PASS
+ok dappco.re/go/rocm 71.426s
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.152s
+
+CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.114s
+
+go test -tags rocm_legacy_server ./go -count=1
+ok dappco.re/go/rocm 0.011s
+```
+
+2026-05-17 batched prefill Q/K norm+RoPE slice:
+
+- Added `rocm_rms_norm_rope_heads_batch`, a batched RMSNorm+RoPE HIP kernel
+  that maps heads onto `GridX`, prompt rows onto `GridY`, and applies
+  `start_position+row` for per-token RoPE. The single-token decode ABI remains
+  unchanged.
+- Added Go launch ABI, source-export checks, fake-driver implementation,
+  focused Good/Bad tests, and real-card transformer smoke coverage for the new
+  batch kernel from the rebuilt `gfx1100` HSACO.
+- Added `hipRunGemma4Q4PrefillQKNormRoPEBatch`, which validates Gemma4 q4 Q/K
+  batch shapes and launches batched query and key norm/RoPE with the decode
+  path's full-rotary vs partial-rotary geometry. This completes the Q/K
+  primitive slice, but still does not write KV slots or run prefill attention.
+- Added `hipRunGemma4Q4PrefillValueNormBatch`, which reuses
+  `rocm_rms_norm_heads` with unit weights to normalize value rows as
+  `[batch, head_dim]`. This completes the projected Q/K/V normalization helpers
+  needed before KV slot writes.
+- Verification:
+
+```text
+go test ./go -run 'TestHIPGemma4Q4Prefill(ValueNorm|QKNormRoPE)Batch|TestHIPKernels_RMSNormRoPEHeads' -count=1 -v
+PASS
+ok dappco.re/go/rocm 0.007s
+
+go test ./go -run 'TestHIPKernels_RMSNormRoPEHeads|TestHIPGemma4Q4PrefillQKNormRoPEBatch|TestHIPKernelSource_ExportsLaunchABI_Good' -count=1 -v
+PASS
+ok dappco.re/go/rocm 0.010s
+
+hipcc --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100.hsaco
+(no output)
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_HIP_TESTS=1 GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco go test ./go -run 'TestHIPHardwareTransformerKernelSource_Good' -count=1 -v
+PASS
+ok dappco.re/go/rocm 0.061s
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.146s
+
+CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.118s
+
+go test -tags rocm_legacy_server ./go -count=1
+ok dappco.re/go/rocm 0.010s
+```
+
+2026-05-17 batched prefill device-KV row page slice:
+
+- Added a device-KV append path for contiguous prompt rows. It validates
+  `[batch, key_width]` and `[batch, value_width]` device buffers, splits them by
+  cache block size, borrows device sub-buffers, and reuses
+  `rocm_kv_encode_token` to encode each row chunk without host readback.
+- Added `newROCmDeviceKVCacheFromDeviceRows` and
+  `withAppendedDeviceRowsWindow`, which create descriptor pages with
+  `token_count > 1` instead of one tiny page per prompt token. The helper keeps
+  existing cache ownership rules by marking borrowed prior pages as unowned and
+  owning only the newly encoded row pages.
+- Added `hipRunGemma4Q4PrefillDeviceKVBatch`, which turns batched RoPE keys and
+  normalized value rows into a `rocmDeviceKVCache`, descriptor table, and launch
+  descriptor for the future prefill attention graph. This still does not wire
+  the full prompt layer graph or implement masked full/SWA attention.
+- Verification:
+
+```text
+go test ./go -run 'TestKVCache_(Good|Bad)_DeviceMirrorAppendsDeviceRowsWindow|TestHIPGemma4Q4PrefillDeviceKVBatch|TestKVCache_Good_KVEncodeTokenKernelEncodesDeviceToken' -count=1 -v
+PASS
+ok dappco.re/go/rocm 0.009s
+```
+
+2026-05-17 composed one-layer prefill KV setup:
+
+- Added `hipRunGemma4Q4PrefillLayerKVBatch`, which composes the completed
+  row-batch primitives for one Gemma4 q4 layer: input RMSNorm, Q/K/V q4
+  projection, Q/K RMSNorm+RoPE, value RMSNorm, and batched device-KV descriptor
+  creation.
+- Added Good/Bad coverage proving the composed path launches the expected
+  primitive set (`rms_norm_heads`, q4 projection batch, batched Q/K RoPE, and
+  KV encode), returns a multi-token device-KV descriptor, and rejects invalid
+  token counts, input shape mismatches, and negative positions before launch.
+- This still stops before prefill attention and does not yet run residual,
+  output projection, MLP, final norm, or logits across prompt rows.
+- Verification:
+
+```text
+go test ./go -run 'TestHIPGemma4Q4Prefill(LayerKV|DeviceKV)Batch|TestKVCache_(Good|Bad)_DeviceMirrorAppendsDeviceRowsWindow' -count=1 -v
+PASS
+ok dappco.re/go/rocm 0.008s
+```
+
+2026-05-17 batched prefill causal attention slice:
+
+- Added `rocm_attention_heads_batch_causal`, a batched prefill attention HIP
+  kernel that maps query heads onto `GridX` and prompt rows onto `GridY`.
+  Each `(row, head)` block reuses the existing single-head attention runner,
+  with the visible KV length set to `query_start_token+row+1` for causal
+  masking.
+- Added the Go launch ABI, fake-driver implementation, source-export checks,
+  focused contiguous/device-KV tests, and real-card transformer smoke coverage
+  for the new kernel. Shared attention weights are used through the existing
+  2048-token threshold; larger contexts allocate per `(row, head)` global
+  weight slots.
+- Added `hipRunGemma4Q4PrefillAttentionBatch`, which consumes the composed
+  one-layer prefill KV setup and writes `[tokens, query_heads*head_dim]`
+  attention output from descriptor-backed Gemma4 q4 device KV. This now reaches
+  one-layer batched attention output, but still does not run the full
+  residual/output-projection/MLP/logit graph or split full-context vs SWA
+  prompt attention across all layers.
+- Verification:
+
+```text
+go test ./go -run 'TestHIPKernels_AttentionHeadsBatchCausalLaunchArgs|TestHIPGemma4Q4PrefillAttentionBatch|TestHIPKernelSource_ExportsLaunchABI_Good' -count=1 -v
+PASS
+ok dappco.re/go/rocm 0.011s
+
+go test ./go -run 'TestHIPGemma4Q4Prefill(LayerKV|DeviceKV)Batch|TestKVCache_(Good|Bad)_DeviceMirrorAppendsDeviceRowsWindow' -count=1 -v
+PASS
+ok dappco.re/go/rocm 0.008s
+
+hipcc --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100.hsaco
+(no output)
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_HIP_TESTS=1 GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco go test ./go -run 'TestHIPHardwareTransformerKernelSource_Good' -count=1 -v
+PASS
+ok dappco.re/go/rocm 0.050s
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.155s
+
+CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.117s
+
+go test -tags rocm_legacy_server ./go -count=1
+ok dappco.re/go/rocm 0.011s
+
+go test ./... -count=1
+ok dappco.re/go/rocm/workspace 0.786s
+
+CGO_ENABLED=0 go test ./... -count=1
+? dappco.re/go/rocm/workspace [no test files]
+
+go test -tags rocm_legacy_server ./... -count=1
+ok dappco.re/go/rocm/workspace 0.178s
+
+git diff --check
+(no output)
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_MODEL_TESTS=1 GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE=1 GO_ROCM_GEMMA4_Q4_GENERATE_PROMPT='text:Hi' go test ./go -run 'TestNativeDecodeSmokeKernelStatus_Good' -count=1 -v
+PASS
+ok dappco.re/go/rocm 15.351s
+```
+
+2026-05-17 one-layer batched prefill body slice:
+
+- Added `hipRunGemma4Q4PrefillLayerBodyBatch`, which composes the existing
+  batch primitives after the one-layer KV setup: batched causal attention,
+  batched q4 output projection, batched post-attention residual plus
+  pre-feed-forward norm, batched q4 MLP, and batched post-FFN residual output.
+- Added small reusable batch residual helpers that mimic the decode
+  residual-add-norm semantics by applying row-wise RMSNorm over each prompt row,
+  elementwise vector add across the batch buffer, optional output scaling, and
+  a second row-wise RMSNorm where needed.
+- Added Good/Bad coverage proving the composed body reaches final hidden output
+  for a prompt batch and launches the expected primitive graph:
+  `attention_heads_batch_causal`, two q4 projection batches, three
+  `rms_norm_heads`, two vector adds, and one batched q4 GELU/MLP multiply.
+- This still does not complete the long-prompt endpoint. The body is one-layer
+  scaffolding and still needs multi-layer integration, per-layer input branch
+  handling, final norm/logit output selection, and the hybrid full/SWA attention
+  policy.
+- Verification:
+
+```text
+go test ./go -run 'TestHIPGemma4Q4Prefill(LayerBody|Attention|MLP|LayerKV)Batch' -count=1 -v
+PASS
+ok dappco.re/go/rocm 0.002s
+
+go test ./go -run 'TestHIPKernels_(RMSNormResidualAdd|VectorAdd|MLXQ4ProjectionLaunchArgs|MLXQ4GELUTanhMultiplyLaunchArgs)' -count=1 -v
+PASS
+ok dappco.re/go/rocm 0.002s
+```
+
+2026-05-17 batched prefill per-layer input branch slice:
+
+- Added `rocm_mlx_q4_gelu_tanh_projection_batch`, the batched form of the
+  Gemma4 per-layer input gate primitive. It maps prompt rows onto `GridY`,
+  computes `gelu(input_gate(hidden_row))*per_layer_input_row`, and writes a
+  `[tokens, per_layer_input_size]` activation matrix for the follow-up batched
+  q4 projection.
+- Added Go launch ABI, fake-driver execution, source-export checks, and
+  hardware projection smoke coverage for the new batched GELU projection symbol.
+- Wired `hipRunGemma4Q4PrefillLayerBodyBatchWithPerLayerInput` so the one-layer
+  scaffold can run post-FFN residual output, per-layer input projection, and
+  post-input residual/norm before final hidden output without host readback of
+  the prompt-row matrices.
+- Added `hipRunGemma4Q4PrefillFinalGreedyForRow`, which borrows only the
+  requested hidden row from a batched final-hidden buffer, applies final RMSNorm,
+  and runs fused q4 LM-head softcap+greedy for that row instead of projecting
+  logits for every prompt token.
+- Added `hipRunGemma4Q4PrefillForwardBatch`, the first all-layer batched prefill
+  scaffold. It accepts a token span, performs one batched embedding pass, runs
+  each layer through the batched KV/body path, consumes per-layer input matrices,
+  and can sample selected output rows. It currently rejects nonzero start
+  positions so it cannot silently skip prior-ubatch KV history.
+- This still does not complete the long-prompt endpoint. The remaining blockers
+  are prior-ubatch KV merging and the Gemma4 full-context vs sliding-window
+  prompt attention policy.
+- Verification:
+
+```text
+go test ./go -run 'TestHIPKernels_MLXQ4GELUTanhProjectionLaunchArgs|TestHIPGemma4Q4PrefillLayerBodyBatch|TestHIPKernelSource_ExportsLaunchABI_Good' -count=1 -v
+PASS
+ok dappco.re/go/rocm 0.011s
+
+hipcc --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100.hsaco
+(no output)
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_HIP_TESTS=1 GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco go test ./go -run 'TestHIPHardwareProjectionKernelSource_Good' -count=1 -v
+PASS
+ok dappco.re/go/rocm 0.043s
+
+go test ./go -run 'TestHIPGemma4Q4Prefill(Forward|LayerBody|FinalGreedy|Attention|MLP|LayerKV)Batch|TestHIPGemma4Q4PrefillFinalGreedyForRow|TestHIPKernelSource_ExportsLaunchABI_Good' -count=1 -v
+PASS
+ok dappco.re/go/rocm 0.013s
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.153s
+
+CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.118s
+
+go test -tags rocm_legacy_server ./go -count=1
+ok dappco.re/go/rocm 0.011s
+
+go test ./... -count=1
+ok dappco.re/go/rocm/workspace 0.656s
+
+CGO_ENABLED=0 go test ./... -count=1
+? dappco.re/go/rocm/workspace [no test files]
+
+go test -tags rocm_legacy_server ./... -count=1
+ok dappco.re/go/rocm/workspace 0.185s
+
+git diff --check
+(no output)
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_MODEL_TESTS=1 GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE=1 GO_ROCM_GEMMA4_Q4_GENERATE_PROMPT='text:Hi' go test ./go -run 'TestNativeDecodeSmokeKernelStatus_Good' -count=1 -v
+Gemma4 q4 public Generate prompt="text:Hi" prompt_tokens=[2 10979] generated tokens=[236764 3307] text=["," "my"]
+PASS
+ok dappco.re/go/rocm 14.085s
+```
+
+2026-05-17 batched prefill prior-ubatch append slice:
+
+- Added `hipRunGemma4Q4PrefillDeviceKVBatchWithPrior`, which appends a
+  multi-token key/value row batch to an existing descriptor-backed device-KV
+  cache and builds a descriptor table for the merged view.
+- Added `hipRunGemma4Q4PrefillLayerKVBatchWithPrior` and
+  `hipRunGemma4Q4PrefillForwardBatchWithPrior`. The forward helper now accepts
+  one prior cache per layer for nonzero ubatch starts, validates that each prior
+  token count matches the ubatch start, appends current rows, and launches
+  batched causal attention with `query_start_token=startPosition`.
+- Added fake-driver coverage for a two-ubatch all-layer pass. The second ubatch
+  asserts descriptor-backed attention sees `token_count=4`, `query_count=2`,
+  and `query_start_token=2` for each layer.
+- Remaining limitations: the merged cache borrows prior pages, so callers must
+  keep the prior forward output alive until the appended view is closed; trimmed
+  sliding-window histories are still rejected by the start-position validation;
+  production full/SWA slot layout is still open.
+- Verification so far:
+
+```text
+go test ./go -run 'TestHIPGemma4Q4Prefill(Forward|LayerBody|FinalGreedy|Attention|MLP|LayerKV)Batch|TestHIPGemma4Q4PrefillForwardBatchWithPrior|TestHIPGemma4Q4PrefillFinalGreedyForRow|TestHIPKernelSource_ExportsLaunchABI_Good' -count=1 -v
+PASS
+ok dappco.re/go/rocm 0.015s
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.157s
+
+CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.116s
+
+go test -tags rocm_legacy_server ./go -count=1
+ok dappco.re/go/rocm 0.011s
+
+go test ./... -count=1
+ok dappco.re/go/rocm/workspace 0.659s
+
+CGO_ENABLED=0 go test ./... -count=1
+? dappco.re/go/rocm/workspace [no test files]
+
+go test -tags rocm_legacy_server ./... -count=1
+ok dappco.re/go/rocm/workspace 0.183s
+
+git diff --check
+(no output)
+```
+
+2026-05-17 Gemma4 q4 2k/4k gap pass after stopping long-context ladder:
+
+- Stopped the 16k/32k/48k ladder after the user pointed out that longer runs are
+  not useful until the 2k/4k gap is much closer to llama.cpp/vLLM-class runners.
+  The useful comparison window is now 2k and 4k actual prompt loads at 48k
+  context.
+- Fixed a real descriptor-backed attention bug in `rocm_attention_device_kv_page`:
+  prompt prefill stores device KV as 16-token pages, but the lookup only had a
+  one-token direct path and otherwise linearly scanned every page for every
+  attended token. The kernel now indexes by descriptor `block_size` first and
+  scans only as a fallback. This moved the live Gemma4 q4 actual-load runs from
+  about `136.6 prompt_tok/s` at 2k and `74.36 prompt_tok/s` at 4k to
+  `272.4 prompt_tok/s` and `252.1 prompt_tok/s`.
+- Added token tiling to q4 prompt projections. `rocm_mlx_q4_projection_batch`
+  now computes an 8-token tile for each row block, reusing q4 weight loads across
+  prompt tokens. `rocm_mlx_q4_gelu_tanh_multiply_batch` uses the same 8-token
+  tile for the fused gate/up projection. A 4-token tile helped, but an 8-token
+  tile was slightly better; a 16-token tile tied/slightly regressed, so the kept
+  tile is 8.
+- Latest live Gemma4 q4 numbers on the RX 7800 XT using
+  `ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85`,
+  `GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit`,
+  `GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco`,
+  48k context, one generated token, and 512-token ubatches:
+
+```text
+2k prompt: 5926204251 ns/op, 345.6 prompt_tok/s, 12339880 B/op, 29793 allocs/op
+4k prompt: 12972145896 ns/op, 315.8 prompt_tok/s, 14297808 B/op, 52310 allocs/op
+```
+
+- Comparison: the local llama.cpp reference is still far ahead at about
+  `4788 tok/s` for 2k, `4520 tok/s` for 4k, and `4072 tok/s` for 8k prompt
+  processing. This Go ROCm path is much better than the broken driver path and
+  above the original `100+ tok/s` floor, but it is not fixed relative to
+  llama.cpp. The remaining gap is the q4 prompt matmul design: row-dot packet
+  primitives with limited token tiling still do not behave like a production
+  tiled GEMM/dequant path.
+- Verification in this slice:
+
+```text
+go test ./go -run 'TestHIPKernels_MLXQ4(Projection|GELUTanhMultiply)LaunchArgs_Good|TestHIPGemma4Q4Prefill(MLP|QKVProjection)Batch_Good' -count=1 -v
+PASS
+ok dappco.re/go/rocm 0.008s
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_HIP_TESTS=1 GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco go test ./go -run 'TestHIPHardwareProjectionKernelSource_Good' -count=1 -v
+PASS
+ok dappco.re/go/rocm 0.054s
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_HIP_TESTS=1 GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco go test ./go -run 'TestHIPHardwareProjectionKernelSource_Good|TestHIPHardwareTransformerKernelSource_Good' -count=1 -v
+PASS
+ok dappco.re/go/rocm 0.058s
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_MODEL_TESTS=1 GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE=1 GO_ROCM_GEMMA4_Q4_GENERATE_PROMPT='text:Hi' go test ./go -run 'TestNativeDecodeSmokeKernelStatus_Good' -count=1 -v
+PASS
+ok dappco.re/go/rocm 13.665s
+
+go test ./go -count=1
+PASS
+ok dappco.re/go/rocm 0.151s
+
+CGO_ENABLED=0 go test ./go -count=1
+PASS
+ok dappco.re/go/rocm 0.116s
+
+go test -tags rocm_legacy_server ./go -count=1
+PASS
+ok dappco.re/go/rocm 0.011s
+
+go test ./... -count=1
+PASS
+ok dappco.re/go/rocm/workspace 0.666s
+
+CGO_ENABLED=0 go test ./... -count=1
+? dappco.re/go/rocm/workspace [no test files]
+
+go test -tags rocm_legacy_server ./... -count=1
+PASS
+ok dappco.re/go/rocm/workspace 0.185s
+
+git diff --check
+(no output)
+```
+
+## 2026-05-26 NVIDIA HIP/ZLUDA acceptance and AX-11 benchmark surface
+
+Added NVIDIA portability acceptance coverage without requiring an NVIDIA card:
+
+```text
+CUDA_PATH=/usr/local/cuda GO_ROCM_RUN_NVIDIA_HIP_COMPILE_TESTS=1 go test ./go -run TestHIPKernelSource_NVIDIAHIPCompile_Good -count=1 -v
+=== RUN   TestHIPKernelSource_NVIDIAHIPCompile_Good
+    hip_kernel_source_test.go:278: compiled HIP kernels for NVIDIA backend std=c++20 arch=sm_75 object_bytes=1211856
+--- PASS: TestHIPKernelSource_NVIDIAHIPCompile_Good (2.75s)
+PASS
+ok dappco.re/go/rocm 2.756s
+```
+
+The first strict `sm_75` pass caught the NVIDIA-only failure: unsuffixed
+`__shfl_down` is not available for the modern CUDA target. `kernels/rocm_kernels.hip`
+now routes shuffle-down through `rocm_shfl_down`; AMD keeps the existing HIP
+intrinsic and CUDA/NVCC uses `__shfl_down_sync`.
+
+Installed CUDA 12.8 `nvcc` from NVIDIA's Ubuntu 24.04 repository because the
+Ubuntu multiverse CUDA 12.0 toolkit was too old for ROCm 7.2's NVIDIA HIP
+headers. CUDA 12.8 rejects `--std=c++23`, so the NVIDIA compile proof defaults
+to `c++20` via `GO_ROCM_NVIDIA_HIP_STD`; the AMD `gfx1100` build remains
+`hipcc --std=c++23 --genco --offload-arch=gfx1100`.
+
+ZLUDA v5 acceptance now passes on the RX 7800 XT when ZLUDA is paired with a
+side-by-side ROCm 6.4.4 rpath runtime for `libamdhip64.so.6`:
+
+```text
+CUDA_PATH=/usr/local/cuda GO_ROCM_RUN_ZLUDA_CUDA_TESTS=1 ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 go test ./go -run TestHIPKernelSource_ZLUDACUDARuntimeSmoke_Good -count=1 -v
+=== RUN   TestHIPKernelSource_ZLUDACUDARuntimeSmoke_Good
+    hip_kernel_source_test.go:321: zluda_cuda_smoke_ok count=1 values=7,8,9,10
+--- PASS: TestHIPKernelSource_ZLUDACUDARuntimeSmoke_Good (0.54s)
+PASS
+ok dappco.re/go/rocm 0.546s
+```
+
+AX-11 benchmark rule added to the active goal and development notes. New
+hot-path State/KV restore benchmark baselines:
+
+```text
+go test ./go -run 'TestHIPKernelSource_NVIDIAHIPCompile_Good|TestHIPKernelSource_ZLUDACUDARuntimeSmoke_Good|TestKVCache' -bench 'BenchmarkROCm(KVCacheBlockFromRawPayload|DeviceKVPageFromRawPayload)' -benchmem -benchtime=3x -count=1 -v
+BenchmarkROCmKVCacheBlockFromRawPayload_KQ8VQ4Page-32           3  26303 ns/op  3741.27 MB/s   98304 B/op   2 allocs/op
+BenchmarkROCmDeviceKVPageFromRawPayload_KQ8VQ4PinnedCopy-32    3  12163 ns/op  8090.55 MB/s  115360 B/op  14 allocs/op
+```
+
+## 2026-05-26 book.md workload endpoint and safer graph benchmarks
+
+The active production endpoint is now the 10-turn `book.md` workload instead of
+synthetic prompt length. The target is the go-mlx/Metal retained-state profile:
+chapter 1 comes from the lighthouse/deep-ocean creative prompt, turns 2-10 ask
+for the next chapter while adding one distractor prompt, and chapter 10 must
+retain the lighthouse keeper/light/deep-ocean arc. `<=90s` wall time is success;
+`<=110s` with story retention is good enough to start flipping the best route
+toward production defaults and deleting obsolete slow paths.
+
+Added:
+
+- `book.md`, documenting the workload, 90s/110s gates, and benchmark command.
+- `BenchmarkInferenceGemma4Q4Book10Turn_ReplayBaseline`, an opt-in replay
+  baseline that reports `book_wall_s/op`, chapter/token counts, memory, arc
+  anchors, and production-candidate metrics.
+- Extra replay safeguards: the book replay benchmark now requires both
+  `GO_ROCM_RUN_BOOK_BENCHMARKS=1` and
+  `GO_ROCM_RUN_UNSAFE_REPLAY_BOOK_BENCHMARKS=1`, supports
+  `GO_ROCM_BOOK_TURNS` for smokes, and defaults to a per-turn timeout via
+  `GO_ROCM_BOOK_TURN_TIMEOUT_SECONDS=60`.
+- `BenchmarkHIPGemma4Q4PrefillComputeGraph_UBatch`, an AX-11 graph benchmark
+  that separates embedding, QKV projection, KV append/descriptor, attention,
+  layer body, whole forward, and forward-with-prior costs.
+
+The first tiny real-card graph pass used 16 prompt tokens and one layer on the
+RX 7800 XT. It showed the graph benchmark works and exposed the rough split:
+embedding `14.48ms`, KV append/descriptor `5.86ms`, forward `50.90ms`, and
+forward-with-prior `26.82ms` for that small probe. A replay-style one-token
+book smoke was stopped after it monopolized the display GPU; no benchmark
+processes were left running afterward. This reinforces that replay is not the
+target path; the production path must retain device KV state between turns.
+
+## 2026-05-26 Gemma4 chat template check
+
+The local Gemma4 chat template is not the fallback `user: ...` template. It is
+the HF-rendered Gemma4 turn format:
+
+```text
+<bos><|turn>user
+...<turn|>
+<|turn>model
+```
+
+The Go path now formats Gemma4 messages with that template, maps assistant
+messages to `model`, handles an initial system/developer message as a system
+turn, and keeps the final generation-prompt newline. `hipGemma4Q4TextPromptIDs`
+was trimming the `text:` body, which silently dropped that final newline; the
+parser now strips only whitespace before the `text:` prefix and preserves the
+body bytes. The guarded tokenizer test verifies the local tokenizer matches HF
+for `Hi`:
+
+```text
+<bos><|turn>user\nHi<turn|>\n<|turn>model\n
+=> [2 105 2364 107 10979 106 107 105 4368 107]
+```
+
+Retained book turns now append only the current turn's chat-control envelope:
+turn 1 starts with `<bos><|turn>user`, later turns start with
+`<turn|>\n<|turn>user`, closing the prior retained assistant turn before the
+new user request. Prior chapter text remains in KV and is not replayed.
+
+Latest short retained smoke after the template/parser fixes:
+
+```text
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 \
+GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco \
+GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit \
+GO_ROCM_RUN_BOOK_BENCHMARKS=1 \
+GO_ROCM_RUN_RETAINED_BOOK_BENCHMARKS=1 \
+GO_ROCM_BOOK_TURNS=10 \
+GO_ROCM_BOOK_CHAPTER_TOKENS=16 \
+GO_ROCM_BOOK_CONTEXT_LEN=4096 \
+GO_ROCM_BOOK_TURN_TIMEOUT_SECONDS=30 \
+GO_ROCM_BOOK_PREFILL_UBATCH_TOKENS=16 \
+GO_ROCM_BOOK_OUTPUT_FILE=/tmp/go-rocm-book-10x16-finalsingle.md \
+/tmp/go-rocm-rocm.test -test.run '^$' \
+  -test.bench '^BenchmarkInferenceGemma4Q4Book10Turn_RetainedState$' \
+  -test.benchtime=1x -test.count=1
+
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32  1  22824578259 ns/op
+book_wall_s/op 22.82
+book_prefill_s/op 13.17
+book_decode_s/op 9.616
+book_generated_tokens/op 160
+book_prompt_tokens/op 1159
+book_tok/s 7.012
+```
+
+The template is now correct, but output quality is still not: the q4 forward
+path repeats Gemma4 sentinel tokens such as `<|turn>model<turn|>` instead of
+prose. Switching retained prefill to sample the first generated token through
+the single-token final prompt path produced the same failure, so the next
+debugging target is the q4 forward/logits stack rather than chat templating.
+The error logs for these runs are kept as `.err` files and were empty for the
+template smokes; the earlier display-GPU reset remains captured in
+`book-retained.err`.
+
+## 2026-05-26 128k context correction and block-page chunked attention
+
+User correction: Gemma4 E2B/E4B have a `128k` token context window, not a
+128-token context. Treat `context_len=128` short decode runs only as hot-loop
+diagnostics; the driver still has to scale toward the retained-state book and
+48k/64k/128k context loads.
+
+Updated the book workload prompt shape per user feedback: chapter 1 now asks for
+chapter 1 of "a book" and does not declare a 10-chapter plan up front. Later
+turns ask for the next chapter while relying on retained KV state plus the new
+distractor prompt.
+
+Experimental kernel/runtime change tested: chunked attention was taught to
+consume normal block-page KQ8/VQ4 device-KV descriptors instead of requiring one
+descriptor page per token. The stage-1 kernel resolves the block page for each
+token through the descriptor lookup helper, computes token-local key/value
+offsets inside the block, and caches the value row pointer for the softmax value
+pass. The speed/memory numbers below came from temporarily allowing any
+non-empty matching-token-count descriptor table.
+
+Fresh RX 7800 XT `gfx1100` runs with the chapter-1 prompt that does not say
+`10 chapter` up front:
+
+```text
+GO_ROCM_BENCH_CONTEXT_LEN=4096
+GO_ROCM_BENCH_PROMPT='text:<bos><|turn>user\nWrite chapter 1 of a book ...'
+
+512 non-chunked:
+BenchmarkInferenceGemma4Q4Generate-32  1  4994614047 ns/op   102.5 tok/s   67639848 B/op    882821 allocs/op
+
+512 chunked block-page:
+BenchmarkInferenceGemma4Q4Generate-32  1  4986932812 ns/op   102.7 tok/s   80148728 B/op    889720 allocs/op
+
+1024 non-chunked:
+BenchmarkInferenceGemma4Q4Generate-32  1  10929701600 ns/op   93.69 tok/s  194356432 B/op  1728159 allocs/op
+
+1024 chunked block-page:
+BenchmarkInferenceGemma4Q4Generate-32  1  10507670732 ns/op   97.45 tok/s  147956160 B/op  1740702 allocs/op
+
+2048 non-chunked:
+BenchmarkInferenceGemma4Q4Generate-32  1  23787926370 ns/op   86.09 tok/s  316828848 B/op  3418531 allocs/op
+
+2048 chunked block-page:
+BenchmarkInferenceGemma4Q4Generate-32  1  22710253831 ns/op   90.18 tok/s  286012000 B/op  3434081 allocs/op
+```
+
+All `.err` files for those four current decode runs were empty. However, the
+block-page chunked route is not production-correct yet: a deterministic
+320-token greedy compare with full outputs captured to
+`/tmp/go-rocm-greedy-320-nochunk.txt` and
+`/tmp/go-rocm-greedy-320-chunk.txt` diverged once forced chunking started. The
+chunked output degraded into nonsensical tokens after the first divergence. Go
+eligibility and the kernel descriptor validator were therefore gated back to the
+prior one-page-per-token requirement, so normal block-page KV stays on the
+non-chunked correctness path until the chunked numerical/correctness gap is
+fixed. A follow-up compare with one-page-per-token debug layout also diverged
+from non-chunked output, so chunked attention is no longer enabled
+automatically for long prompts. `GO_ROCM_GEMMA4_Q4_CHUNKED_ATTENTION=1` forces
+the experimental route and `GO_ROCM_GEMMA4_Q4_CHUNKED_ATTENTION=auto` restores
+the old threshold behavior only when explicitly requested.
+
+```text
+one-page-per-token debug layout compare:
+GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE=1
+
+non-chunked: 107.5 tok/s  46452136 B/op  562261 allocs/op
+chunked:     106.2 tok/s  49473200 B/op  564776 allocs/op
+cmp /tmp/go-rocm-greedy-320-block1-nochunk.txt /tmp/go-rocm-greedy-320-block1-chunk.txt
+# exit 1, output diverged
+```
+
+After restoring the gate, forced chunking with the normal block-page descriptor
+falls back to the non-chunked path and matches the full 320-token baseline:
+
+```text
+GO_ROCM_GEMMA4_Q4_CHUNKED_ATTENTION=1
+GO_ROCM_BENCH_OUTPUT_FILE=/tmp/go-rocm-greedy-320-chunk-gated.txt
+BenchmarkInferenceGemma4Q4Generate-32  1  3050418731 ns/op  104.9 tok/s  46101008 B/op  560310 allocs/op
+
+cmp -s /tmp/go-rocm-greedy-320-nochunk.txt /tmp/go-rocm-greedy-320-chunk-gated.txt
+# exit 0
+```
+
+Retained book prompt smoke with the revised "ask for more chapters" wording:
+
+```text
+GO_ROCM_BOOK_TURNS=2
+GO_ROCM_BOOK_CHAPTER_TOKENS=8
+GO_ROCM_BOOK_CONTEXT_LEN=4096
+GO_ROCM_BOOK_PREFILL_UBATCH_TOKENS=16
+GO_ROCM_BOOK_TURN_TIMEOUT_SECONDS=0
+GO_ROCM_BOOK_OUTPUT_FILE=/tmp/go-rocm-book-2x8-morechapters.md
+
+sampling defaults:
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32  1  101226703249 ns/op
+book_wall_s/op 101.2
+book_prefill_s/op 14.34
+book_decode_s/op 86.88
+book_generated_tokens/op 16
+book_tok/s 0.1581
+book_temperature 1
+book_top_p 0.95
+book_top_k 64
+166529792 B/op 78633 allocs/op
+
+greedy/device sampling:
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32  1  644331780 ns/op
+book_wall_s/op 0.6442
+book_prefill_s/op 0.4756
+book_decode_s/op 0.1637
+book_generated_tokens/op 16
+book_tok/s 24.84
+book_temperature 0
+book_top_p 0
+book_top_k 0
+14210904 B/op 78125 allocs/op
+
+rebuilt metric check:
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32  1  650860690 ns/op
+book_host_sampling 0
+book_wall_s/op 0.6507
+book_decode_s/op 0.1635
+14208832 B/op 78137 allocs/op
+```
+
+Both retained smoke `.err` files were empty. The full greedy output was written
+to `/tmp/go-rocm-book-2x8-morechapters-greedy.md`; the sampled output was
+written to `/tmp/go-rocm-book-2x8-morechapters.md`. The sampled path is not a
+kernel correctness failure, but it is not production-viable: host sampling pulls
+the full logits path into the per-token loop. The device-resident greedy path
+restores the expected ~100 tok/s decode behavior inside the retained book
+session, so the next production work is a device-side sampler or a deliberate
+greedy retained-book default.
+
+User correction after an attempted `GO_ROCM_BOOK_CHAPTER_TOKENS=512` full
+10-turn run: 512 generated tokens per chapter is only a throughput/smoke cap and
+is not the book acceptance workload. That run was interrupted with SIGQUIT and
+its stack was captured in `book-retained-10x512-greedy.err`. The benchmark
+defaults now treat omitted `GO_ROCM_BOOK_CHAPTER_TOKENS` or
+`GO_ROCM_BOOK_CHAPTER_TOKENS=0` as a full-chapter safety cap derived from
+context length and turn count. With `GO_ROCM_BOOK_CONTEXT_LEN=48000` and
+`GO_ROCM_BOOK_TURNS=10`, the cap is 4390 generated tokens per chapter, leaving a
+4096-token context reserve for chat controls, distractors, and prompt overhead.
+Explicit smaller values are smoke/debug caps only and must not be used as the
+acceptance endpoint.
+
+## 2026-05-26 - Full-chapter retained book acceptance check
+
+The 512-token chapter cap is invalid for acceptance; it is smoke/debug only. The benchmark now treats omitted `GO_ROCM_BOOK_CHAPTER_TOKENS` or `GO_ROCM_BOOK_CHAPTER_TOKENS=0` as the real full-chapter mode, deriving a large safety cap from context length and turn count. At 48k context and 10 turns this gives 4390 generated tokens per chapter, leaving a 4096-token reserve.
+
+After replacing the mixed-layout KV descriptor fallback with binary search, the 2-turn full-cap greedy retained run improved from 90.23s wall / 20.36 tok/s to 23.56s wall / 77.98 tok/s for the same 1837 generated tokens. The full 10-turn retained run then completed cleanly with an empty `.err`, generated 8526 tokens, and wrote `/tmp/go-rocm-book-10turn-fullcap-greedy-bsearch.md`, but it took 439.4s wall / 428.2s decode / 19.41 tok/s. That is not a production pass. Chapter 10 also repeated chapter-1 material instead of cleanly maintaining the story arc, so quality/state continuity still needs diagnosis alongside speed.
+
+Next benchmark pass needs per-turn generated-token and decode timing instrumentation, because aggregate 439s cannot distinguish long natural chapters, missing stop behavior, or a retained KV lookup cliff after several turns.
+
+## 2026-05-26 - Device-KV page layout diagnostic
+
+Per-turn stats showed the full-cap retained book slowdown was a retained decode
+scaling failure, not a chapter cap failure. The 16-token device-KV page run did
+not hit the 4390-token chapter safety cap on any turn, but decode decayed almost
+monotonically as retained state grew:
+
+```text
+turn  generated  decode_s  tok/s
+1     978        10.425    93.81
+2     859        12.575    68.31
+3     858        25.235    34.00
+4     858        32.775    26.18
+5     858        40.476    21.20
+6     859        48.379    17.76
+7     858        56.367    15.22
+8     857        64.433    13.30
+9     858        72.611    11.82
+10    683        64.433    10.60
+```
+
+The inflection matches the attention path losing the shared per-token value
+metadata path after roughly 2k retained tokens and then repeatedly resolving a
+mixed page layout. Retained turns create blocks of prompt pages interleaved with
+long runs of one-token decode pages, so the old block-page default no longer
+keeps descriptor lookup cheap.
+
+Forcing `GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE=1` made every retained KV page a
+direct token page. The full 10-turn retained full-cap run then completed in
+`56.7s` wall with empty stderr, `3460` generated tokens, zero cap-hit turns, and
+chapter-10 anchor hits of `4`:
+
+```text
+turn  generated  decode_s  tok/s
+1     502        4.791     104.78
+2     405        4.543      89.16
+3     319        3.782      84.34
+4     318        3.977      79.96
+5     318        4.844      65.65
+6     320        5.223      61.27
+7     319        5.466      58.36
+8     320        6.332      50.54
+9     319        6.725      47.43
+10    320        7.022      45.57
+```
+
+The benchmark reports `book_90s_success=1` and
+`book_110s_production_candidate=1` for this route. The driver is still not done:
+average decode is `61.0 tok/s`, later turns are below the `90-100+ tok/s` target,
+and the output still absorbs distractor chapter concepts. The immediate default
+has been changed to one-token Gemma4 device-KV pages because it is the measured
+fast path for retained book workloads; the longer-term fix is a compact retained
+page layout or global metadata cache that preserves O(1) lookup without one page
+per token.
+
+After moving the distractor before the final continuation instruction, the
+default one-token-page route still passes the wall-time endpoint and gives better
+chapter-10 arc retention:
+
+```text
+GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE unset
+GO_ROCM_BOOK_CHAPTER_TOKENS=0
+GO_ROCM_BOOK_CONTEXT_LEN=48000
+GO_ROCM_BOOK_TURNS=10
+
+wall_s                 74.22
+decode_s               69.33
+generated_tokens        4215
+book_tok/s             56.79
+book_90s_success           1
+book_110s_candidate        1
+chapter10_arc_hits         3
+stderr_bytes               0
+```
+
+Per-turn decode still decays from `104.7 tok/s` to `42.6 tok/s`, so the book
+endpoint is passing but the `100+ tok/s` retained long-context driver endpoint
+is not. The short hot-loop diagnostic remains green with the new default:
+`context_len=128`, `max_new_tokens=2048`, `text:Hi` reports `102.4 tok/s` with
+empty stderr. The 4096-context 2048-token diagnostic reports `88.65 tok/s`,
+which is better than the old 4096-context non-chunked number but still below the
+long-context target.
+
+## 2026-05-26 - Direct retained KQ8/VQ4 value fast path
+
+Kept a direct one-token KQ8/VQ4 value path for retained device-KV pages after
+the shared q4 value metadata cache no longer fits beside long-context attention
+weights. The new branch is only active for direct one-token descriptor tables in
+the no-shared-metadata region; it skips generic value descriptor math but keeps
+the same per-lane accumulation order.
+
+4096-token diagnostic, chapter prompt, greedy, context_len=8192:
+
+```text
+before value fast path: 69.05 tok/s  715310248 B/op  6833978 allocs/op
+after value fast path:  72.45 tok/s  633262152 B/op  6833550 allocs/op
+stderr_bytes: 0
+output_cmp: byte-identical to /tmp/go-rocm-greedy-4096-current.txt
+```
+
+The full-cap retained book route also stayed clean with empty stderr and passed
+the chapter-10 arc check:
+
+```text
+book_wall_s/op             60.22
+book_decode_s/op           55.45
+book_generated_tokens/op    3801
+book_tok/s                 63.12
+book_turn01_tok/s         104.83
+book_turn10_tok/s          48.38
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+stderr_bytes                   0
+output: /tmp/go-rocm-book-10turn-fullcap-greedy-fastpath.md
+```
+
+This improves the book wall-time headroom but does not meet the actual retained
+long-context driver endpoint. Late-turn decode is still far below `90-100+ tok/s`;
+the remaining work is still the long full-attention kernel and/or a compact
+retained KV layout, not the chapter cap or benchmark accounting.
+
+Rejected a direct one-token Q8 key-dot shortcut for the same descriptor layout.
+It preserved byte-identical 4096-token greedy output and empty stderr, but
+measured `72.38 tok/s`, slightly below the value-only fast path, so it was
+removed.
+
+Final `rocprof --stats` on the kept value-fast HSACO:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32  1  57243281593 ns/op  71.55 tok/s
+stderr_bytes: 0
+
+kernel                              calls   total_s  pct
+rocm_attention_heads.kd            143325   20.228   44.20
+rocm_mlx_q4_projection.kd          511893    8.475   18.52
+rocm_mlx_q4_gelu_tanh_multiply.kd  143325    5.077   11.09
+rocm_rms_norm_residual_add_norm.kd 286650    3.366    7.36
+```
+
+The value fast path shaved attention share from the previous `46.48%` to
+`44.20%`, but attention remains the dominant scaling limit. The next meaningful
+kernel change should be a real tiled/multi-block long-context decode attention
+path or a compact retained KV arena that stops chasing one descriptor and scale
+per token in the global layers.
+
+## 2026-05-26 - Chunked attention promoted with 128-token chunks
+
+The old chunked attention route was correct after the stage-2 launch-packet fix,
+but too slow at the default 256-token chunk size. A direct chunked KQ8/VQ4
+one-token descriptor path only moved forced 4096-token chunked decode from the
+old `58.24 tok/s` to `58.49 tok/s`, so the real win came from reducing the
+chunk size to 128. That gives each token four score lanes per 512-thread block
+instead of two, while stage 2 remains cheap enough for this model size.
+
+Kept changes:
+
+```text
+ROCM_ATTENTION_HEADS_CHUNK_SIZE / hipAttentionHeadsChunkSize: 256 -> 128
+GO_ROCM_GEMMA4_Q4_CHUNKED_ATTENTION default: enabled
+GO_ROCM_GEMMA4_Q4_CHUNKED_ATTENTION=0: explicit opt-out
+```
+
+Verification on the RX 7800 XT with `/tmp/go-rocm-kernels-gfx1100.hsaco`:
+
+```text
+4096 chapter prompt, forced chunk128:
+  51230708162 ns/op, 79.95 tok/s, 792578616 B/op, 6745568 allocs/op
+  stderr_bytes=0
+  output byte-identical to /tmp/go-rocm-greedy-4096-current.txt
+
+2048 chapter prompt, forced chunk128:
+  22622622374 ns/op, 90.53 tok/s, 314809632 B/op, 3426653 allocs/op
+  stderr_bytes=0
+
+1024 chapter prompt, forced chunk128:
+  10753463398 ns/op, 95.23 tok/s, 181780152 B/op, 1734305 allocs/op
+  stderr_bytes=0
+
+2048 text:Hi, default chunk128:
+  19925758722 ns/op, 102.8 tok/s, 248175744 B/op, 3403515 allocs/op
+  stderr_bytes=0
+  output byte-identical to forced chunk128
+```
+
+The full retained book route is now much closer to the Metal wall-time target,
+but still below the true retained long-context decode target:
+
+```text
+book_wall_s/op             41.81
+book_decode_s/op           37.54
+book_generated_tokens/op    3021
+book_tok/s                 72.26
+book_turn01_tok/s         103.25
+book_turn10_tok/s          62.35
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+stderr_bytes                   0
+output: /tmp/go-rocm-book-10turn-fullcap-greedy-chunk128.md
+```
+
+The same retained-book command with the default chunked route, not forcing
+`GO_ROCM_GEMMA4_Q4_CHUNKED_ATTENTION=1`, completed with equivalent behavior:
+
+```text
+book_wall_s/op             41.95
+book_decode_s/op           37.70
+book_generated_tokens/op    3021
+book_tok/s                 72.01
+book_turn01_tok/s         103.4
+book_turn10_tok/s          61.13
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+stderr_bytes                   0
+output: /tmp/go-rocm-book-10turn-fullcap-greedy-default-chunk128.md
+```
+
+After trimming redundant direct-page field validation inside chunked stage 1,
+the default retained-book run stayed equivalent:
+
+```text
+book_wall_s/op             41.96
+book_decode_s/op           37.73
+book_generated_tokens/op    3021
+book_tok/s                 72.00
+book_turn01_tok/s         103.2
+book_turn10_tok/s          61.80
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+stderr_bytes                   0
+output: /tmp/go-rocm-book-10turn-fullcap-greedy-default-chunk128-fastvalid.md
+```
+
+Rejected chunk64. It preserved byte-identical 4096-token output and empty
+stderr, but the doubled chunk count outweighed the extra score lanes:
+`54856300787 ns/op`, `74.67 tok/s`, `716524872 B/op`, `6693941 allocs/op`.
+
+Rejected using the shared scratch query inside chunked stage1's multi-lane score
+loop. The 4096-token single-stream diagnostic improved to `80.84 tok/s` and
+byte-matched the previous greedy output, but the 10-turn retained book run
+failed the chapter-10 arc check with only 2 anchors. The likely cause is scratch
+aliasing: the same buffer holds the cached query and later per-token partial
+scores, so faster lanes can overwrite query entries before slower lanes finish
+reading them. Keep the original `query[dim]` read until there is a separate
+query shared buffer or a different stage1 layout.
+
+This is the new production-candidate default, not final completion. The remaining
+gap is still late-turn/global-attention scaling: turn 10 is about `61-62 tok/s`, not
+`90-100+ tok/s`.
+
+`rocprof --stats` on the active chunk128 route:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32  1  52103713137 ns/op  78.61 tok/s
+stderr_bytes: 0
+
+kernel                                  calls   total_s  pct
+rocm_attention_heads_chunked_stage1.kd 139475   13.995  34.23
+rocm_mlx_q4_projection.kd              511893    8.874  21.71
+rocm_mlx_q4_gelu_tanh_multiply.kd      143325    5.091  12.45
+rocm_rms_norm_residual_add_norm.kd     286650    3.439   8.41
+rocm_mlx_q4_projection_greedy.kd         4097    1.702   4.16
+rocm_attention_heads_chunked_stage2.kd 139475    0.844   2.06
+```
+
+Compared with the non-chunked value-fast profile, chunking moves the active
+attention share from `44.20%` in `rocm_attention_heads` to `34.23%` in
+`rocm_attention_heads_chunked_stage1`. Stage2 is not the bottleneck. The next
+work should focus on stage1 score/value memory access or q4 projection
+throughput.

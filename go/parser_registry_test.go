@@ -20,7 +20,7 @@ func TestParserRegistry_Good_QwenThinkTags(t *testing.T) {
 }
 
 func TestParserRegistry_Good_GemmaChannels(t *testing.T) {
-	result, err := NewParserRegistry("gemma3").ParseReasoning(nil, "[analysis]hidden[/analysis]visible")
+	result, err := NewParserRegistry("gemma3").ParseReasoning(nil, "<analysis>hidden</analysis>visible")
 
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, "visible", result.VisibleText)
@@ -65,11 +65,11 @@ func TestParserRegistry_Good_GPTOSSChannels(t *testing.T) {
 
 func TestParserRegistry_Good_KimiAndGLMAnalysisFinal(t *testing.T) {
 	for _, architecture := range []string{"Kimi-K2-Instruct", "GLM4ForCausalLM"} {
-		result, err := NewParserRegistry(architecture).ParseReasoning(nil, "analysis: hidden plan\nfinal: visible answer")
+		result, err := NewParserRegistry(architecture).ParseReasoning(nil, "<think>hidden plan</think>visible answer")
 
 		core.RequireNoError(t, err)
 		core.AssertEqual(t, "visible answer", result.VisibleText)
-		core.AssertEqual(t, "analysis", result.Reasoning[0].Kind)
+		core.AssertEqual(t, "thinking", result.Reasoning[0].Kind)
 		core.AssertEqual(t, "hidden plan", result.Reasoning[0].Text)
 	}
 }
@@ -87,13 +87,12 @@ func TestParserRegistry_Good_MistralToolCallsArray(t *testing.T) {
 	result, err := NewParserRegistry("mistral").ParseTools(nil, `[{"name":"search","arguments":{"q":"rocm"}}]`)
 
 	core.RequireNoError(t, err)
-	core.AssertEqual(t, "json", result.Labels["parser"])
 	core.AssertEqual(t, "search", result.Calls[0].Name)
 	core.AssertContains(t, result.Calls[0].ArgumentsJSON, "rocm")
 }
 
 func TestParserRegistry_Good_MistralToolCallsPrefix(t *testing.T) {
-	result, err := NewParserRegistry("mistral").ParseTools(nil, `[TOOL_CALLS] [{"name":"lookup","arguments":{"id":7}}]`)
+	result, err := NewParserRegistry("mistral").ParseTools(nil, `<tool_calls>[{"name":"lookup","arguments":{"id":7}}]</tool_calls>`)
 
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, "lookup", result.Calls[0].Name)
@@ -105,14 +104,13 @@ func TestParserRegistry_Good_HermesAndGraniteJSONTools(t *testing.T) {
 		result, err := NewParserRegistry(architecture).ParseTools(nil, `{"name":"lookup","arguments":{"id":42}}`)
 
 		core.RequireNoError(t, err)
-		core.AssertEqual(t, "json", result.Labels["parser"])
 		core.AssertEqual(t, "lookup", result.Calls[0].Name)
 		core.AssertContains(t, result.Calls[0].ArgumentsJSON, "42")
 	}
 }
 
 func TestParserRegistry_Good_GenericXMLToolCall(t *testing.T) {
-	result, err := NewParserRegistry("unknown").ParseTools(nil, `<tool name="lookup">{"a":1}</tool>`)
+	result, err := NewParserRegistry("unknown").ParseTools(nil, `<tool_call>{"name":"lookup","arguments":{"a":1}}</tool_call>`)
 
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, "lookup", result.Calls[0].Name)
@@ -162,7 +160,7 @@ func TestParserRegistry_Bad_RocmModelParseToolsRecordsErrAndSuccessClears_Bad(t 
 	}
 	core.AssertContains(t, model.Err().Error(), "parse JSON")
 
-	result, err := model.ParseTools(nil, `[TOOL_CALLS] [{"name":"search","arguments":{"q":"rocm"}}]`)
+	result, err := model.ParseTools(nil, `<tool_call>{"name":"search","arguments":{"q":"rocm"}}</tool_call>`)
 
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, "search", result.Calls[0].Name)

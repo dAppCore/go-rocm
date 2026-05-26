@@ -4,33 +4,60 @@
 
 package rocm
 
-import core "dappco.re/go"
+import (
+	"sync"
+
+	core "dappco.re/go"
+)
 
 const (
-	hipKernelNamePrefill       = "rocm_prefill"
-	hipKernelNameDecode        = "rocm_decode"
-	hipKernelNameProjection    = "rocm_projection"
-	hipKernelNameMLXQ4Proj     = "rocm_mlx_q4_projection"
-	hipKernelNameRMSNorm       = "rocm_rms_norm"
-	hipKernelNameRoPE          = "rocm_rope"
-	hipKernelNameGreedy        = "rocm_greedy_sample"
-	hipKernelNameAttention     = "rocm_attention"
-	hipKernelNameVectorAdd     = "rocm_vector_add"
-	hipKernelNameVectorScale   = "rocm_vector_scale"
-	hipKernelNameSwiGLU        = "rocm_swiglu"
-	hipKernelNameMoERouter     = "rocm_moe_router"
-	hipKernelNameMoELazy       = "rocm_moe_lazy_experts"
-	hipKernelNameJANGTQ        = "rocm_jangtq_projection"
-	hipKernelNameCodebook      = "rocm_codebook_lookup"
-	hipKernelNameLoRA          = "rocm_lora_projection"
-	hipKernelNameEmbedLookup   = "rocm_embedding_lookup"
-	hipKernelNameEmbedMean     = "rocm_embedding_mean_pool"
-	hipKernelNameRerank        = "rocm_rerank_cosine"
-	hipKernelNameTinyPrefill   = "rocm_tiny_prefill"
-	hipKernelNameTinyDecode    = "rocm_tiny_decode"
-	hipKernelNameCrossEntropy  = "rocm_cross_entropy_loss"
-	hipKernelNameDistillKL     = "rocm_distillation_kl_loss"
-	hipKernelNameGRPOAdvantage = "rocm_grpo_advantage"
+	hipKernelNamePrefill                     = "rocm_prefill"
+	hipKernelNameDecode                      = "rocm_decode"
+	hipKernelNameKVEncodeToken               = "rocm_kv_encode_token"
+	hipKernelNameKVDescriptorAppend          = "rocm_kv_descriptor_append"
+	hipKernelNameProjection                  = "rocm_projection"
+	hipKernelNameProjectionBatch             = "rocm_projection_batch"
+	hipKernelNameMLXQ4Proj                   = "rocm_mlx_q4_projection"
+	hipKernelNameMLXQ4ProjBatch              = "rocm_mlx_q4_projection_batch"
+	hipKernelNameMLXQ4ProjGreedy             = "rocm_mlx_q4_projection_greedy"
+	hipKernelNameMLXQ4TripleProj             = "rocm_mlx_q4_triple_projection"
+	hipKernelNameMLXQ4GELUTanhMul            = "rocm_mlx_q4_gelu_tanh_multiply"
+	hipKernelNameMLXQ4GELUTanhMulBatch       = "rocm_mlx_q4_gelu_tanh_multiply_batch"
+	hipKernelNameMLXQ4GELUTanhProj           = "rocm_mlx_q4_gelu_tanh_projection"
+	hipKernelNameMLXQ4GELUTanhProjBatch      = "rocm_mlx_q4_gelu_tanh_projection_batch"
+	hipKernelNameRMSNorm                     = "rocm_rms_norm"
+	hipKernelNameRMSNormResidualAdd          = "rocm_rms_norm_residual_add"
+	hipKernelNameRMSNormResAddNorm           = "rocm_rms_norm_residual_add_norm"
+	hipKernelNameRMSNormHeads                = "rocm_rms_norm_heads"
+	hipKernelNameRMSNormRoPEHeads            = "rocm_rms_norm_rope_heads"
+	hipKernelNameRMSNormRoPEHeadsBatch       = "rocm_rms_norm_rope_heads_batch"
+	hipKernelNameRoPE                        = "rocm_rope"
+	hipKernelNameRoPEHeads                   = "rocm_rope_heads"
+	hipKernelNameGreedy                      = "rocm_greedy_sample"
+	hipKernelNameSoftcapGreedy               = "rocm_softcap_greedy_sample"
+	hipKernelNameAttention                   = "rocm_attention"
+	hipKernelNameAttentionHeads              = "rocm_attention_heads"
+	hipKernelNameAttentionHeadsBatchCausal   = "rocm_attention_heads_batch_causal"
+	hipKernelNameAttentionHeadsChunkedStage1 = "rocm_attention_heads_chunked_stage1"
+	hipKernelNameAttentionHeadsChunkedStage2 = "rocm_attention_heads_chunked_stage2"
+	hipKernelNameVectorAdd                   = "rocm_vector_add"
+	hipKernelNameVectorScale                 = "rocm_vector_scale"
+	hipKernelNamePerLayerInputTranspose      = "rocm_per_layer_input_transpose"
+	hipKernelNameSwiGLU                      = "rocm_swiglu"
+	hipKernelNameGELUTanhMul                 = "rocm_gelu_tanh_multiply"
+	hipKernelNameMoERouter                   = "rocm_moe_router"
+	hipKernelNameMoELazy                     = "rocm_moe_lazy_experts"
+	hipKernelNameJANGTQ                      = "rocm_jangtq_projection"
+	hipKernelNameCodebook                    = "rocm_codebook_lookup"
+	hipKernelNameLoRA                        = "rocm_lora_projection"
+	hipKernelNameEmbedLookup                 = "rocm_embedding_lookup"
+	hipKernelNameEmbedMean                   = "rocm_embedding_mean_pool"
+	hipKernelNameRerank                      = "rocm_rerank_cosine"
+	hipKernelNameTinyPrefill                 = "rocm_tiny_prefill"
+	hipKernelNameTinyDecode                  = "rocm_tiny_decode"
+	hipKernelNameCrossEntropy                = "rocm_cross_entropy_loss"
+	hipKernelNameDistillKL                   = "rocm_distillation_kl_loss"
+	hipKernelNameGRPOAdvantage               = "rocm_grpo_advantage"
 )
 
 type hipKernelLaunchConfig struct {
@@ -47,6 +74,33 @@ type hipKernelLaunchConfig struct {
 
 type nativeHIPKernelLauncher interface {
 	LaunchKernel(config hipKernelLaunchConfig) error
+}
+
+var hipLaunchPacketPools sync.Map
+
+func hipBorrowLaunchPacket(size int) []byte {
+	if size <= 0 {
+		return nil
+	}
+	poolValue, ok := hipLaunchPacketPools.Load(size)
+	if !ok {
+		pool := &sync.Pool{}
+		poolValue, _ = hipLaunchPacketPools.LoadOrStore(size, pool)
+	}
+	if packet := poolValue.(*sync.Pool).Get(); packet != nil {
+		return packet.([]byte)[:size]
+	}
+	return make([]byte, size, size+1)
+}
+
+func hipReleaseLaunchPacket(packet []byte) {
+	if len(packet) == 0 || cap(packet) != len(packet)+1 {
+		return
+	}
+	clear(packet)
+	if poolValue, ok := hipLaunchPacketPools.Load(len(packet)); ok {
+		poolValue.(*sync.Pool).Put(packet[:0])
+	}
 }
 
 func hipLaunchKernel(driver nativeHIPDriver, config hipKernelLaunchConfig) error {
@@ -91,8 +145,22 @@ func hipOneDimensionalLaunchConfig(name string, args []byte, workItems int) (hip
 	gridX := (work + blockSize - 1) / blockSize
 	config := hipKernelLaunchConfig{
 		Name:   name,
-		Args:   append([]byte(nil), args...),
+		Args:   args,
 		GridX:  gridX,
+		GridY:  1,
+		GridZ:  1,
+		BlockX: blockSize,
+		BlockY: 1,
+		BlockZ: 1,
+	}
+	return config, config.Validate()
+}
+
+func hipSingleBlockLaunchConfig(name string, args []byte, blockSize uint32) (hipKernelLaunchConfig, error) {
+	config := hipKernelLaunchConfig{
+		Name:   name,
+		Args:   args,
+		GridX:  1,
 		GridY:  1,
 		GridZ:  1,
 		BlockX: blockSize,

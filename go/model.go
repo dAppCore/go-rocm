@@ -316,7 +316,6 @@ func newCompletionRequest(prompt string, generateConfig inference.GenerateConfig
 		Temperature:   generateConfig.Temperature,
 		TopK:          generateConfig.TopK,
 		TopP:          generateConfig.TopP,
-		Stop:          append([]string(nil), generateConfig.StopSequences...),
 		RepeatPenalty: generateConfig.RepeatPenalty,
 	}
 }
@@ -328,7 +327,6 @@ func newChatRequest(messages []llamacpp.ChatMessage, generateConfig inference.Ge
 		Temperature:   generateConfig.Temperature,
 		TopK:          generateConfig.TopK,
 		TopP:          generateConfig.TopP,
-		Stop:          append([]string(nil), generateConfig.StopSequences...),
 		RepeatPenalty: generateConfig.RepeatPenalty,
 	}
 }

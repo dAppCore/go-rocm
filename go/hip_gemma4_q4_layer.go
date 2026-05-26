@@ -76,18 +76,28 @@ type hipGemma4Q4Layer0Request struct {
 }
 
 type hipGemma4Q4DecoderLayerRequest struct {
-	Position          int
-	RoPEBase          float32
-	Epsilon           float32
-	PriorKeys         []float32
-	PriorValues       []float32
-	DeviceKVAttention bool
-	DeviceKVMode      string
-	PriorDeviceKV     *rocmDeviceKVCache
-	KeepDeviceKV      bool
-	PerLayerInput     []float32
-	SharedKeys        []float32
-	SharedValues      []float32
+	Position              int
+	RoPEBase              float32
+	Epsilon               float32
+	PriorKeys             []float32
+	PriorValues           []float32
+	DeviceKVAttention     bool
+	DeviceKVMode          string
+	PriorDeviceKV         *rocmDeviceKVCache
+	PriorDescriptorTable  *rocmDeviceKVDescriptorTable
+	KeepDeviceKV          bool
+	PerLayerInput         []float32
+	PerLayerInputDevice   *hipDeviceByteBuffer
+	SharedKeys            []float32
+	SharedValues          []float32
+	SharedDeviceKV        *rocmDeviceKVCache
+	SharedDescriptorTable *rocmDeviceKVDescriptorTable
+	LayerInputDevice      *hipDeviceByteBuffer
+	NextInputNorm         *hipRMSNormDeviceWeightConfig
+	AttentionWorkspace    *hipAttentionHeadsChunkedWorkspace
+	OmitDebugTensors      bool
+	ReturnDeviceHidden    bool
+	OmitHostKV            bool
 }
 
 type hipGemma4Q4ForwardConfig struct {
@@ -96,19 +106,55 @@ type hipGemma4Q4ForwardConfig struct {
 }
 
 type hipGemma4Q4ForwardRequest struct {
-	TokenID           int32
-	Position          int
-	RoPEBase          float32
-	Epsilon           float32
-	DeviceKVAttention bool
-	DeviceKVMode      string
-	PriorDeviceState  *hipGemma4Q4DeviceDecodeState
-	ReturnDeviceState bool
+	TokenID            int32
+	Position           int
+	RoPEBase           float32
+	Epsilon            float32
+	DeviceKVAttention  bool
+	DeviceKVMode       string
+	PriorDeviceState   *hipGemma4Q4DeviceDecodeState
+	ReturnDeviceState  bool
+	DeviceFinalSample  bool
+	SkipFinalSample    bool
+	FinalGreedyBuffer  *hipDeviceByteBuffer
+	SuppressTokens     []int32
+	AttentionWorkspace *hipAttentionHeadsChunkedWorkspace
+	OmitDebugTensors   bool
 }
 
 type hipGemma4Q4LayerKVState struct {
 	Keys   []float32
 	Values []float32
+}
+
+type hipGemma4Q4PerLayerInputDeviceSet struct {
+	Layers  []*hipDeviceByteBuffer
+	Backing []*hipDeviceByteBuffer
+}
+
+func (set *hipGemma4Q4PerLayerInputDeviceSet) Layer(index int) *hipDeviceByteBuffer {
+	if set == nil || index < 0 || index >= len(set.Layers) {
+		return nil
+	}
+	return set.Layers[index]
+}
+
+func (set *hipGemma4Q4PerLayerInputDeviceSet) Close() error {
+	if set == nil {
+		return nil
+	}
+	var lastErr error
+	for _, layer := range set.Layers {
+		if err := layer.Close(); err != nil {
+			lastErr = err
+		}
+	}
+	for _, buffer := range set.Backing {
+		if err := buffer.Close(); err != nil {
+			lastErr = err
+		}
+	}
+	return lastErr
 }
 
 type hipGemma4Q4DecodeState struct {
@@ -141,18 +187,20 @@ type hipGemma4Q4Layer0Result struct {
 }
 
 type hipGemma4Q4DecoderLayerResult struct {
-	LayerInput          []float32
-	Key                 []float32
-	Value               []float32
-	UpdatedKeys         []float32
-	UpdatedValues       []float32
-	DeviceKVAttention   string
-	DeviceLayer         *hipGemma4Q4DeviceLayerKVState
-	AttentionOutput     []float32
-	AttentionProjection []float32
-	AttentionResidual   []float32
-	MLPOutput           []float32
-	FinalHidden         []float32
+	LayerInput           []float32
+	Key                  []float32
+	Value                []float32
+	UpdatedKeys          []float32
+	UpdatedValues        []float32
+	DeviceKVAttention    string
+	DeviceLayer          *hipGemma4Q4DeviceLayerKVState
+	AttentionOutput      []float32
+	AttentionProjection  []float32
+	AttentionResidual    []float32
+	MLPOutput            []float32
+	FinalHidden          []float32
+	DeviceFinalHidden    *hipDeviceByteBuffer
+	DeviceNextLayerInput *hipDeviceByteBuffer
 }
 
 type hipGemma4Q4ForwardResult struct {
@@ -254,7 +302,7 @@ func (model *hipLoadedModel) loadedGemma4Q4LayerConfig(layer int) (hipGemma4Q4La
 	layerType := hipGemma4Q4LayerTypeFromHeadDim(headDim)
 	ropeBase := hipGemma4Q4LayerRoPEBase(headDim)
 	ropeRotaryDim := hipGemma4Q4LayerRoPERotaryDim(headDim)
-	slidingWindow := hipGemma4Q4LayerSlidingWindow(headDim)
+	slidingWindow := hipGemma4Q4EffectiveSlidingWindow(headDim, model.contextSize)
 
 	inputNorm, err := model.loadedGemma4BF16NormConfig(layerPrefix+".input_layernorm.weight", "input_layernorm", hidden)
 	if err != nil {
@@ -436,56 +484,101 @@ func hipRunGemma4Q4SingleTokenForward(ctx context.Context, driver nativeHIPDrive
 }
 
 func hipRunGemma4Q4SingleTokenForwardWithState(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4ForwardConfig, state hipGemma4Q4DecodeState, req hipGemma4Q4ForwardRequest) (hipGemma4Q4ForwardResult, hipGemma4Q4DecodeState, error) {
+	return hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx, driver, cfg, state, req, true)
+}
+
+func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4ForwardConfig, state hipGemma4Q4DecodeState, req hipGemma4Q4ForwardRequest, validate bool) (hipGemma4Q4ForwardResult, hipGemma4Q4DecodeState, error) {
 	if err := hipContextErr(ctx); err != nil {
 		return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
 	}
 	if driver == nil || !driver.Available() {
 		return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, core.E(hipGemma4Q4Layer0Operation, "HIP driver is not available", nil)
 	}
-	if err := cfg.validate(); err != nil {
-		return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
-	}
-	if err := state.validate(cfg); err != nil {
-		return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+	if validate {
+		if err := cfg.validate(); err != nil {
+			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+		}
+		if err := state.validate(cfg); err != nil {
+			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+		}
 	}
 	if req.PriorDeviceState != nil {
 		if !req.DeviceKVAttention {
 			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, core.E(hipGemma4Q4Layer0Operation, "prior device state requires device KV attention", nil)
 		}
-		if err := req.PriorDeviceState.CompatibleWithHostState(cfg, state, req.DeviceKVMode); err != nil {
-			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+		if validate {
+			if err := req.PriorDeviceState.CompatibleWithHostState(cfg, state, req.DeviceKVMode); err != nil {
+				return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+			}
 		}
 	}
 	if req.ReturnDeviceState && !req.DeviceKVAttention {
 		return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, core.E(hipGemma4Q4Layer0Operation, "returning device state requires device KV attention", nil)
 	}
+	if req.DeviceFinalSample && req.SkipFinalSample {
+		return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, core.E(hipGemma4Q4Layer0Operation, "final sample cannot be both requested and skipped", nil)
+	}
 	first := cfg.Layers[0]
-	if err := (hipGemma4Q4Layer0Request{
-		TokenID:  req.TokenID,
-		Position: req.Position,
-		RoPEBase: req.RoPEBase,
-		Epsilon:  req.Epsilon,
-	}).validate(first); err != nil {
-		return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+	if validate {
+		if err := (hipGemma4Q4Layer0Request{
+			TokenID:  req.TokenID,
+			Position: req.Position,
+			RoPEBase: req.RoPEBase,
+			Epsilon:  req.Epsilon,
+		}).validate(first); err != nil {
+			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+		}
 	}
-	embedding, err := hipRunEmbeddingLookupKernelWithDeviceTable(ctx, driver, []int32{req.TokenID}, first.Embedding)
-	if err != nil {
-		return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
-	}
-	scaledEmbedding, err := hipRunVectorScaleKernel(ctx, driver, hipVectorScaleRequest{
-		Input: embedding,
-		Scale: float32(math.Sqrt(float64(first.HiddenSize))),
-	})
-	if err != nil {
-		return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
-	}
-	perLayerInputs, err := hipRunGemma4Q4PerLayerInputs(ctx, driver, cfg, req.TokenID, scaledEmbedding, req.Epsilon)
-	if err != nil {
-		return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+	var err error
+	var embedding []float32
+	var scaledEmbedding []float32
+	var hidden []float32
+	var hiddenBuffer *hipDeviceByteBuffer
+	var perLayerInputs [][]float32
+	var perLayerInputDevices *hipGemma4Q4PerLayerInputDeviceSet
+	if req.OmitDebugTensors {
+		embeddingBuffer, err := hipRunEmbeddingLookupKernelWithDeviceTableBuffer(ctx, driver, []int32{req.TokenID}, first.Embedding)
+		if err != nil {
+			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+		}
+		defer embeddingBuffer.Close()
+		hiddenBuffer, err = hipRunVectorScaleDeviceKernel(ctx, driver, embeddingBuffer, float32(math.Sqrt(float64(first.HiddenSize))))
+		if err != nil {
+			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+		}
+		perLayerInputDevices, err = hipRunGemma4Q4PerLayerInputDeviceSet(ctx, driver, cfg, req.TokenID, hiddenBuffer, req.Epsilon)
+		if err != nil {
+			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+		}
+		defer perLayerInputDevices.Close()
+	} else {
+		embedding, err = hipRunEmbeddingLookupKernelWithDeviceTable(ctx, driver, []int32{req.TokenID}, first.Embedding)
+		if err != nil {
+			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+		}
+		scaledEmbedding, err = hipRunVectorScaleKernel(ctx, driver, hipVectorScaleRequest{
+			Input: embedding,
+			Scale: float32(math.Sqrt(float64(first.HiddenSize))),
+		})
+		if err != nil {
+			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+		}
+		perLayerInputs, err = hipRunGemma4Q4PerLayerInputs(ctx, driver, cfg, req.TokenID, scaledEmbedding, req.Epsilon)
+		if err != nil {
+			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+		}
+		hidden = scaledEmbedding
 	}
 	sharedSources := hipGemma4Q4SharedKVSourceByLayer(cfg)
-	hidden := scaledEmbedding
-	layerResults := make([]hipGemma4Q4DecoderLayerResult, 0, len(cfg.Layers))
+	defer func() {
+		if hiddenBuffer != nil {
+			_ = hiddenBuffer.Close()
+		}
+	}()
+	var layerResults []hipGemma4Q4DecoderLayerResult
+	if !req.OmitDebugTensors {
+		layerResults = make([]hipGemma4Q4DecoderLayerResult, 0, len(cfg.Layers))
+	}
 	nextState := hipGemma4Q4DecodeState{Layers: make([]hipGemma4Q4LayerKVState, len(cfg.Layers))}
 	var nextDeviceState *hipGemma4Q4DeviceDecodeState
 	if req.ReturnDeviceState {
@@ -503,80 +596,202 @@ func hipRunGemma4Q4SingleTokenForwardWithState(ctx context.Context, driver nativ
 	}()
 	deviceAppendLayers := 0
 	deviceRemirrorLayers := 0
+	deviceSharedLayers := 0
 	sharedKVLayers := 0
+	useDeviceSharedKV := req.DeviceKVAttention && req.ReturnDeviceState && req.OmitDebugTensors
+	precomputedLayerInputBuffer := (*hipDeviceByteBuffer)(nil)
+	defer func() {
+		if precomputedLayerInputBuffer != nil {
+			_ = precomputedLayerInputBuffer.Close()
+		}
+	}()
+	hostKVRequiredByLayer := make([]bool, len(cfg.Layers))
+	if !useDeviceSharedKV {
+		for index, source := range sharedSources {
+			if source != index && source >= 0 && source < len(hostKVRequiredByLayer) {
+				hostKVRequiredByLayer[source] = true
+				hostKVRequiredByLayer[index] = true
+			}
+		}
+	}
 	for index, layerCfg := range cfg.Layers {
 		layerState := state.layer(index)
 		var priorDeviceKV *rocmDeviceKVCache
+		var priorDescriptorTable *rocmDeviceKVDescriptorTable
 		if req.PriorDeviceState != nil {
 			priorDeviceKV = req.PriorDeviceState.layerCache(index)
+			priorDescriptorTable = req.PriorDeviceState.layerDescriptorTable(index)
 		}
 		layerReq := hipGemma4Q4DecoderLayerRequest{
-			Position:          req.Position,
-			RoPEBase:          req.RoPEBase,
-			Epsilon:           req.Epsilon,
-			PriorKeys:         layerState.Keys,
-			PriorValues:       layerState.Values,
-			DeviceKVAttention: req.DeviceKVAttention,
-			DeviceKVMode:      req.DeviceKVMode,
-			PriorDeviceKV:     priorDeviceKV,
-			KeepDeviceKV:      req.ReturnDeviceState,
+			Position:             req.Position,
+			RoPEBase:             req.RoPEBase,
+			Epsilon:              req.Epsilon,
+			PriorKeys:            layerState.Keys,
+			PriorValues:          layerState.Values,
+			DeviceKVAttention:    req.DeviceKVAttention,
+			DeviceKVMode:         req.DeviceKVMode,
+			PriorDeviceKV:        priorDeviceKV,
+			PriorDescriptorTable: priorDescriptorTable,
+			KeepDeviceKV:         req.ReturnDeviceState,
+			AttentionWorkspace:   req.AttentionWorkspace,
+			OmitDebugTensors:     req.OmitDebugTensors,
+			ReturnDeviceHidden:   req.OmitDebugTensors,
+			OmitHostKV:           req.DeviceKVAttention && req.ReturnDeviceState && req.OmitDebugTensors && !hostKVRequiredByLayer[index],
 		}
-		if len(perLayerInputs) > index {
+		if precomputedLayerInputBuffer != nil {
+			layerReq.LayerInputDevice = precomputedLayerInputBuffer
+		}
+		if req.OmitDebugTensors {
+			var nextInputNormCfg hipRMSNormDeviceWeightConfig
+			if index+1 < len(cfg.Layers) {
+				nextInputNormCfg = cfg.Layers[index+1].InputNorm
+			} else {
+				if req.SkipFinalSample {
+					nextInputNormCfg = hipRMSNormDeviceWeightConfig{}
+				} else if req.DeviceFinalSample {
+					nextInputNormCfg = layerCfg.FinalNorm
+				}
+			}
+			if nextInputNormCfg.Count > 0 {
+				nextInputNormCfg.Epsilon = req.Epsilon
+				layerReq.NextInputNorm = &nextInputNormCfg
+			}
+		}
+		if perLayerInputDevices != nil && perLayerInputDevices.Layer(index) != nil {
+			layerReq.PerLayerInputDevice = perLayerInputDevices.Layer(index)
+		} else if len(perLayerInputs) > index {
 			layerReq.PerLayerInput = perLayerInputs[index]
 		}
 		if len(sharedSources) > index && sharedSources[index] != index {
 			source := sharedSources[index]
-			if source < 0 || source >= len(nextState.Layers) || len(nextState.Layers[source].Keys) == 0 {
-				return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, core.E(hipGemma4Q4Layer0Operation, "shared KV source layer is unavailable", nil)
+			if useDeviceSharedKV {
+				if nextDeviceState == nil || source < 0 || source >= len(nextDeviceState.layers) || nextDeviceState.layers[source].cache == nil {
+					return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, core.E(hipGemma4Q4Layer0Operation, "shared device KV source layer is unavailable", nil)
+				}
+				layerReq.SharedDeviceKV = nextDeviceState.layers[source].cache
+				layerReq.SharedDescriptorTable = nextDeviceState.layers[source].descriptorTable
+			} else {
+				if source < 0 || source >= len(nextState.Layers) || len(nextState.Layers[source].Keys) == 0 {
+					return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, core.E(hipGemma4Q4Layer0Operation, "shared KV source layer is unavailable", nil)
+				}
+				layerReq.SharedKeys = nextState.Layers[source].Keys
+				layerReq.SharedValues = nextState.Layers[source].Values
 			}
-			layerReq.SharedKeys = nextState.Layers[source].Keys
-			layerReq.SharedValues = nextState.Layers[source].Values
 			sharedKVLayers++
 		}
-		layer, err := hipRunGemma4Q4DecoderLayer(ctx, driver, layerCfg, hidden, layerReq)
+		consumedLayerInputBuffer := precomputedLayerInputBuffer
+		precomputedLayerInputBuffer = nil
+		layer, err := hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx, driver, layerCfg, hidden, hiddenBuffer, layerReq, false)
+		if consumedLayerInputBuffer != nil {
+			_ = consumedLayerInputBuffer.Close()
+		}
 		if err != nil {
 			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
 		}
+		nextHiddenBuffer := layer.DeviceFinalHidden
+		layer.DeviceFinalHidden = nil
+		precomputedLayerInputBuffer = layer.DeviceNextLayerInput
+		layer.DeviceNextLayerInput = nil
 		switch layer.DeviceKVAttention {
 		case "append_existing_device":
 			deviceAppendLayers++
 		case "remirror_host_kv":
 			deviceRemirrorLayers++
+		case "shared_device_kv":
+			deviceSharedLayers++
 		}
 		if req.ReturnDeviceState {
 			if layer.DeviceLayer == nil {
+				if nextHiddenBuffer != nil {
+					_ = nextHiddenBuffer.Close()
+				}
 				return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, core.E(hipGemma4Q4Layer0Operation, "decoder layer did not return device KV state", nil)
 			}
 			nextDeviceState.layers = append(nextDeviceState.layers, *layer.DeviceLayer)
 			layer.DeviceLayer = nil
 		}
-		layerResults = append(layerResults, layer)
+		if !req.OmitDebugTensors {
+			layerResults = append(layerResults, layer)
+		}
 		nextState.Layers[index] = hipGemma4Q4LayerKVState{Keys: layer.UpdatedKeys, Values: layer.UpdatedValues}
-		hidden = layer.FinalHidden
+		if hiddenBuffer != nil {
+			_ = hiddenBuffer.Close()
+			hiddenBuffer = nil
+		}
+		if nextHiddenBuffer != nil {
+			hiddenBuffer = nextHiddenBuffer
+			hidden = nil
+		} else {
+			hidden = layer.FinalHidden
+		}
 	}
 	last := cfg.Layers[len(cfg.Layers)-1]
 	finalNormCfg := last.FinalNorm
 	finalNormCfg.Epsilon = req.Epsilon
-	finalNorm, err := hipRunRMSNormKernelWithDeviceWeightConfig(ctx, driver, hidden, finalNormCfg)
-	if err != nil {
-		return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
-	}
-	logits, err := hipRunMLXQ4ProjectionKernelWithDeviceWeightConfig(ctx, driver, finalNorm, last.LMHeadProjection)
-	if err != nil {
-		return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
-	}
-	logits, err = hipGemma4Q4SoftcapLogits(logits, last.FinalLogitSoftcap)
-	if err != nil {
-		return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
-	}
-	greedy, err := hipRunGreedyKernel(ctx, driver, hipGreedySampleRequest{Logits: logits})
-	if err != nil {
-		return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+	var logits []float32
+	var greedy hipGreedySampleResult
+	if req.SkipFinalSample {
+		// Prompt prefill only needs updated KV state; sampling every intermediate
+		// prompt token wastes a full LM-head projection.
+	} else if req.DeviceFinalSample {
+		finalHiddenBuffer := hiddenBuffer
+		if finalHiddenBuffer == nil {
+			finalHiddenBuffer, err = hipUploadGemma4Q4Float32Input(driver, "Gemma4 q4 final hidden", hidden)
+			if err != nil {
+				return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+			}
+			defer finalHiddenBuffer.Close()
+		}
+		finalNormBuffer := precomputedLayerInputBuffer
+		if finalNormBuffer == nil {
+			finalNormBuffer, err = hipRunRMSNormKernelWithDeviceInputWeightConfig(ctx, driver, finalHiddenBuffer, finalNormCfg)
+			if err != nil {
+				return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+			}
+			defer finalNormBuffer.Close()
+		}
+		greedy, err = hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppress(ctx, driver, finalNormBuffer, last.LMHeadProjection, last.FinalLogitSoftcap, req.FinalGreedyBuffer, req.SuppressTokens)
+		if err != nil {
+			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+		}
+	} else {
+		if hidden == nil && hiddenBuffer != nil {
+			hidden, err = hipReadFloat32DeviceOutput(hiddenBuffer, hipGemma4Q4Layer0Operation, "final hidden output", last.HiddenSize)
+			if err != nil {
+				return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+			}
+		}
+		finalNorm, err := hipRunRMSNormKernelWithDeviceWeightConfig(ctx, driver, hidden, finalNormCfg)
+		if err != nil {
+			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+		}
+		logits, err = hipRunMLXQ4ProjectionKernelWithDeviceWeightConfig(ctx, driver, finalNorm, last.LMHeadProjection)
+		if err != nil {
+			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+		}
+		logits, err = hipGemma4Q4SoftcapLogits(logits, last.FinalLogitSoftcap)
+		if err != nil {
+			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+		}
+		greedy, err = hipRunGreedyKernel(ctx, driver, hipGreedySampleRequest{Logits: logits})
+		if err != nil {
+			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+		}
 	}
 	labels := hipGemma4Q4ForwardLabels(cfg, req)
+	if req.DeviceFinalSample {
+		labels["gemma4_q4_final_sample"] = "device_q4_projection_softcap_greedy"
+	}
+	if req.SkipFinalSample {
+		labels["gemma4_q4_final_sample"] = "skipped"
+	}
+	if req.OmitDebugTensors {
+		labels["gemma4_q4_debug_tensors"] = "omitted"
+	}
 	if req.DeviceKVAttention {
 		labels["attention_kv_append_layers"] = core.Sprintf("%d", deviceAppendLayers)
 		labels["attention_kv_remirror_layers"] = core.Sprintf("%d", deviceRemirrorLayers)
+		labels["attention_kv_shared_device_layers"] = core.Sprintf("%d", deviceSharedLayers)
 	}
 	if cfg.KVSharedLayers > 0 {
 		labels["gemma4_q4_kv_shared_layers"] = core.Sprintf("%d", cfg.KVSharedLayers)
@@ -591,18 +806,22 @@ func hipRunGemma4Q4SingleTokenForwardWithState(ctx context.Context, driver nativ
 		labels["gemma4_q4_forward_device_state"] = "returned"
 		labels["gemma4_q4_device_kv_append_layers"] = core.Sprintf("%d", deviceAppendLayers)
 		labels["gemma4_q4_device_kv_remirror_layers"] = core.Sprintf("%d", deviceRemirrorLayers)
+		labels["gemma4_q4_device_kv_shared_layers"] = core.Sprintf("%d", deviceSharedLayers)
 	}
 	success = true
-	return hipGemma4Q4ForwardResult{
-		Embedding:       embedding,
-		ScaledEmbedding: scaledEmbedding,
-		LayerResults:    layerResults,
-		FinalHidden:     hidden,
-		Logits:          logits,
-		Greedy:          greedy,
-		DeviceState:     nextDeviceState,
-		Labels:          labels,
-	}, nextState, nil
+	result := hipGemma4Q4ForwardResult{
+		LayerResults: layerResults,
+		Logits:       logits,
+		Greedy:       greedy,
+		DeviceState:  nextDeviceState,
+		Labels:       labels,
+	}
+	if !req.OmitDebugTensors {
+		result.Embedding = embedding
+		result.ScaledEmbedding = scaledEmbedding
+		result.FinalHidden = hidden
+	}
+	return result, nextState, nil
 }
 
 func hipRunGemma4Q4GreedyDecode(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4ForwardConfig, req hipGemma4Q4GreedyDecodeRequest) (hipGemma4Q4GreedyDecodeResult, error) {
@@ -625,10 +844,11 @@ func hipRunGemma4Q4GreedyDecode(ctx context.Context, driver nativeHIPDriver, cfg
 	position := req.Position
 	var current hipGemma4Q4ForwardResult
 	forwardOwnsDeviceState := req.MirrorDeviceKV && req.DeviceKVAttention
-	for _, tokenID := range req.PromptTokenIDs {
+	for index, tokenID := range req.PromptTokenIDs {
 		var err error
 		previousState := state
-		current, state, err = hipRunGemma4Q4SingleTokenForwardWithState(ctx, driver, cfg, state, hipGemma4Q4ForwardRequest{
+		skipFinalSample := index+1 < len(req.PromptTokenIDs)
+		current, state, err = hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx, driver, cfg, state, hipGemma4Q4ForwardRequest{
 			TokenID:           tokenID,
 			Position:          position,
 			RoPEBase:          req.RoPEBase,
@@ -637,7 +857,8 @@ func hipRunGemma4Q4GreedyDecode(ctx context.Context, driver nativeHIPDriver, cfg
 			DeviceKVMode:      req.DeviceKVMode,
 			PriorDeviceState:  hipGemma4Q4PriorDeviceStateForForward(req, deviceState),
 			ReturnDeviceState: forwardOwnsDeviceState,
-		})
+			SkipFinalSample:   skipFinalSample,
+		}, false)
 		if err != nil {
 			_ = deviceState.Close()
 			return hipGemma4Q4GreedyDecodeResult{}, err
@@ -671,7 +892,7 @@ func hipRunGemma4Q4GreedyDecode(ctx context.Context, driver nativeHIPDriver, cfg
 		}
 		var err error
 		previousState := state
-		current, state, err = hipRunGemma4Q4SingleTokenForwardWithState(ctx, driver, cfg, state, hipGemma4Q4ForwardRequest{
+		current, state, err = hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx, driver, cfg, state, hipGemma4Q4ForwardRequest{
 			TokenID:           int32(current.Greedy.TokenID),
 			Position:          position,
 			RoPEBase:          req.RoPEBase,
@@ -680,7 +901,7 @@ func hipRunGemma4Q4GreedyDecode(ctx context.Context, driver nativeHIPDriver, cfg
 			DeviceKVMode:      req.DeviceKVMode,
 			PriorDeviceState:  hipGemma4Q4PriorDeviceStateForForward(req, deviceState),
 			ReturnDeviceState: forwardOwnsDeviceState,
-		})
+		}, false)
 		if err != nil {
 			_ = deviceState.Close()
 			return hipGemma4Q4GreedyDecodeResult{}, err
@@ -729,98 +950,214 @@ func hipGemma4Q4PriorDeviceStateForForward(req hipGemma4Q4GreedyDecodeRequest, s
 }
 
 func hipRunGemma4Q4DecoderLayer(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4Layer0Config, input []float32, req hipGemma4Q4DecoderLayerRequest) (hipGemma4Q4DecoderLayerResult, error) {
+	return hipRunGemma4Q4DecoderLayerInternal(ctx, driver, cfg, input, req, true)
+}
+
+func hipRunGemma4Q4DecoderLayerInternal(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4Layer0Config, input []float32, req hipGemma4Q4DecoderLayerRequest, validate bool) (hipGemma4Q4DecoderLayerResult, error) {
+	return hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx, driver, cfg, input, nil, req, validate)
+}
+
+func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4Layer0Config, input []float32, inputDevice *hipDeviceByteBuffer, req hipGemma4Q4DecoderLayerRequest, validate bool) (hipGemma4Q4DecoderLayerResult, error) {
 	if err := hipContextErr(ctx); err != nil {
 		return hipGemma4Q4DecoderLayerResult{}, err
 	}
 	if driver == nil || !driver.Available() {
 		return hipGemma4Q4DecoderLayerResult{}, core.E(hipGemma4Q4Layer0Operation, "HIP driver is not available", nil)
 	}
-	if err := cfg.validate(); err != nil {
-		return hipGemma4Q4DecoderLayerResult{}, err
-	}
-	if err := req.validate(cfg); err != nil {
-		return hipGemma4Q4DecoderLayerResult{}, err
+	if validate {
+		if err := cfg.validate(); err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+		if err := req.validate(cfg); err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
 	}
 	ropeBase, err := req.effectiveRoPEBase(cfg)
 	if err != nil {
 		return hipGemma4Q4DecoderLayerResult{}, err
 	}
-	if len(input) != cfg.HiddenSize {
-		return hipGemma4Q4DecoderLayerResult{}, core.E(hipGemma4Q4Layer0Operation, "decoder layer input length must match hidden size", nil)
-	}
-	runNorm := func(input []float32, norm hipRMSNormDeviceWeightConfig) ([]float32, error) {
-		norm.Epsilon = req.Epsilon
-		return hipRunRMSNormKernelWithDeviceWeightConfig(ctx, driver, input, norm)
-	}
-	runProjection := func(input []float32, projection hipMLXQ4DeviceWeightConfig) ([]float32, error) {
-		return hipRunMLXQ4ProjectionKernelWithDeviceWeightConfig(ctx, driver, input, projection)
-	}
-
-	layerInput, err := runNorm(input, cfg.InputNorm)
-	if err != nil {
-		return hipGemma4Q4DecoderLayerResult{}, err
-	}
-	query, err := runProjection(layerInput, cfg.QueryProjection)
-	if err != nil {
-		return hipGemma4Q4DecoderLayerResult{}, err
-	}
-
-	query = append([]float32(nil), query...)
-	for head := 0; head < cfg.QueryHeads; head++ {
-		start := head * cfg.HeadDim
-		end := start + cfg.HeadDim
-		normalized, err := runNorm(query[start:end], cfg.QueryNorm)
+	var inputBuffer *hipDeviceByteBuffer
+	if inputDevice != nil {
+		if inputDevice.Pointer() == 0 || inputDevice.Count() != cfg.HiddenSize || inputDevice.SizeBytes() != uint64(cfg.HiddenSize*4) {
+			return hipGemma4Q4DecoderLayerResult{}, core.E(hipGemma4Q4Layer0Operation, "decoder layer device input shape mismatch", nil)
+		}
+		inputBuffer = inputDevice
+	} else {
+		if len(input) != cfg.HiddenSize {
+			return hipGemma4Q4DecoderLayerResult{}, core.E(hipGemma4Q4Layer0Operation, "decoder layer input length must match hidden size", nil)
+		}
+		var err error
+		inputBuffer, err = hipUploadGemma4Q4Float32Input(driver, "Gemma4 q4 decoder layer input", input)
 		if err != nil {
 			return hipGemma4Q4DecoderLayerResult{}, err
 		}
-		copy(query[start:end], normalized)
+		defer inputBuffer.Close()
 	}
-
-	ropeQueries := make([][]float32, 0, cfg.QueryHeads)
-	for head := 0; head < cfg.QueryHeads; head++ {
-		start := head * cfg.HeadDim
-		end := start + cfg.HeadDim
-		ropeQuery, err := hipRunGemma4Q4RoPEVector(ctx, driver, query[start:end], req.Position, ropeBase, cfg.RoPERotaryDim)
+	inputNormCfg := cfg.InputNorm
+	inputNormCfg.Epsilon = req.Epsilon
+	var layerInputBuffer *hipDeviceByteBuffer
+	if req.LayerInputDevice != nil {
+		if req.LayerInputDevice.Pointer() == 0 || req.LayerInputDevice.Count() != cfg.HiddenSize || req.LayerInputDevice.SizeBytes() != uint64(cfg.HiddenSize*4) {
+			return hipGemma4Q4DecoderLayerResult{}, core.E(hipGemma4Q4Layer0Operation, "decoder layer precomputed input norm shape mismatch", nil)
+		}
+		layerInputBuffer = req.LayerInputDevice
+	} else {
+		layerInputBuffer, err = hipRunRMSNormKernelWithDeviceInputWeightConfig(ctx, driver, inputBuffer, inputNormCfg)
 		if err != nil {
 			return hipGemma4Q4DecoderLayerResult{}, err
 		}
-		ropeQueries = append(ropeQueries, ropeQuery)
+		defer layerInputBuffer.Close()
 	}
+	var layerInput []float32
+	ensureLayerInput := func() ([]float32, error) {
+		if layerInput != nil {
+			return layerInput, nil
+		}
+		read, err := hipReadFloat32DeviceOutput(layerInputBuffer, hipGemma4Q4Layer0Operation, "layer input output", cfg.HiddenSize)
+		if err != nil {
+			return nil, err
+		}
+		layerInput = read
+		return layerInput, nil
+	}
+	var ropeQueries [][]float32
+	var ropeQueryBuffer *hipDeviceByteBuffer
+	var qkvOutputBuffer *hipDeviceByteBuffer
+	var queryBuffer *hipDeviceByteBuffer
+	var keyBuffer *hipDeviceByteBuffer
+	var valueBuffer *hipDeviceByteBuffer
+	projectLocalKV := req.SharedDeviceKV == nil && len(req.SharedKeys) == 0
+	if projectLocalKV &&
+		cfg.QueryProjection.Cols == cfg.KeyProjection.Cols && cfg.QueryProjection.Cols == cfg.ValueProjection.Cols &&
+		cfg.QueryProjection.GroupSize == cfg.KeyProjection.GroupSize && cfg.QueryProjection.GroupSize == cfg.ValueProjection.GroupSize {
+		qkvOutputBuffer, queryBuffer, keyBuffer, valueBuffer, err = hipRunMLXQ4TripleProjectionKernelWithDeviceInput(ctx, driver, layerInputBuffer, cfg.QueryProjection, cfg.KeyProjection, cfg.ValueProjection)
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+		defer qkvOutputBuffer.Close()
+		defer queryBuffer.Close()
+		defer keyBuffer.Close()
+		defer valueBuffer.Close()
+	} else {
+		queryBuffer, err = hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx, driver, layerInputBuffer, cfg.QueryProjection)
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+		defer queryBuffer.Close()
+	}
+	queryNormCfg := hipGemma4Q4RoPENormConfig(cfg.QueryNorm, req.Epsilon, cfg.HeadDim)
+	ropeFrequencyDim, ropeRotaryCount := hipGemma4Q4RoPEKernelDims(cfg)
+	ropeQueryBuffer, err = hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfig(ctx, driver, queryBuffer, queryNormCfg, cfg.QueryHeads, req.Position, ropeBase, ropeFrequencyDim, ropeRotaryCount)
+	if err != nil {
+		return hipGemma4Q4DecoderLayerResult{}, err
+	}
+	defer ropeQueryBuffer.Close()
 	var ropeKey []float32
 	var value []float32
+	var ropeKeyDevice *hipDeviceByteBuffer
+	var valueDevice *hipDeviceByteBuffer
 	var updatedKeys []float32
 	var updatedValues []float32
-	if len(req.SharedKeys) > 0 {
+	if req.SharedDeviceKV != nil {
+		// Shared-KV layers use the source layer's current device cache directly in
+		// generation mode. Debug/host-state paths continue to use SharedKeys.
+	} else if len(req.SharedKeys) > 0 {
 		updatedKeys = append([]float32(nil), req.SharedKeys...)
 		updatedValues = append([]float32(nil), req.SharedValues...)
 		ropeKey, value, err = hipGemma4Q4LastKVToken(updatedKeys, updatedValues, cfg.HeadDim)
 		if err != nil {
 			return hipGemma4Q4DecoderLayerResult{}, err
 		}
+	} else if cfg.RoPERotaryDim == cfg.HeadDim {
+		if keyBuffer == nil {
+			keyBuffer, err = hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx, driver, layerInputBuffer, cfg.KeyProjection)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			defer keyBuffer.Close()
+		}
+		if valueBuffer == nil {
+			valueBuffer, err = hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx, driver, layerInputBuffer, cfg.ValueProjection)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			defer valueBuffer.Close()
+		}
+		useDeviceKVToken := req.OmitHostKV && req.DeviceKVAttention
+		valueDevice, err = hipRunGemma4Q4RMSNormNoScaleDeviceKernel(ctx, driver, valueBuffer, req.Epsilon)
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+		defer valueDevice.Close()
+		if !useDeviceKVToken {
+			value, err = hipReadFloat32DeviceOutput(valueDevice, hipGemma4Q4Layer0Operation, "RMSNormNoScale output", valueDevice.Count())
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+		}
+		keyNormCfg := hipGemma4Q4RoPENormConfig(cfg.KeyNorm, req.Epsilon, cfg.HeadDim)
+		ropeKeyBuffer, err := hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfig(ctx, driver, keyBuffer, keyNormCfg, 1, req.Position, ropeBase, 0, 0)
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+		defer ropeKeyBuffer.Close()
+		ropeKeyDevice = ropeKeyBuffer
+		if !useDeviceKVToken {
+			ropeKey, err = hipReadFloat32DeviceOutput(ropeKeyBuffer, hipGemma4Q4Layer0Operation, "RoPE key output", cfg.HeadDim)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+		}
+		if !req.OmitHostKV {
+			updatedKeys = hipGemma4Q4AppendKV(req.PriorKeys, ropeKey)
+			updatedValues = hipGemma4Q4AppendKV(req.PriorValues, value)
+			updatedKeys, updatedValues = hipGemma4Q4TrimKVWindow(updatedKeys, updatedValues, cfg.HeadDim, cfg.SlidingWindow)
+		}
 	} else {
-		key, err := runProjection(layerInput, cfg.KeyProjection)
+		if keyBuffer == nil {
+			keyBuffer, err = hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx, driver, layerInputBuffer, cfg.KeyProjection)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			defer keyBuffer.Close()
+		}
+		if valueBuffer == nil {
+			valueBuffer, err = hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx, driver, layerInputBuffer, cfg.ValueProjection)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			defer valueBuffer.Close()
+		}
+		useDeviceKVToken := req.OmitHostKV && req.DeviceKVAttention
+		valueDevice, err = hipRunGemma4Q4RMSNormNoScaleDeviceKernel(ctx, driver, valueBuffer, req.Epsilon)
 		if err != nil {
 			return hipGemma4Q4DecoderLayerResult{}, err
 		}
-		value, err = runProjection(layerInput, cfg.ValueProjection)
+		defer valueDevice.Close()
+		if !useDeviceKVToken {
+			value, err = hipReadFloat32DeviceOutput(valueDevice, hipGemma4Q4Layer0Operation, "RMSNormNoScale output", valueDevice.Count())
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+		}
+		keyNormCfg := hipGemma4Q4RoPENormConfig(cfg.KeyNorm, req.Epsilon, cfg.HeadDim)
+		ropeKeyBuffer, err := hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfig(ctx, driver, keyBuffer, keyNormCfg, 1, req.Position, ropeBase, cfg.HeadDim, cfg.RoPERotaryDim)
 		if err != nil {
 			return hipGemma4Q4DecoderLayerResult{}, err
 		}
-		value, err = hipRunGemma4Q4RMSNormNoScale(ctx, driver, value, req.Epsilon)
-		if err != nil {
-			return hipGemma4Q4DecoderLayerResult{}, err
+		defer ropeKeyBuffer.Close()
+		ropeKeyDevice = ropeKeyBuffer
+		if !useDeviceKVToken {
+			ropeKey, err = hipReadFloat32DeviceOutput(ropeKeyBuffer, hipGemma4Q4Layer0Operation, "RoPE key output", cfg.HeadDim)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
 		}
-		key, err = runNorm(key, cfg.KeyNorm)
-		if err != nil {
-			return hipGemma4Q4DecoderLayerResult{}, err
+		if !req.OmitHostKV {
+			updatedKeys = hipGemma4Q4AppendKV(req.PriorKeys, ropeKey)
+			updatedValues = hipGemma4Q4AppendKV(req.PriorValues, value)
+			updatedKeys, updatedValues = hipGemma4Q4TrimKVWindow(updatedKeys, updatedValues, cfg.HeadDim, cfg.SlidingWindow)
 		}
-		ropeKey, err = hipRunGemma4Q4RoPEVector(ctx, driver, key, req.Position, ropeBase, cfg.RoPERotaryDim)
-		if err != nil {
-			return hipGemma4Q4DecoderLayerResult{}, err
-		}
-		updatedKeys = hipGemma4Q4AppendKV(req.PriorKeys, ropeKey)
-		updatedValues = hipGemma4Q4AppendKV(req.PriorValues, value)
-		updatedKeys, updatedValues = hipGemma4Q4TrimKVWindow(updatedKeys, updatedValues, cfg.HeadDim, cfg.SlidingWindow)
 	}
 
 	var deviceKV *rocmDeviceKVCache
@@ -835,7 +1172,39 @@ func hipRunGemma4Q4DecoderLayer(ctx context.Context, driver nativeHIPDriver, cfg
 	}()
 	if req.DeviceKVAttention {
 		borrowedPageCount := 0
-		if req.PriorDeviceKV != nil && hipGemma4Q4LayerStateCanAppendDeviceKV(cfg,
+		if req.SharedDeviceKV != nil {
+			deviceKV, err = req.SharedDeviceKV.borrowedAlias()
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			if req.SharedDescriptorTable != nil {
+				descriptorTable, err = req.SharedDescriptorTable.borrowedAlias()
+				if err != nil {
+					return hipGemma4Q4DecoderLayerResult{}, err
+				}
+			}
+			deviceKVAttention = "shared_device_kv"
+		} else if req.OmitHostKV && req.PriorDeviceKV != nil && ropeKeyDevice != nil && valueDevice != nil {
+			deviceKV, err = req.PriorDeviceKV.withAppendedDeviceTokenWindow(ctx, ropeKeyDevice, valueDevice, cfg.SlidingWindow)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			deviceKVAttention = "append_existing_device"
+			borrowedPageCount = req.PriorDeviceKV.PageCount()
+		} else if req.OmitHostKV && ropeKeyDevice != nil && valueDevice != nil {
+			deviceKV, err = newROCmDeviceKVCacheFromDeviceToken(ctx, driver, firstNonEmptyString(req.DeviceKVMode, rocmKVCacheModeFP16), hipGemma4Q4DeviceKVBlockSize(), ropeKeyDevice, valueDevice, cfg.SlidingWindow)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			deviceKVAttention = "new_device_kv"
+		} else if req.OmitHostKV && req.PriorDeviceKV != nil {
+			deviceKV, err = req.PriorDeviceKV.withAppendedTokenWindow(ropeKey, value, cfg.SlidingWindow)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			deviceKVAttention = "append_existing_device"
+			borrowedPageCount = req.PriorDeviceKV.PageCount()
+		} else if req.PriorDeviceKV != nil && hipGemma4Q4LayerStateCanAppendDeviceKV(cfg,
 			hipGemma4Q4LayerKVState{Keys: req.PriorKeys, Values: req.PriorValues},
 			hipGemma4Q4LayerKVState{Keys: updatedKeys, Values: updatedValues}) {
 			deviceKV, err = req.PriorDeviceKV.withAppendedToken(ropeKey, value)
@@ -845,11 +1214,17 @@ func hipRunGemma4Q4DecoderLayer(ctx context.Context, driver nativeHIPDriver, cfg
 			deviceKVAttention = "append_existing_device"
 			borrowedPageCount = req.PriorDeviceKV.PageCount()
 		} else {
-			host, err := newROCmKVCache(firstNonEmptyString(req.DeviceKVMode, rocmKVCacheModeFP16), defaultROCmKVBlockSize)
+			host, err := newROCmKVCache(firstNonEmptyString(req.DeviceKVMode, rocmKVCacheModeFP16), hipGemma4Q4DeviceKVBlockSize())
 			if err != nil {
 				return hipGemma4Q4DecoderLayerResult{}, err
 			}
-			if err := host.AppendVectors(0, cfg.HeadDim, cfg.HeadDim, updatedKeys, updatedValues); err != nil {
+			keys := updatedKeys
+			values := updatedValues
+			if req.OmitHostKV {
+				keys = ropeKey
+				values = value
+			}
+			if err := host.AppendVectors(0, cfg.HeadDim, cfg.HeadDim, keys, values); err != nil {
 				return hipGemma4Q4DecoderLayerResult{}, err
 			}
 			deviceKV, err = host.MirrorToDevice(driver)
@@ -858,7 +1233,12 @@ func hipRunGemma4Q4DecoderLayer(ctx context.Context, driver nativeHIPDriver, cfg
 			}
 			deviceKVAttention = "remirror_host_kv"
 		}
-		descriptorTable, err = deviceKV.KernelDescriptorTable()
+		if deviceKVAttention == "append_existing_device" && req.PriorDeviceKV != nil && req.PriorDescriptorTable != nil {
+			descriptorTable, err = deviceKV.KernelDescriptorTableFromAppendedToken(ctx, req.PriorDeviceKV, req.PriorDescriptorTable)
+		}
+		if descriptorTable == nil && err == nil {
+			descriptorTable, err = deviceKV.KernelDescriptorTable()
+		}
 		if err != nil {
 			if borrowedPageCount > 0 {
 				_ = deviceKV.closePagesFrom(borrowedPageCount)
@@ -890,117 +1270,270 @@ func hipRunGemma4Q4DecoderLayer(ctx context.Context, driver nativeHIPDriver, cfg
 		}
 	}
 
-	attentionOutput := make([]float32, 0, cfg.QueryHeads*cfg.HeadDim)
-	for _, ropeQuery := range ropeQueries {
-		attentionReq := hipAttentionRequest{
-			Query:  ropeQuery,
-			Keys:   updatedKeys,
-			Values: updatedValues,
-			Scale:  hipGemma4Q4AttentionScale(cfg.HeadDim),
+	attentionOutputBuffer, err := hipAllocateByteBuffer(driver, hipGemma4Q4Layer0Operation, "Gemma4 q4 attention concat output", uint64(cfg.QueryHeads*cfg.HeadDim*4), cfg.QueryHeads*cfg.HeadDim)
+	if err != nil {
+		return hipGemma4Q4DecoderLayerResult{}, err
+	}
+	defer attentionOutputBuffer.Close()
+	if ropeQueryBuffer == nil {
+		ropeQueryConcat := make([]float32, 0, cfg.QueryHeads*cfg.HeadDim)
+		for _, ropeQuery := range ropeQueries {
+			ropeQueryConcat = append(ropeQueryConcat, ropeQuery...)
 		}
-		if req.DeviceKVAttention {
-			attentionReq.Keys = nil
-			attentionReq.Values = nil
-			attentionReq.DeviceKV = deviceKV
-			attentionReq.DescriptorTable = descriptorTable
-		}
-		attention, err := hipRunAttentionKernel(ctx, driver, attentionReq)
+		ropeQueryBuffer, err = hipUploadGemma4Q4Float32Input(driver, "Gemma4 q4 RoPE query concat", ropeQueryConcat)
 		if err != nil {
 			return hipGemma4Q4DecoderLayerResult{}, err
 		}
-		attentionOutput = append(attentionOutput, attention.Output...)
+		defer ropeQueryBuffer.Close()
 	}
-	attentionProjection, err := runProjection(attentionOutput, cfg.OutputProjection)
+	attentionReq := hipAttentionRequest{
+		QueryDim: cfg.HeadDim,
+		Keys:     updatedKeys,
+		Values:   updatedValues,
+		Scale:    hipGemma4Q4AttentionScale(cfg.HeadDim),
+	}
+	if req.DeviceKVAttention {
+		attentionReq.Keys = nil
+		attentionReq.Values = nil
+		attentionReq.DeviceKV = deviceKV
+		attentionReq.DescriptorTable = descriptorTable
+	}
+	if err := hipRunAttentionHeadsOutputFromDeviceQueryToDeviceKernelWithWorkspace(ctx, driver, attentionReq, ropeQueryBuffer, cfg.QueryHeads, attentionOutputBuffer, req.AttentionWorkspace); err != nil {
+		return hipGemma4Q4DecoderLayerResult{}, err
+	}
+	attentionProjectionBuffer, err := hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx, driver, attentionOutputBuffer, cfg.OutputProjection)
 	if err != nil {
 		return hipGemma4Q4DecoderLayerResult{}, err
 	}
-	attentionNorm, err := runNorm(attentionProjection, cfg.PostAttentionNorm)
-	if err != nil {
-		return hipGemma4Q4DecoderLayerResult{}, err
-	}
-	attentionResidual, err := hipRunVectorAddKernel(ctx, driver, hipVectorAddRequest{Left: input, Right: attentionNorm})
-	if err != nil {
-		return hipGemma4Q4DecoderLayerResult{}, err
-	}
-	preFeedForward, err := runNorm(attentionResidual, cfg.PreFeedForwardNorm)
-	if err != nil {
-		return hipGemma4Q4DecoderLayerResult{}, err
-	}
-	gate, err := runProjection(preFeedForward, cfg.GateProjection)
-	if err != nil {
-		return hipGemma4Q4DecoderLayerResult{}, err
-	}
-	up, err := runProjection(preFeedForward, cfg.UpProjection)
-	if err != nil {
-		return hipGemma4Q4DecoderLayerResult{}, err
-	}
-	activated, err := hipGemma4Q4HostGELU(gate)
-	if err != nil {
-		return hipGemma4Q4DecoderLayerResult{}, err
-	}
-	activated, err = hipGemma4Q4HostMultiply(activated, up)
-	if err != nil {
-		return hipGemma4Q4DecoderLayerResult{}, err
-	}
-	mlpOutput, err := runProjection(activated, cfg.DownProjection)
-	if err != nil {
-		return hipGemma4Q4DecoderLayerResult{}, err
-	}
-	mlpNorm, err := runNorm(mlpOutput, cfg.PostFeedForwardNorm)
-	if err != nil {
-		return hipGemma4Q4DecoderLayerResult{}, err
-	}
-	finalHidden, err := hipRunVectorAddKernel(ctx, driver, hipVectorAddRequest{Left: attentionResidual, Right: mlpNorm})
-	if err != nil {
-		return hipGemma4Q4DecoderLayerResult{}, err
-	}
-	if len(req.PerLayerInput) > 0 {
-		perLayerGate, err := runProjection(finalHidden, cfg.PerLayerInput.InputGate)
+	defer attentionProjectionBuffer.Close()
+	var attentionProjection []float32
+	var attentionOutput []float32
+	if !req.OmitDebugTensors {
+		attentionProjection, err = hipReadFloat32DeviceOutput(attentionProjectionBuffer, hipGemma4Q4Layer0Operation, "attention projection output", cfg.HiddenSize)
 		if err != nil {
 			return hipGemma4Q4DecoderLayerResult{}, err
 		}
-		perLayerActivated, err := hipGemma4Q4HostGELU(perLayerGate)
-		if err != nil {
-			return hipGemma4Q4DecoderLayerResult{}, err
-		}
-		perLayerMultiplied, err := hipGemma4Q4HostMultiply(perLayerActivated, req.PerLayerInput)
-		if err != nil {
-			return hipGemma4Q4DecoderLayerResult{}, err
-		}
-		perLayerProjection, err := runProjection(perLayerMultiplied, cfg.PerLayerInput.Projection)
-		if err != nil {
-			return hipGemma4Q4DecoderLayerResult{}, err
-		}
-		perLayerNorm, err := runNorm(perLayerProjection, cfg.PerLayerInput.PostInputNorm)
-		if err != nil {
-			return hipGemma4Q4DecoderLayerResult{}, err
-		}
-		finalHidden, err = hipRunVectorAddKernel(ctx, driver, hipVectorAddRequest{Left: finalHidden, Right: perLayerNorm})
+		attentionOutput, err = hipReadFloat32DeviceOutput(attentionOutputBuffer, hipGemma4Q4Layer0Operation, "attention concat output", cfg.QueryHeads*cfg.HeadDim)
 		if err != nil {
 			return hipGemma4Q4DecoderLayerResult{}, err
 		}
 	}
-	if scalar := cfg.effectiveLayerScalar(); scalar != 1 {
-		finalHidden, err = hipRunVectorScaleKernel(ctx, driver, hipVectorScaleRequest{Input: finalHidden, Scale: scalar})
+	postAttentionNormCfg := cfg.PostAttentionNorm
+	postAttentionNormCfg.Epsilon = req.Epsilon
+	preFeedForwardNormCfg := cfg.PreFeedForwardNorm
+	preFeedForwardNormCfg.Epsilon = req.Epsilon
+	attentionResidualBuffer, preFeedForwardBuffer, err := hipRunRMSNormResidualAddNormKernelWithDeviceInputWeightConfig(ctx, driver, attentionProjectionBuffer, inputBuffer, postAttentionNormCfg, preFeedForwardNormCfg)
+	if err != nil {
+		return hipGemma4Q4DecoderLayerResult{}, err
+	}
+	defer attentionResidualBuffer.Close()
+	defer preFeedForwardBuffer.Close()
+	var attentionResidual []float32
+	if !req.OmitDebugTensors {
+		attentionResidual, err = hipReadFloat32DeviceOutput(attentionResidualBuffer, hipGemma4Q4Layer0Operation, "attention residual output", cfg.HiddenSize)
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+	}
+	mlpOutputBuffer, err := hipRunGemma4Q4DeviceGELUTanhMLPWithDeviceInput(ctx, driver, preFeedForwardBuffer, cfg.GateProjection, cfg.UpProjection, cfg.DownProjection)
+	if err != nil {
+		return hipGemma4Q4DecoderLayerResult{}, err
+	}
+	defer mlpOutputBuffer.Close()
+	var mlpOutput []float32
+	if !req.OmitDebugTensors {
+		mlpOutput, err = hipReadFloat32DeviceOutput(mlpOutputBuffer, hipGemma4Q4Layer0Operation, "GELU tanh MLP output", cfg.DownProjection.Rows)
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+	}
+	postFeedForwardNormCfg := cfg.PostFeedForwardNorm
+	postFeedForwardNormCfg.Epsilon = req.Epsilon
+	var returnedFinalHiddenBuffer *hipDeviceByteBuffer
+	var nextLayerInputBuffer *hipDeviceByteBuffer
+	nextLayerInputReturned := false
+	defer func() {
+		if nextLayerInputBuffer != nil && !nextLayerInputReturned {
+			_ = nextLayerInputBuffer.Close()
+		}
+	}()
+	layerScalar := cfg.effectiveLayerScalar()
+	hasPerLayerInput := req.PerLayerInputDevice != nil || len(req.PerLayerInput) > 0
+	postFeedForwardOutputScale := float32(1)
+	if !hasPerLayerInput {
+		postFeedForwardOutputScale = layerScalar
+	}
+	var finalHiddenBuffer *hipDeviceByteBuffer
+	if req.NextInputNorm != nil && !hasPerLayerInput {
+		finalHiddenBuffer, nextLayerInputBuffer, err = hipRunRMSNormResidualAddNormScaledKernelWithDeviceInputWeightConfig(ctx, driver, mlpOutputBuffer, attentionResidualBuffer, postFeedForwardNormCfg, *req.NextInputNorm, postFeedForwardOutputScale)
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+	} else {
+		finalHiddenBuffer, err = hipRunRMSNormResidualAddScaledKernelWithDeviceInputWeightConfig(ctx, driver, mlpOutputBuffer, attentionResidualBuffer, postFeedForwardNormCfg, postFeedForwardOutputScale)
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+	}
+	defer func(buffer *hipDeviceByteBuffer) {
+		if buffer != returnedFinalHiddenBuffer {
+			_ = buffer.Close()
+		}
+	}(finalHiddenBuffer)
+	if hasPerLayerInput {
+		var perLayerProjectionBuffer *hipDeviceByteBuffer
+		if req.PerLayerInputDevice != nil {
+			perLayerProjectionBuffer, err = hipRunGemma4Q4DeviceGELUTanhProjectionWithDeviceMultiplier(ctx, driver, finalHiddenBuffer, req.PerLayerInputDevice, cfg.PerLayerInput.InputGate, cfg.PerLayerInput.Projection)
+		} else {
+			perLayerProjectionBuffer, err = hipRunGemma4Q4DeviceGELUTanhProjectionWithDeviceInput(ctx, driver, finalHiddenBuffer, req.PerLayerInput, cfg.PerLayerInput.InputGate, cfg.PerLayerInput.Projection)
+		}
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+		defer perLayerProjectionBuffer.Close()
+		perLayerNormCfg := cfg.PerLayerInput.PostInputNorm
+		perLayerNormCfg.Epsilon = req.Epsilon
+		var perLayerFinalHiddenBuffer *hipDeviceByteBuffer
+		if req.NextInputNorm != nil {
+			perLayerFinalHiddenBuffer, nextLayerInputBuffer, err = hipRunRMSNormResidualAddNormScaledKernelWithDeviceInputWeightConfig(ctx, driver, perLayerProjectionBuffer, finalHiddenBuffer, perLayerNormCfg, *req.NextInputNorm, layerScalar)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+		} else {
+			perLayerFinalHiddenBuffer, err = hipRunRMSNormResidualAddScaledKernelWithDeviceInputWeightConfig(ctx, driver, perLayerProjectionBuffer, finalHiddenBuffer, perLayerNormCfg, layerScalar)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+		}
+		defer func(buffer *hipDeviceByteBuffer) {
+			if buffer != returnedFinalHiddenBuffer {
+				_ = buffer.Close()
+			}
+		}(perLayerFinalHiddenBuffer)
+		finalHiddenBuffer = perLayerFinalHiddenBuffer
+	}
+	var finalHidden []float32
+	var deviceFinalHidden *hipDeviceByteBuffer
+	if req.ReturnDeviceHidden {
+		returnedFinalHiddenBuffer = finalHiddenBuffer
+		deviceFinalHidden = finalHiddenBuffer
+		if !req.OmitDebugTensors {
+			finalHidden, err = hipReadFloat32DeviceOutput(finalHiddenBuffer, hipGemma4Q4Layer0Operation, "final hidden output", cfg.HiddenSize)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+		}
+	} else {
+		finalHidden, err = hipReadFloat32DeviceOutput(finalHiddenBuffer, hipGemma4Q4Layer0Operation, "final hidden output", cfg.HiddenSize)
 		if err != nil {
 			return hipGemma4Q4DecoderLayerResult{}, err
 		}
 	}
 	retainedDeviceLayerSuccess = true
-	return hipGemma4Q4DecoderLayerResult{
-		LayerInput:          layerInput,
-		Key:                 ropeKey,
-		Value:               value,
-		UpdatedKeys:         updatedKeys,
-		UpdatedValues:       updatedValues,
-		DeviceKVAttention:   deviceKVAttention,
-		DeviceLayer:         retainedDeviceLayer,
-		AttentionOutput:     attentionOutput,
-		AttentionProjection: attentionProjection,
-		AttentionResidual:   attentionResidual,
-		MLPOutput:           mlpOutput,
-		FinalHidden:         finalHidden,
-	}, nil
+	result := hipGemma4Q4DecoderLayerResult{
+		Key:                  ropeKey,
+		Value:                value,
+		UpdatedKeys:          updatedKeys,
+		UpdatedValues:        updatedValues,
+		DeviceKVAttention:    deviceKVAttention,
+		DeviceLayer:          retainedDeviceLayer,
+		FinalHidden:          finalHidden,
+		DeviceFinalHidden:    deviceFinalHidden,
+		DeviceNextLayerInput: nextLayerInputBuffer,
+	}
+	if !req.OmitDebugTensors {
+		layerInput, err = ensureLayerInput()
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+		result.LayerInput = layerInput
+		result.AttentionOutput = attentionOutput
+		result.AttentionProjection = attentionProjection
+		result.AttentionResidual = attentionResidual
+		result.MLPOutput = mlpOutput
+	}
+	nextLayerInputReturned = nextLayerInputBuffer != nil
+	return result, nil
+}
+
+func hipRunGemma4Q4DeviceGELUTanhMLP(ctx context.Context, driver nativeHIPDriver, input []float32, gateCfg, upCfg, downCfg hipMLXQ4DeviceWeightConfig) ([]float32, error) {
+	inputBuffer, err := hipUploadGemma4Q4Float32Input(driver, "GELU tanh MLP input", input)
+	if err != nil {
+		return nil, err
+	}
+	defer inputBuffer.Close()
+	output, err := hipRunGemma4Q4DeviceGELUTanhMLPWithDeviceInput(ctx, driver, inputBuffer, gateCfg, upCfg, downCfg)
+	if err != nil {
+		return nil, err
+	}
+	defer output.Close()
+	return hipReadFloat32DeviceOutput(output, hipGemma4Q4Layer0Operation, "GELU tanh MLP output", downCfg.Rows)
+}
+
+func hipRunGemma4Q4DeviceGELUTanhMLPWithDeviceInput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, gateCfg, upCfg, downCfg hipMLXQ4DeviceWeightConfig) (*hipDeviceByteBuffer, error) {
+	activated, err := hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInput(ctx, driver, input, gateCfg, upCfg)
+	if err != nil {
+		return nil, err
+	}
+	defer activated.Close()
+	output, err := hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx, driver, activated, downCfg)
+	if err != nil {
+		return nil, err
+	}
+	return output, nil
+}
+
+func hipRunGemma4Q4DeviceGELUTanhProjection(ctx context.Context, driver nativeHIPDriver, input, multiplyBy []float32, gateCfg, projectionCfg hipMLXQ4DeviceWeightConfig) ([]float32, error) {
+	inputBuffer, err := hipUploadGemma4Q4Float32Input(driver, "GELU tanh projection input", input)
+	if err != nil {
+		return nil, err
+	}
+	defer inputBuffer.Close()
+	output, err := hipRunGemma4Q4DeviceGELUTanhProjectionWithDeviceInput(ctx, driver, inputBuffer, multiplyBy, gateCfg, projectionCfg)
+	if err != nil {
+		return nil, err
+	}
+	defer output.Close()
+	return hipReadFloat32DeviceOutput(output, hipGemma4Q4Layer0Operation, "GELU tanh projection output", projectionCfg.Rows)
+}
+
+func hipRunGemma4Q4DeviceGELUTanhProjectionWithDeviceInput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, multiplyBy []float32, gateCfg, projectionCfg hipMLXQ4DeviceWeightConfig) (*hipDeviceByteBuffer, error) {
+	multiplyBuffer, err := hipUploadGemma4Q4Float32Input(driver, "GELU tanh projection multiplier", multiplyBy)
+	if err != nil {
+		return nil, err
+	}
+	defer multiplyBuffer.Close()
+	return hipRunGemma4Q4DeviceGELUTanhProjectionWithDeviceMultiplier(ctx, driver, input, multiplyBuffer, gateCfg, projectionCfg)
+}
+
+func hipRunGemma4Q4DeviceGELUTanhProjectionWithDeviceMultiplier(ctx context.Context, driver nativeHIPDriver, input, multiplyBuffer *hipDeviceByteBuffer, gateCfg, projectionCfg hipMLXQ4DeviceWeightConfig) (*hipDeviceByteBuffer, error) {
+	if multiplyBuffer == nil || multiplyBuffer.Pointer() == 0 || multiplyBuffer.Count() != gateCfg.Rows || multiplyBuffer.SizeBytes() != uint64(gateCfg.Rows*4) {
+		return nil, core.E(hipGemma4Q4Layer0Operation, "GELU tanh projection multiplier device buffer shape mismatch", nil)
+	}
+	activated, err := hipRunMLXQ4GELUTanhProjectionKernelWithDeviceMultiplier(ctx, driver, input, multiplyBuffer, gateCfg)
+	if err != nil {
+		return nil, err
+	}
+	defer activated.Close()
+	output, err := hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx, driver, activated, projectionCfg)
+	if err != nil {
+		return nil, err
+	}
+	return output, nil
+}
+
+func hipUploadGemma4Q4Float32Input(driver nativeHIPDriver, label string, input []float32) (*hipDeviceByteBuffer, error) {
+	if len(input) == 0 {
+		return nil, core.E(hipGemma4Q4Layer0Operation, label+" is required", nil)
+	}
+	if !rocmFloat32SliceFinite(input) {
+		return nil, core.E(hipGemma4Q4Layer0Operation, label+" values must be finite", nil)
+	}
+	payload, err := hipFloat32Payload(input)
+	if err != nil {
+		return nil, core.E(hipGemma4Q4Layer0Operation, "encode "+label, err)
+	}
+	return hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, label, payload, len(input))
 }
 
 func (cfg hipGemma4Q4Layer0Config) validate() error {
@@ -1061,8 +1594,7 @@ func (cfg hipGemma4Q4Layer0Config) validate() error {
 		"mlp.down_proj":        {cfg: cfg.DownProjection, cols: cfg.IntermediateSize},
 		"embed_tokens_lm_head": {cfg: cfg.LMHeadProjection, cols: cfg.HiddenSize},
 	} {
-		input := make([]float32, projection.cols)
-		if err := projection.cfg.validate(input); err != nil {
+		if err := projection.cfg.validateInputCount(projection.cols); err != nil {
 			return core.E(hipGemma4Q4Layer0Operation, label+" config", err)
 		}
 	}
@@ -1113,10 +1645,10 @@ func (cfg hipGemma4Q4Layer0Config) validatePerLayerInput() error {
 		if perLayer.Projection.Rows != cfg.HiddenSize || perLayer.Projection.Cols != perLayer.InputSize {
 			return core.E(hipGemma4Q4Layer0Operation, "per-layer projection shape does not match layer geometry", nil)
 		}
-		if err := perLayer.InputGate.validate(make([]float32, cfg.HiddenSize)); err != nil {
+		if err := perLayer.InputGate.validateInputCount(cfg.HiddenSize); err != nil {
 			return core.E(hipGemma4Q4Layer0Operation, "per-layer input gate config", err)
 		}
-		if err := perLayer.Projection.validate(make([]float32, perLayer.InputSize)); err != nil {
+		if err := perLayer.Projection.validateInputCount(perLayer.InputSize); err != nil {
 			return core.E(hipGemma4Q4Layer0Operation, "per-layer projection config", err)
 		}
 		if err := hipValidateGemma4Q4NormConfig("post_per_layer_input_norm", perLayer.PostInputNorm, cfg.HiddenSize); err != nil {
@@ -1344,11 +1876,53 @@ func (req hipGemma4Q4DecoderLayerRequest) validate(cfg hipGemma4Q4Layer0Config) 
 			return core.E(hipGemma4Q4Layer0Operation, "per-layer input values must be finite", nil)
 		}
 	}
+	if req.PerLayerInputDevice != nil {
+		if len(req.PerLayerInput) > 0 {
+			return core.E(hipGemma4Q4Layer0Operation, "per-layer input cannot mix host and device buffers", nil)
+		}
+		if !cfg.PerLayerInput.hasLayerApply() {
+			return core.E(hipGemma4Q4Layer0Operation, "per-layer input requires configured gate/projection tensors", nil)
+		}
+		if req.PerLayerInputDevice.Pointer() == 0 ||
+			req.PerLayerInputDevice.Count() != cfg.PerLayerInput.InputSize ||
+			req.PerLayerInputDevice.SizeBytes() != uint64(cfg.PerLayerInput.InputSize*4) {
+			return core.E(hipGemma4Q4Layer0Operation, "per-layer input device buffer shape mismatch", nil)
+		}
+	}
+	if req.LayerInputDevice != nil {
+		if req.LayerInputDevice.Pointer() == 0 ||
+			req.LayerInputDevice.Count() != cfg.HiddenSize ||
+			req.LayerInputDevice.SizeBytes() != uint64(cfg.HiddenSize*4) {
+			return core.E(hipGemma4Q4Layer0Operation, "precomputed layer input device buffer shape mismatch", nil)
+		}
+	}
+	if req.NextInputNorm != nil {
+		if req.NextInputNorm.Count != cfg.HiddenSize {
+			return core.E(hipGemma4Q4Layer0Operation, "next input norm count must match hidden size", nil)
+		}
+		if err := hipValidateRMSNormDeviceWeightConfig("Gemma4Q4NextInputNorm", *req.NextInputNorm); err != nil {
+			return err
+		}
+	}
 	if err := hipGemma4Q4ValidateKVState(req.PriorKeys, req.PriorValues, cfg.HeadDim); err != nil {
 		return core.E(hipGemma4Q4Layer0Operation, "prior key/value state", err)
 	}
 	if req.PriorDeviceKV != nil && !req.DeviceKVAttention {
 		return core.E(hipGemma4Q4Layer0Operation, "prior device KV requires device KV attention", nil)
+	}
+	if req.SharedDeviceKV != nil && !req.DeviceKVAttention {
+		return core.E(hipGemma4Q4Layer0Operation, "shared device KV requires device KV attention", nil)
+	}
+	if req.SharedDeviceKV != nil && (len(req.SharedKeys) > 0 || len(req.SharedValues) > 0) {
+		return core.E(hipGemma4Q4Layer0Operation, "shared device KV cannot be combined with host shared KV", nil)
+	}
+	if req.SharedDescriptorTable != nil {
+		if req.SharedDeviceKV == nil {
+			return core.E(hipGemma4Q4Layer0Operation, "shared descriptor table requires shared device KV", nil)
+		}
+		if err := req.SharedDescriptorTable.CompatibleWith(req.SharedDeviceKV); err != nil {
+			return core.E(hipGemma4Q4Layer0Operation, "shared descriptor table", err)
+		}
 	}
 	if req.KeepDeviceKV && !req.DeviceKVAttention {
 		return core.E(hipGemma4Q4Layer0Operation, "keeping device KV requires device KV attention", nil)
@@ -1364,16 +1938,42 @@ func (req hipGemma4Q4DecoderLayerRequest) validate(cfg hipGemma4Q4Layer0Config) 
 		if req.PriorDeviceKV.mode != "" && req.PriorDeviceKV.mode != mode {
 			return core.E(hipGemma4Q4Layer0Operation, "prior device KV mode mismatch", nil)
 		}
-		hostTokens := 0
-		if len(req.PriorKeys) > 0 {
-			hostTokens = len(req.PriorKeys) / cfg.HeadDim
-		}
-		if req.PriorDeviceKV.TokenCount() != hostTokens {
-			return core.E(hipGemma4Q4Layer0Operation, "prior device KV token count mismatch", nil)
+		if !req.OmitHostKV || len(req.PriorKeys) > 0 {
+			hostTokens := 0
+			if len(req.PriorKeys) > 0 {
+				hostTokens = len(req.PriorKeys) / cfg.HeadDim
+			}
+			if req.PriorDeviceKV.TokenCount() != hostTokens {
+				return core.E(hipGemma4Q4Layer0Operation, "prior device KV token count mismatch", nil)
+			}
 		}
 		keyWidth, valueWidth, ok := req.PriorDeviceKV.LastVectorWidths()
 		if !ok || keyWidth != cfg.HeadDim || valueWidth != cfg.HeadDim {
 			return core.E(hipGemma4Q4Layer0Operation, "prior device KV width mismatch", nil)
+		}
+	}
+	if req.PriorDescriptorTable != nil {
+		if req.PriorDeviceKV == nil {
+			return core.E(hipGemma4Q4Layer0Operation, "prior descriptor table requires prior device KV", nil)
+		}
+		if err := req.PriorDescriptorTable.CompatibleWith(req.PriorDeviceKV); err != nil {
+			return core.E(hipGemma4Q4Layer0Operation, "prior descriptor table", err)
+		}
+	}
+	if req.SharedDeviceKV != nil {
+		if req.SharedDeviceKV.closed {
+			return core.E(hipGemma4Q4Layer0Operation, "shared device KV is closed", nil)
+		}
+		mode := firstNonEmptyString(req.DeviceKVMode, req.SharedDeviceKV.mode)
+		if mode == "" {
+			mode = rocmKVCacheModeFP16
+		}
+		if req.SharedDeviceKV.mode != "" && req.SharedDeviceKV.mode != mode {
+			return core.E(hipGemma4Q4Layer0Operation, "shared device KV mode mismatch", nil)
+		}
+		keyWidth, valueWidth, ok := req.SharedDeviceKV.LastVectorWidths()
+		if !ok || keyWidth != cfg.HeadDim || valueWidth != cfg.HeadDim {
+			return core.E(hipGemma4Q4Layer0Operation, "shared device KV width mismatch", nil)
 		}
 	}
 	return nil
@@ -1506,6 +2106,38 @@ func hipRunGemma4Q4RMSNormNoScale(ctx context.Context, driver nativeHIPDriver, i
 	})
 }
 
+func hipRunGemma4Q4RMSNormNoScaleWithDeviceInput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, epsilon float32) ([]float32, error) {
+	output, err := hipRunGemma4Q4RMSNormNoScaleDeviceKernel(ctx, driver, input, epsilon)
+	if err != nil {
+		return nil, err
+	}
+	defer output.Close()
+	return hipReadFloat32DeviceOutput(output, hipGemma4Q4Layer0Operation, "RMSNormNoScale output", input.Count())
+}
+
+func hipRunGemma4Q4RMSNormNoScaleDeviceKernel(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, epsilon float32) (*hipDeviceByteBuffer, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return nil, err
+	}
+	if input == nil || input.Pointer() == 0 || input.Count() <= 0 || input.SizeBytes() != uint64(input.Count()*4) {
+		return nil, core.E(hipGemma4Q4Layer0Operation, "RMSNormNoScale device input is required", nil)
+	}
+	output, err := hipAllocateByteBuffer(driver, hipGemma4Q4Layer0Operation, "RMSNormNoScale output", input.SizeBytes(), input.Count())
+	if err != nil {
+		return nil, err
+	}
+	cfg := hipRMSNormDeviceWeightConfig{
+		Count:          input.Count(),
+		Epsilon:        epsilon,
+		WeightEncoding: hipRMSNormWeightEncodingNone,
+	}
+	if err := hipRunRMSNormDeviceToDeviceKernel(ctx, driver, input.Pointer(), input.SizeBytes(), output.Pointer(), output.SizeBytes(), cfg); err != nil {
+		_ = output.Close()
+		return nil, err
+	}
+	return output, nil
+}
+
 func hipRunGemma4Q4PerLayerInputForLayer(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4Layer0Config, tokenID int32, hidden []float32, epsilon float32) ([]float32, error) {
 	if !cfg.PerLayerInput.hasGlobalPrecompute() {
 		return nil, nil
@@ -1617,6 +2249,111 @@ func hipRunGemma4Q4PerLayerInputSet(ctx context.Context, driver nativeHIPDriver,
 	return outputs, nil
 }
 
+func hipRunGemma4Q4PerLayerInputDeviceSet(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4ForwardConfig, tokenID int32, hidden *hipDeviceByteBuffer, epsilon float32) (*hipGemma4Q4PerLayerInputDeviceSet, error) {
+	if len(cfg.Layers) == 0 || !cfg.Layers[0].PerLayerInput.hasGlobalPrecompute() {
+		return nil, nil
+	}
+	inputs, err := hipRunGemma4Q4PerLayerInputConfigDeviceSet(ctx, driver, cfg.Layers[0].PerLayerInput, tokenID, hidden, epsilon)
+	if err != nil {
+		return nil, err
+	}
+	if len(inputs.Layers) < len(cfg.Layers) {
+		_ = inputs.Close()
+		return nil, core.E(hipGemma4Q4Layer0Operation, "computed per-layer input count is smaller than forward layer count", nil)
+	}
+	return inputs, nil
+}
+
+func hipRunGemma4Q4PerLayerInputConfigDeviceSet(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4PerLayerInputConfig, tokenID int32, hidden *hipDeviceByteBuffer, epsilon float32) (*hipGemma4Q4PerLayerInputDeviceSet, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return nil, err
+	}
+	if driver == nil || !driver.Available() {
+		return nil, core.E(hipGemma4Q4Layer0Operation, "HIP driver is not available", nil)
+	}
+	if !cfg.hasGlobalPrecompute() {
+		return nil, nil
+	}
+	if !cfg.hasLayerApply() {
+		return nil, core.E(hipGemma4Q4Layer0Operation, "per-layer input precompute requires per-layer gate/projection tensors", nil)
+	}
+	if hidden == nil || hidden.Pointer() == 0 || hidden.Count() != cfg.ModelProjection.Cols || hidden.SizeBytes() != uint64(cfg.ModelProjection.Cols*4) {
+		return nil, core.E(hipGemma4Q4Layer0Operation, "per-layer input hidden device buffer shape mismatch", nil)
+	}
+	if cfg.InputSize <= 0 || cfg.ModelProjection.Rows%cfg.InputSize != 0 {
+		return nil, core.E(hipGemma4Q4Layer0Operation, "per-layer input rows must align with input size", nil)
+	}
+	layerCount := cfg.ModelProjection.Rows / cfg.InputSize
+	if layerCount <= 0 || cfg.Embedding.HiddenSize != cfg.ModelProjection.Rows {
+		return nil, core.E(hipGemma4Q4Layer0Operation, "per-layer input global shape mismatch", nil)
+	}
+	perLayerEmbedding, err := hipRunEmbeddingLookupKernelWithDeviceTableBuffer(ctx, driver, []int32{tokenID}, cfg.Embedding)
+	if err != nil {
+		return nil, err
+	}
+	defer perLayerEmbedding.Close()
+	perLayerEmbeddingScaled, err := hipRunVectorScaleDeviceKernel(ctx, driver, perLayerEmbedding, float32(math.Sqrt(float64(cfg.InputSize))))
+	if err != nil {
+		return nil, err
+	}
+	defer perLayerEmbeddingScaled.Close()
+	projected, err := hipRunProjectionKernelWithDeviceInputWeightEncoding(
+		ctx,
+		driver,
+		hidden,
+		cfg.ModelProjection.WeightPointer,
+		cfg.ModelProjection.WeightBytes,
+		cfg.ModelProjection.Rows,
+		cfg.ModelProjection.Cols,
+		hipProjectionWeightEncodingBF16,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer projected.Close()
+	projectedScaled, err := hipRunVectorScaleDeviceKernel(ctx, driver, projected, float32(math.Pow(float64(cfg.ModelProjection.Cols), -0.5)))
+	if err != nil {
+		return nil, err
+	}
+	defer projectedScaled.Close()
+
+	normCfg := cfg.ProjectionNorm
+	normCfg.Epsilon = epsilon
+	normCfg.Count = cfg.InputSize
+	projectedNorm, err := hipRunRMSNormHeadsKernelWithDeviceInputWeightConfig(ctx, driver, projectedScaled, normCfg, layerCount)
+	if err != nil {
+		return nil, err
+	}
+	defer projectedNorm.Close()
+	combined, err := hipRunVectorAddDeviceKernel(ctx, driver, projectedNorm, perLayerEmbeddingScaled)
+	if err != nil {
+		return nil, err
+	}
+	defer combined.Close()
+	scaled, err := hipRunVectorScaleDeviceKernel(ctx, driver, combined, float32(math.Sqrt(0.5)))
+	if err != nil {
+		return nil, err
+	}
+
+	outputs := &hipGemma4Q4PerLayerInputDeviceSet{
+		Layers:  make([]*hipDeviceByteBuffer, 0, layerCount),
+		Backing: []*hipDeviceByteBuffer{scaled},
+	}
+	success := false
+	defer func() {
+		if !success {
+			_ = outputs.Close()
+		}
+	}()
+	for layer := 0; layer < layerCount; layer++ {
+		offset := nativeDevicePointer(layer * cfg.InputSize * 4)
+		bytes := uint64(cfg.InputSize * 4)
+		outputs.Layers = append(outputs.Layers, hipBorrowDeviceByteBuffer(driver, "per-layer input slice", scaled.Pointer()+offset, bytes, cfg.InputSize))
+	}
+	success = true
+	return outputs, nil
+}
+
 func hipGemma4Q4HostGELU(input []float32) ([]float32, error) {
 	if len(input) == 0 {
 		return nil, core.E(hipGemma4Q4Layer0Operation, "GELU input is required", nil)
@@ -1661,12 +2398,13 @@ func hipGemma4Q4Layer0Labels(cfg hipGemma4Q4Layer0Config, req hipGemma4Q4Layer0R
 		"decode_hidden_size":      core.Sprintf("%d", cfg.HiddenSize),
 		"final_logit_softcap":     core.Sprintf("%g", cfg.FinalLogitSoftcap),
 		"decode_primitives":       "embedding_lookup,vector_scale,rms_norm,mlx_q4_projection,rope,attention,vector_add,gelu_tanh_mlp,logit_softcap,greedy",
+		"gemma4_mlp_activation":   "device_gelu_tanh_multiply",
 		"production_decode":       hipKernelStatusNotLinked,
 	}
 	if cfg.PerLayerInput.hasGlobalPrecompute() {
 		labels["gemma4_per_layer_inputs"] = hipKernelStatusLinked
 		labels["gemma4_per_layer_input_size"] = core.Sprintf("%d", cfg.PerLayerInput.InputSize)
-		labels["gemma4_per_layer_input_activation"] = "host_gelu_tanh"
+		labels["gemma4_per_layer_input_activation"] = "device_gelu_tanh_multiply"
 		labels["decode_primitives"] += ",gemma4_per_layer_input"
 	}
 	if cfg.LayerType != "" {
@@ -1689,6 +2427,7 @@ func hipGemma4Q4ForwardLabels(cfg hipGemma4Q4ForwardConfig, req hipGemma4Q4Forwa
 		"decode_hidden_size":       core.Sprintf("%d", first.HiddenSize),
 		"final_logit_softcap":      core.Sprintf("%g", first.FinalLogitSoftcap),
 		"decode_primitives":        "embedding_lookup,vector_scale,rms_norm,mlx_q4_projection,rope,attention,vector_add,gelu_tanh_mlp,logit_softcap,greedy",
+		"gemma4_mlp_activation":    "device_gelu_tanh_multiply",
 		"production_decode":        hipKernelStatusNotLinked,
 	}
 	if req.DeviceKVAttention {
@@ -1699,7 +2438,7 @@ func hipGemma4Q4ForwardLabels(cfg hipGemma4Q4ForwardConfig, req hipGemma4Q4Forwa
 	if first.PerLayerInput.hasGlobalPrecompute() {
 		labels["gemma4_per_layer_inputs"] = hipKernelStatusLinked
 		labels["gemma4_per_layer_input_size"] = core.Sprintf("%d", first.PerLayerInput.InputSize)
-		labels["gemma4_per_layer_input_activation"] = "host_gelu_tanh"
+		labels["gemma4_per_layer_input_activation"] = "device_gelu_tanh_multiply"
 		labels["decode_primitives"] += ",gemma4_per_layer_input"
 	}
 	if cfg.KVSharedLayers > 0 {
@@ -1726,13 +2465,14 @@ func hipGemma4Q4GreedyDecodeLabels(cfg hipGemma4Q4ForwardConfig, req hipGemma4Q4
 		"decode_hidden_size":          core.Sprintf("%d", first.HiddenSize),
 		"final_logit_softcap":         core.Sprintf("%g", first.FinalLogitSoftcap),
 		"decode_primitives":           "embedding_lookup,vector_scale,rms_norm,mlx_q4_projection,rope,attention,kv_state,vector_add,gelu_tanh_mlp,logit_softcap,greedy",
+		"gemma4_mlp_activation":       "device_gelu_tanh_multiply",
 		"production_decode":           hipKernelStatusNotLinked,
 		"production_kv_cache_backing": hipKernelStatusNotLinked,
 	}
 	if first.PerLayerInput.hasGlobalPrecompute() {
 		labels["gemma4_per_layer_inputs"] = hipKernelStatusLinked
 		labels["gemma4_per_layer_input_size"] = core.Sprintf("%d", first.PerLayerInput.InputSize)
-		labels["gemma4_per_layer_input_activation"] = "host_gelu_tanh"
+		labels["gemma4_per_layer_input_activation"] = "device_gelu_tanh_multiply"
 		labels["decode_primitives"] += ",gemma4_per_layer_input"
 	}
 	if cfg.KVSharedLayers > 0 {
@@ -2105,11 +2845,36 @@ func hipGemma4Q4LayerRoPERotaryDim(headDim int) int {
 	return headDim
 }
 
+func hipGemma4Q4RoPENormConfig(cfg hipRMSNormDeviceWeightConfig, epsilon float32, count int) hipRMSNormDeviceWeightConfig {
+	cfg.Epsilon = epsilon
+	cfg.Count = count
+	cfg.Flags |= hipRMSNormLaunchFlagRoPENeoX
+	return cfg
+}
+
+func hipGemma4Q4RoPEKernelDims(cfg hipGemma4Q4Layer0Config) (frequencyDim, rotaryCount int) {
+	if cfg.RoPERotaryDim != cfg.HeadDim {
+		return cfg.HeadDim, cfg.RoPERotaryDim
+	}
+	return 0, 0
+}
+
 func hipGemma4Q4LayerSlidingWindow(headDim int) int {
 	if headDim >= 512 {
 		return 0
 	}
 	return 512
+}
+
+func hipGemma4Q4EffectiveSlidingWindow(headDim, contextSize int) int {
+	window := hipGemma4Q4LayerSlidingWindow(headDim)
+	if contextSize <= 0 {
+		return window
+	}
+	if window > 0 && contextSize < window {
+		return contextSize
+	}
+	return window
 }
 
 func hipGemma4Q4AttentionScale(_ int) float32 {

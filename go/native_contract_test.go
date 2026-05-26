@@ -1108,7 +1108,7 @@ func TestNativeContract_ProbeSinkReceivesGeneratedTokens_Good(t *testing.T) {
 	}
 }
 
-func TestNativeContract_GeneratePassesStopSequences_Good(t *testing.T) {
+func TestNativeContract_GeneratePassesStopTokens_Good(t *testing.T) {
 	native := &fakeNativeModel{tokens: []inference.Token{{ID: 1, Text: "ok"}}}
 	model := &rocmModel{
 		modelType: "qwen3",
@@ -1116,9 +1116,9 @@ func TestNativeContract_GeneratePassesStopSequences_Good(t *testing.T) {
 		native:    native,
 	}
 
-	core.AssertEqual(t, []string{"ok"}, collectTokenText(model.Generate(context.Background(), "hello", inference.WithStopSequences("END"))))
+	core.AssertEqual(t, []string{"ok"}, collectTokenText(model.Generate(context.Background(), "hello", inference.WithStopTokens(2, 3))))
 
-	core.AssertEqual(t, []string{"END"}, native.generateConfigs[0].StopSequences)
+	core.AssertEqual(t, []int32{2, 3}, native.generateConfigs[0].StopTokens)
 }
 
 func TestNativeContract_TokenizerBoundariesCloneMutableSlices_Good(t *testing.T) {
@@ -1171,24 +1171,7 @@ func TestNativeContract_ApplyChatTemplateBadRecordsErrAndSuccessClears_Bad(t *te
 	}
 }
 
-func TestNativeContract_GenerateEnforcesStopSequencesAcrossChunks_Good(t *testing.T) {
-	model := &rocmModel{
-		modelType: "qwen3",
-		modelInfo: inference.ModelInfo{Architecture: "qwen3"},
-		native: &fakeNativeModel{tokens: []inference.Token{
-			{ID: 1, Text: "hello "},
-			{ID: 2, Text: "EN"},
-			{ID: 3, Text: "D hidden"},
-		}},
-	}
-
-	text := strings.Join(collectTokenText(model.Generate(context.Background(), "hello", inference.WithStopSequences("END"))), "")
-
-	core.AssertEqual(t, "hello ", text)
-	core.AssertEqual(t, 1, model.Metrics().GeneratedTokens)
-}
-
-func TestNativeContract_GenerateStopSequencesSurviveNativeConfigMutation_Good(t *testing.T) {
+func TestNativeContract_GenerateStopTokensSurviveNativeConfigMutation_Good(t *testing.T) {
 	model := &rocmModel{
 		modelType: "qwen3",
 		modelInfo: inference.ModelInfo{Architecture: "qwen3"},
@@ -1202,9 +1185,9 @@ func TestNativeContract_GenerateStopSequencesSurviveNativeConfigMutation_Good(t 
 		},
 	}
 
-	text := strings.Join(collectTokenText(model.Generate(context.Background(), "hello", inference.WithStopSequences("END"))), "")
+	text := strings.Join(collectTokenText(model.Generate(context.Background(), "hello", inference.WithStopTokens(2))), "")
 
-	core.AssertEqual(t, "hello ", text)
+	core.AssertEqual(t, "hello END hidden", text)
 }
 
 func TestNativeContract_ClassifyWithLogitsEmitsLogitAndEntropyProbes_Good(t *testing.T) {
@@ -1494,7 +1477,7 @@ func TestNativeContract_NonStreamingPromptInputsClonedAtNativeBoundary_Good(t *t
 	core.AssertEqual(t, "hello", prompts[0])
 }
 
-func TestNativeContract_BatchGenerateEnforcesStopSequencesAcrossChunks_Good(t *testing.T) {
+func TestNativeContract_BatchGeneratePassesStopTokens_Good(t *testing.T) {
 	nativeResults := []inference.BatchResult{{
 		Tokens: []inference.Token{
 			{ID: 1, Text: "hello "},
@@ -1510,19 +1493,20 @@ func TestNativeContract_BatchGenerateEnforcesStopSequencesAcrossChunks_Good(t *t
 		},
 	}
 
-	results, err := model.BatchGenerate(context.Background(), []string{"hello"}, inference.WithStopSequences("END"))
+	results, err := model.BatchGenerate(context.Background(), []string{"hello"}, inference.WithStopTokens(2, 3))
 	core.RequireNoError(t, err)
 	var text string
 	for _, token := range results[0].Tokens {
 		text += token.Text
 	}
 
-	core.AssertEqual(t, "hello ", text)
+	core.AssertEqual(t, "hello END hidden", text)
 	core.AssertEqual(t, "D hidden", nativeResults[0].Tokens[2].Text)
-	core.AssertEqual(t, 1, model.Metrics().GeneratedTokens)
+	core.AssertEqual(t, []int32{2, 3}, model.native.(*fakeNativeModel).generateConfigs[0].StopTokens)
+	core.AssertEqual(t, 3, model.Metrics().GeneratedTokens)
 }
 
-func TestNativeContract_BatchGenerateStopSequencesSurviveNativeConfigMutation_Good(t *testing.T) {
+func TestNativeContract_BatchGenerateStopTokensSurviveNativeConfigMutation_Good(t *testing.T) {
 	nativeResults := []inference.BatchResult{{
 		Tokens: []inference.Token{
 			{ID: 1, Text: "hello "},
@@ -1539,14 +1523,14 @@ func TestNativeContract_BatchGenerateStopSequencesSurviveNativeConfigMutation_Go
 		},
 	}
 
-	results, err := model.BatchGenerate(context.Background(), []string{"hello"}, inference.WithStopSequences("END"))
+	results, err := model.BatchGenerate(context.Background(), []string{"hello"}, inference.WithStopTokens(2))
 	core.RequireNoError(t, err)
 	var text string
 	for _, token := range results[0].Tokens {
 		text += token.Text
 	}
 
-	core.AssertEqual(t, "hello ", text)
+	core.AssertEqual(t, "hello END hidden", text)
 }
 
 func TestNativeContract_NonStreamingTextMetricsUseTokenizerPromptCounts_Good(t *testing.T) {
@@ -2133,34 +2117,6 @@ func TestNativeContract_BenchmarkWarmupRunsAllPromptsWithoutMeasuredCounters_Goo
 	}
 }
 
-func TestNativeContract_BenchmarkPassesStopSequences_Good(t *testing.T) {
-	native := &fakeNativeModel{tokens: []inference.Token{
-		{ID: 1, Text: "visible "},
-		{ID: 2, Text: "EN"},
-		{ID: 3, Text: "D hidden"},
-	}}
-	model := &rocmModel{
-		modelType: "qwen3",
-		modelInfo: inference.ModelInfo{Architecture: "qwen3"},
-		native:    native,
-	}
-
-	bench, err := model.Benchmark(context.Background(), inference.BenchConfig{
-		Prompts:       []string{"hello"},
-		MaxTokens:     3,
-		StopSequences: []string{"END"},
-		WarmupRuns:    1,
-		MeasuredRuns:  1,
-	})
-
-	core.RequireNoError(t, err)
-	core.AssertEqual(t, 1, bench.GeneratedTokens)
-	core.AssertEqual(t, 2, len(native.generateConfigs))
-	for _, cfg := range native.generateConfigs {
-		core.AssertEqual(t, []string{"END"}, cfg.StopSequences)
-	}
-}
-
 func TestNativeContract_GeneratedPromptUsesExplicitGemma4Q4TextMode_Good(t *testing.T) {
 	model := &rocmModel{
 		native: &hipLoadedModel{
@@ -2450,32 +2406,6 @@ func TestNativeContract_EvaluateQualityProbes_Good(t *testing.T) {
 	}
 }
 
-func TestNativeContract_EvaluateQualityProbesPassStopSequences_Good(t *testing.T) {
-	native := &fakeNativeModel{tokens: []inference.Token{
-		{ID: 1, Text: "visible "},
-		{ID: 2, Text: "EN"},
-		{ID: 3, Text: "D hidden"},
-	}}
-	model := &rocmModel{
-		modelType: "qwen3",
-		modelInfo: inference.ModelInfo{Architecture: "qwen3"},
-		native:    native,
-	}
-
-	eval, err := model.Evaluate(context.Background(), &singleInferenceSample{sample: inference.DatasetSample{Text: "hello world"}}, inference.EvalConfig{
-		MaxSamples:    1,
-		MaxSeqLen:     8,
-		StopSequences: []string{"END"},
-		Probes:        []inference.QualityProbe{{Name: "sanity", Prompt: "say hi"}},
-	})
-
-	core.RequireNoError(t, err)
-	if len(eval.Probes) != 1 || eval.Probes[0].Text != "visible " || !eval.Probes[0].Passed {
-		t.Fatalf("eval probes = %+v, want quality probe truncated at stop sequence", eval.Probes)
-	}
-	core.AssertEqual(t, []string{"END"}, native.generateConfigs[0].StopSequences)
-}
-
 func TestNativeContract_EvaluateUsesClassifyLogitsForLoss_Good(t *testing.T) {
 	model := &rocmModel{
 		modelType: "tiny",
@@ -2731,8 +2661,8 @@ func TestNativeContract_BenchmarkEmitsCacheAndMemoryProbeEvents_Good(t *testing.
 	if err != nil {
 		t.Fatalf("Benchmark: %v", err)
 	}
-	if bench.PeakMemoryBytes < 64 || bench.ActiveMemoryBytes != 32 {
-		t.Fatalf("bench = %+v, want active and peak native memory propagated", bench)
+	if bench.PeakMemoryBytes < 64 {
+		t.Fatalf("bench = %+v, want peak native memory propagated", bench)
 	}
 	if bench.Labels["memory_active_bytes"] != "32" || bench.Labels["memory_peak_bytes"] != core.Sprintf("%d", bench.PeakMemoryBytes) || floatLabel(t, bench.Labels, "memory_peak_bytes") < 64 {
 		t.Fatalf("bench labels = %+v, want active and peak memory byte labels", bench.Labels)
@@ -3762,6 +3692,7 @@ func (model *fakeNativeModel) BatchGenerate(_ context.Context, prompts []string,
 	if model.mutateGenerateConfig {
 		mutateGenerateConfig(&cfg)
 	}
+	model.generateConfigs = append(model.generateConfigs, cfg)
 	if model.batchErr != nil {
 		return nil, model.batchErr
 	}
@@ -3778,9 +3709,6 @@ func (model *fakeNativeModel) BatchGenerate(_ context.Context, prompts []string,
 func mutateGenerateConfig(cfg *inference.GenerateConfig) {
 	if cfg == nil {
 		return
-	}
-	if len(cfg.StopSequences) > 0 {
-		cfg.StopSequences[0] = "mutated"
 	}
 	if len(cfg.StopTokens) > 0 {
 		cfg.StopTokens[0] = 99

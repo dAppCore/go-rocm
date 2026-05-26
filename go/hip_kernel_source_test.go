@@ -6,6 +6,8 @@ package rocm
 
 import (
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -20,15 +22,38 @@ func TestHIPKernelSource_ExportsLaunchABI_Good(t *testing.T) {
 	for _, symbol := range []string{
 		`extern "C" __global__ void rocm_prefill`,
 		`extern "C" __global__ void rocm_decode`,
+		`extern "C" __global__ void rocm_kv_encode_token`,
+		`extern "C" __global__ void rocm_kv_descriptor_append`,
 		`extern "C" __global__ void rocm_projection`,
+		`extern "C" __global__ void rocm_projection_batch`,
 		`extern "C" __global__ void rocm_mlx_q4_projection`,
+		`extern "C" __global__ void rocm_mlx_q4_projection_batch`,
+		`extern "C" __global__ void rocm_mlx_q4_projection_greedy`,
+		`extern "C" __global__ void rocm_mlx_q4_triple_projection`,
+		`extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply`,
+		`extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply_batch`,
+		`extern "C" __global__ void rocm_mlx_q4_gelu_tanh_projection`,
+		`extern "C" __global__ void rocm_mlx_q4_gelu_tanh_projection_batch`,
 		`extern "C" __global__ void rocm_rms_norm`,
+		`extern "C" __global__ void rocm_rms_norm_residual_add`,
+		`extern "C" __global__ void rocm_rms_norm_residual_add_norm`,
+		`extern "C" __global__ void rocm_rms_norm_heads`,
+		`extern "C" __global__ void rocm_rms_norm_rope_heads`,
+		`extern "C" __global__ void rocm_rms_norm_rope_heads_batch`,
 		`extern "C" __global__ void rocm_rope`,
+		`extern "C" __global__ void rocm_rope_heads`,
 		`extern "C" __global__ void rocm_greedy_sample`,
+		`extern "C" __global__ void rocm_softcap_greedy_sample`,
 		`extern "C" __global__ void rocm_attention`,
+		`extern "C" __global__ void rocm_attention_heads`,
+		`extern "C" __global__ void rocm_attention_heads_batch_causal`,
+		`extern "C" __global__ void rocm_attention_heads_chunked_stage1`,
+		`extern "C" __global__ void rocm_attention_heads_chunked_stage2`,
 		`extern "C" __global__ void rocm_vector_add`,
 		`extern "C" __global__ void rocm_vector_scale`,
+		`extern "C" __global__ void rocm_per_layer_input_transpose`,
 		`extern "C" __global__ void rocm_swiglu`,
+		`extern "C" __global__ void rocm_gelu_tanh_multiply`,
 		`extern "C" __global__ void rocm_moe_router`,
 		`extern "C" __global__ void rocm_moe_lazy_experts`,
 		`extern "C" __global__ void rocm_jangtq_projection`,
@@ -59,35 +84,88 @@ func TestHIPKernelSource_ExportsLaunchABI_Good(t *testing.T) {
 		core.Sprintf("ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_FP16 = %d", rocmDeviceKVDescriptorEncodingFP16),
 		core.Sprintf("ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8 = %d", rocmDeviceKVDescriptorEncodingQ8),
 		core.Sprintf("ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4 = %d", rocmDeviceKVDescriptorEncodingQ4),
+		core.Sprintf("ROCM_KV_ENCODE_TOKEN_LAUNCH_ARGS_VERSION = %d", hipKVEncodeTokenLaunchArgsVersion),
+		core.Sprintf("ROCM_KV_ENCODE_TOKEN_LAUNCH_ARGS_BYTES = %d", hipKVEncodeTokenLaunchArgsBytes),
+		core.Sprintf("ROCM_KV_ENCODE_TOKEN_BLOCK_SIZE = %d", hipKVEncodeTokenBlockSize),
+		core.Sprintf("ROCM_KV_DESCRIPTOR_APPEND_LAUNCH_ARGS_VERSION = %d", hipKVDescriptorAppendLaunchArgsVersion),
+		core.Sprintf("ROCM_KV_DESCRIPTOR_APPEND_LAUNCH_ARGS_BYTES = %d", hipKVDescriptorAppendLaunchArgsBytes),
+		core.Sprintf("ROCM_KV_DESCRIPTOR_APPEND_BLOCK_SIZE = %d", hipKVDescriptorAppendBlockSize),
 		core.Sprintf("ROCM_PROJECTION_LAUNCH_ARGS_VERSION = %d", hipProjectionLaunchArgsVersion),
 		core.Sprintf("ROCM_PROJECTION_LAUNCH_ARGS_BYTES = %d", hipProjectionLaunchArgsBytes),
+		core.Sprintf("ROCM_PROJECTION_BATCH_LAUNCH_ARGS_VERSION = %d", hipProjectionBatchLaunchArgsVersion),
+		core.Sprintf("ROCM_PROJECTION_BATCH_LAUNCH_ARGS_BYTES = %d", hipProjectionBatchLaunchArgsBytes),
 		core.Sprintf("ROCM_PROJECTION_WEIGHT_ENCODING_FP16 = %d", hipProjectionWeightEncodingFP16),
 		core.Sprintf("ROCM_PROJECTION_WEIGHT_ENCODING_Q8 = %d", hipProjectionWeightEncodingQ8),
 		core.Sprintf("ROCM_PROJECTION_WEIGHT_ENCODING_F32 = %d", hipProjectionWeightEncodingF32),
 		core.Sprintf("ROCM_PROJECTION_WEIGHT_ENCODING_BF16 = %d", hipProjectionWeightEncodingBF16),
 		core.Sprintf("ROCM_MLX_Q4_PROJECTION_LAUNCH_ARGS_VERSION = %d", hipMLXQ4ProjectionLaunchArgsVersion),
 		core.Sprintf("ROCM_MLX_Q4_PROJECTION_LAUNCH_ARGS_BYTES = %d", hipMLXQ4ProjectionLaunchArgsBytes),
+		core.Sprintf("ROCM_MLX_Q4_PROJECTION_BATCH_LAUNCH_ARGS_VERSION = %d", hipMLXQ4ProjectionBatchLaunchArgsVersion),
+		core.Sprintf("ROCM_MLX_Q4_PROJECTION_BATCH_LAUNCH_ARGS_BYTES = %d", hipMLXQ4ProjectionBatchLaunchArgsBytes),
+		core.Sprintf("ROCM_MLX_Q4_TRIPLE_PROJECTION_LAUNCH_ARGS_VERSION = %d", hipMLXQ4TripleProjLaunchArgsVersion),
+		core.Sprintf("ROCM_MLX_Q4_TRIPLE_PROJECTION_LAUNCH_ARGS_BYTES = %d", hipMLXQ4TripleProjLaunchArgsBytes),
+		core.Sprintf("ROCM_MLX_Q4_GELU_TANH_MUL_LAUNCH_ARGS_VERSION = %d", hipMLXQ4GELUTanhMulLaunchArgsVersion),
+		core.Sprintf("ROCM_MLX_Q4_GELU_TANH_MUL_LAUNCH_ARGS_BYTES = %d", hipMLXQ4GELUTanhMulLaunchArgsBytes),
+		core.Sprintf("ROCM_MLX_Q4_GELU_TANH_MUL_BATCH_LAUNCH_ARGS_VERSION = %d", hipMLXQ4GELUTanhMulBatchLaunchArgsVersion),
+		core.Sprintf("ROCM_MLX_Q4_GELU_TANH_MUL_BATCH_LAUNCH_ARGS_BYTES = %d", hipMLXQ4GELUTanhMulBatchLaunchArgsBytes),
+		core.Sprintf("ROCM_MLX_Q4_GELU_TANH_PROJ_LAUNCH_ARGS_VERSION = %d", hipMLXQ4GELUTanhProjLaunchArgsVersion),
+		core.Sprintf("ROCM_MLX_Q4_GELU_TANH_PROJ_LAUNCH_ARGS_BYTES = %d", hipMLXQ4GELUTanhProjLaunchArgsBytes),
+		core.Sprintf("ROCM_MLX_Q4_GELU_TANH_PROJ_BATCH_LAUNCH_ARGS_VERSION = %d", hipMLXQ4GELUTanhProjBatchLaunchArgsVersion),
+		core.Sprintf("ROCM_MLX_Q4_GELU_TANH_PROJ_BATCH_LAUNCH_ARGS_BYTES = %d", hipMLXQ4GELUTanhProjBatchLaunchArgsBytes),
 		core.Sprintf("ROCM_MLX_Q4_PROJECTION_BITS = %d", hipMLXQ4ProjectionBits),
+		core.Sprintf("ROCM_MLX_Q4_PROJECTION_BLOCK_SIZE = %d", hipMLXQ4ProjectionBlockSize),
+		core.Sprintf("ROCM_MLX_Q4_PROJECTION_ROWS_PER_BLOCK = %d", hipMLXQ4ProjectionRowsPerBlock),
+		core.Sprintf("ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK = %d", hipMLXQ4ProjectionGreedyRowsPerBlock),
+		core.Sprintf("ROCM_MLX_Q4_PROJECTION_BEST_BYTES = %d", hipMLXQ4ProjectionBestBytes),
 		core.Sprintf("ROCM_RMS_NORM_LAUNCH_ARGS_VERSION = %d", hipRMSNormLaunchArgsVersion),
 		core.Sprintf("ROCM_RMS_NORM_LAUNCH_ARGS_BYTES = %d", hipRMSNormLaunchArgsBytes),
+		core.Sprintf("ROCM_RMS_NORM_RESIDUAL_ADD_LAUNCH_ARGS_VERSION = %d", hipRMSNormResidualAddArgsVersion),
+		core.Sprintf("ROCM_RMS_NORM_RESIDUAL_ADD_LAUNCH_ARGS_BYTES = %d", hipRMSNormResidualAddArgsBytes),
+		core.Sprintf("ROCM_RMS_NORM_RESIDUAL_ADD_NORM_LAUNCH_ARGS_VERSION = %d", hipRMSNormResAddNormArgsVersion),
+		core.Sprintf("ROCM_RMS_NORM_RESIDUAL_ADD_NORM_LAUNCH_ARGS_BYTES = %d", hipRMSNormResAddNormArgsBytes),
+		core.Sprintf("ROCM_RMS_NORM_HEADS_LAUNCH_ARGS_VERSION = %d", hipRMSNormHeadsLaunchArgsVersion),
+		core.Sprintf("ROCM_RMS_NORM_HEADS_LAUNCH_ARGS_BYTES = %d", hipRMSNormHeadsLaunchArgsBytes),
+		core.Sprintf("ROCM_RMS_NORM_ROPE_HEADS_LAUNCH_ARGS_VERSION = %d", hipRMSNormRoPEHeadsLaunchArgsVersion),
+		core.Sprintf("ROCM_RMS_NORM_ROPE_HEADS_LAUNCH_ARGS_BYTES = %d", hipRMSNormRoPEHeadsLaunchArgsBytes),
+		core.Sprintf("ROCM_RMS_NORM_ROPE_HEADS_BATCH_LAUNCH_ARGS_VERSION = %d", hipRMSNormRoPEHeadsBatchLaunchArgsVersion),
+		core.Sprintf("ROCM_RMS_NORM_ROPE_HEADS_BATCH_LAUNCH_ARGS_BYTES = %d", hipRMSNormRoPEHeadsBatchLaunchArgsBytes),
+		core.Sprintf("ROCM_RMS_NORM_WEIGHT_ENCODING_NONE = %d", hipRMSNormWeightEncodingNone),
 		core.Sprintf("ROCM_RMS_NORM_WEIGHT_ENCODING_F32 = %d", hipRMSNormWeightEncodingF32),
 		core.Sprintf("ROCM_RMS_NORM_WEIGHT_ENCODING_BF16 = %d", hipRMSNormWeightEncodingBF16),
 		core.Sprintf("ROCM_RMS_NORM_LAUNCH_FLAG_ADD_UNIT_WEIGHT = %d", hipRMSNormLaunchFlagAddUnitWeight),
+		core.Sprintf("ROCM_RMS_NORM_LAUNCH_FLAG_ROPE_NEOX = %d", hipRMSNormLaunchFlagRoPENeoX),
 		core.Sprintf("ROCM_ROPE_LAUNCH_ARGS_VERSION = %d", hipRoPELaunchArgsVersion),
 		core.Sprintf("ROCM_ROPE_LAUNCH_ARGS_BYTES = %d", hipRoPELaunchArgsBytes),
+		core.Sprintf("ROCM_ROPE_HEADS_LAUNCH_ARGS_VERSION = %d", hipRoPEHeadsLaunchArgsVersion),
+		core.Sprintf("ROCM_ROPE_HEADS_LAUNCH_ARGS_BYTES = %d", hipRoPEHeadsLaunchArgsBytes),
 		core.Sprintf("ROCM_GREEDY_LAUNCH_ARGS_VERSION = %d", hipGreedyLaunchArgsVersion),
 		core.Sprintf("ROCM_GREEDY_LAUNCH_ARGS_BYTES = %d", hipGreedyLaunchArgsBytes),
+		core.Sprintf("ROCM_SOFTCAP_GREEDY_LAUNCH_ARGS_VERSION = %d", hipSoftcapGreedyLaunchArgsVersion),
+		core.Sprintf("ROCM_SOFTCAP_GREEDY_LAUNCH_ARGS_BYTES = %d", hipSoftcapGreedyLaunchArgsBytes),
 		core.Sprintf("ROCM_GREEDY_RESULT_BYTES = %d", hipGreedyResultBytes),
 		core.Sprintf("ROCM_ATTENTION_LAUNCH_ARGS_VERSION = %d", hipAttentionLaunchArgsVersion),
 		core.Sprintf("ROCM_ATTENTION_LAUNCH_ARGS_BYTES = %d", hipAttentionLaunchArgsBytes),
+		core.Sprintf("ROCM_ATTENTION_HEADS_LAUNCH_ARGS_VERSION = %d", hipAttentionHeadsLaunchArgsVersion),
+		core.Sprintf("ROCM_ATTENTION_HEADS_LAUNCH_ARGS_BYTES = %d", hipAttentionHeadsLaunchArgsBytes),
+		core.Sprintf("ROCM_ATTENTION_HEADS_BATCH_CAUSAL_LAUNCH_ARGS_VERSION = %d", hipAttentionHeadsBatchCausalLaunchArgsVersion),
+		core.Sprintf("ROCM_ATTENTION_HEADS_BATCH_CAUSAL_LAUNCH_ARGS_BYTES = %d", hipAttentionHeadsBatchCausalLaunchArgsBytes),
+		core.Sprintf("ROCM_ATTENTION_HEADS_SHARED_MAX_TOKENS = %d", hipAttentionHeadsSharedMaxTokens),
+		core.Sprintf("ROCM_ATTENTION_HEADS_CHUNKED_LAUNCH_ARGS_VERSION = %d", hipAttentionHeadsChunkedLaunchArgsVersion),
+		core.Sprintf("ROCM_ATTENTION_HEADS_CHUNKED_LAUNCH_ARGS_BYTES = %d", hipAttentionHeadsChunkedLaunchArgsBytes),
+		core.Sprintf("ROCM_ATTENTION_HEADS_CHUNKED_BLOCK_SIZE = %d", hipAttentionHeadsChunkedBlockSize),
+		core.Sprintf("ROCM_ATTENTION_HEADS_CHUNK_SIZE = %d", hipAttentionHeadsChunkSize),
 		core.Sprintf("ROCM_ATTENTION_KV_SOURCE_CONTIGUOUS = %d", hipAttentionKVSourceContiguous),
 		core.Sprintf("ROCM_ATTENTION_KV_SOURCE_DEVICE = %d", hipAttentionKVSourceDevice),
 		core.Sprintf("ROCM_VECTOR_ADD_LAUNCH_ARGS_VERSION = %d", hipVectorAddLaunchArgsVersion),
 		core.Sprintf("ROCM_VECTOR_ADD_LAUNCH_ARGS_BYTES = %d", hipVectorAddLaunchArgsBytes),
 		core.Sprintf("ROCM_VECTOR_SCALE_LAUNCH_ARGS_VERSION = %d", hipVectorScaleLaunchArgsVersion),
 		core.Sprintf("ROCM_VECTOR_SCALE_LAUNCH_ARGS_BYTES = %d", hipVectorScaleLaunchArgsBytes),
+		core.Sprintf("ROCM_PER_LAYER_INPUT_TRANSPOSE_LAUNCH_ARGS_VERSION = %d", hipPerLayerInputTransposeLaunchArgsVersion),
+		core.Sprintf("ROCM_PER_LAYER_INPUT_TRANSPOSE_LAUNCH_ARGS_BYTES = %d", hipPerLayerInputTransposeLaunchArgsBytes),
 		core.Sprintf("ROCM_SWIGLU_LAUNCH_ARGS_VERSION = %d", hipSwiGLULaunchArgsVersion),
 		core.Sprintf("ROCM_SWIGLU_LAUNCH_ARGS_BYTES = %d", hipSwiGLULaunchArgsBytes),
+		core.Sprintf("ROCM_GELU_TANH_MUL_LAUNCH_ARGS_VERSION = %d", hipGELUTanhMulLaunchArgsVersion),
+		core.Sprintf("ROCM_GELU_TANH_MUL_LAUNCH_ARGS_BYTES = %d", hipGELUTanhMulLaunchArgsBytes),
 		core.Sprintf("ROCM_MOE_ROUTER_LAUNCH_ARGS_VERSION = %d", hipMoERouterLaunchArgsVersion),
 		core.Sprintf("ROCM_MOE_ROUTER_LAUNCH_ARGS_BYTES = %d", hipMoERouterLaunchArgsBytes),
 		core.Sprintf("ROCM_MOE_LAZY_LAUNCH_ARGS_VERSION = %d", hipMoELazyLaunchArgsVersion),
@@ -128,4 +206,317 @@ func TestHIPKernelSource_ExportsLaunchABI_Good(t *testing.T) {
 	} {
 		core.AssertTrue(t, strings.Contains(source, abi), abi)
 	}
+}
+
+func TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good(t *testing.T) {
+	sourceBytes, err := os.ReadFile("../kernels/rocm_kernels.hip")
+	core.RequireNoError(t, err)
+	source := string(sourceBytes)
+
+	projection := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_projection`)
+	core.AssertTrue(t, strings.Contains(projection, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_THREADS_PER_ROW`), "projection rows use normal row geometry")
+	core.AssertTrue(t, strings.Contains(projection, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_ROWS_PER_BLOCK + row_lane`), "projection grid uses normal row blocks")
+	core.AssertTrue(t, !strings.Contains(projection, `ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK`), "projection must not use greedy row blocks")
+	core.AssertTrue(t, !strings.Contains(projection, `ROCM_MLX_Q4_PROJECTION_GREEDY_THREADS_PER_ROW`), "projection must not use greedy row threads")
+
+	batch := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_projection_batch`)
+	core.AssertTrue(t, strings.Contains(batch, `blockIdx.y * ROCM_MLX_Q4_PROJECTION_BATCH_TOKENS_PER_BLOCK`), "batch projection must use grid Y for token blocks")
+	core.AssertTrue(t, strings.Contains(batch, `batch >= args.batch`), "batch projection must guard partial token blocks")
+	core.AssertTrue(t, strings.Contains(batch, `+ batch * args.cols`), "batch projection input must be row-offset by batch")
+	core.AssertTrue(t, strings.Contains(batch, `+ batch * args.rows`), "batch projection output must be row-offset by batch")
+
+	geluBatch := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply_batch`)
+	core.AssertTrue(t, strings.Contains(geluBatch, `blockIdx.y * ROCM_MLX_Q4_PROJECTION_BATCH_TOKENS_PER_BLOCK`), "batch GELU multiply must use grid Y for token blocks")
+	core.AssertTrue(t, strings.Contains(geluBatch, `batch >= args.batch`), "batch GELU multiply must guard partial token blocks")
+	core.AssertTrue(t, strings.Contains(geluBatch, `+ batch * args.cols`), "batch GELU multiply input must be row-offset by batch")
+	core.AssertTrue(t, strings.Contains(geluBatch, `+ batch * args.rows`), "batch GELU multiply output must be row-offset by batch")
+
+	geluProjBatch := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_gelu_tanh_projection_batch`)
+	core.AssertTrue(t, strings.Contains(geluProjBatch, `blockIdx.y * ROCM_MLX_Q4_PROJECTION_BATCH_TOKENS_PER_BLOCK`), "batch GELU projection must use grid Y for token blocks")
+	core.AssertTrue(t, strings.Contains(geluProjBatch, `batch >= args.batch`), "batch GELU projection must guard partial token blocks")
+	core.AssertTrue(t, strings.Contains(geluProjBatch, `+ batch * args.cols`), "batch GELU projection input must be row-offset by batch")
+	core.AssertTrue(t, strings.Contains(geluProjBatch, `+ batch * args.rows`), "batch GELU projection output must be row-offset by batch")
+
+	greedy := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_projection_greedy`)
+	core.AssertTrue(t, strings.Contains(greedy, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_GREEDY_THREADS_PER_ROW`), "greedy rows use greedy row geometry")
+	core.AssertTrue(t, strings.Contains(greedy, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK + row_lane`), "greedy grid uses greedy row blocks")
+}
+
+func TestHIPKernelSource_NVIDIAHIPCompile_Good(t *testing.T) {
+	if os.Getenv("GO_ROCM_RUN_NVIDIA_HIP_COMPILE_TESTS") != "1" {
+		t.Skip("set GO_ROCM_RUN_NVIDIA_HIP_COMPILE_TESTS=1 to compile HIP source through the NVIDIA backend")
+	}
+
+	hipcc := rocmNVIDIATestLookPath(t, "hipcc")
+	cudaPath := rocmNVIDIATestCUDAPath(t)
+	arch := rocmNVIDIATestEnvDefault("GO_ROCM_NVIDIA_HIP_ARCH", "sm_75")
+	std := rocmNVIDIATestEnvDefault("GO_ROCM_NVIDIA_HIP_STD", "c++20")
+	outputPath := filepath.Join(t.TempDir(), "rocm_kernels_nvidia.o")
+	cmd := exec.Command(
+		hipcc,
+		"--std="+std,
+		"-c",
+		"-x",
+		"cu",
+		"-I/opt/rocm/include",
+		"-arch="+arch,
+		"../kernels/rocm_kernels.hip",
+		"-o",
+		outputPath,
+	)
+	cmd.Env = rocmNVIDIATestEnv(cudaPath, "HIP_PLATFORM=nvidia")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("compile HIP kernels through NVIDIA backend: %v\n%s", err, rocmNVIDIATestOutputTail(output))
+	}
+	info, err := os.Stat(outputPath)
+	if err != nil {
+		t.Fatalf("stat NVIDIA HIP object: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Fatalf("NVIDIA HIP object is empty: %s", outputPath)
+	}
+	t.Logf("compiled HIP kernels for NVIDIA backend std=%s arch=%s object_bytes=%d", std, arch, info.Size())
+}
+
+func TestHIPKernelSource_ZLUDACUDARuntimeSmoke_Good(t *testing.T) {
+	if os.Getenv("GO_ROCM_RUN_ZLUDA_CUDA_TESTS") != "1" {
+		t.Skip("set GO_ROCM_RUN_ZLUDA_CUDA_TESTS=1 to compile CUDA with nvcc and run it through ZLUDA")
+	}
+
+	cudaPath := rocmNVIDIATestCUDAPath(t)
+	nvcc := filepath.Join(cudaPath, "bin", "nvcc")
+	if _, err := os.Stat(nvcc); err != nil {
+		nvcc = rocmNVIDIATestLookPath(t, "nvcc")
+	}
+	zludaDir := rocmZLUDATestDir(t)
+	arch := rocmNVIDIATestEnvDefault("GO_ROCM_NVIDIA_CUDA_ARCH", "sm_75")
+	tempDir := t.TempDir()
+	sourcePath := filepath.Join(tempDir, "zluda_cuda_smoke.cu")
+	binaryPath := filepath.Join(tempDir, "zluda_cuda_smoke")
+	core.RequireNoError(t, os.WriteFile(sourcePath, []byte(rocmZLUDACUDASmokeSource), 0o644))
+
+	compile := exec.Command(
+		nvcc,
+		"-std=c++17",
+		"-arch="+arch,
+		"-Wno-deprecated-gpu-targets",
+		sourcePath,
+		"-o",
+		binaryPath,
+	)
+	compile.Env = rocmNVIDIATestEnv(cudaPath)
+	output, err := compile.CombinedOutput()
+	if err != nil {
+		t.Fatalf("compile CUDA smoke with nvcc: %v\n%s", err, rocmNVIDIATestOutputTail(output))
+	}
+
+	run := exec.Command(binaryPath)
+	run.Env = rocmZLUDATestEnv(t, cudaPath, zludaDir)
+	output, err = run.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run CUDA smoke through ZLUDA: %v\n%s", err, rocmNVIDIATestOutputTail(output))
+	}
+	if !strings.Contains(string(output), "zluda_cuda_smoke_ok") {
+		t.Fatalf("ZLUDA smoke did not report success:\n%s", rocmNVIDIATestOutputTail(output))
+	}
+	t.Log(strings.TrimSpace(string(output)))
+}
+
+func hipKernelSourceFunctionBodyForTest(t *testing.T, source, marker string) string {
+	t.Helper()
+	start := strings.Index(source, marker)
+	if start < 0 {
+		t.Fatalf("kernel marker %q not found", marker)
+	}
+	open := strings.Index(source[start:], "{")
+	if open < 0 {
+		t.Fatalf("kernel marker %q has no body", marker)
+	}
+	index := start + open
+	depth := 0
+	for ; index < len(source); index++ {
+		switch source[index] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return source[start : index+1]
+			}
+		}
+	}
+	t.Fatalf("kernel marker %q body did not close", marker)
+	return ""
+}
+
+const rocmZLUDACUDASmokeSource = `
+#include <cuda_runtime.h>
+#include <cstdio>
+
+__global__ void rocm_zluda_smoke_kernel(int *out) {
+	const int index = threadIdx.x;
+	out[index] = index + 7;
+}
+
+int main() {
+	int count = 0;
+	cudaError_t err = cudaGetDeviceCount(&count);
+	if (err != cudaSuccess || count < 1) {
+		std::printf("device_count_error=%s count=%d\n", cudaGetErrorString(err), count);
+		return 10;
+	}
+
+	int *device = nullptr;
+	int host[4] = {0, 0, 0, 0};
+	err = cudaMalloc(reinterpret_cast<void **>(&device), sizeof(host));
+	if (err != cudaSuccess) {
+		std::printf("malloc_error=%s\n", cudaGetErrorString(err));
+		return 11;
+	}
+
+	rocm_zluda_smoke_kernel<<<1, 4>>>(device);
+	err = cudaGetLastError();
+	if (err != cudaSuccess) {
+		std::printf("launch_error=%s\n", cudaGetErrorString(err));
+		cudaFree(device);
+		return 12;
+	}
+
+	err = cudaDeviceSynchronize();
+	if (err != cudaSuccess) {
+		std::printf("sync_error=%s\n", cudaGetErrorString(err));
+		cudaFree(device);
+		return 13;
+	}
+
+	err = cudaMemcpy(host, device, sizeof(host), cudaMemcpyDeviceToHost);
+	cudaFree(device);
+	if (err != cudaSuccess) {
+		std::printf("copy_error=%s\n", cudaGetErrorString(err));
+		return 14;
+	}
+	for (int i = 0; i < 4; ++i) {
+		if (host[i] != i + 7) {
+			std::printf("value_error index=%d got=%d\n", i, host[i]);
+			return 15;
+		}
+	}
+	std::printf("zluda_cuda_smoke_ok count=%d values=%d,%d,%d,%d\n", count, host[0], host[1], host[2], host[3]);
+	return 0;
+}
+`
+
+func rocmNVIDIATestCUDAPath(t *testing.T) string {
+	t.Helper()
+	if cudaPath := os.Getenv("CUDA_PATH"); cudaPath != "" {
+		return cudaPath
+	}
+	if cudaPath := os.Getenv("CUDA_HOME"); cudaPath != "" {
+		return cudaPath
+	}
+	for _, candidate := range []string{"/usr/local/cuda", "/usr"} {
+		if _, err := os.Stat(filepath.Join(candidate, "bin", "nvcc")); err == nil {
+			return candidate
+		}
+	}
+	t.Fatalf("CUDA toolkit with nvcc not found; install cuda-nvcc-12-8 or set CUDA_PATH")
+	return ""
+}
+
+func rocmNVIDIATestLookPath(t *testing.T, name string) string {
+	t.Helper()
+	path, err := exec.LookPath(name)
+	if err != nil {
+		t.Fatalf("%s not found in PATH: %v", name, err)
+	}
+	return path
+}
+
+func rocmNVIDIATestEnv(cudaPath string, extra ...string) []string {
+	env := append([]string{}, os.Environ()...)
+	env = append(env, "CUDA_PATH="+cudaPath, "CUDA_HOME="+cudaPath)
+	env = append(env, extra...)
+	return env
+}
+
+func rocmNVIDIATestEnvDefault(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func rocmNVIDIATestOutputTail(output []byte) string {
+	const limit = 8192
+	if len(output) <= limit {
+		return string(output)
+	}
+	return string(output[len(output)-limit:])
+}
+
+func rocmZLUDATestDir(t *testing.T) string {
+	t.Helper()
+	candidates := []string{}
+	if dir := os.Getenv("GO_ROCM_ZLUDA_DIR"); dir != "" {
+		candidates = append(candidates, dir)
+	}
+	candidates = append(candidates, "/opt/zluda/v5/zluda", "/tmp/zluda-v5/zluda")
+	for _, candidate := range candidates {
+		if _, err := os.Stat(filepath.Join(candidate, "libcuda.so")); err == nil {
+			return candidate
+		}
+	}
+	t.Fatalf("ZLUDA directory not found; set GO_ROCM_ZLUDA_DIR to a v5 unpack containing libcuda.so")
+	return ""
+}
+
+func rocmZLUDATestEnv(t *testing.T, cudaPath, zludaDir string) []string {
+	t.Helper()
+	paths := []string{zludaDir, filepath.Join(cudaPath, "lib64")}
+	if _, err := os.Stat("/opt/rocm-6.4.4/lib/libamdhip64.so.6"); err == nil {
+		paths = append(paths, "/opt/rocm-6.4.4/lib")
+	}
+	compatDir := rocmZLUDAHIPCompatDir(t)
+	if compatDir != "" {
+		paths = append(paths, compatDir)
+	}
+	paths = append(paths, "/opt/rocm/lib")
+	if current := os.Getenv("LD_LIBRARY_PATH"); current != "" {
+		paths = append(paths, current)
+	}
+	env := append([]string{}, os.Environ()...)
+	env = append(env, "LD_LIBRARY_PATH="+strings.Join(paths, ":"))
+	return env
+}
+
+func rocmZLUDAHIPCompatDir(t *testing.T) string {
+	t.Helper()
+	for _, candidate := range []string{
+		"/opt/rocm-6.4.4/lib/libamdhip64.so.6",
+		"/opt/rocm/lib/libamdhip64.so.6",
+		"/usr/lib/x86_64-linux-gnu/libamdhip64.so.6",
+	} {
+		if _, err := os.Stat(candidate); err == nil {
+			return ""
+		}
+	}
+	target := ""
+	for _, candidate := range []string{
+		"/opt/rocm/lib/libamdhip64.so.7",
+		"/opt/rocm-7.2.0/lib/libamdhip64.so.7",
+	} {
+		if _, err := os.Stat(candidate); err == nil {
+			target = candidate
+			break
+		}
+	}
+	if target == "" {
+		return ""
+	}
+	compatDir := filepath.Join(t.TempDir(), "zluda-hip-compat")
+	core.RequireNoError(t, os.MkdirAll(compatDir, 0o755))
+	core.RequireNoError(t, os.Symlink(target, filepath.Join(compatDir, "libamdhip64.so.6")))
+	t.Logf("using local ZLUDA HIP ABI symlink libamdhip64.so.6 -> %s", target)
+	return compatDir
 }

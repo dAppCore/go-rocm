@@ -10,18 +10,23 @@ import (
 
 	core "dappco.re/go"
 	"dappco.re/go/inference"
+	"dappco.re/go/inference/state"
 )
 
 const (
-	rocmKVCacheModeFP16     = "fp16"
-	rocmKVCacheModeQ8       = "q8"
-	rocmKVCacheModeKQ8VQ4   = "k-q8-v-q4"
-	rocmKVEncodingFP16      = "fp16"
-	rocmKVEncodingQ8        = "q8"
-	rocmKVEncodingQ4        = "q4"
-	rocmKVSnapshotEncoding  = "rocm/kv-cache+json"
-	defaultROCmKVBlockSize  = 16
-	rocmKVRestoreMillisUnit = 0.01
+	rocmKVCacheModeFP16       = "fp16"
+	rocmKVCacheModeQ8         = "q8"
+	rocmKVCacheModeKQ8VQ4     = "k-q8-v-q4"
+	rocmKVEncodingFP16        = "fp16"
+	rocmKVEncodingQ8          = "q8"
+	rocmKVEncodingQ4          = "q4"
+	rocmKVSnapshotEncoding    = "rocm/kv-cache+json"
+	rocmKVBlockBundleEncoding = "rocm/kv-cache-block-bundle+json"
+	rocmKVBlockRawEncoding    = "rocm/kv-cache-block+raw"
+	rocmKVBlockBundleKind     = "rocm-kv-state-block-bundle"
+	rocmKVBlockKind           = "rocm-kv-state-block"
+	defaultROCmKVBlockSize    = 16
+	rocmKVRestoreMillisUnit   = 0.01
 )
 
 type rocmKVCache struct {
@@ -73,6 +78,31 @@ type rocmKVCacheBlockSnapshot struct {
 	ValueWidth int                         `json:"value_width,omitempty"`
 	Key        rocmKVEncodedTensorSnapshot `json:"key"`
 	Value      rocmKVEncodedTensorSnapshot `json:"value"`
+}
+
+type rocmKVBlockBundleSnapshot struct {
+	Version     int                    `json:"version"`
+	Kind        string                 `json:"kind"`
+	Mode        string                 `json:"mode"`
+	BlockSize   int                    `json:"block_size"`
+	TokenCount  int                    `json:"token_count"`
+	MemoryBytes uint64                 `json:"memory_bytes,omitempty"`
+	Labels      map[string]string      `json:"labels,omitempty"`
+	Blocks      []rocmKVBlockBundleRef `json:"blocks,omitempty"`
+}
+
+type rocmKVBlockBundleRef struct {
+	Index      int               `json:"index"`
+	URI        string            `json:"uri"`
+	ChunkID    int               `json:"chunk_id,omitempty"`
+	State      state.ChunkRef    `json:"state,omitempty"`
+	TokenStart int               `json:"token_start"`
+	TokenCount int               `json:"token_count"`
+	KeyWidth   int               `json:"key_width,omitempty"`
+	ValueWidth int               `json:"value_width,omitempty"`
+	SizeBytes  uint64            `json:"size_bytes,omitempty"`
+	Encoding   string            `json:"encoding,omitempty"`
+	Labels     map[string]string `json:"labels,omitempty"`
 }
 
 type rocmKVEncodedTensorSnapshot struct {
@@ -220,6 +250,23 @@ func (cache *rocmKVCache) Snapshot() ([]byte, error) {
 	payload, err := json.Marshal(snapshot)
 	if err != nil {
 		return nil, core.E("rocm.KVCache.Snapshot", "encode snapshot", err)
+	}
+	return payload, nil
+}
+
+func (cache *rocmKVCache) snapshotBlock(block rocmKVCacheBlock) ([]byte, error) {
+	if cache == nil {
+		return nil, core.E("rocm.KVCache.SnapshotBlock", "cache is nil", nil)
+	}
+	snapshot := rocmKVCacheSnapshot{
+		Version:   1,
+		Mode:      cache.mode,
+		BlockSize: cache.blockSize,
+		Blocks:    []rocmKVCacheBlockSnapshot{block.snapshot()},
+	}
+	payload, err := json.Marshal(snapshot)
+	if err != nil {
+		return nil, core.E("rocm.KVCache.SnapshotBlock", "encode snapshot block", err)
 	}
 	return payload, nil
 }

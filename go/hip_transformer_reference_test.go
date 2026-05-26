@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	core "dappco.re/go"
+	"dappco.re/go/inference"
 )
 
 func TestHIPTransformerReferenceEmbeddingLookup_Good(t *testing.T) {
@@ -81,6 +82,15 @@ func TestHIPTransformerReferenceRoPE_Good(t *testing.T) {
 		float32(math.Sin(1)),
 		float32(math.Cos(0.1)),
 		float32(math.Sin(0.1)),
+	}, output, 0.0001)
+
+	output, err = hipReferenceRoPENeoXWithFrequencyDim([]float32{1, 2, 3, 4}, 1, 1, 4, 2)
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{
+		1*float32(math.Cos(1)) - 3*float32(math.Sin(1)),
+		2,
+		1*float32(math.Sin(1)) + 3*float32(math.Cos(1)),
+		4,
 	}, output, 0.0001)
 }
 
@@ -252,6 +262,10 @@ func TestHIPTransformerReferenceRoPEBadInputs_Bad(t *testing.T) {
 	_, err = hipReferenceRoPEWithFrequencyDim([]float32{1, 0, 0, 1}, 0, 10000, 2)
 	core.AssertError(t, err)
 	core.AssertContains(t, err.Error(), "frequency dimension")
+
+	_, err = hipReferenceRoPENeoXWithFrequencyDim([]float32{1, 0, 0, 1}, 0, 10000, 4, 3)
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "rotary count")
 }
 
 func TestHIPTransformerReferenceAttentionBadInputs_Bad(t *testing.T) {
@@ -309,6 +323,35 @@ func TestHIPTransformerReferenceSamplerBadInputsAndTies_Bad(t *testing.T) {
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, 1, index)
 	assertFloat32Near(t, 2, value)
+
+	index, value, err = hipReferenceGreedySampleSuppress([]float32{1, 4, 3}, []int32{1})
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 2, index)
+	assertFloat32Near(t, 3, value)
+
+	_, _, err = hipReferenceGreedySampleSuppress([]float32{1}, []int32{0})
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "all logits are suppressed")
+
+	sampled, err := hipGemma4Q4HostSampleResult(
+		[]float32{1, 5, 4},
+		inference.GenerateConfig{Temperature: 1, TopK: 2, TopP: 1, RepeatPenalty: 1},
+		[]int32{1},
+		nil,
+		0,
+	)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 2, sampled.TokenID)
+
+	penalized, err := hipGemma4Q4HostSampleResult(
+		[]float32{1, 5, 4},
+		inference.GenerateConfig{RepeatPenalty: 2},
+		nil,
+		[]int32{1},
+		0,
+	)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 2, penalized.TokenID)
 
 	probs, err := hipReferenceTopKProbabilities([]float32{1, 2, 2}, 1, 1)
 	core.RequireNoError(t, err)

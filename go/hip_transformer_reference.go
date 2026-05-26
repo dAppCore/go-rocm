@@ -219,6 +219,52 @@ func hipReferenceRoPEWithFrequencyDim(input []float32, position int, base float6
 	return out, nil
 }
 
+func hipReferenceRoPENeoXWithFrequencyDim(input []float32, position int, base float64, frequencyDim, rotaryCount int) ([]float32, error) {
+	if len(input) == 0 || len(input)%2 != 0 {
+		return nil, core.E("rocm.hip.ReferenceRoPENeoX", "input length must be positive and even", nil)
+	}
+	if position < 0 {
+		return nil, core.E("rocm.hip.ReferenceRoPENeoX", "position must be non-negative", nil)
+	}
+	if base <= 0 || math.IsNaN(base) || math.IsInf(base, 0) {
+		return nil, core.E("rocm.hip.ReferenceRoPENeoX", "base must be positive and finite", nil)
+	}
+	if frequencyDim < 0 || (frequencyDim > 0 && frequencyDim < len(input)) {
+		return nil, core.E("rocm.hip.ReferenceRoPENeoX", "frequency dimension must be zero or at least input length", nil)
+	}
+	if rotaryCount < 0 || rotaryCount > len(input) || rotaryCount%2 != 0 {
+		return nil, core.E("rocm.hip.ReferenceRoPENeoX", "rotary count must be zero or an even count no larger than input length", nil)
+	}
+	if frequencyDim == 0 {
+		frequencyDim = len(input)
+	}
+	if rotaryCount == 0 {
+		rotaryCount = len(input)
+	}
+	out := append([]float32(nil), input...)
+	half := len(input) / 2
+	activePairs := rotaryCount / 2
+	dim := float64(frequencyDim)
+	for pair := 0; pair < half; pair++ {
+		first := pair
+		second := pair + half
+		if pair >= activePairs {
+			out[first] = input[first]
+			out[second] = input[second]
+			continue
+		}
+		frequency := 1 / math.Pow(base, float64(pair*2)/dim)
+		angle := float64(position) * frequency
+		cosine := float32(math.Cos(angle))
+		sine := float32(math.Sin(angle))
+		x := input[first]
+		y := input[second]
+		out[first] = x*cosine - y*sine
+		out[second] = x*sine + y*cosine
+	}
+	return out, nil
+}
+
 func hipReferenceSingleHeadAttention(query []float32, keys, values [][]float32) ([]float32, []float32, error) {
 	return hipReferenceSingleHeadAttentionWithScale(query, keys, values, 0)
 }
@@ -340,6 +386,30 @@ func hipReferenceGreedySample(logits []float32) (int, float32, error) {
 			index = i
 			value = logits[i]
 		}
+	}
+	return index, value, nil
+}
+
+func hipReferenceGreedySampleSuppress(logits []float32, suppressTokens []int32) (int, float32, error) {
+	if len(suppressTokens) == 0 {
+		return hipReferenceGreedySample(logits)
+	}
+	if len(logits) == 0 {
+		return 0, 0, core.E("rocm.hip.ReferenceGreedySample", "logits are required", nil)
+	}
+	index := -1
+	value := float32(0)
+	for i, logit := range logits {
+		if hipTokenIsSuppressed(int32(i), suppressTokens) {
+			continue
+		}
+		if index < 0 || logit > value {
+			index = i
+			value = logit
+		}
+	}
+	if index < 0 {
+		return 0, 0, core.E("rocm.hip.ReferenceGreedySample", "all logits are suppressed", nil)
 	}
 	return index, value, nil
 }

@@ -572,14 +572,15 @@ func assertLoadedGemma4MLXQ4Layer0Smoke(t *testing.T, model *hipLoadedModel, emb
 			{layer: 15, headDim: 256, intermediate: 12288},
 		} {
 			layerCfg := allLayers.Layers[check.layer]
+			wantSlidingWindow := hipGemma4Q4EffectiveSlidingWindow(check.headDim, model.contextSize)
 			if layerCfg.HeadDim != check.headDim ||
 				layerCfg.QueryHeads != 8 ||
 				layerCfg.IntermediateSize != check.intermediate ||
 				layerCfg.RoPEBase != hipGemma4Q4LayerRoPEBase(check.headDim) ||
 				layerCfg.RoPERotaryDim != hipGemma4Q4LayerRoPERotaryDim(check.headDim) ||
-				layerCfg.SlidingWindow != hipGemma4Q4LayerSlidingWindow(check.headDim) {
+				layerCfg.SlidingWindow != wantSlidingWindow {
 				t.Fatalf("Gemma4 q4 layer %d config head=%d qheads=%d intermediate=%d rope=%f rotary=%d sliding=%d, want head=%d qheads=8 intermediate=%d rope=%f rotary=%d sliding=%d",
-					check.layer, layerCfg.HeadDim, layerCfg.QueryHeads, layerCfg.IntermediateSize, layerCfg.RoPEBase, layerCfg.RoPERotaryDim, layerCfg.SlidingWindow, check.headDim, check.intermediate, hipGemma4Q4LayerRoPEBase(check.headDim), hipGemma4Q4LayerRoPERotaryDim(check.headDim), hipGemma4Q4LayerSlidingWindow(check.headDim))
+					check.layer, layerCfg.HeadDim, layerCfg.QueryHeads, layerCfg.IntermediateSize, layerCfg.RoPEBase, layerCfg.RoPERotaryDim, layerCfg.SlidingWindow, check.headDim, check.intermediate, hipGemma4Q4LayerRoPEBase(check.headDim), hipGemma4Q4LayerRoPERotaryDim(check.headDim), wantSlidingWindow)
 			}
 			layerOutput, err := hipRunGemma4Q4DecoderLayer(context.Background(), model.driver, layerCfg, result.ScaledEmbedding, hipGemma4Q4DecoderLayerRequest{
 				Position: 1,
@@ -1804,6 +1805,91 @@ func TestHIPHardwareProjectionKernelSource_Good(t *testing.T) {
 		q4Output, err := hipRunMLXQ4ProjectionKernel(context.Background(), hipRuntime.driver, q4Req)
 		core.RequireNoError(t, err)
 		assertFloat32SlicesNear(t, q4Want, q4Output, 0.0001)
+
+		q4Buffers, err := q4Req.deviceBuffers(hipRuntime.driver)
+		core.RequireNoError(t, err)
+		defer q4Buffers.Close()
+		batchInput := append(append([]float32(nil), q4Req.Input...), []float32{2, 2, 2, 2, 2, 2, 2, 2}...)
+		batchPayload, err := hipFloat32Payload(batchInput)
+		core.RequireNoError(t, err)
+		batchInputBuffer, err := hipUploadByteBuffer(hipRuntime.driver, "rocm.hip.MLXQ4ProjectionBatchLaunch", "MLX q4 projection batch input", batchPayload, len(batchInput))
+		core.RequireNoError(t, err)
+		defer batchInputBuffer.Close()
+		batchOutputBuffer, err := hipRunMLXQ4ProjectionBatchKernelWithDeviceInput(context.Background(), hipRuntime.driver, batchInputBuffer, hipMLXQ4DeviceWeightConfig{
+			WeightPointer: q4Buffers.Weight.Pointer(),
+			ScalePointer:  q4Buffers.Scales.Pointer(),
+			BiasPointer:   q4Buffers.Biases.Pointer(),
+			WeightBytes:   q4Buffers.Weight.SizeBytes(),
+			ScaleBytes:    q4Buffers.Scales.SizeBytes(),
+			BiasBytes:     q4Buffers.Biases.SizeBytes(),
+			Rows:          q4Req.Rows,
+			Cols:          q4Req.Cols,
+			GroupSize:     q4Req.GroupSize,
+		}, 2)
+		core.RequireNoError(t, err)
+		defer batchOutputBuffer.Close()
+		batchOutput, err := hipReadFloat32DeviceOutput(batchOutputBuffer, "rocm.hip.MLXQ4ProjectionBatchLaunch", "MLX q4 projection batch output", q4Req.Rows*2)
+		core.RequireNoError(t, err)
+		assertFloat32SlicesNear(t, []float32{q4Want[0], q4Want[1], q4Want[0] * 2, q4Want[1] * 2}, batchOutput, 0.0001)
+
+		batchActivated, err := hipRunMLXQ4GELUTanhMultiplyBatchKernelWithDeviceInput(context.Background(), hipRuntime.driver, batchInputBuffer, hipMLXQ4DeviceWeightConfig{
+			WeightPointer: q4Buffers.Weight.Pointer(),
+			ScalePointer:  q4Buffers.Scales.Pointer(),
+			BiasPointer:   q4Buffers.Biases.Pointer(),
+			WeightBytes:   q4Buffers.Weight.SizeBytes(),
+			ScaleBytes:    q4Buffers.Scales.SizeBytes(),
+			BiasBytes:     q4Buffers.Biases.SizeBytes(),
+			Rows:          q4Req.Rows,
+			Cols:          q4Req.Cols,
+			GroupSize:     q4Req.GroupSize,
+		}, hipMLXQ4DeviceWeightConfig{
+			WeightPointer: q4Buffers.Weight.Pointer(),
+			ScalePointer:  q4Buffers.Scales.Pointer(),
+			BiasPointer:   q4Buffers.Biases.Pointer(),
+			WeightBytes:   q4Buffers.Weight.SizeBytes(),
+			ScaleBytes:    q4Buffers.Scales.SizeBytes(),
+			BiasBytes:     q4Buffers.Biases.SizeBytes(),
+			Rows:          q4Req.Rows,
+			Cols:          q4Req.Cols,
+			GroupSize:     q4Req.GroupSize,
+		}, 2)
+		core.RequireNoError(t, err)
+		defer batchActivated.Close()
+		activatedOutput, err := hipReadFloat32DeviceOutput(batchActivated, "rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "MLX q4 GELU tanh multiply batch output", q4Req.Rows*2)
+		core.RequireNoError(t, err)
+		secondReq := q4Req
+		secondReq.Input = []float32{2, 2, 2, 2, 2, 2, 2, 2}
+		wantActivated := append(
+			expectedGELUTanhMultiplyFromQ4(t, q4Req, q4Req),
+			expectedGELUTanhMultiplyFromQ4(t, secondReq, secondReq)...,
+		)
+		assertFloat32SlicesNear(t, wantActivated, activatedOutput, 0.0001)
+
+		batchMultiplierPayload, err := hipFloat32Payload([]float32{2, 3, 4, 5})
+		core.RequireNoError(t, err)
+		batchMultiplier, err := hipUploadByteBuffer(hipRuntime.driver, "rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "MLX q4 GELU tanh projection batch multiplier", batchMultiplierPayload, q4Req.Rows*2)
+		core.RequireNoError(t, err)
+		defer batchMultiplier.Close()
+		batchProjected, err := hipRunMLXQ4GELUTanhProjectionBatchKernelWithDeviceMultiplier(context.Background(), hipRuntime.driver, batchInputBuffer, batchMultiplier, hipMLXQ4DeviceWeightConfig{
+			WeightPointer: q4Buffers.Weight.Pointer(),
+			ScalePointer:  q4Buffers.Scales.Pointer(),
+			BiasPointer:   q4Buffers.Biases.Pointer(),
+			WeightBytes:   q4Buffers.Weight.SizeBytes(),
+			ScaleBytes:    q4Buffers.Scales.SizeBytes(),
+			BiasBytes:     q4Buffers.Biases.SizeBytes(),
+			Rows:          q4Req.Rows,
+			Cols:          q4Req.Cols,
+			GroupSize:     q4Req.GroupSize,
+		}, 2)
+		core.RequireNoError(t, err)
+		defer batchProjected.Close()
+		batchProjectedOutput, err := hipReadFloat32DeviceOutput(batchProjected, "rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "MLX q4 GELU tanh projection batch output", q4Req.Rows*2)
+		core.RequireNoError(t, err)
+		wantProjected := append(
+			expectedGELUTanhProjectionFromQ4(t, q4Req, []float32{2, 3}),
+			expectedGELUTanhProjectionFromQ4(t, secondReq, []float32{4, 5})...,
+		)
+		assertFloat32SlicesNear(t, wantProjected, batchProjectedOutput, 0.0001)
 	})
 
 	t.Run("jangtq-projection", func(t *testing.T) {
@@ -2024,6 +2110,62 @@ func TestHIPHardwareTransformerKernelSource_Good(t *testing.T) {
 	core.RequireNoError(t, err)
 	assertFloat32SlicesNear(t, []float32{float32(math.Cos(1)), float32(math.Sin(1))}, ropeOutput, 0.0001)
 
+	ropeBatchInputValues := []float32{1, 0, 3, 4, 2, 0, 1, 1}
+	ropeBatchInputPayload, err := hipFloat32Payload(ropeBatchInputValues)
+	core.RequireNoError(t, err)
+	ropeBatchInput, err := hipUploadByteBuffer(hipRuntime.driver, "rocm.hip.RMSNormRoPEHeadsBatchLaunch", "hardware rms norm rope heads batch input", ropeBatchInputPayload, len(ropeBatchInputValues))
+	core.RequireNoError(t, err)
+	defer ropeBatchInput.Close()
+	ropeBatchOutput, err := hipRunRMSNormRoPEHeadsBatchKernelWithDeviceInputWeightConfig(context.Background(), hipRuntime.driver, ropeBatchInput, hipRMSNormDeviceWeightConfig{
+		Count:          4,
+		WeightEncoding: hipRMSNormWeightEncodingNone,
+	}, 1, 2, 1, 1, 4, 2)
+	core.RequireNoError(t, err)
+	defer ropeBatchOutput.Close()
+	ropeBatchValues, err := hipReadFloat32DeviceOutput(ropeBatchOutput, "rocm.hip.RMSNormRoPEHeadsBatchLaunch", "hardware rms norm rope heads batch output", len(ropeBatchInputValues))
+	core.RequireNoError(t, err)
+	var ropeBatchWant []float32
+	unitWeight := []float32{1, 1, 1, 1}
+	for batch := 0; batch < 2; batch++ {
+		start := batch * 4
+		normalized, err := hipReferenceRMSNorm(ropeBatchInputValues[start:start+4], unitWeight, 0)
+		core.RequireNoError(t, err)
+		rotated, err := hipReferenceRoPEWithFrequencyDim(normalized[:2], 1+batch, 1, 4)
+		core.RequireNoError(t, err)
+		normalized[0] = rotated[0]
+		normalized[1] = rotated[1]
+		ropeBatchWant = append(ropeBatchWant, normalized...)
+	}
+	assertFloat32SlicesNear(t, ropeBatchWant, ropeBatchValues, 0.0001)
+
+	neoxBatchWeightPayload, err := hipUint16Payload([]uint16{0x0000, 0x3f00, 0xbf00, 0x3f80})
+	core.RequireNoError(t, err)
+	neoxBatchWeight, err := hipUploadByteBuffer(hipRuntime.driver, "rocm.hip.RMSNormRoPEHeadsBatchLaunch", "hardware rms norm rope heads batch neox bf16 weight", neoxBatchWeightPayload, 4)
+	core.RequireNoError(t, err)
+	defer neoxBatchWeight.Close()
+	neoxBatchOutput, err := hipRunRMSNormRoPEHeadsBatchKernelWithDeviceInputWeightConfig(context.Background(), hipRuntime.driver, ropeBatchInput, hipRMSNormDeviceWeightConfig{
+		WeightPointer:  neoxBatchWeight.Pointer(),
+		WeightBytes:    neoxBatchWeight.SizeBytes(),
+		Count:          4,
+		WeightEncoding: hipRMSNormWeightEncodingBF16,
+		Flags:          hipRMSNormLaunchFlagAddUnitWeight | hipRMSNormLaunchFlagRoPENeoX,
+	}, 1, 2, 1, 1, 4, 2)
+	core.RequireNoError(t, err)
+	defer neoxBatchOutput.Close()
+	neoxBatchValues, err := hipReadFloat32DeviceOutput(neoxBatchOutput, "rocm.hip.RMSNormRoPEHeadsBatchLaunch", "hardware rms norm rope heads batch neox output", len(ropeBatchInputValues))
+	core.RequireNoError(t, err)
+	neoxBatchWeights := []float32{1, 1.5, 0.5, 2}
+	var neoxBatchWant []float32
+	for batch := 0; batch < 2; batch++ {
+		start := batch * 4
+		normalized, err := hipReferenceRMSNorm(ropeBatchInputValues[start:start+4], neoxBatchWeights, 0)
+		core.RequireNoError(t, err)
+		rotated, err := hipReferenceRoPENeoXWithFrequencyDim(normalized, 1+batch, 1, 4, 2)
+		core.RequireNoError(t, err)
+		neoxBatchWant = append(neoxBatchWant, rotated...)
+	}
+	assertFloat32SlicesNear(t, neoxBatchWant, neoxBatchValues, 0.0001)
+
 	greedyReq := hipGreedySampleRequest{Logits: []float32{-1, 0.25, 0.2}}
 	greedyBuffers, err := greedyReq.deviceBuffers(hipRuntime.driver)
 	core.RequireNoError(t, err)
@@ -2158,6 +2300,127 @@ func TestHIPHardwareTransformerKernelSource_Good(t *testing.T) {
 		assertFloat32SlicesNear(t, wantOutput, modeAttentionOutput.Output, 0.0001)
 		assertFloat32SlicesNear(t, wantWeights, modeAttentionOutput.Weights, 0.0001)
 	}
+
+	t.Run("attention-heads-chunked-direct-token-kv", func(t *testing.T) {
+		for _, dim := range []int{256, 512} {
+			t.Run(core.Sprintf("dim%d", dim), func(t *testing.T) {
+				const tokenCount = 320
+				headCount := 2
+				if dim == 512 {
+					headCount = 4
+				}
+				queryValues := make([]float32, headCount*dim)
+				keyValues := make([]float32, tokenCount*dim)
+				valueValues := make([]float32, tokenCount*dim)
+				for index := range queryValues {
+					queryValues[index] = float32(math.Sin(float64(index)*0.013) * 0.75)
+				}
+				for index := range keyValues {
+					keyValues[index] = float32(math.Sin(float64(index)*0.017) * 0.5)
+				}
+				for index := range valueValues {
+					valueValues[index] = float32(math.Cos(float64(index)*0.011) * 0.5)
+				}
+				cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 1)
+				core.RequireNoError(t, err)
+				core.RequireNoError(t, cache.AppendVectors(0, dim, dim, keyValues, valueValues))
+				deviceKV, err := cache.MirrorToDevice(hipRuntime.driver)
+				core.RequireNoError(t, err)
+				defer deviceKV.Close()
+				table, err := deviceKV.KernelDescriptorTable()
+				core.RequireNoError(t, err)
+				defer table.Close()
+				queryPayload, err := hipFloat32Payload(queryValues)
+				core.RequireNoError(t, err)
+				queryBuffer, err := hipUploadByteBuffer(hipRuntime.driver, "rocm.hip.AttentionHeadsChunkedLaunch", "hardware chunked attention query", queryPayload, len(queryValues))
+				core.RequireNoError(t, err)
+				defer queryBuffer.Close()
+				normalOutput, err := hipAllocateByteBuffer(hipRuntime.driver, "rocm.hip.AttentionHeadsLaunch", "hardware normal attention output", uint64(len(queryValues)*4), len(queryValues))
+				core.RequireNoError(t, err)
+				defer normalOutput.Close()
+				chunkedOutput, err := hipAllocateByteBuffer(hipRuntime.driver, "rocm.hip.AttentionHeadsChunkedLaunch", "hardware chunked attention output", uint64(len(queryValues)*4), len(queryValues))
+				core.RequireNoError(t, err)
+				defer chunkedOutput.Close()
+				req := hipAttentionRequest{
+					QueryDim:        dim,
+					DeviceKV:        deviceKV,
+					DescriptorTable: table,
+					Scale:           1,
+				}
+				core.RequireNoError(t, hipRunAttentionHeadsOutputFromDeviceQueryToDeviceKernel(context.Background(), hipRuntime.driver, req, queryBuffer, headCount, normalOutput))
+				workspace := &hipAttentionHeadsChunkedWorkspace{}
+				defer workspace.Close()
+				core.RequireNoError(t, hipRunAttentionHeadsChunked(context.Background(), hipRuntime.driver, req, queryBuffer, headCount, dim, tokenCount, chunkedOutput, workspace))
+				normalGot, err := hipReadFloat32DeviceOutput(normalOutput, "rocm.hip.AttentionHeadsLaunch", "hardware normal attention output", len(queryValues))
+				core.RequireNoError(t, err)
+				chunkedGot, err := hipReadFloat32DeviceOutput(chunkedOutput, "rocm.hip.AttentionHeadsChunkedLaunch", "hardware chunked attention output", len(queryValues))
+				core.RequireNoError(t, err)
+				assertFloat32SlicesNear(t, normalGot, chunkedGot, 0.001)
+			})
+		}
+	})
+
+	attentionBatchQueryValues := []float32{
+		1, 0,
+		0, 1,
+		0, 1,
+		1, 1,
+	}
+	attentionBatchKeyValues := []float32{
+		1, 0,
+		0, 1,
+		1, 1,
+	}
+	attentionBatchValueValues := []float32{
+		2, 0,
+		0, 4,
+		4, 4,
+	}
+	attentionBatchQueryPayload, err := hipFloat32Payload(attentionBatchQueryValues)
+	core.RequireNoError(t, err)
+	attentionBatchQuery, err := hipUploadByteBuffer(hipRuntime.driver, "rocm.hip.AttentionHeadsBatchCausalLaunch", "hardware attention batch query", attentionBatchQueryPayload, len(attentionBatchQueryValues))
+	core.RequireNoError(t, err)
+	defer attentionBatchQuery.Close()
+	attentionBatchKeyPayload, err := hipFloat32Payload(attentionBatchKeyValues)
+	core.RequireNoError(t, err)
+	attentionBatchKeys, err := hipUploadByteBuffer(hipRuntime.driver, "rocm.hip.AttentionHeadsBatchCausalLaunch", "hardware attention batch keys", attentionBatchKeyPayload, len(attentionBatchKeyValues))
+	core.RequireNoError(t, err)
+	defer attentionBatchKeys.Close()
+	attentionBatchValuePayload, err := hipFloat32Payload(attentionBatchValueValues)
+	core.RequireNoError(t, err)
+	attentionBatchValues, err := hipUploadByteBuffer(hipRuntime.driver, "rocm.hip.AttentionHeadsBatchCausalLaunch", "hardware attention batch values", attentionBatchValuePayload, len(attentionBatchValueValues))
+	core.RequireNoError(t, err)
+	defer attentionBatchValues.Close()
+	attentionBatchOutput, err := hipAllocateByteBuffer(hipRuntime.driver, "rocm.hip.AttentionHeadsBatchCausalLaunch", "hardware attention batch output", uint64(len(attentionBatchQueryValues)*4), len(attentionBatchQueryValues))
+	core.RequireNoError(t, err)
+	defer attentionBatchOutput.Close()
+	core.RequireNoError(t, hipRunAttentionHeadsBatchCausalOutputFromDeviceQueryToDeviceKernel(context.Background(), hipRuntime.driver, hipAttentionHeadsBatchCausalDeviceRequest{
+		Key:             attentionBatchKeys,
+		Value:           attentionBatchValues,
+		Dim:             2,
+		TokenCount:      3,
+		HeadCount:       2,
+		QueryCount:      2,
+		QueryStartToken: 1,
+		Scale:           1,
+	}, attentionBatchQuery, attentionBatchOutput))
+	attentionBatchGot, err := hipReadFloat32DeviceOutput(attentionBatchOutput, "rocm.hip.AttentionHeadsBatchCausalLaunch", "hardware attention batch output", len(attentionBatchQueryValues))
+	core.RequireNoError(t, err)
+	attentionBatchKeysSplit, err := splitHIPReferenceVectors(attentionBatchKeyValues, 2)
+	core.RequireNoError(t, err)
+	attentionBatchValuesSplit, err := splitHIPReferenceVectors(attentionBatchValueValues, 2)
+	core.RequireNoError(t, err)
+	attentionBatchWant := make([]float32, 0, len(attentionBatchQueryValues))
+	for queryIndex := 0; queryIndex < 2; queryIndex++ {
+		visibleTokens := 1 + queryIndex + 1
+		for head := 0; head < 2; head++ {
+			queryBase := (queryIndex*2 + head) * 2
+			headOutput, _, err := hipReferenceSingleHeadAttentionWithScale(attentionBatchQueryValues[queryBase:queryBase+2], attentionBatchKeysSplit[:visibleTokens], attentionBatchValuesSplit[:visibleTokens], 1)
+			core.RequireNoError(t, err)
+			attentionBatchWant = append(attentionBatchWant, headOutput...)
+		}
+	}
+	assertFloat32SlicesNear(t, attentionBatchWant, attentionBatchGot, 0.0001)
 
 	vectorReq := hipVectorAddRequest{Left: []float32{1, -2, 0.5}, Right: []float32{4, 3, -0.25}}
 	vectorBuffers, err := vectorReq.deviceBuffers(hipRuntime.driver)

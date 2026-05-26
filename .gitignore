@@ -25,3 +25,12 @@ go.work.sum
 # env file
 .env
 
+# Local ROCm benchmark/profiler artifacts
+/.rocprofv3/
+/*.err
+/*.prof
+/book-retained-*
+/chat-template-public-smoke-*
+/llama-gemma4-*
+/prefill-forward-*
+/q4-*

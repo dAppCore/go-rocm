@@ -7,11 +7,13 @@ package rocm
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"testing"
 
 	core "dappco.re/go"
 	"dappco.re/go/inference"
 	"dappco.re/go/inference/state"
+	"dappco.re/go/inference/state/filestore"
 )
 
 func TestStateSession_Good_WakeStateReturnsRefs(t *testing.T) {
@@ -340,6 +342,102 @@ func TestStateSession_Good_SleepStateSerializesRuntimeOwnedKVSnapshot(t *testing
 	chunk, err := store.ResolveURI(context.Background(), "state://entry/kv")
 	core.RequireNoError(t, err)
 	core.AssertContains(t, string(chunk.Data), rocmKVCacheModeQ8)
+}
+
+func TestStateSession_Good_SleepWakeRuntimeOwnedKVBlockBundle(t *testing.T) {
+	store := state.NewInMemoryStore(nil)
+	cache, err := newROCmKVCache(rocmKVCacheModeQ8, 2)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(0, 2, 2, []float32{1, 0, 0, 1, 2, 3}, []float32{3, 2, 1, 0, -1, -2}))
+	session := newStateSessionWithRuntime(inference.ModelIdentity{Hash: "model-a"}, inference.TokenizerIdentity{}, nil, cache)
+
+	sleep, err := session.SleepState(context.Background(), inference.AgentMemorySleepRequest{
+		Store:    store,
+		EntryURI: "state://entry/kv-blocks",
+		Model:    inference.ModelIdentity{Hash: "model-a"},
+		Encoding: rocmKVBlockBundleEncoding,
+	})
+
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, rocmKVBlockBundleEncoding, sleep.Encoding)
+	core.AssertEqual(t, "runtime_owned_blocks", sleep.Labels["kv_serialize"])
+	core.AssertEqual(t, "state_refs", sleep.Labels["kv_block_bundle"])
+	core.AssertEqual(t, "2", sleep.Labels["kv_block_bundle_blocks"])
+	core.AssertEqual(t, 3, sleep.TokenCount)
+	core.AssertEqual(t, 2, sleep.BlocksWritten)
+	core.RequireTrue(t, len(sleep.Entry.StateRefs) == 2)
+	core.AssertEqual(t, "kv-block", sleep.Entry.StateRefs[0].Kind)
+	core.AssertEqual(t, rocmKVBlockRawEncoding, sleep.Entry.StateRefs[0].Encoding)
+	core.AssertEqual(t, "0", sleep.Entry.StateRefs[0].Labels["kv_block_token_start"])
+	core.AssertEqual(t, "2", sleep.Entry.StateRefs[1].Labels["kv_block_token_start"])
+	chunk, err := store.ResolveURI(context.Background(), "state://entry/kv-blocks")
+	core.RequireNoError(t, err)
+	var manifest rocmKVBlockBundleSnapshot
+	core.RequireNoError(t, json.Unmarshal(chunk.Data, &manifest))
+	core.AssertEqual(t, rocmKVBlockBundleKind, manifest.Kind)
+	core.AssertEqual(t, 2, len(manifest.Blocks))
+	core.AssertEqual(t, rocmKVBlockRawEncoding, manifest.Blocks[0].Encoding)
+	core.AssertEqual(t, true, manifest.Blocks[0].State.HasFrameOffset)
+	_, err = store.ResolveURI(context.Background(), manifest.Blocks[0].URI)
+	core.RequireNoError(t, err)
+
+	woken := NewStateSession(inference.ModelIdentity{Hash: "model-a"}, inference.TokenizerIdentity{}, nil)
+	wake, err := woken.WakeState(context.Background(), inference.AgentMemoryWakeRequest{
+		Store:    store,
+		EntryURI: "state://entry/kv-blocks",
+		Model:    inference.ModelIdentity{Hash: "model-a"},
+	})
+
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, rocmKVBlockBundleEncoding, wake.Bundle.Encoding)
+	core.AssertEqual(t, "runtime_owned", wake.Labels["kv_restore"])
+	core.AssertEqual(t, "block_stream", wake.Labels["kv_restore_path"])
+	core.AssertEqual(t, 3, wake.PrefixTokens)
+	core.AssertEqual(t, 2, wake.BlocksRead)
+	restored, ok := woken.runtime.(*rocmKVCache)
+	core.RequireTrue(t, ok)
+	keys, values, err := restored.Restore(0, 3)
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{1, 0, 0, 1, 2, 3}, keys, 0.02)
+	assertFloat32SlicesNear(t, []float32{3, 2, 1, 0, -1, -2}, values, 0.02)
+}
+
+func TestStateSession_Good_WakeKVBlockBundleBorrowsChunkRefs(t *testing.T) {
+	store := &borrowRecordingStateStore{InMemoryStore: state.NewInMemoryStore(nil)}
+	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 2)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(
+		0,
+		2,
+		3,
+		[]float32{1, 0, 0, 1},
+		[]float32{3, 2, 1, 0, -1, -2},
+	))
+	session := newStateSessionWithRuntime(inference.ModelIdentity{Hash: "model-a"}, inference.TokenizerIdentity{}, nil, cache)
+	_, err = session.SleepState(context.Background(), inference.AgentMemorySleepRequest{
+		Store:    store,
+		EntryURI: "state://entry/kv-borrow",
+		Model:    inference.ModelIdentity{Hash: "model-a"},
+		Encoding: rocmKVBlockBundleEncoding,
+	})
+	core.RequireNoError(t, err)
+	chunk, err := store.ResolveURI(context.Background(), "state://entry/kv-borrow")
+	core.RequireNoError(t, err)
+	var manifest rocmKVBlockBundleSnapshot
+	core.RequireNoError(t, json.Unmarshal(chunk.Data, &manifest))
+
+	woken := NewStateSession(inference.ModelIdentity{Hash: "model-a"}, inference.TokenizerIdentity{}, nil)
+	wake, err := woken.WakeState(context.Background(), inference.AgentMemoryWakeRequest{
+		Store:    store,
+		EntryURI: "state://entry/kv-borrow",
+		Model:    inference.ModelIdentity{Hash: "model-a"},
+	})
+
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, "block_stream", wake.Labels["kv_restore_path"])
+	core.AssertEqual(t, len(manifest.Blocks), len(store.borrowRefs))
+	core.AssertEqual(t, manifest.Blocks[0].State.ChunkID, store.borrowRefs[0].ChunkID)
+	core.AssertEqual(t, true, store.borrowRefs[0].HasFrameOffset)
 }
 
 func TestStateSession_Bad_SleepStateRuntimeOwnedKVWriteFailureKeepsRuntime(t *testing.T) {
@@ -920,14 +1018,13 @@ func TestStateSession_Good_RocmModelCapturesMetadataStateBundle(t *testing.T) {
 		},
 	}
 
-	bundle, err := model.CaptureState(context.Background(), "hello world", inference.WithMaxTokens(8), inference.WithTemperature(0.25), inference.WithStopTokens(2), inference.WithStopSequences("END"))
+	bundle, err := model.CaptureState(context.Background(), "hello world", inference.WithMaxTokens(8), inference.WithTemperature(0.25), inference.WithStopTokens(2))
 
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, "rocm-state-bundle-v1", bundle.Version)
 	core.AssertEqual(t, "qwen3", bundle.Model.Architecture)
 	core.AssertEqual(t, 8, bundle.Sampler.MaxTokens)
 	core.AssertEqual(t, []int32{2}, bundle.Sampler.StopTokens)
-	core.AssertEqual(t, []string{"END"}, bundle.Sampler.StopSequences)
 	core.AssertEqual(t, 2, bundle.PromptTokens)
 	core.AssertEqual(t, 2, bundle.GeneratedTokens)
 	core.AssertContains(t, bundle.PromptHash, "sha256:")
@@ -1155,6 +1252,100 @@ func TestStateSession_Good_RocmModelWakeStateRemirrorsKVSnapshotToHIPDevice(t *t
 	core.AssertEqual(t, true, device.closed)
 }
 
+func TestStateSession_Good_RocmModelWakeStateRestoresKVBlockBundleDirectToHIPDevice(t *testing.T) {
+	store := state.NewInMemoryStore(nil)
+	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 2)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(
+		0,
+		2,
+		3,
+		[]float32{1, 0.5, -1, 0, 2, -2},
+		[]float32{0.75, -0.5, 0.25, 1, -1, 0.5, 2, -2, 3},
+	))
+	sleeping := newStateSessionWithRuntime(inference.ModelIdentity{Hash: "model-a"}, inference.TokenizerIdentity{}, nil, cache)
+	_, err = sleeping.SleepState(context.Background(), inference.AgentMemorySleepRequest{
+		Store:    store,
+		EntryURI: "state://entry/kv-blocks-direct",
+		Model:    inference.ModelIdentity{Hash: "model-a"},
+		Encoding: rocmKVBlockBundleEncoding,
+	})
+	core.RequireNoError(t, err)
+	driver := &fakeHIPDriver{available: true}
+	model := &rocmModel{
+		modelInfo: inference.ModelInfo{Architecture: "qwen3"},
+		native:    &hipLoadedModel{driver: driver},
+	}
+
+	wake, err := model.WakeState(context.Background(), inference.AgentMemoryWakeRequest{
+		Store:    store,
+		EntryURI: "state://entry/kv-blocks-direct",
+		Model:    inference.ModelIdentity{Hash: "model-a"},
+	})
+
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, "hip_device_block_stream", wake.Labels["kv_restore"])
+	core.AssertEqual(t, "block_stream", wake.Labels["kv_device_restore"])
+	core.AssertEqual(t, "borrow_ref_pinned", wake.Labels["kv_device_restore_path"])
+	core.AssertEqual(t, "hip_device_mirror", wake.Labels["kv_backing"])
+	device, ok := model.state.runtime.(*rocmDeviceKVCache)
+	core.RequireTrue(t, ok)
+	core.AssertEqual(t, 3, device.TokenCount())
+	core.AssertEqual(t, 2, device.PageCount())
+	if rocmHIPPinnedHostCopySupported {
+		core.AssertEqual(t, true, driver.pinnedCopies >= 4)
+	}
+
+	host, err := device.hostCache()
+	core.RequireNoError(t, err)
+	keys, values, err := host.Restore(0, 3)
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{1, 0.5, -1, 0, 2, -2}, keys, 0.15)
+	assertFloat32SlicesNear(t, []float32{0.75, -0.5, 0.25, 1, -1, 0.5, 2, -2, 3}, values, 0.25)
+}
+
+func TestStateSession_Good_RocmModelWakeStateDirectHIPDeviceFromFileStoreBorrowedBlocks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.mvlog")
+	writer, err := filestore.Create(context.Background(), path)
+	core.RequireNoError(t, err)
+	cache, err := newROCmKVCache(rocmKVCacheModeQ8, 2)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(0, 2, 2, []float32{1, 0, 0, 1}, []float32{2, 0, 0, 2}))
+	sleeping := newStateSessionWithRuntime(inference.ModelIdentity{Hash: "model-a"}, inference.TokenizerIdentity{}, nil, cache)
+	_, err = sleeping.SleepState(context.Background(), inference.AgentMemorySleepRequest{
+		Store:    writer,
+		EntryURI: "state://entry/kv-file-blocks",
+		Model:    inference.ModelIdentity{Hash: "model-a"},
+		Encoding: rocmKVBlockBundleEncoding,
+	})
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, writer.Close())
+	reader, err := filestore.Open(context.Background(), path)
+	core.RequireNoError(t, err)
+	defer reader.Close()
+	driver := &fakeHIPDriver{available: true}
+	model := &rocmModel{
+		modelInfo: inference.ModelInfo{Architecture: "qwen3"},
+		native:    &hipLoadedModel{driver: driver},
+	}
+
+	wake, err := model.WakeState(context.Background(), inference.AgentMemoryWakeRequest{
+		Store:    reader,
+		EntryURI: "state://entry/kv-file-blocks",
+		Model:    inference.ModelIdentity{Hash: "model-a"},
+	})
+
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, "hip_device_block_stream", wake.Labels["kv_restore"])
+	core.AssertEqual(t, "borrow_ref_pinned", wake.Labels["kv_device_restore_path"])
+	device, ok := model.state.runtime.(*rocmDeviceKVCache)
+	core.RequireTrue(t, ok)
+	core.AssertEqual(t, 2, device.TokenCount())
+	if rocmHIPPinnedHostCopySupported {
+		core.AssertEqual(t, true, driver.pinnedCopies >= 2)
+	}
+}
+
 func TestStateSession_Good_RocmModelWakeStateKeepsPackageLocalKVOnDeviceMirrorFailure(t *testing.T) {
 	store := state.NewInMemoryStore(nil)
 	cache, err := newROCmKVCache(rocmKVCacheModeQ8, 2)
@@ -1273,6 +1464,11 @@ type failingStateBinaryWriter struct {
 	payload       []byte
 }
 
+type borrowRecordingStateStore struct {
+	*state.InMemoryStore
+	borrowRefs []state.ChunkRef
+}
+
 type failingStateRuntime struct {
 	err        error
 	closeCalls int
@@ -1298,4 +1494,13 @@ func (writer *failingStateBinaryWriter) PutBytes(_ context.Context, data []byte,
 	writer.options = opts
 	writer.payload = append([]byte(nil), data...)
 	return state.ChunkRef{}, writer.err
+}
+
+func (store *borrowRecordingStateStore) BorrowRefBytes(ctx context.Context, ref state.ChunkRef) (state.BorrowedChunk, error) {
+	store.borrowRefs = append(store.borrowRefs, ref)
+	chunk, err := state.ResolveRefBytes(ctx, store.InMemoryStore, ref)
+	if err != nil {
+		return state.BorrowedChunk{}, err
+	}
+	return state.BorrowedChunk{Ref: chunk.Ref, Data: chunk.Data}, nil
 }
