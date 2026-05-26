@@ -58,6 +58,31 @@ type rocmDeviceKVCache struct {
 	borrowed   bool
 }
 
+var rocmDeviceKVCachePool = sync.Pool{
+	New: func() any { return &rocmDeviceKVCache{} },
+}
+
+func rocmBorrowDeviceKVCache(driver nativeHIPDriver, mode string, blockSize, tokenCount int, pages []rocmDeviceKVPage, borrowed bool) *rocmDeviceKVCache {
+	cache := rocmDeviceKVCachePool.Get().(*rocmDeviceKVCache)
+	*cache = rocmDeviceKVCache{
+		driver:     driver,
+		mode:       mode,
+		blockSize:  blockSize,
+		pages:      pages,
+		tokenCount: tokenCount,
+		borrowed:   borrowed,
+	}
+	return cache
+}
+
+func rocmReleaseDeviceKVCache(cache *rocmDeviceKVCache) {
+	if cache == nil {
+		return
+	}
+	*cache = rocmDeviceKVCache{}
+	rocmDeviceKVCachePool.Put(cache)
+}
+
 type rocmDeviceKVPage struct {
 	tokenStart int
 	tokenCount int
@@ -495,13 +520,7 @@ func (cache *rocmDeviceKVCache) withAppendedToken(key, value []float32) (*rocmDe
 		return nil, core.E("rocm.KVCache.DeviceAppend", "copy KV value page", err)
 	}
 	tokenStart := cache.TokenCount()
-	next := &rocmDeviceKVCache{
-		driver:     cache.driver,
-		mode:       cache.mode,
-		blockSize:  cache.blockSize,
-		tokenCount: tokenStart + 1,
-		pages:      rocmDeviceKVCopyPagesWithExtra(cache.pages, 1),
-	}
+	next := rocmBorrowDeviceKVCache(cache.driver, cache.mode, cache.blockSize, tokenStart+1, rocmDeviceKVCopyPagesWithExtra(cache.pages, 1), false)
 	for index := range next.pages {
 		next.pages[index].owned = false
 	}
@@ -618,13 +637,7 @@ func (cache *rocmDeviceKVCache) withAppendedDeviceRowsWindow(ctx context.Context
 	}
 	pageCount := (tokenCount + blockSize - 1) / blockSize
 	tokenStart := cache.TokenCount()
-	next := &rocmDeviceKVCache{
-		driver:     cache.driver,
-		mode:       mode,
-		blockSize:  blockSize,
-		tokenCount: tokenStart + tokenCount,
-		pages:      rocmDeviceKVCopyPagesWithExtra(cache.pages, pageCount),
-	}
+	next := rocmBorrowDeviceKVCache(cache.driver, mode, blockSize, tokenStart+tokenCount, rocmDeviceKVCopyPagesWithExtra(cache.pages, pageCount), false)
 	for index := range next.pages {
 		next.pages[index].owned = false
 	}
@@ -689,8 +702,9 @@ func newROCmDeviceKVCacheFromDeviceToken(ctx context.Context, driver nativeHIPDr
 	if err != nil {
 		return nil, err
 	}
-	cache := &rocmDeviceKVCache{driver: driver, mode: mode, blockSize: blockSize}
+	cache := rocmBorrowDeviceKVCache(driver, mode, blockSize, 0, nil, false)
 	next, err := cache.withAppendedEncodedToken(encodedKey, encodedValue, key.Count(), value.Count())
+	rocmReleaseDeviceKVCache(cache)
 	if err != nil {
 		_ = rocmDeviceKVTensorFree(driver, encodedKey.pointer, encodedKey.sizeBytes)
 		_ = rocmDeviceKVTensorFree(driver, encodedValue.pointer, encodedValue.sizeBytes)
@@ -716,8 +730,10 @@ func newROCmDeviceKVCacheFromDeviceRows(ctx context.Context, driver nativeHIPDri
 	if blockSize <= 0 {
 		blockSize = defaultROCmKVBlockSize
 	}
-	cache := &rocmDeviceKVCache{driver: driver, mode: mode, blockSize: blockSize}
-	return cache.withAppendedDeviceRowsWindow(ctx, key, value, keyWidth, valueWidth, tokenCount, window)
+	cache := rocmBorrowDeviceKVCache(driver, mode, blockSize, 0, nil, false)
+	next, err := cache.withAppendedDeviceRowsWindow(ctx, key, value, keyWidth, valueWidth, tokenCount, window)
+	rocmReleaseDeviceKVCache(cache)
+	return next, err
 }
 
 func (cache *rocmDeviceKVCache) withAppendedEncodedToken(key, value rocmDeviceKVTensor, keyWidth, valueWidth int) (*rocmDeviceKVCache, error) {
@@ -762,13 +778,7 @@ func (cache *rocmDeviceKVCache) withAppendedEncodedRows(key, value rocmDeviceKVT
 		return nil, core.E("rocm.KVCache.DeviceAppend", "encoded device KV row byte count mismatch", nil)
 	}
 	tokenStart := cache.TokenCount()
-	next := &rocmDeviceKVCache{
-		driver:     cache.driver,
-		mode:       cache.mode,
-		blockSize:  cache.blockSize,
-		tokenCount: tokenStart + tokenCount,
-		pages:      rocmDeviceKVCopyPagesWithExtra(cache.pages, 1),
-	}
+	next := rocmBorrowDeviceKVCache(cache.driver, cache.mode, cache.blockSize, tokenStart+tokenCount, rocmDeviceKVCopyPagesWithExtra(cache.pages, 1), false)
 	for index := range next.pages {
 		next.pages[index].owned = false
 	}

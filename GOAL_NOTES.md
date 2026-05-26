@@ -13363,3 +13363,71 @@ This is a clean production-path allocation win, not the long-context decode
 breakthrough. Turn 10 improved only to `65.31 tok/s`; the next real speed target
 remains `rocm_attention_heads_chunked_stage1` and q4 projection at retained
 context.
+
+## 2026-05-26: Cache Wrapper and Probe Allocation Batch
+
+The next 2048-token fast-loop batch targeted host allocation only. Retained
+device-state layer slices now reuse a small pool, append-created
+`rocmDeviceKVCache` owner wrappers are borrowed and released as ownership moves
+to the next retained state, Gemma4 q4 forward config is prepared during
+`LoadModel`, q4 config validation no longer allocates a scratch input slice,
+token probe events are not constructed when no probe sink is installed, and the
+q4 greedy readback payload is stack-backed.
+
+AX-11 microbenchmarks for the touched hot surfaces:
+
+```text
+BenchmarkHIPGemma4Q4DeviceLayerKVStateValueHandoff-32             2.648 ns/op  0 B/op  0 allocs/op
+BenchmarkHIPGemma4Q4DeviceLayerStatePool_Reused-32               28.86 ns/op   0 B/op  0 allocs/op
+BenchmarkROCmDeviceKVCacheBorrowRelease_Hot-32                   11.14 ns/op   0 B/op  0 allocs/op
+BenchmarkHIPMLXQ4DeviceWeightConfigValidateInputCount_Hot-32      2.906 ns/op  0 B/op  0 allocs/op
+BenchmarkROCmModelEmitTokenProbe_NoSink-32                        7.969 ns/op  0 B/op  0 allocs/op
+```
+
+Short generation guard:
+
+```text
+2048 text:Hi:
+  19811032696 ns/op, 103.4 tok/s, 20404472 B/op, 72262 allocs/op
+  stderr_bytes=0
+```
+
+Chapter-shaped fast guard:
+
+```text
+2048 generated tokens, context_len=4096, chapter-1 lighthouse prompt:
+  22550870699 ns/op, 90.82 tok/s, 44950928 B/op, 87745 allocs/op
+  stderr_bytes=0
+```
+
+Retained-book acceptance after the batch:
+
+```text
+book_wall_s/op             41.23
+book_decode_s/op           36.97
+book_generated_tokens/op    3021
+book_tok/s                 73.27
+book_turn01_tok/s         103.6
+book_turn10_tok/s          64.47
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+stderr_bytes                   0
+B/op                    232519696
+allocs/op                  227862
+output: /tmp/go-rocm-book-10turn-fullcap-greedy-cachepool.md
+```
+
+The allocation step-down is now:
+
+```text
+3.40M -> 2.04M -> 1.98M -> 1.85M -> 1.78M -> 1.69M -> 1.31M
+  -> 1.23M -> 1.16M -> 0.73M -> 0.53M -> 0.46M -> 0.31M
+  -> 0.28M -> 0.26M -> 0.11M -> 0.072M allocs/op
+```
+
+This batch is accepted as an allocation cleanup because the 2048 short gate
+stayed above `100 tok/s`, the chapter-shaped guard stayed above `90 tok/s`, and
+the retained book route stayed within the `<=90s` wall target with arc retention.
+It is not a decode breakthrough: turn 10 is still `64.47 tok/s`, so the next
+speed work remains retained long-context attention/projection rather than more
+wrapper cleanup.

@@ -218,9 +218,19 @@ for host sampling then moved the short guard to `19775658852 ns/op`,
 The retained book route stayed green at `40.60s` wall, `36.36s` decode, `3021`
 generated tokens, `74.41 tok/s` average, `65.31 tok/s` on turn 10, empty stderr,
 no cap hits, and chapter-10 anchor hits of `3`, while dropping to
-`251419160 B/op` and `277596 allocs/op`. This is the current best allocation
-route for the book endpoint, but not the final driver endpoint: later-turn
-decode is still only `65.3 tok/s`, below the
+`251419160 B/op` and `277596 allocs/op`. Reusing retained device-state layer
+slices and device KV cache owner wrappers, warming the immutable Gemma4 q4
+forward config during load, skipping token-probe construction when no probe sink
+is installed, avoiding q4 config validation scratch slices, and stack-backing
+the greedy readback payload then moved the short guard to `19811032696 ns/op`,
+`103.4 tok/s`, `20404472 B/op`, and `72262 allocs/op`. The chapter-shaped
+2048-token guard stayed above threshold at `22550870699 ns/op`, `90.82 tok/s`,
+`44950928 B/op`, and `87745 allocs/op`. The retained book route stayed green at
+`41.23s` wall, `36.97s` decode, `3021` generated tokens, `73.27 tok/s` average,
+`64.47 tok/s` on turn 10, empty stderr, no cap hits, and chapter-10 anchor hits
+of `3`, while dropping to `232519696 B/op` and `227862 allocs/op`. This is the
+current best allocation route for the book endpoint, but not the final driver
+endpoint: later-turn decode is still only `64.5 tok/s`, below the
 `90-100+ tok/s` target, and the visible output remains repetitive. Keep tuning
 retained long-context attention and state quality until the later turns stay
 near the target.
@@ -242,6 +252,8 @@ max_new_tokens  route                    tok/s   B/op       allocs/op
 2048 text:Hi    token/PLE workspace      103.5    49.54M      255531
 2048 text:Hi    state handoff cleanup    103.6    36.32M      110184
 2048 chapter    state handoff cleanup     92.22   60.79M      125647
+2048 text:Hi    cache/probe cleanup      103.4    20.40M       72262
+2048 chapter    cache/probe cleanup       90.82   44.95M       87745
 ```
 
 The earlier 256-token chunked route was rejected because it fell to `58.24

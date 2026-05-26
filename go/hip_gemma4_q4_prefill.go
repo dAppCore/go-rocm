@@ -1181,11 +1181,8 @@ func hipGemma4Q4DeviceDecodeStateFromPrefillForward(forward *hipGemma4Q4PrefillF
 	if forward == nil {
 		return nil, core.E(hipGemma4Q4Layer0Operation, "prefill forward output is required", nil)
 	}
-	state := &hipGemma4Q4DeviceDecodeState{
-		mode:         firstNonEmptyString(mode, rocmKVCacheModeFP16),
-		layers:       make([]hipGemma4Q4DeviceLayerKVState, 0, len(forward.Layers)),
-		appendLayers: len(forward.Layers),
-	}
+	state := hipNewGemma4Q4DeviceDecodeState(firstNonEmptyString(mode, rocmKVCacheModeFP16), len(forward.Layers))
+	state.appendLayers = len(forward.Layers)
 	success := false
 	defer func() {
 		if !success {

@@ -2474,6 +2474,19 @@ func BenchmarkHIPGemma4Q4DeviceLayerKVStateValueHandoff(b *testing.B) {
 	}
 }
 
+func BenchmarkHIPGemma4Q4DeviceLayerStatePool_Reused(b *testing.B) {
+	layers := hipBorrowGemma4Q4DeviceLayerStates(32)
+	hipReleaseGemma4Q4DeviceLayerStates(layers)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		layers = hipBorrowGemma4Q4DeviceLayerStates(32)
+		if len(layers) != 0 || cap(layers) < 32 {
+			b.Fatalf("layer state slice len/cap = %d/%d, want 0/>=32", len(layers), cap(layers))
+		}
+		hipReleaseGemma4Q4DeviceLayerStates(layers)
+	}
+}
+
 func BenchmarkHIPGemma4Q4DeviceLayerKVStateClose_Borrowed(b *testing.B) {
 	driver := &fakeHIPDriver{available: true}
 	cache := &rocmDeviceKVCache{
@@ -2512,6 +2525,49 @@ func BenchmarkHIPGemma4Q4DeviceLayerKVStateClose_Borrowed(b *testing.B) {
 		if cache.closed || table.closed {
 			b.Fatal("borrowed layer close closed source owner")
 		}
+	}
+}
+
+func BenchmarkROCmDeviceKVCacheBorrowRelease_Hot(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	cache := rocmBorrowDeviceKVCache(driver, rocmKVCacheModeKQ8VQ4, 1, 0, nil, false)
+	rocmReleaseDeviceKVCache(cache)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		cache = rocmBorrowDeviceKVCache(driver, rocmKVCacheModeKQ8VQ4, 1, 128, nil, false)
+		if cache.driver != driver || cache.mode != rocmKVCacheModeKQ8VQ4 || cache.TokenCount() != 128 {
+			b.Fatalf("cache = %#v", cache)
+		}
+		rocmReleaseDeviceKVCache(cache)
+	}
+}
+
+func BenchmarkHIPMLXQ4DeviceWeightConfigValidateInputCount_Hot(b *testing.B) {
+	cfg := hipMLXQ4DeviceWeightConfig{
+		WeightPointer: 0x1000,
+		ScalePointer:  0x2000,
+		BiasPointer:   0x3000,
+		WeightBytes:   2304 * 288 * 4,
+		ScaleBytes:    2304 * 36 * 2,
+		BiasBytes:     2304 * 36 * 2,
+		Rows:          2304,
+		Cols:          2304,
+		GroupSize:     64,
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := cfg.validateInputCount(2304); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkROCmModelEmitTokenProbe_NoSink(b *testing.B) {
+	model := &rocmModel{}
+	token := inference.Token{ID: 42, Text: "hello"}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		model.emitTokenProbe(token, 2, i+1)
 	}
 }
 

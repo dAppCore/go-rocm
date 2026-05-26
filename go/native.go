@@ -133,6 +133,16 @@ func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (infe
 		return nil, core.E("rocm.LoadModel", "load native model", err)
 	}
 
+	if hipModel, ok := loaded.(*hipLoadedModel); ok &&
+		isROCmGemma4Architecture(modelInfo.Architecture) &&
+		modelInfo.QuantBits == 4 &&
+		modelInfo.NumLayers > 0 {
+		if _, err := hipModel.cachedGemma4Q4ForwardConfig(modelInfo.NumLayers); err != nil {
+			_ = loaded.Close()
+			return nil, core.E("rocm.LoadModel", "prepare Gemma4 q4 forward config", err)
+		}
+	}
+
 	model := &rocmModel{native: loaded, modelType: modelInfo.Architecture, modelInfo: modelInfo}
 	if loadConfig.AdapterPath != "" {
 		if _, err := model.LoadAdapter(loadConfig.AdapterPath); err != nil {
@@ -1706,7 +1716,16 @@ func stopSequencePrefixHold(text string, stops []string) int {
 }
 
 func (m *rocmModel) emitTokenProbe(token inference.Token, promptTokens, generatedTokens int) {
-	m.emitProbe(inference.ProbeEvent{
+	if m == nil {
+		return
+	}
+	m.stateMutex.Lock()
+	sink := m.probeSink
+	m.stateMutex.Unlock()
+	if sink == nil {
+		return
+	}
+	sink.EmitProbe(inference.ProbeEvent{
 		Kind:  inference.ProbeEventToken,
 		Phase: inference.ProbePhaseDecode,
 		Token: &inference.ProbeToken{ID: token.ID, Text: token.Text, PromptTokens: promptTokens, GeneratedTokens: generatedTokens},

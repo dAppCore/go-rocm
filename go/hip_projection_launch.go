@@ -2231,11 +2231,11 @@ func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBuffer(ctx context.C
 	if err := hipLaunchKernel(driver, config); err != nil {
 		return hipGreedySampleResult{}, err
 	}
-	payload := make([]byte, hipMLXQ4ProjectionBestBytes)
-	if err := driver.CopyDeviceToHost(best.Pointer(), payload); err != nil {
+	var payload [hipMLXQ4ProjectionBestBytes]byte
+	if err := driver.CopyDeviceToHost(best.Pointer(), payload[:]); err != nil {
 		return hipGreedySampleResult{}, core.E("rocm.hip.MLXQ4ProjectionGreedyLaunch", "copy greedy best", err)
 	}
-	return hipUnpackGreedyBest(binary.LittleEndian.Uint64(payload), softcap, cfg.Rows)
+	return hipUnpackGreedyBest(binary.LittleEndian.Uint64(payload[:]), softcap, cfg.Rows)
 }
 
 func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppress(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, best *hipDeviceByteBuffer, suppressTokens []int32) (hipGreedySampleResult, error) {

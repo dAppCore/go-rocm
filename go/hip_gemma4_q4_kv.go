@@ -4,7 +4,11 @@
 
 package rocm
 
-import core "dappco.re/go"
+import (
+	"sync"
+
+	core "dappco.re/go"
+)
 
 type hipGemma4Q4DeviceDecodeState struct {
 	mode           string
@@ -22,6 +26,47 @@ type hipGemma4Q4DeviceLayerKVState struct {
 	borrowedDescriptorTable bool
 }
 
+var hipGemma4Q4DeviceLayerStatePool = struct {
+	sync.Mutex
+	layers [][]hipGemma4Q4DeviceLayerKVState
+}{}
+
+const hipGemma4Q4DeviceLayerStatePoolMax = 4096
+
+func hipNewGemma4Q4DeviceDecodeState(mode string, layerCapacity int) *hipGemma4Q4DeviceDecodeState {
+	return &hipGemma4Q4DeviceDecodeState{mode: mode, layers: hipBorrowGemma4Q4DeviceLayerStates(layerCapacity)}
+}
+
+func hipBorrowGemma4Q4DeviceLayerStates(layerCapacity int) []hipGemma4Q4DeviceLayerKVState {
+	if layerCapacity <= 0 {
+		layerCapacity = 1
+	}
+	hipGemma4Q4DeviceLayerStatePool.Lock()
+	for index := len(hipGemma4Q4DeviceLayerStatePool.layers) - 1; index >= 0; index-- {
+		layers := hipGemma4Q4DeviceLayerStatePool.layers[index]
+		hipGemma4Q4DeviceLayerStatePool.layers[index] = nil
+		hipGemma4Q4DeviceLayerStatePool.layers = hipGemma4Q4DeviceLayerStatePool.layers[:index]
+		if cap(layers) >= layerCapacity {
+			hipGemma4Q4DeviceLayerStatePool.Unlock()
+			return layers[:0]
+		}
+	}
+	hipGemma4Q4DeviceLayerStatePool.Unlock()
+	return make([]hipGemma4Q4DeviceLayerKVState, 0, layerCapacity)
+}
+
+func hipReleaseGemma4Q4DeviceLayerStates(layers []hipGemma4Q4DeviceLayerKVState) {
+	if cap(layers) == 0 {
+		return
+	}
+	clear(layers[:cap(layers)])
+	hipGemma4Q4DeviceLayerStatePool.Lock()
+	if len(hipGemma4Q4DeviceLayerStatePool.layers) < hipGemma4Q4DeviceLayerStatePoolMax {
+		hipGemma4Q4DeviceLayerStatePool.layers = append(hipGemma4Q4DeviceLayerStatePool.layers, layers[:0])
+	}
+	hipGemma4Q4DeviceLayerStatePool.Unlock()
+}
+
 func (layer *hipGemma4Q4DeviceLayerKVState) Close() error {
 	if layer == nil {
 		return nil
@@ -33,8 +78,11 @@ func (layer *hipGemma4Q4DeviceLayerKVState) Close() error {
 		}
 	}
 	if !layer.borrowedCache {
-		if err := layer.cache.Close(); err != nil {
+		cache := layer.cache
+		if err := cache.Close(); err != nil {
 			lastErr = core.E("rocm.hip.Gemma4Q4DeviceKV", "free device KV layer", err)
+		} else {
+			rocmReleaseDeviceKVCache(cache)
 		}
 	}
 	layer.cache = nil
@@ -72,7 +120,8 @@ func hipMirrorGemma4Q4DecodeState(driver nativeHIPDriver, cfg hipGemma4Q4Forward
 	if mode == "" {
 		mode = rocmKVCacheModeFP16
 	}
-	deviceState := &hipGemma4Q4DeviceDecodeState{mode: mode, remirrorLayers: len(state.Layers), layers: make([]hipGemma4Q4DeviceLayerKVState, 0, len(state.Layers))}
+	deviceState := hipNewGemma4Q4DeviceDecodeState(mode, len(state.Layers))
+	deviceState.remirrorLayers = len(state.Layers)
 	for index, layerState := range state.Layers {
 		layer, err := hipMirrorGemma4Q4LayerDecodeState(driver, cfg.Layers[index], layerState, mode)
 		if err != nil {
@@ -121,7 +170,7 @@ func hipUpdateGemma4Q4DeviceDecodeState(driver nativeHIPDriver, cfg hipGemma4Q4F
 	if previousDevice.mode != "" && mode != previousDevice.mode {
 		return nil, core.E("rocm.hip.Gemma4Q4DeviceKV", "device KV mode mismatch", nil)
 	}
-	nextDevice := &hipGemma4Q4DeviceDecodeState{mode: mode, layers: make([]hipGemma4Q4DeviceLayerKVState, 0, len(nextHost.Layers))}
+	nextDevice := hipNewGemma4Q4DeviceDecodeState(mode, len(nextHost.Layers))
 	type ownershipAction struct {
 		oldLayer *hipGemma4Q4DeviceLayerKVState
 		newCache *rocmDeviceKVCache
@@ -172,16 +221,25 @@ func hipUpdateGemma4Q4DeviceDecodeState(driver nativeHIPDriver, cfg hipGemma4Q4F
 		if action.oldLayer.borrowedCache {
 			// The source owner layer handles the shared cache once.
 		} else if action.append {
-			if err := action.oldLayer.cache.transferPagesTo(action.newCache); err != nil {
+			oldCache := action.oldLayer.cache
+			if err := oldCache.transferPagesTo(action.newCache); err != nil {
 				return nil, err
 			}
-		} else if err := action.oldLayer.cache.Close(); err != nil {
-			return nil, err
+			action.oldLayer.cache = nil
+			rocmReleaseDeviceKVCache(oldCache)
+		} else {
+			oldCache := action.oldLayer.cache
+			if err := oldCache.Close(); err != nil {
+				return nil, err
+			}
+			action.oldLayer.cache = nil
+			rocmReleaseDeviceKVCache(oldCache)
 		}
 		if err := action.oldLayer.closeDescriptorTable(); err != nil {
 			return nil, err
 		}
 	}
+	hipReleaseGemma4Q4DeviceLayerStates(previousDevice.layers)
 	previousDevice.layers = nil
 	previousDevice.closed = true
 	success = true
@@ -204,20 +262,32 @@ func hipFinalizeGemma4Q4ForwardDeviceState(previous, next *hipGemma4Q4DeviceDeco
 		if oldLayer.borrowedCache {
 			// The source owner layer handles the shared cache once.
 		} else if oldLayer.cache.ownsAnyPages() && newLayer.cache.borrowsPagesFrom(oldLayer.cache) {
-			if err := oldLayer.cache.transferPagesTo(newLayer.cache); err != nil {
+			oldCache := oldLayer.cache
+			if err := oldCache.transferPagesTo(newLayer.cache); err != nil {
 				return err
 			}
+			oldLayer.cache = nil
+			rocmReleaseDeviceKVCache(oldCache)
 		} else if oldLayer.cache.ownsAnyPages() && newLayer.cache.sharesPagesFrom(oldLayer.cache) {
-			if err := oldLayer.cache.transferSharedPagesTo(newLayer.cache); err != nil {
+			oldCache := oldLayer.cache
+			if err := oldCache.transferSharedPagesTo(newLayer.cache); err != nil {
 				return err
 			}
-		} else if err := oldLayer.cache.Close(); err != nil {
-			return err
+			oldLayer.cache = nil
+			rocmReleaseDeviceKVCache(oldCache)
+		} else {
+			oldCache := oldLayer.cache
+			if err := oldCache.Close(); err != nil {
+				return err
+			}
+			oldLayer.cache = nil
+			rocmReleaseDeviceKVCache(oldCache)
 		}
 		if err := oldLayer.closeDescriptorTable(); err != nil {
 			return err
 		}
 	}
+	hipReleaseGemma4Q4DeviceLayerStates(previous.layers)
 	previous.layers = nil
 	previous.closed = true
 	return nil
@@ -284,6 +354,8 @@ func (state *hipGemma4Q4DeviceDecodeState) Close() error {
 			lastErr = err
 		}
 	}
+	hipReleaseGemma4Q4DeviceLayerStates(state.layers)
+	state.layers = nil
 	state.closed = true
 	return lastErr
 }

@@ -665,7 +665,7 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 		if req.PriorDeviceState != nil && req.PriorDeviceState.mode != "" {
 			mode = firstNonEmptyString(req.DeviceKVMode, req.PriorDeviceState.mode)
 		}
-		nextDeviceState = &hipGemma4Q4DeviceDecodeState{mode: mode, layers: make([]hipGemma4Q4DeviceLayerKVState, 0, len(cfg.Layers))}
+		nextDeviceState = hipNewGemma4Q4DeviceDecodeState(mode, len(cfg.Layers))
 	}
 	success := false
 	defer func() {
@@ -3236,7 +3236,7 @@ func (model *hipLoadedModel) loadedGemma4Q4ProjectionConfig(baseName, label stri
 		Cols:          cols,
 		GroupSize:     groupSize,
 	}
-	if err := cfg.validate(make([]float32, cols)); err != nil {
+	if err := cfg.validateInputCount(cols); err != nil {
 		return hipMLXQ4DeviceWeightConfig{}, 0, 0, core.E(hipGemma4Q4Layer0Operation, label+" q4 config", err)
 	}
 	return cfg, rows, cols, nil
