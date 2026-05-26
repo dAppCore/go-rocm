@@ -1,5 +1,36 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-26 2048 Workspace Per-Layer Input Set Pass
+
+- Kept the 2048-token fast loop as the edit gate, then promoted only after the
+  retained 10-turn full-cap book acceptance passed.
+- Reused the Gemma4 per-layer input device-set wrapper through the existing
+  decode workspace when the backing buffer is already workspace-owned. This
+  removes the per-token heap allocation for the wrapper and one-element backing
+  slice without changing kernel math, KV ownership, or generated-token
+  selection.
+- Avoided constructing the same per-layer input view twice per decoder layer.
+- Added `BenchmarkHIPAttentionHeadsChunkedWorkspace_PerLayerInputDeviceSetReused`;
+  it reports about `14.26 ns/op`, `0 B/op`, and `0 allocs/op`.
+- Focused checks passed:
+  `TestHIPKernelSource`,
+  `TestHIPAttentionHeadsChunkedSharedMemBytes_Good`,
+  `TestKVCache_DevicePageSliceCapacity_Good`, the new AX-11 microbenchmark, and
+  `git diff --check`.
+- Live RX 7800 XT 2048-token guards after this batch:
+  short `text:Hi` reports `109.0 tok/s`, `17305768 B/op`, and
+  `68198 allocs/op`; chapter-shaped prompt reports `101.2 tok/s`,
+  `44339368 B/op`, and `83691 allocs/op`.
+- Retained 10-turn full-cap greedy book acceptance stayed green and improved:
+  `37.58s` wall, `33.36s` decode, `3021` generated tokens,
+  `80.39 tok/s` average, `69.81 tok/s` on turn 10, empty stderr, no cap hits,
+  chapter-10 anchor hits of `3`, `231825488 B/op`, and `221859 allocs/op`.
+- This is accepted as a clean allocation/small throughput step. It is not the
+  final endpoint: turn 10 is still under the `90-100+ tok/s` late-turn target.
+  The next isolated batch should move suppressed-token filtering into the
+  device greedy path or continue attacking retained long-context
+  attention/projection.
+
 ## 2026-05-26 2048 Score-Lane Kernel Pass
 
 - Used the 2048-token fast loop as the first gate, then promoted only after the

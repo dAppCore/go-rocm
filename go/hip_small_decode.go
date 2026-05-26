@@ -2104,31 +2104,33 @@ func hipRunAttentionHeadsBatchCausalOutputFromDeviceQueryToDeviceKernel(ctx cont
 }
 
 type hipAttentionHeadsChunkedWorkspace struct {
-	Partial             *hipDeviceByteBuffer
-	Stats               *hipDeviceByteBuffer
-	TokenID             *hipDeviceByteBuffer
-	EmbeddingOutputs    map[int]*hipDeviceByteBuffer
-	ScaledEmbeddings    map[int]*hipDeviceByteBuffer
-	PerLayerEmbeddings  map[int]*hipDeviceByteBuffer
-	PerLayerProjected   map[int]*hipDeviceByteBuffer
-	PerLayerScaled      map[int]*hipDeviceByteBuffer
-	PerLayerProjScaled  map[int]*hipDeviceByteBuffer
-	PerLayerNorm        map[int]*hipDeviceByteBuffer
-	PerLayerCombined    map[int]*hipDeviceByteBuffer
-	PerLayerOutput      map[int]*hipDeviceByteBuffer
-	AttentionOutputs    map[int]*hipDeviceByteBuffer
-	ProjectionOutputs   map[int]*hipDeviceByteBuffer
-	ActivationOutputs   map[int]*hipDeviceByteBuffer
-	RMSResidualOutputs  map[int]*hipDeviceByteBuffer
-	RMSNormOutputs      map[int]*hipDeviceByteBuffer
-	RMSRoPEOutputs      map[int]*hipDeviceByteBuffer
-	RMSNoScaleOutputs   map[int]*hipDeviceByteBuffer
-	IntermediateOutputs map[int]*hipDeviceByteBuffer
-	QKVOutputs          map[int]*hipDeviceByteBuffer
-	FinalHiddenOutputs  [2]map[int]*hipDeviceByteBuffer
-	NextInputOutputs    [2]map[int]*hipDeviceByteBuffer
-	partialCap          int
-	statsCap            int
+	Partial              *hipDeviceByteBuffer
+	Stats                *hipDeviceByteBuffer
+	TokenID              *hipDeviceByteBuffer
+	EmbeddingOutputs     map[int]*hipDeviceByteBuffer
+	ScaledEmbeddings     map[int]*hipDeviceByteBuffer
+	PerLayerEmbeddings   map[int]*hipDeviceByteBuffer
+	PerLayerProjected    map[int]*hipDeviceByteBuffer
+	PerLayerScaled       map[int]*hipDeviceByteBuffer
+	PerLayerProjScaled   map[int]*hipDeviceByteBuffer
+	PerLayerNorm         map[int]*hipDeviceByteBuffer
+	PerLayerCombined     map[int]*hipDeviceByteBuffer
+	PerLayerOutput       map[int]*hipDeviceByteBuffer
+	AttentionOutputs     map[int]*hipDeviceByteBuffer
+	ProjectionOutputs    map[int]*hipDeviceByteBuffer
+	ActivationOutputs    map[int]*hipDeviceByteBuffer
+	RMSResidualOutputs   map[int]*hipDeviceByteBuffer
+	RMSNormOutputs       map[int]*hipDeviceByteBuffer
+	RMSRoPEOutputs       map[int]*hipDeviceByteBuffer
+	RMSNoScaleOutputs    map[int]*hipDeviceByteBuffer
+	IntermediateOutputs  map[int]*hipDeviceByteBuffer
+	QKVOutputs           map[int]*hipDeviceByteBuffer
+	FinalHiddenOutputs   [2]map[int]*hipDeviceByteBuffer
+	NextInputOutputs     [2]map[int]*hipDeviceByteBuffer
+	PerLayerInputSet     hipGemma4Q4PerLayerInputDeviceSet
+	PerLayerInputBacking [1]*hipDeviceByteBuffer
+	partialCap           int
+	statsCap             int
 }
 
 func (workspace *hipAttentionHeadsChunkedWorkspace) Ensure(driver nativeHIPDriver, headCount, dim, tokenCount, chunkSize int) error {
@@ -2218,6 +2220,29 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) EnsurePerLayerCombined(drive
 
 func (workspace *hipAttentionHeadsChunkedWorkspace) EnsurePerLayerOutput(driver nativeHIPDriver, count int) (*hipDeviceByteBuffer, error) {
 	return workspace.ensureMappedOutput(driver, &workspace.PerLayerOutput, count, "per-layer final output")
+}
+
+func (workspace *hipAttentionHeadsChunkedWorkspace) BorrowPerLayerInputDeviceSet(driver nativeHIPDriver, layerCount, inputSize int, backing *hipDeviceByteBuffer) (*hipGemma4Q4PerLayerInputDeviceSet, error) {
+	if workspace == nil {
+		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "attention workspace is required", nil)
+	}
+	if layerCount <= 0 || inputSize <= 0 {
+		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "per-layer input dimensions must be positive", nil)
+	}
+	if backing == nil || backing.Pointer() == 0 || backing.Count() != layerCount*inputSize || backing.SizeBytes() != uint64(layerCount*inputSize*4) {
+		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "per-layer input backing shape mismatch", nil)
+	}
+	workspace.PerLayerInputBacking[0] = backing
+	workspace.PerLayerInputSet = hipGemma4Q4PerLayerInputDeviceSet{
+		driver:           driver,
+		layerCount:       layerCount,
+		layerStrideBytes: uint64(inputSize * 4),
+		layerValueCount:  inputSize,
+		viewLabel:        "per-layer input slice",
+		borrowedBacking:  true,
+		Backing:          workspace.PerLayerInputBacking[:],
+	}
+	return &workspace.PerLayerInputSet, nil
 }
 
 func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureAttentionOutput(driver nativeHIPDriver, headCount, dim int) (*hipDeviceByteBuffer, error) {
@@ -2638,6 +2663,8 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 	workspace.QKVOutputs = nil
 	workspace.FinalHiddenOutputs = [2]map[int]*hipDeviceByteBuffer{}
 	workspace.NextInputOutputs = [2]map[int]*hipDeviceByteBuffer{}
+	workspace.PerLayerInputSet = hipGemma4Q4PerLayerInputDeviceSet{}
+	workspace.PerLayerInputBacking[0] = nil
 	return lastErr
 }
 

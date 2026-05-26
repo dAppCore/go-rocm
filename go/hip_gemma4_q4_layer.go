@@ -752,9 +752,10 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 				}
 			}
 		}
-		if perLayerInputDevices != nil && perLayerInputDevices.Layer(index) != nil {
+		if perLayerInputDevices != nil {
 			layerReq.PerLayerInputDevice = perLayerInputDevices.Layer(index)
-		} else if len(perLayerInputs) > index {
+		}
+		if layerReq.PerLayerInputDevice == nil && len(perLayerInputs) > index {
 			layerReq.PerLayerInput = perLayerInputs[index]
 		}
 		if len(sharedSources) > index && sharedSources[index] != index {
@@ -2840,6 +2841,9 @@ func hipRunGemma4Q4PerLayerInputConfigDeviceSet(ctx context.Context, driver nati
 		return nil, err
 	}
 
+	if workspace != nil {
+		return workspace.BorrowPerLayerInputDeviceSet(driver, layerCount, cfg.InputSize, scaled)
+	}
 	outputs := &hipGemma4Q4PerLayerInputDeviceSet{
 		driver:           driver,
 		layerCount:       layerCount,

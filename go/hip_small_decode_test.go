@@ -2377,6 +2377,40 @@ func BenchmarkHIPGemma4Q4PerLayerInputDeviceSetLayer_View(b *testing.B) {
 	}
 }
 
+func BenchmarkHIPAttentionHeadsChunkedWorkspace_PerLayerInputDeviceSetReused(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	const (
+		layerCount = 32
+		inputSize  = 2304
+	)
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	backing := &hipDeviceByteBuffer{
+		driver:    driver,
+		pointer:   0x100000,
+		count:     layerCount * inputSize,
+		sizeBytes: uint64(layerCount * inputSize * 4),
+	}
+	set, err := workspace.BorrowPerLayerInputDeviceSet(driver, layerCount, inputSize, backing)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if set.LayerCount() != layerCount || set.Layer(0) == nil {
+		b.Fatalf("per-layer input set = %#v, want reusable device views", set)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		set, err = workspace.BorrowPerLayerInputDeviceSet(driver, layerCount, inputSize, backing)
+		if err != nil {
+			b.Fatal(err)
+		}
+		layer := set.Layer(i % layerCount)
+		if layer == nil || layer.Pointer() == 0 || layer.Count() != inputSize {
+			b.Fatalf("layer view = %#v", layer)
+		}
+	}
+}
+
 func BenchmarkHIPGemma4Q4SharedKVSourceByLayer_Cached(b *testing.B) {
 	const layerCount = 32
 	layers := make([]hipGemma4Q4Layer0Config, layerCount)

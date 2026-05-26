@@ -280,9 +280,16 @@ then moved the short guard to `18811240904 ns/op`, `108.9 tok/s`,
 and kept the retained book route green at `38.18s` wall, `33.96s` decode,
 `3021` generated tokens, `79.12 tok/s` average, `68.81 tok/s` on turn 10,
 empty stderr, no cap hits, and chapter-10 anchor hits of `3`, with
-`232416808 B/op` and `227925 allocs/op`.
+`232416808 B/op` and `227925 allocs/op`. Reusing the per-layer input device-set
+wrapper from the decode workspace then moved the short guard to
+`18785434694 ns/op`, `109.0 tok/s`, `17305768 B/op`, and `68198 allocs/op`;
+moved the chapter-shaped guard to `20246696622 ns/op`, `101.2 tok/s`,
+`44339368 B/op`, and `83691 allocs/op`; and kept the retained book route green
+at `37.58s` wall, `33.36s` decode, `3021` generated tokens, `80.39 tok/s`
+average, `69.81 tok/s` on turn 10, empty stderr, no cap hits, and chapter-10
+anchor hits of `3`, with `231825488 B/op` and `221859 allocs/op`.
 This is still not the final driver endpoint: later-turn decode is only
-`68.81 tok/s`, below the `90-100+ tok/s` target, and the visible output remains
+`69.81 tok/s`, below the `90-100+ tok/s` target, and the visible output remains
 repetitive. Keep tuning retained long-context attention and state quality until
 the later turns stay near the target.
 
@@ -305,6 +312,8 @@ max_new_tokens  route                    tok/s   B/op       allocs/op
 2048 chapter    state handoff cleanup     92.22   60.79M      125647
 2048 text:Hi    cache/probe cleanup      103.4    20.40M       72262
 2048 chapter    cache/probe cleanup       90.82   44.95M       87745
+2048 text:Hi    per-layer set workspace  109.0    17.31M       68198
+2048 chapter    per-layer set workspace  101.2    44.34M       83691
 ```
 
 The earlier 256-token chunked route was rejected because it fell to `58.24
