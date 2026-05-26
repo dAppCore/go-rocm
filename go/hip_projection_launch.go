@@ -2276,11 +2276,26 @@ func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressBuffer
 	if err := hipLaunchKernel(driver, config); err != nil {
 		return hipGreedySampleResult{}, err
 	}
-	var payload [hipMLXQ4ProjectionBestBytes]byte
-	if err := driver.CopyDeviceToHost(best.Pointer(), payload[:]); err != nil {
+	packed, err := hipReadDeviceUint64(driver, best.Pointer())
+	if err != nil {
 		return hipGreedySampleResult{}, core.E("rocm.hip.MLXQ4ProjectionGreedyLaunch", "copy greedy best", err)
 	}
-	return hipUnpackGreedyBest(binary.LittleEndian.Uint64(payload[:]), softcap, cfg.Rows)
+	return hipUnpackGreedyBest(packed, softcap, cfg.Rows)
+}
+
+type nativeHIPDeviceUint64Reader interface {
+	CopyDeviceToHostUint64(pointer nativeDevicePointer) (uint64, error)
+}
+
+func hipReadDeviceUint64(driver nativeHIPDriver, pointer nativeDevicePointer) (uint64, error) {
+	if reader, ok := driver.(nativeHIPDeviceUint64Reader); ok {
+		return reader.CopyDeviceToHostUint64(pointer)
+	}
+	var payload [8]byte
+	if err := driver.CopyDeviceToHost(pointer, payload[:]); err != nil {
+		return 0, err
+	}
+	return binary.LittleEndian.Uint64(payload[:]), nil
 }
 
 func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppress(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, best *hipDeviceByteBuffer, suppressTokens []int32, workspace *hipAttentionHeadsChunkedWorkspace) (hipGreedySampleResult, error) {

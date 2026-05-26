@@ -13776,3 +13776,63 @@ the short guard and the chapter-shaped guard remained above `90 tok/s`. It is
 not a retained long-context decode win: turn 10 remains about `64.5 tok/s`, so
 the next speed target remains chunked attention stage 1 and q4 projection at
 retained context.
+
+## 2026-05-26: Scalar Greedy Read and Cgo Free-List Bucket Batch
+
+This 2048-token fast-loop pass targeted the remaining generation-loop host
+allocations visible after subtracting a 1-token exact allocation profile from a
+2048-token exact allocation profile. The hot profile showed the old q4 greedy
+readback stack array escaping once per generated token, and the cgo device
+memory pool allocating a backing slice for descriptor sizes that often only
+cache one pointer.
+
+Accepted changes:
+
+```text
+- Add a cgo scalar `uint64` D2H copy for the final q4 greedy packed result.
+- Route `hipRunMLXQ4ProjectionSoftcapGreedy...` through `hipReadDeviceUint64`.
+- Store the first cgo device-memory free-list pointer inline per size, with a
+  spill slice only when a second pointer for the same size is cached.
+```
+
+AX-11 microbenchmark:
+
+```text
+BenchmarkHIPReadDeviceUint64_DirectReader-32  2.207 ns/op  0 B/op  0 allocs/op
+```
+
+2048-token fast guards:
+
+```text
+2048 text:Hi:
+  18802191130 ns/op, 108.9 tok/s, 7392408 B/op, 8814 allocs/op
+
+2048 generated tokens, context_len=4096, chapter-1 lighthouse prompt:
+  20169854734 ns/op, 101.5 tok/s, 15384152 B/op, 10428 allocs/op
+```
+
+Retained-book acceptance:
+
+```text
+book_wall_s/op             37.62
+book_decode_s/op           33.40
+book_generated_tokens/op    3021
+book_tok/s                 80.31
+book_turn01_tok/s         110.2
+book_turn10_tok/s          69.87
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+stderr_bytes                   0
+B/op                    230986816
+allocs/op                  106647
+output: /tmp/go-rocm-book-10turn-fullcap-cgo-greedy-scalar.md
+```
+
+Rejected in the same pass: a direct sliding-window append path that avoided the
+second local-window page-slice copy. It reduced the chapter-shaped 2048-token
+allocation count to about `10.4k`, but slowed the chapter guard to `99.8 tok/s`
+and the retained book to `38.24s` wall / `79.01 tok/s`, so it was removed.
+
+The accepted batch is a host-allocation cleanup, not the decode breakthrough.
+Turn 10 remains about `70 tok/s`; the next speed target remains retained
+long-context attention/projection.

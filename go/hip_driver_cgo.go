@@ -39,6 +39,11 @@ typedef struct {
 	uintptr_t second;
 } core_rocm_hip_uintptr2_result;
 
+typedef struct {
+	int rc;
+	uint64_t value;
+} core_rocm_hip_uint64_result;
+
 static void* core_rocm_hip_lib = NULL;
 
 static void* core_rocm_open_hip() {
@@ -213,6 +218,14 @@ static int core_rocm_hip_memcpy_dtoh(void* dst, uintptr_t src, size_t size) {
 		return -100012;
 	}
 	return fn(dst, (void*)src, size, 2);
+}
+
+static core_rocm_hip_uint64_result core_rocm_hip_memcpy_dtoh_u64(uintptr_t src) {
+	core_rocm_hip_uint64_result result = {0, 0};
+	uint64_t value = 0;
+	result.rc = core_rocm_hip_memcpy_dtoh(&value, src, sizeof(value));
+	result.value = value;
+	return result;
 }
 
 static int core_rocm_hip_memcpy_htod_async(uintptr_t dst, void* src, size_t size) {
@@ -616,14 +629,26 @@ var cgoHIPAsyncCopyRing = struct {
 	slots: make([]cgoHIPAsyncCopySlot, cgoHIPAsyncCopyRingSize),
 }
 
+type cgoHIPMemoryPoolBucket struct {
+	first nativeDevicePointer
+	rest  []nativeDevicePointer
+}
+
+func (bucket cgoHIPMemoryPoolBucket) len() int {
+	if bucket.first == 0 {
+		return 0
+	}
+	return 1 + len(bucket.rest)
+}
+
 var cgoHIPMemoryPool = struct {
 	sync.Mutex
 	live      map[nativeDevicePointer]uint64
-	free      map[uint64][]nativeDevicePointer
+	free      map[uint64]cgoHIPMemoryPoolBucket
 	freeBytes uint64
 }{
 	live: map[nativeDevicePointer]uint64{},
-	free: map[uint64][]nativeDevicePointer{},
+	free: map[uint64]cgoHIPMemoryPoolBucket{},
 }
 
 func newSystemHIPDriver() nativeHIPDriver {
@@ -665,10 +690,18 @@ func (driver cgoHIPDriver) DeviceInfo() nativeDeviceInfo {
 func (cgoHIPDriver) Malloc(size uint64) (nativeDevicePointer, error) {
 	if size <= cgoHIPPoolMaxBufferBytes {
 		cgoHIPMemoryPool.Lock()
-		free := cgoHIPMemoryPool.free[size]
-		if len(free) > 0 {
-			pointer := free[len(free)-1]
-			cgoHIPMemoryPool.free[size] = free[:len(free)-1]
+		bucket := cgoHIPMemoryPool.free[size]
+		if bucket.first != 0 {
+			pointer := bucket.first
+			if count := len(bucket.rest); count > 0 {
+				bucket.first = bucket.rest[count-1]
+				bucket.rest[count-1] = 0
+				bucket.rest = bucket.rest[:count-1]
+				cgoHIPMemoryPool.free[size] = bucket
+			} else {
+				bucket.first = 0
+				cgoHIPMemoryPool.free[size] = bucket
+			}
 			cgoHIPMemoryPool.live[pointer] = size
 			cgoHIPMemoryPool.freeBytes -= size
 			cgoHIPMemoryPool.Unlock()
@@ -699,12 +732,17 @@ func (cgoHIPDriver) Free(pointer nativeDevicePointer) error {
 	if tracked &&
 		size <= cgoHIPPoolMaxBufferBytes &&
 		cgoHIPMemoryPool.freeBytes+size <= cgoHIPPoolMaxTotalBytes &&
-		len(cgoHIPMemoryPool.free[size]) < cgoHIPPoolMaxPerSize {
-		free := cgoHIPMemoryPool.free[size]
-		if free == nil {
-			free = make([]nativeDevicePointer, 0, cgoHIPPoolInitialPerSize)
+		cgoHIPMemoryPool.free[size].len() < cgoHIPPoolMaxPerSize {
+		bucket := cgoHIPMemoryPool.free[size]
+		if bucket.first == 0 {
+			bucket.first = pointer
+		} else {
+			if bucket.rest == nil {
+				bucket.rest = make([]nativeDevicePointer, 0, cgoHIPPoolInitialPerSize)
+			}
+			bucket.rest = append(bucket.rest, pointer)
 		}
-		cgoHIPMemoryPool.free[size] = append(free, pointer)
+		cgoHIPMemoryPool.free[size] = bucket
 		cgoHIPMemoryPool.freeBytes += size
 		cgoHIPMemoryPool.Unlock()
 		return nil
@@ -844,6 +882,17 @@ func (cgoHIPDriver) CopyDeviceToHost(pointer nativeDevicePointer, data []byte) e
 		return hipReturnError("hipMemcpyDeviceToHost", int(rc))
 	}
 	return nil
+}
+
+func (cgoHIPDriver) CopyDeviceToHostUint64(pointer nativeDevicePointer) (uint64, error) {
+	if pointer == 0 {
+		return 0, nil
+	}
+	result := C.core_rocm_hip_memcpy_dtoh_u64(C.uintptr_t(pointer))
+	if result.rc != 0 {
+		return 0, hipReturnError("hipMemcpyDeviceToHost", int(result.rc))
+	}
+	return uint64(result.value), nil
 }
 
 func (driver cgoHIPDriver) LaunchKernel(config hipKernelLaunchConfig) error {

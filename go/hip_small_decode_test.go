@@ -2100,6 +2100,32 @@ func BenchmarkHIPLaunchPacketPool_ReusedSize(b *testing.B) {
 	}
 }
 
+type fakeHIPUint64Reader struct {
+	fakeHIPDriver
+	value uint64
+}
+
+func (driver *fakeHIPUint64Reader) CopyDeviceToHostUint64(nativeDevicePointer) (uint64, error) {
+	return driver.value, nil
+}
+
+func BenchmarkHIPReadDeviceUint64_DirectReader(b *testing.B) {
+	driver := &fakeHIPUint64Reader{
+		fakeHIPDriver: fakeHIPDriver{available: true},
+		value:         0x400921fb54442d18,
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		value, err := hipReadDeviceUint64(driver, 42)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if value != driver.value {
+			b.Fatalf("value = %#x, want %#x", value, driver.value)
+		}
+	}
+}
+
 func BenchmarkHIPAttentionHeadsChunkedWorkspace_AttentionOutputReused(b *testing.B) {
 	driver := &fakeHIPDriver{available: true}
 	workspace := &hipAttentionHeadsChunkedWorkspace{}

@@ -330,8 +330,21 @@ retained book route stayed green at `37.71s` wall, `33.49s` decode, `3021`
 generated tokens, `80.11 tok/s` average, `69.90 tok/s` on turn 10, empty
 stderr, no cap hits, and chapter-10 anchor hits of `3`, with `230972112 B/op`
 and `109684 allocs/op`.
+Reading the final greedy q4 result through a scalar cgo `uint64` copy then
+removed the per-token escaping Go byte slice, and the cgo device-memory pool now
+keeps a first pointer inline per size so one-off retained descriptor sizes do
+not allocate a backing slice just to cache one pointer. The 2048-token guards
+stayed green at `108.9 tok/s`, `7392408 B/op`, and `8814 allocs/op` for
+`text:Hi`, and `101.5 tok/s`, `15384152 B/op`, and `10428 allocs/op` for the
+chapter-shaped prompt. The retained book route stayed green at `37.62s` wall,
+`33.40s` decode, `3021` generated tokens, `80.31 tok/s` average,
+`69.87 tok/s` on turn 10, empty stderr, no cap hits, and chapter-10 anchor hits
+of `3`, with `230986816 B/op` and `106647 allocs/op`. A same-batch attempt to
+avoid the second local-window page-slice copy was rejected: it reduced the
+chapter-shaped 2048-token allocation count but slowed the retained book to
+`38.24s` wall and `79.01 tok/s`.
 This is still not the final driver endpoint: later-turn decode is only
-`69.90 tok/s`, below the `90-100+ tok/s` target, and the visible output remains
+`69.87 tok/s`, below the `90-100+ tok/s` target, and the visible output remains
 repetitive. Keep tuning retained long-context attention and state quality until
 the later turns stay near the target.
 
@@ -366,6 +379,8 @@ max_new_tokens  route                    tok/s   B/op       allocs/op
 2048 chapter    cgo/free-list cleanup  101.4    15.39M       13344
 2048 text:Hi    VRAM metrics cache     108.9     7.34M       10853
 2048 chapter    VRAM metrics cache     101.4    15.37M       12555
+2048 text:Hi    scalar greedy read     108.9     7.39M        8814
+2048 chapter    scalar greedy read     101.5    15.38M       10428
 ```
 
 The earlier 256-token chunked route was rejected because it fell to `58.24
