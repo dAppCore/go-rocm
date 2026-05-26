@@ -1,5 +1,29 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-26 2048 Score-Lane Kernel Pass
+
+- Used the 2048-token fast loop as the first gate, then promoted only after the
+  retained 10-turn book acceptance passed.
+- Rejected the first tree-style shuffle reduction for
+  `rocm_attention_heads_chunked_stage1`: it improved the 2048-token guards but
+  changed floating-point accumulation order enough for the retained book
+  acceptance to fail with chapter-10 anchor hits of `0`.
+- Kept an order-preserving lane-shuffle score reduction for the chunked stage-1
+  score-lanes path. It removes the per-chunk shared-memory score scratch/barrier
+  while preserving the old lane addition order. Added a HIP source guard so the
+  hot path keeps using `rocm_shfl_down(partial_dot, score_lane, ...)` and does
+  not silently return to `scratch[tid] = partial_dot`.
+- Live RX 7800 XT 2048-token guards:
+  short prompt `text:Hi` reports `107.7 tok/s`, `17641136 B/op`, and
+  `72291 allocs/op`; chapter-shaped prompt reports `98.87 tok/s`,
+  `44673712 B/op`, and `87783 allocs/op`.
+- Retained 10-turn full-cap greedy book acceptance stayed green:
+  `38.37s` wall, `34.12s` decode, `3021` generated tokens,
+  `78.74 tok/s` average, `67.74 tok/s` on turn 10, empty stderr, no cap hits,
+  chapter-10 anchor hits of `3`, `232339832 B/op`, and `227919 allocs/op`.
+  This is a real speed step, but not the final endpoint: later-turn decode still
+  needs to move from the high-60s into the `90-100+ tok/s` band.
+
 ## 2026-05-26 Allocation/Transfer Step-Down Pass
 
 - Followed the measured allocation-reduction path rather than exact story-text

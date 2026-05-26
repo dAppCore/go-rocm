@@ -239,8 +239,16 @@ reports `22546790165 ns/op`, `90.83 tok/s`, `44646464 B/op`, and
 `87792 allocs/op`. The retained book route stayed green at `41.29s` wall,
 `37.00s` decode, `3021` generated tokens, `73.17 tok/s` average,
 `64.50 tok/s` on turn 10, empty stderr, no cap hits, and chapter-10 anchor hits
-of `3`, with `232426568 B/op` and `227955 allocs/op`. This is still not the
-final driver endpoint: later-turn decode is only `64.5 tok/s`, below the
+of `3`, with `232426568 B/op` and `227955 allocs/op`. Replacing the chunked
+stage-1 shared-memory score-lane reduction with an order-preserving lane
+shuffle then moved the short 2048-token guard to `19020344753 ns/op`,
+`107.7 tok/s`, `17641136 B/op`, and `72291 allocs/op`, while the
+chapter-shaped 2048-token guard moved to `20713968694 ns/op`, `98.87 tok/s`,
+`44673712 B/op`, and `87783 allocs/op`. The retained book route stayed green at
+`38.37s` wall, `34.12s` decode, `3021` generated tokens, `78.74 tok/s`
+average, `67.74 tok/s` on turn 10, empty stderr, no cap hits, and chapter-10
+anchor hits of `3`, with `232339832 B/op` and `227919 allocs/op`. This is still
+not the final driver endpoint: later-turn decode is only `67.74 tok/s`, below the
 `90-100+ tok/s` target, and the visible output remains repetitive. Keep tuning
 retained long-context attention and state quality until the later turns stay
 near the target.

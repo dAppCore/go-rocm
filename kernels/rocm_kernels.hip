@@ -5428,7 +5428,7 @@ extern "C" __global__ void rocm_attention_heads_chunked_stage1(const unsigned ch
 	const uint32_t score_lanes = args.chunk_size <= threads && (threads % args.chunk_size) == 0u
 		? threads / args.chunk_size
 		: 1u;
-	if (score_lanes > 1u && score_lanes <= 8u && args.dim >= score_lanes) {
+	if (score_lanes > 1u && score_lanes <= 8u && (score_lanes & (score_lanes - 1u)) == 0u && args.dim >= score_lanes) {
 		const uint32_t local = tid / score_lanes;
 		const uint32_t lane = tid - local * score_lanes;
 		float partial_dot = 0.0f;
@@ -5464,13 +5464,11 @@ extern "C" __global__ void rocm_attention_heads_chunked_stage1(const unsigned ch
 				}
 			}
 		}
-		scratch[tid] = partial_dot;
-		__syncthreads();
+		float dot = partial_dot;
+		for (uint32_t score_lane = 1u; score_lane < score_lanes; ++score_lane) {
+			dot += rocm_shfl_down(partial_dot, score_lane, static_cast<int>(score_lanes));
+		}
 		if (lane == 0u && local < local_count) {
-			float dot = 0.0f;
-			for (uint32_t score_lane = 0; score_lane < score_lanes; ++score_lane) {
-				dot += scratch[local * score_lanes + score_lane];
-			}
 			float score = -FLT_MAX;
 			if (page_valid) {
 				score = dot * scale;

@@ -250,6 +250,17 @@ func TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good(t *test
 	core.AssertTrue(t, strings.Contains(greedy, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK + row_lane`), "greedy grid uses greedy row blocks")
 }
 
+func TestHIPKernelSource_AttentionChunkedStage1ScoreLaneReduction_Good(t *testing.T) {
+	sourceBytes, err := os.ReadFile("../kernels/rocm_kernels.hip")
+	core.RequireNoError(t, err)
+	source := string(sourceBytes)
+
+	stage1 := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_attention_heads_chunked_stage1`)
+	core.AssertTrue(t, strings.Contains(stage1, `(score_lanes & (score_lanes - 1u)) == 0u`), "stage1 score lanes must stay shuffle-width safe")
+	core.AssertTrue(t, strings.Contains(stage1, `rocm_shfl_down(partial_dot, score_lane, static_cast<int>(score_lanes))`), "stage1 score lane reduction must use ordered lane shuffles")
+	core.AssertTrue(t, !strings.Contains(stage1, `scratch[tid] = partial_dot`), "stage1 score lane reduction must not reintroduce shared-memory score scratch")
+}
+
 func TestHIPKernelSource_NVIDIAHIPCompile_Good(t *testing.T) {
 	if os.Getenv("GO_ROCM_RUN_NVIDIA_HIP_COMPILE_TESTS") != "1" {
 		t.Skip("set GO_ROCM_RUN_NVIDIA_HIP_COMPILE_TESTS=1 to compile HIP source through the NVIDIA backend")
