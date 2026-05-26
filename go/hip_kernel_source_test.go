@@ -254,6 +254,8 @@ func TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good(t *test
 	greedy := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_projection_greedy`)
 	core.AssertTrue(t, strings.Contains(greedy, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_GREEDY_THREADS_PER_ROW`), "greedy rows use greedy row geometry")
 	core.AssertTrue(t, strings.Contains(greedy, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK + row_lane`), "greedy grid uses greedy row blocks")
+	core.AssertTrue(t, strings.Contains(greedy, `args.suppress_pointer`), "greedy fallback must accept device suppress tokens")
+	core.AssertTrue(t, strings.Contains(greedy, `!rocm_mlx_q4_token_suppressed(row, suppress_tokens, args.suppress_count)`), "greedy fallback must filter suppressed rows on device")
 	core.AssertTrue(t, strings.Contains(greedy, `for (uint32_t index = 1u; index < ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK; ++index)`), "greedy best reduction uses one post-sync serial pass")
 	core.AssertTrue(t, !strings.Contains(greedy, `ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK / 2u`), "greedy best reduction must not reintroduce repeated block barriers")
 }

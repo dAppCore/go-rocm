@@ -2411,6 +2411,30 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_PerLayerInputDeviceSetReused(b *
 	}
 }
 
+func BenchmarkHIPAttentionHeadsChunkedWorkspace_SuppressTokenBufferReused(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	tokens := []int32{0, 2, 105, 106, 107, 200}
+	buffer, err := workspace.EnsureSuppressTokenBuffer(driver, tokens)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if buffer == nil || buffer.Count() != len(tokens) {
+		b.Fatalf("suppress token buffer = %#v, want %d tokens", buffer, len(tokens))
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		buffer, err = workspace.EnsureSuppressTokenBuffer(driver, tokens)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if buffer == nil || buffer.Count() != len(tokens) {
+			b.Fatalf("suppress token buffer = %#v, want %d tokens", buffer, len(tokens))
+		}
+	}
+}
+
 func BenchmarkHIPGemma4Q4SharedKVSourceByLayer_Cached(b *testing.B) {
 	const layerCount = 32
 	layers := make([]hipGemma4Q4Layer0Config, layerCount)

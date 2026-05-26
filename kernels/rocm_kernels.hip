@@ -313,8 +313,8 @@ struct rocm_mlx_q4_projection_launch_args {
 	uint32_t scale_bytes;
 	uint32_t bias_bytes;
 	uint32_t output_bytes;
-	uint32_t reserved0;
-	uint64_t reserved1;
+	uint32_t suppress_count;
+	uint64_t suppress_pointer;
 };
 
 struct rocm_mlx_q4_projection_batch_launch_args {
@@ -1381,11 +1381,28 @@ __device__ bool rocm_valid_mlx_q4_projection_greedy_args(const rocm_mlx_q4_proje
 		args.output_bytes != ROCM_MLX_Q4_PROJECTION_BEST_BYTES) {
 		return false;
 	}
+	if (args.suppress_count != 0 && args.suppress_pointer == 0) {
+		return false;
+	}
 	const uint32_t packed_per_row = args.cols / 8;
 	const uint32_t groups_per_row = args.cols / args.group_size;
 	return args.weight_bytes == args.rows * packed_per_row * sizeof(uint32_t) &&
 		args.scale_bytes == args.rows * groups_per_row * sizeof(uint16_t) &&
 			args.bias_bytes == args.rows * groups_per_row * sizeof(uint16_t);
+}
+
+__device__ bool rocm_mlx_q4_token_suppressed(uint32_t row, const int32_t *suppress_tokens, uint32_t suppress_count)
+{
+	if (suppress_tokens == nullptr || suppress_count == 0) {
+		return false;
+	}
+	const int32_t token = static_cast<int32_t>(row);
+	for (uint32_t index = 0; index < suppress_count; ++index) {
+		if (suppress_tokens[index] == token) {
+			return true;
+		}
+	}
+	return false;
 }
 
 __device__ bool rocm_valid_mlx_q4_triple_projection_part(uint32_t rows, uint32_t cols, uint32_t group_size, uint32_t weight_bytes, uint32_t scale_bytes, uint32_t bias_bytes)
@@ -3240,6 +3257,7 @@ extern "C" __global__ void rocm_mlx_q4_projection_greedy(const unsigned char *pa
 	const uint32_t *weights = reinterpret_cast<const uint32_t *>(static_cast<uintptr_t>(args.weight_pointer));
 	const uint16_t *scales = reinterpret_cast<const uint16_t *>(static_cast<uintptr_t>(args.scale_pointer));
 	const uint16_t *biases = reinterpret_cast<const uint16_t *>(static_cast<uintptr_t>(args.bias_pointer));
+	const int32_t *suppress_tokens = reinterpret_cast<const int32_t *>(static_cast<uintptr_t>(args.suppress_pointer));
 	float sum = 0.0f;
 	if (row < args.rows) {
 		sum = rocm_mlx_q4_projection_row_sum(input, weights, scales, biases, row, args.cols, args.group_size, col_lane, ROCM_MLX_Q4_PROJECTION_GREEDY_THREADS_PER_ROW);
@@ -3247,7 +3265,7 @@ extern "C" __global__ void rocm_mlx_q4_projection_greedy(const unsigned char *pa
 	sum = rocm_mlx_q4_greedy_row_reduce(sum);
 	if (col_lane == 0) {
 		unsigned long long packed = 0;
-		if (row < args.rows && isfinite(sum)) {
+		if (row < args.rows && isfinite(sum) && !rocm_mlx_q4_token_suppressed(row, suppress_tokens, args.suppress_count)) {
 			packed = static_cast<unsigned long long>(rocm_pack_score_index(sum, row));
 		}
 		block_best[row_lane] = packed;

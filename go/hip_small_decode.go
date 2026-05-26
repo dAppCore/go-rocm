@@ -2129,6 +2129,8 @@ type hipAttentionHeadsChunkedWorkspace struct {
 	NextInputOutputs     [2]map[int]*hipDeviceByteBuffer
 	PerLayerInputSet     hipGemma4Q4PerLayerInputDeviceSet
 	PerLayerInputBacking [1]*hipDeviceByteBuffer
+	SuppressTokenIDs     []int32
+	SuppressTokenBuffer  *hipDeviceTokenBuffer
 	partialCap           int
 	statsCap             int
 }
@@ -2243,6 +2245,41 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) BorrowPerLayerInputDeviceSet
 		Backing:          workspace.PerLayerInputBacking[:],
 	}
 	return &workspace.PerLayerInputSet, nil
+}
+
+func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureSuppressTokenBuffer(driver nativeHIPDriver, tokens []int32) (*hipDeviceTokenBuffer, error) {
+	if workspace == nil {
+		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "attention workspace is required", nil)
+	}
+	if len(tokens) == 0 {
+		return nil, nil
+	}
+	if workspace.SuppressTokenBuffer != nil && workspace.SuppressTokenBuffer.Pointer() != 0 &&
+		workspace.SuppressTokenBuffer.Count() == len(tokens) && hipInt32SlicesEqual(workspace.SuppressTokenIDs, tokens) {
+		return workspace.SuppressTokenBuffer, nil
+	}
+	if err := workspace.SuppressTokenBuffer.Close(); err != nil {
+		return nil, err
+	}
+	buffer, err := hipUploadTokenIDs(driver, tokens)
+	if err != nil {
+		return nil, err
+	}
+	workspace.SuppressTokenBuffer = buffer
+	workspace.SuppressTokenIDs = append(workspace.SuppressTokenIDs[:0], tokens...)
+	return buffer, nil
+}
+
+func hipInt32SlicesEqual(left, right []int32) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureAttentionOutput(driver nativeHIPDriver, headCount, dim int) (*hipDeviceByteBuffer, error) {
@@ -2539,6 +2576,9 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 	if err := workspace.TokenID.Close(); err != nil {
 		lastErr = err
 	}
+	if err := workspace.SuppressTokenBuffer.Close(); err != nil {
+		lastErr = err
+	}
 	for _, output := range workspace.EmbeddingOutputs {
 		if err := output.Close(); err != nil {
 			lastErr = err
@@ -2665,6 +2705,8 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 	workspace.NextInputOutputs = [2]map[int]*hipDeviceByteBuffer{}
 	workspace.PerLayerInputSet = hipGemma4Q4PerLayerInputDeviceSet{}
 	workspace.PerLayerInputBacking[0] = nil
+	workspace.SuppressTokenBuffer = nil
+	workspace.SuppressTokenIDs = nil
 	return lastErr
 }
 

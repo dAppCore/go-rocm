@@ -855,7 +855,7 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 			}
 			defer finalNormBuffer.Close()
 		}
-		greedy, err = hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppress(ctx, driver, finalNormBuffer, last.LMHeadProjection, last.FinalLogitSoftcap, req.FinalGreedyBuffer, req.SuppressTokens)
+		greedy, err = hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppress(ctx, driver, finalNormBuffer, last.LMHeadProjection, last.FinalLogitSoftcap, req.FinalGreedyBuffer, req.SuppressTokens, req.AttentionWorkspace)
 		if err != nil {
 			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
 		}

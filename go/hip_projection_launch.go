@@ -165,20 +165,22 @@ type hipMLXQ4DeviceWeightConfig struct {
 }
 
 type hipMLXQ4ProjectionLaunchArgs struct {
-	InputPointer  nativeDevicePointer
-	WeightPointer nativeDevicePointer
-	ScalePointer  nativeDevicePointer
-	BiasPointer   nativeDevicePointer
-	OutputPointer nativeDevicePointer
-	Rows          int
-	Cols          int
-	GroupSize     int
-	Bits          int
-	InputBytes    uint64
-	WeightBytes   uint64
-	ScaleBytes    uint64
-	BiasBytes     uint64
-	OutputBytes   uint64
+	InputPointer    nativeDevicePointer
+	WeightPointer   nativeDevicePointer
+	ScalePointer    nativeDevicePointer
+	BiasPointer     nativeDevicePointer
+	OutputPointer   nativeDevicePointer
+	SuppressPointer nativeDevicePointer
+	Rows            int
+	Cols            int
+	GroupSize       int
+	Bits            int
+	SuppressCount   int
+	InputBytes      uint64
+	WeightBytes     uint64
+	ScaleBytes      uint64
+	BiasBytes       uint64
+	OutputBytes     uint64
 }
 
 type hipMLXQ4ProjectionBatchLaunchArgs struct {
@@ -807,6 +809,20 @@ func (args hipMLXQ4ProjectionLaunchArgs) binary(outputKind int) ([]byte, error) 
 	if args.OutputBytes != wantOutputBytes {
 		return nil, core.E("rocm.hip.MLXQ4ProjectionLaunch", "output byte count mismatch", nil)
 	}
+	suppressCount := uint32(0)
+	if args.SuppressCount > 0 {
+		if outputKind != hipMLXQ4ProjectionOutputBest {
+			return nil, core.E("rocm.hip.MLXQ4ProjectionLaunch", "suppress tokens require greedy output", nil)
+		}
+		if args.SuppressPointer == 0 {
+			return nil, core.E("rocm.hip.MLXQ4ProjectionLaunch", "suppress token pointer is required", nil)
+		}
+		value, err := rocmDeviceKVPositiveUint32("suppress token count", args.SuppressCount)
+		if err != nil {
+			return nil, err
+		}
+		suppressCount = value
+	}
 	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4ProjectionLaunch", "input bytes", args.InputBytes); err != nil {
 		return nil, err
 	}
@@ -839,6 +855,8 @@ func (args hipMLXQ4ProjectionLaunchArgs) binary(outputKind int) ([]byte, error) 
 	binary.LittleEndian.PutUint32(payload[72:], uint32(args.ScaleBytes))
 	binary.LittleEndian.PutUint32(payload[76:], uint32(args.BiasBytes))
 	binary.LittleEndian.PutUint32(payload[80:], uint32(args.OutputBytes))
+	binary.LittleEndian.PutUint32(payload[84:], suppressCount)
+	binary.LittleEndian.PutUint64(payload[88:], uint64(args.SuppressPointer))
 	return payload, nil
 }
 
@@ -2170,6 +2188,10 @@ func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInput(ctx context.Context
 }
 
 func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBuffer(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, best *hipDeviceByteBuffer) (hipGreedySampleResult, error) {
+	return hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressBuffer(ctx, driver, input, cfg, softcap, best, nil)
+}
+
+func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressBuffer(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, best *hipDeviceByteBuffer, suppress *hipDeviceTokenBuffer) (hipGreedySampleResult, error) {
 	if err := hipContextErr(ctx); err != nil {
 		return hipGreedySampleResult{}, err
 	}
@@ -2199,6 +2221,9 @@ func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBuffer(ctx context.C
 	} else if best.Pointer() == 0 || best.Count() != 1 || best.SizeBytes() != hipMLXQ4ProjectionBestBytes {
 		return hipGreedySampleResult{}, core.E("rocm.hip.MLXQ4ProjectionGreedyLaunch", "MLX q4 projection greedy best buffer shape mismatch", nil)
 	}
+	if suppress != nil && (suppress.Pointer() == 0 || suppress.Count() <= 0 || suppress.SizeBytes() != uint64(suppress.Count()*4)) {
+		return hipGreedySampleResult{}, core.E("rocm.hip.MLXQ4ProjectionGreedyLaunch", "MLX q4 suppress token buffer shape mismatch", nil)
+	}
 	if ownsBest {
 		defer best.Close()
 	}
@@ -2221,6 +2246,26 @@ func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBuffer(ctx context.C
 		BiasBytes:     cfg.BiasBytes,
 		OutputBytes:   best.SizeBytes(),
 	}).GreedyBinary()
+	if suppress != nil {
+		launchBytes, err = (hipMLXQ4ProjectionLaunchArgs{
+			InputPointer:    input.Pointer(),
+			WeightPointer:   cfg.WeightPointer,
+			ScalePointer:    cfg.ScalePointer,
+			BiasPointer:     cfg.BiasPointer,
+			OutputPointer:   best.Pointer(),
+			SuppressPointer: suppress.Pointer(),
+			Rows:            cfg.Rows,
+			Cols:            cfg.Cols,
+			GroupSize:       cfg.GroupSize,
+			Bits:            hipMLXQ4ProjectionBits,
+			SuppressCount:   suppress.Count(),
+			InputBytes:      input.SizeBytes(),
+			WeightBytes:     cfg.WeightBytes,
+			ScaleBytes:      cfg.ScaleBytes,
+			BiasBytes:       cfg.BiasBytes,
+			OutputBytes:     best.SizeBytes(),
+		}).GreedyBinary()
+	}
 	if err != nil {
 		return hipGreedySampleResult{}, err
 	}
@@ -2238,10 +2283,17 @@ func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBuffer(ctx context.C
 	return hipUnpackGreedyBest(binary.LittleEndian.Uint64(payload[:]), softcap, cfg.Rows)
 }
 
-func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppress(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, best *hipDeviceByteBuffer, suppressTokens []int32) (hipGreedySampleResult, error) {
+func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppress(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, best *hipDeviceByteBuffer, suppressTokens []int32, workspace *hipAttentionHeadsChunkedWorkspace) (hipGreedySampleResult, error) {
 	greedy, err := hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBuffer(ctx, driver, input, cfg, softcap, best)
 	if err != nil || !hipTokenIsSuppressed(int32(greedy.TokenID), suppressTokens) {
 		return greedy, err
+	}
+	if workspace != nil {
+		suppress, err := workspace.EnsureSuppressTokenBuffer(driver, suppressTokens)
+		if err != nil {
+			return hipGreedySampleResult{}, err
+		}
+		return hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressBuffer(ctx, driver, input, cfg, softcap, best, suppress)
 	}
 	logitsBuffer, err := hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx, driver, input, cfg)
 	if err != nil {

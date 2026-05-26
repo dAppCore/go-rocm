@@ -287,9 +287,16 @@ moved the chapter-shaped guard to `20246696622 ns/op`, `101.2 tok/s`,
 `44339368 B/op`, and `83691 allocs/op`; and kept the retained book route green
 at `37.58s` wall, `33.36s` decode, `3021` generated tokens, `80.39 tok/s`
 average, `69.81 tok/s` on turn 10, empty stderr, no cap hits, and chapter-10
-anchor hits of `3`, with `231825488 B/op` and `221859 allocs/op`.
+anchor hits of `3`, with `231825488 B/op` and `221859 allocs/op`. Moving the
+suppressed-token fallback onto a second device greedy pass with a workspace
+cached suppress-token buffer then cut the short guard to `7868528 B/op` and the
+chapter-shaped guard to `15985280 B/op` while keeping decode at `108.9 tok/s`
+and `101.5 tok/s` respectively. The retained book route stayed green at
+`37.64s` wall, `33.43s` decode, `3021` generated tokens, `80.26 tok/s` average,
+`69.56 tok/s` on turn 10, empty stderr, no cap hits, and chapter-10 anchor hits
+of `3`, with `231896312 B/op` and `221840 allocs/op`.
 This is still not the final driver endpoint: later-turn decode is only
-`69.81 tok/s`, below the `90-100+ tok/s` target, and the visible output remains
+`69.56 tok/s`, below the `90-100+ tok/s` target, and the visible output remains
 repetitive. Keep tuning retained long-context attention and state quality until
 the later turns stay near the target.
 
@@ -314,6 +321,8 @@ max_new_tokens  route                    tok/s   B/op       allocs/op
 2048 chapter    cache/probe cleanup       90.82   44.95M       87745
 2048 text:Hi    per-layer set workspace  109.0    17.31M       68198
 2048 chapter    per-layer set workspace  101.2    44.34M       83691
+2048 text:Hi    device suppress fallback 108.9     7.87M       68194
+2048 chapter    device suppress fallback 101.5    15.99M       83672
 ```
 
 The earlier 256-token chunked route was rejected because it fell to `58.24

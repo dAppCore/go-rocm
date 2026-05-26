@@ -555,6 +555,8 @@ func TestHIPKernels_MLXQ4ProjectionLaunchArgs_Good(t *testing.T) {
 	core.AssertEqual(t, uint32(4), binary.LittleEndian.Uint32(launchBytes[72:]))
 	core.AssertEqual(t, uint32(4), binary.LittleEndian.Uint32(launchBytes[76:]))
 	core.AssertEqual(t, uint32(8), binary.LittleEndian.Uint32(launchBytes[80:]))
+	core.AssertEqual(t, uint32(0), binary.LittleEndian.Uint32(launchBytes[84:]))
+	core.AssertEqual(t, uint64(0), binary.LittleEndian.Uint64(launchBytes[88:]))
 	config, err := hipOneDimensionalLaunchConfig(hipKernelNameMLXQ4Proj, launchBytes, req.Rows)
 	core.AssertNoError(t, err)
 	core.AssertNoError(t, hipLaunchKernel(driver, config))
@@ -629,6 +631,49 @@ func TestHIPKernels_MLXQ4ProjectionLaunchArgs_Good(t *testing.T) {
 	assertFloat32Near(t, 38, greedy.Score)
 	core.AssertEqual(t, []uint64{hipMLXQ4ProjectionBestBytes}, driver.memsets)
 	core.AssertEqual(t, hipKernelNameMLXQ4ProjGreedy, driver.launches[len(driver.launches)-1].Name)
+}
+
+func TestHIPKernels_MLXQ4ProjectionGreedySuppressDevice_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	req := hipMLXQ4ProjectionRequest{
+		Input:     []float32{1, 1, 1, 1, 1, 1, 1, 1},
+		Weight:    []uint32{0x76543210, 0xfedcba98},
+		Scales:    []uint16{0x3f80, 0x3f00},
+		Biases:    []uint16{0x0000, 0xbf80},
+		Rows:      2,
+		Cols:      8,
+		GroupSize: 8,
+	}
+	buffers, err := req.deviceBuffers(driver)
+	core.AssertNoError(t, err)
+	defer buffers.Close()
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	got, err := hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppress(
+		context.Background(),
+		driver,
+		buffers.Input,
+		hipMLXQ4DeviceWeightConfig{
+			WeightPointer: buffers.Weight.Pointer(),
+			ScalePointer:  buffers.Scales.Pointer(),
+			BiasPointer:   buffers.Biases.Pointer(),
+			WeightBytes:   buffers.Weight.SizeBytes(),
+			ScaleBytes:    buffers.Scales.SizeBytes(),
+			BiasBytes:     buffers.Biases.SizeBytes(),
+			Rows:          req.Rows,
+			Cols:          req.Cols,
+			GroupSize:     req.GroupSize,
+		},
+		0,
+		nil,
+		[]int32{1},
+		workspace,
+	)
+	core.AssertNoError(t, err)
+	core.AssertEqual(t, 0, got.TokenID)
+	assertFloat32Near(t, 28, got.Score)
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjGreedy, driver.launches[len(driver.launches)-1].Name)
+	core.AssertEqual(t, uint32(1), binary.LittleEndian.Uint32(driver.launches[len(driver.launches)-1].Args[84:]))
 }
 
 func TestHIPKernels_MLXQ4TripleProjectionLaunchArgs_Good(t *testing.T) {

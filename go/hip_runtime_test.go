@@ -3620,10 +3620,13 @@ func (driver *fakeHIPDriver) launchMLXQ4ProjectionGreedy(args []byte) error {
 	scaleBytes := int(binary.LittleEndian.Uint32(args[72:]))
 	biasBytes := int(binary.LittleEndian.Uint32(args[76:]))
 	outputBytes := int(binary.LittleEndian.Uint32(args[80:]))
+	suppressCount := int(binary.LittleEndian.Uint32(args[84:]))
+	suppressPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[88:]))
 	if bits != hipMLXQ4ProjectionBits ||
 		validateHIPMLXQ4ProjectionShape(cols, weightBytes/4, scaleBytes/2, biasBytes/2, rows, cols, groupSize) != nil ||
 		inputBytes != cols*4 ||
-		outputBytes != hipMLXQ4ProjectionBestBytes {
+		outputBytes != hipMLXQ4ProjectionBestBytes ||
+		(suppressCount > 0 && suppressPointer == 0) {
 		return core.E("rocm.hip.FakeLaunch", "MLX q4 greedy projection shape metadata mismatch", nil)
 	}
 	inputData, inputOffset, ok := driver.memoryForPointer(inputPointer, inputBytes)
@@ -3666,7 +3669,19 @@ func (driver *fakeHIPDriver) launchMLXQ4ProjectionGreedy(args []byte) error {
 	if err != nil {
 		return err
 	}
-	bestIndex, bestScore, err := hipReferenceGreedySample(output)
+	var suppressTokens []int32
+	if suppressCount > 0 {
+		suppressBytes := suppressCount * 4
+		suppressData, suppressOffset, ok := driver.memoryForPointer(suppressPointer, suppressBytes)
+		if !ok {
+			return core.E("rocm.hip.FakeLaunch", "MLX q4 greedy suppress token buffer is missing", nil)
+		}
+		suppressTokens = make([]int32, suppressCount)
+		for index := range suppressTokens {
+			suppressTokens[index] = int32(binary.LittleEndian.Uint32(suppressData[suppressOffset+index*4:]))
+		}
+	}
+	bestIndex, bestScore, err := hipReferenceGreedySampleSuppress(output, suppressTokens)
 	if err != nil {
 		return err
 	}

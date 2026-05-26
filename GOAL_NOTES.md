@@ -1,5 +1,31 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-26 Device Greedy Suppression Fallback Pass
+
+- Kept the normal q4 greedy path unchanged. If the first device greedy winner
+  is a suppressed control token and a decode workspace is present, the fallback
+  now runs a second q4 greedy pass with a cached device suppress-token buffer
+  instead of materializing the full LM-head logits and reading them back to host.
+- Reused the suppress-token buffer through the decode workspace. Added
+  `BenchmarkHIPAttentionHeadsChunkedWorkspace_SuppressTokenBufferReused`, which
+  reports about `2.73 ns/op`, `0 B/op`, and `0 allocs/op`.
+- Added source and fake-driver coverage for the q4 greedy suppress fields, plus
+  `TestHIPKernels_MLXQ4ProjectionGreedySuppressDevice_Good`.
+- Rebuilt the live `gfx1100` HSACO with `hipcc --std=c++23 --genco
+  --offload-arch=gfx1100 -O2`.
+- Live RX 7800 XT 2048-token guards after this batch:
+  short `text:Hi` reports `108.9 tok/s`, `7868528 B/op`, and
+  `68194 allocs/op`; chapter-shaped prompt reports `101.5 tok/s`,
+  `15985280 B/op`, and `83672 allocs/op`.
+- Retained 10-turn full-cap greedy book acceptance stayed green but did not
+  improve materially: `37.64s` wall, `33.43s` decode, `3021` generated tokens,
+  `80.26 tok/s` average, `69.56 tok/s` on turn 10, empty stderr, no cap hits,
+  chapter-10 anchor hits of `3`, `231896312 B/op`, and `221840 allocs/op`.
+- This is accepted as a host-transfer/short-guard byte-volume cut, not a
+  late-turn decode breakthrough. The next speed target remains retained
+  long-context attention/projection; turn 10 is still below the `90-100+ tok/s`
+  target.
+
 ## 2026-05-26 2048 Workspace Per-Layer Input Set Pass
 
 - Kept the 2048-token fast loop as the edit gate, then promoted only after the

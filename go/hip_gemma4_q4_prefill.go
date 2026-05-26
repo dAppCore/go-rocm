@@ -1387,5 +1387,5 @@ func hipRunGemma4Q4PrefillFinalGreedyForRowSuppress(ctx context.Context, driver 
 		return hipGreedySampleResult{}, err
 	}
 	defer finalNorm.Close()
-	return hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppress(ctx, driver, finalNorm, cfg.LMHeadProjection, cfg.FinalLogitSoftcap, best, suppressTokens)
+	return hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppress(ctx, driver, finalNorm, cfg.LMHeadProjection, cfg.FinalLogitSoftcap, best, suppressTokens, nil)
 }
