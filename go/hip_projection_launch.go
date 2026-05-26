@@ -1843,6 +1843,38 @@ func hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInput(ctx context.Context, drive
 			_ = output.Close()
 		}
 	}()
+	if err := hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInputOutput(ctx, driver, input, gateCfg, upCfg, output); err != nil {
+		return nil, err
+	}
+	success = true
+	return output, nil
+}
+
+func hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInputOutput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, gateCfg, upCfg hipMLXQ4DeviceWeightConfig, output *hipDeviceByteBuffer) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	if driver == nil || !driver.Available() {
+		return core.E("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "HIP driver is not available", nil)
+	}
+	if input == nil || input.Pointer() == 0 {
+		return core.E("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "MLX q4 GELU tanh multiply device input is required", nil)
+	}
+	if gateCfg.Rows != upCfg.Rows || gateCfg.Cols != upCfg.Cols || gateCfg.GroupSize != upCfg.GroupSize {
+		return core.E("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "gate and up q4 projection shapes must match", nil)
+	}
+	if err := gateCfg.validateInputCount(input.Count()); err != nil {
+		return err
+	}
+	if err := upCfg.validateInputCount(input.Count()); err != nil {
+		return err
+	}
+	if input.SizeBytes() != uint64(gateCfg.Cols*4) {
+		return core.E("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "MLX q4 GELU tanh multiply device input byte count mismatch", nil)
+	}
+	if output == nil || output.Pointer() == 0 || output.Count() != gateCfg.Rows || output.SizeBytes() != uint64(gateCfg.Rows*4) {
+		return core.E("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "MLX q4 GELU tanh multiply output shape mismatch", nil)
+	}
 	launchBytes, err := (hipMLXQ4GELUTanhMulLaunchArgs{
 		InputPointer:      input.Pointer(),
 		GateWeightPointer: gateCfg.WeightPointer,
@@ -1866,17 +1898,16 @@ func hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInput(ctx context.Context, drive
 		OutputBytes:       output.SizeBytes(),
 	}).Binary()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	config, err := hipMLXQ4GELUTanhMultiplyLaunchConfig(launchBytes, gateCfg.Rows)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if err := hipLaunchKernel(driver, config); err != nil {
-		return nil, err
+		return err
 	}
-	success = true
-	return output, nil
+	return nil
 }
 
 func hipRunMLXQ4GELUTanhMultiplyBatchKernelWithDeviceInput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, gateCfg, upCfg hipMLXQ4DeviceWeightConfig, batch int) (*hipDeviceByteBuffer, error) {
@@ -1978,6 +2009,35 @@ func hipRunMLXQ4GELUTanhProjectionKernelWithDeviceMultiplier(ctx context.Context
 			_ = output.Close()
 		}
 	}()
+	if err := hipRunMLXQ4GELUTanhProjectionKernelWithDeviceMultiplierOutput(ctx, driver, input, multiplier, cfg, output); err != nil {
+		return nil, err
+	}
+	success = true
+	return output, nil
+}
+
+func hipRunMLXQ4GELUTanhProjectionKernelWithDeviceMultiplierOutput(ctx context.Context, driver nativeHIPDriver, input, multiplier *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, output *hipDeviceByteBuffer) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	if driver == nil || !driver.Available() {
+		return core.E("rocm.hip.MLXQ4GELUTanhProjectionLaunch", "HIP driver is not available", nil)
+	}
+	if input == nil || input.Pointer() == 0 {
+		return core.E("rocm.hip.MLXQ4GELUTanhProjectionLaunch", "MLX q4 GELU tanh projection device input is required", nil)
+	}
+	if multiplier == nil || multiplier.Pointer() == 0 || multiplier.Count() != cfg.Rows || multiplier.SizeBytes() != uint64(cfg.Rows*4) {
+		return core.E("rocm.hip.MLXQ4GELUTanhProjectionLaunch", "MLX q4 GELU tanh projection multiplier device buffer shape mismatch", nil)
+	}
+	if err := cfg.validateInputCount(input.Count()); err != nil {
+		return err
+	}
+	if input.SizeBytes() != uint64(cfg.Cols*4) {
+		return core.E("rocm.hip.MLXQ4GELUTanhProjectionLaunch", "MLX q4 GELU tanh projection device input byte count mismatch", nil)
+	}
+	if output == nil || output.Pointer() == 0 || output.Count() != cfg.Rows || output.SizeBytes() != uint64(cfg.Rows*4) {
+		return core.E("rocm.hip.MLXQ4GELUTanhProjectionLaunch", "MLX q4 GELU tanh projection output shape mismatch", nil)
+	}
 	launchBytes, err := (hipMLXQ4GELUTanhProjLaunchArgs{
 		InputPointer:      input.Pointer(),
 		WeightPointer:     cfg.WeightPointer,
@@ -1997,17 +2057,16 @@ func hipRunMLXQ4GELUTanhProjectionKernelWithDeviceMultiplier(ctx context.Context
 		OutputBytes:       output.SizeBytes(),
 	}).Binary()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	config, err := hipMLXQ4GELUTanhProjectionLaunchConfig(launchBytes, cfg.Rows)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if err := hipLaunchKernel(driver, config); err != nil {
-		return nil, err
+		return err
 	}
-	success = true
-	return output, nil
+	return nil
 }
 
 func hipRunMLXQ4GELUTanhProjectionBatchKernelWithDeviceMultiplier(ctx context.Context, driver nativeHIPDriver, input, multiplier *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, batch int) (*hipDeviceByteBuffer, error) {

@@ -1394,12 +1394,28 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 	postAttentionNormCfg.Epsilon = req.Epsilon
 	preFeedForwardNormCfg := cfg.PreFeedForwardNorm
 	preFeedForwardNormCfg.Epsilon = req.Epsilon
-	attentionResidualBuffer, preFeedForwardBuffer, err := hipRunRMSNormResidualAddNormKernelWithDeviceInputWeightConfig(ctx, driver, attentionProjectionBuffer, inputBuffer, postAttentionNormCfg, preFeedForwardNormCfg)
-	if err != nil {
-		return hipGemma4Q4DecoderLayerResult{}, err
+	var attentionResidualBuffer *hipDeviceByteBuffer
+	var preFeedForwardBuffer *hipDeviceByteBuffer
+	if req.AttentionWorkspace != nil && req.OmitDebugTensors {
+		attentionResidualBuffer, err = req.AttentionWorkspace.EnsureRMSResidualOutput(driver, postAttentionNormCfg.Count)
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+		preFeedForwardBuffer, err = req.AttentionWorkspace.EnsureRMSNormOutput(driver, preFeedForwardNormCfg.Count)
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+		if err := hipRunRMSNormResidualAddNormScaledKernelWithDeviceInputWeightConfigOutput(ctx, driver, attentionProjectionBuffer, inputBuffer, postAttentionNormCfg, preFeedForwardNormCfg, attentionResidualBuffer, preFeedForwardBuffer, 1); err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+	} else {
+		attentionResidualBuffer, preFeedForwardBuffer, err = hipRunRMSNormResidualAddNormKernelWithDeviceInputWeightConfig(ctx, driver, attentionProjectionBuffer, inputBuffer, postAttentionNormCfg, preFeedForwardNormCfg)
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+		defer attentionResidualBuffer.Close()
+		defer preFeedForwardBuffer.Close()
 	}
-	defer attentionResidualBuffer.Close()
-	defer preFeedForwardBuffer.Close()
 	var attentionResidual []float32
 	if !req.OmitDebugTensors {
 		attentionResidual, err = hipReadFloat32DeviceOutput(attentionResidualBuffer, hipGemma4Q4Layer0Operation, "attention residual output", cfg.HiddenSize)
@@ -1407,11 +1423,22 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 			return hipGemma4Q4DecoderLayerResult{}, err
 		}
 	}
-	mlpOutputBuffer, err := hipRunGemma4Q4DeviceGELUTanhMLPWithDeviceInput(ctx, driver, preFeedForwardBuffer, cfg.GateProjection, cfg.UpProjection, cfg.DownProjection)
-	if err != nil {
-		return hipGemma4Q4DecoderLayerResult{}, err
+	var mlpOutputBuffer *hipDeviceByteBuffer
+	if req.AttentionWorkspace != nil && req.OmitDebugTensors {
+		mlpOutputBuffer, err = req.AttentionWorkspace.EnsureProjectionOutput(driver, cfg.DownProjection.Rows)
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+		if err := hipRunGemma4Q4DeviceGELUTanhMLPWithDeviceInputOutput(ctx, driver, preFeedForwardBuffer, cfg.GateProjection, cfg.UpProjection, cfg.DownProjection, mlpOutputBuffer, req.AttentionWorkspace); err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+	} else {
+		mlpOutputBuffer, err = hipRunGemma4Q4DeviceGELUTanhMLPWithDeviceInput(ctx, driver, preFeedForwardBuffer, cfg.GateProjection, cfg.UpProjection, cfg.DownProjection)
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+		defer mlpOutputBuffer.Close()
 	}
-	defer mlpOutputBuffer.Close()
 	var mlpOutput []float32
 	if !req.OmitDebugTensors {
 		mlpOutput, err = hipReadFloat32DeviceOutput(mlpOutputBuffer, hipGemma4Q4Layer0Operation, "GELU tanh MLP output", cfg.DownProjection.Rows)
@@ -1454,15 +1481,25 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 	}(finalHiddenBuffer)
 	if hasPerLayerInput {
 		var perLayerProjectionBuffer *hipDeviceByteBuffer
-		if req.PerLayerInputDevice != nil {
-			perLayerProjectionBuffer, err = hipRunGemma4Q4DeviceGELUTanhProjectionWithDeviceMultiplier(ctx, driver, finalHiddenBuffer, req.PerLayerInputDevice, cfg.PerLayerInput.InputGate, cfg.PerLayerInput.Projection)
+		if req.PerLayerInputDevice != nil && req.AttentionWorkspace != nil && req.OmitDebugTensors {
+			perLayerProjectionBuffer, err = req.AttentionWorkspace.EnsureProjectionOutput(driver, cfg.PerLayerInput.Projection.Rows)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			if err := hipRunGemma4Q4DeviceGELUTanhProjectionWithDeviceMultiplierOutput(ctx, driver, finalHiddenBuffer, req.PerLayerInputDevice, cfg.PerLayerInput.InputGate, cfg.PerLayerInput.Projection, perLayerProjectionBuffer, req.AttentionWorkspace); err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
 		} else {
-			perLayerProjectionBuffer, err = hipRunGemma4Q4DeviceGELUTanhProjectionWithDeviceInput(ctx, driver, finalHiddenBuffer, req.PerLayerInput, cfg.PerLayerInput.InputGate, cfg.PerLayerInput.Projection)
+			if req.PerLayerInputDevice != nil {
+				perLayerProjectionBuffer, err = hipRunGemma4Q4DeviceGELUTanhProjectionWithDeviceMultiplier(ctx, driver, finalHiddenBuffer, req.PerLayerInputDevice, cfg.PerLayerInput.InputGate, cfg.PerLayerInput.Projection)
+			} else {
+				perLayerProjectionBuffer, err = hipRunGemma4Q4DeviceGELUTanhProjectionWithDeviceInput(ctx, driver, finalHiddenBuffer, req.PerLayerInput, cfg.PerLayerInput.InputGate, cfg.PerLayerInput.Projection)
+			}
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			defer perLayerProjectionBuffer.Close()
 		}
-		if err != nil {
-			return hipGemma4Q4DecoderLayerResult{}, err
-		}
-		defer perLayerProjectionBuffer.Close()
 		perLayerNormCfg := cfg.PerLayerInput.PostInputNorm
 		perLayerNormCfg.Epsilon = req.Epsilon
 		var perLayerFinalHiddenBuffer *hipDeviceByteBuffer
@@ -1543,16 +1580,47 @@ func hipRunGemma4Q4DeviceGELUTanhMLP(ctx context.Context, driver nativeHIPDriver
 }
 
 func hipRunGemma4Q4DeviceGELUTanhMLPWithDeviceInput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, gateCfg, upCfg, downCfg hipMLXQ4DeviceWeightConfig) (*hipDeviceByteBuffer, error) {
-	activated, err := hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInput(ctx, driver, input, gateCfg, upCfg)
+	output, err := hipAllocateByteBuffer(driver, hipGemma4Q4Layer0Operation, "GELU tanh MLP output", uint64(downCfg.Rows*4), downCfg.Rows)
 	if err != nil {
 		return nil, err
 	}
-	defer activated.Close()
-	output, err := hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx, driver, activated, downCfg)
-	if err != nil {
+	success := false
+	defer func() {
+		if !success {
+			_ = output.Close()
+		}
+	}()
+	if err := hipRunGemma4Q4DeviceGELUTanhMLPWithDeviceInputOutput(ctx, driver, input, gateCfg, upCfg, downCfg, output, nil); err != nil {
 		return nil, err
 	}
+	success = true
 	return output, nil
+}
+
+func hipRunGemma4Q4DeviceGELUTanhMLPWithDeviceInputOutput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, gateCfg, upCfg, downCfg hipMLXQ4DeviceWeightConfig, output *hipDeviceByteBuffer, workspace *hipAttentionHeadsChunkedWorkspace) error {
+	var activated *hipDeviceByteBuffer
+	closeActivated := false
+	if workspace != nil {
+		var err error
+		activated, err = workspace.EnsureActivationOutput(driver, gateCfg.Rows)
+		if err != nil {
+			return err
+		}
+		if err := hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInputOutput(ctx, driver, input, gateCfg, upCfg, activated); err != nil {
+			return err
+		}
+	} else {
+		var err error
+		activated, err = hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInput(ctx, driver, input, gateCfg, upCfg)
+		if err != nil {
+			return err
+		}
+		closeActivated = true
+	}
+	if closeActivated {
+		defer activated.Close()
+	}
+	return hipRunMLXQ4ProjectionKernelWithDeviceInputOutput(ctx, driver, activated, downCfg, output)
 }
 
 func hipRunGemma4Q4DeviceGELUTanhProjection(ctx context.Context, driver nativeHIPDriver, input, multiplyBy []float32, gateCfg, projectionCfg hipMLXQ4DeviceWeightConfig) ([]float32, error) {
@@ -1592,6 +1660,35 @@ func hipRunGemma4Q4DeviceGELUTanhProjectionWithDeviceMultiplier(ctx context.Cont
 		return nil, err
 	}
 	return output, nil
+}
+
+func hipRunGemma4Q4DeviceGELUTanhProjectionWithDeviceMultiplierOutput(ctx context.Context, driver nativeHIPDriver, input, multiplyBuffer *hipDeviceByteBuffer, gateCfg, projectionCfg hipMLXQ4DeviceWeightConfig, output *hipDeviceByteBuffer, workspace *hipAttentionHeadsChunkedWorkspace) error {
+	if multiplyBuffer == nil || multiplyBuffer.Pointer() == 0 || multiplyBuffer.Count() != gateCfg.Rows || multiplyBuffer.SizeBytes() != uint64(gateCfg.Rows*4) {
+		return core.E(hipGemma4Q4Layer0Operation, "GELU tanh projection multiplier device buffer shape mismatch", nil)
+	}
+	var activated *hipDeviceByteBuffer
+	closeActivated := false
+	if workspace != nil {
+		var err error
+		activated, err = workspace.EnsureActivationOutput(driver, gateCfg.Rows)
+		if err != nil {
+			return err
+		}
+		if err := hipRunMLXQ4GELUTanhProjectionKernelWithDeviceMultiplierOutput(ctx, driver, input, multiplyBuffer, gateCfg, activated); err != nil {
+			return err
+		}
+	} else {
+		var err error
+		activated, err = hipRunMLXQ4GELUTanhProjectionKernelWithDeviceMultiplier(ctx, driver, input, multiplyBuffer, gateCfg)
+		if err != nil {
+			return err
+		}
+		closeActivated = true
+	}
+	if closeActivated {
+		defer activated.Close()
+	}
+	return hipRunMLXQ4ProjectionKernelWithDeviceInputOutput(ctx, driver, activated, projectionCfg, output)
 }
 
 func hipUploadGemma4Q4Float32Input(driver nativeHIPDriver, label string, input []float32) (*hipDeviceByteBuffer, error) {

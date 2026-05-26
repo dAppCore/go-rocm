@@ -845,7 +845,7 @@ func TestHIPKernels_MLXQ4GELUTanhMultiplyLaunchArgs_Good(t *testing.T) {
 	want := expectedGELUTanhMultiplyFromQ4(t, gateReq, upReq)
 	assertFloat32SlicesNear(t, want, outputValues, 0.0001)
 
-	activated, err := hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInput(context.Background(), driver, gateBuffers.Input, hipMLXQ4DeviceWeightConfig{
+	gateCfg := hipMLXQ4DeviceWeightConfig{
 		WeightPointer: gateBuffers.Weight.Pointer(),
 		ScalePointer:  gateBuffers.Scales.Pointer(),
 		BiasPointer:   gateBuffers.Biases.Pointer(),
@@ -855,7 +855,8 @@ func TestHIPKernels_MLXQ4GELUTanhMultiplyLaunchArgs_Good(t *testing.T) {
 		Rows:          gateReq.Rows,
 		Cols:          gateReq.Cols,
 		GroupSize:     gateReq.GroupSize,
-	}, hipMLXQ4DeviceWeightConfig{
+	}
+	upCfg := hipMLXQ4DeviceWeightConfig{
 		WeightPointer: upBuffers.Weight.Pointer(),
 		ScalePointer:  upBuffers.Scales.Pointer(),
 		BiasPointer:   upBuffers.Biases.Pointer(),
@@ -865,12 +866,22 @@ func TestHIPKernels_MLXQ4GELUTanhMultiplyLaunchArgs_Good(t *testing.T) {
 		Rows:          upReq.Rows,
 		Cols:          upReq.Cols,
 		GroupSize:     upReq.GroupSize,
-	})
+	}
+	activated, err := hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInput(context.Background(), driver, gateBuffers.Input, gateCfg, upCfg)
 	core.AssertNoError(t, err)
 	defer activated.Close()
 	activatedValues, err := hipReadFloat32DeviceOutput(activated, "rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "MLX q4 GELU tanh multiply output", gateReq.Rows)
 	core.AssertNoError(t, err)
 	assertFloat32SlicesNear(t, want, activatedValues, 0.0001)
+	core.AssertEqual(t, hipKernelNameMLXQ4GELUTanhMul, driver.launches[len(driver.launches)-1].Name)
+
+	reusedActivated, err := hipAllocateByteBuffer(driver, "rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "reused MLX q4 GELU tanh multiply output", uint64(gateReq.Rows*4), gateReq.Rows)
+	core.AssertNoError(t, err)
+	defer reusedActivated.Close()
+	core.AssertNoError(t, hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInputOutput(context.Background(), driver, gateBuffers.Input, gateCfg, upCfg, reusedActivated))
+	reusedActivatedValues, err := hipReadFloat32DeviceOutput(reusedActivated, "rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "reused MLX q4 GELU tanh multiply output", gateReq.Rows)
+	core.AssertNoError(t, err)
+	assertFloat32SlicesNear(t, want, reusedActivatedValues, 0.0001)
 	core.AssertEqual(t, hipKernelNameMLXQ4GELUTanhMul, driver.launches[len(driver.launches)-1].Name)
 
 	batchInputPayload, err := hipFloat32Payload([]float32{
@@ -1105,7 +1116,7 @@ func TestHIPKernels_MLXQ4GELUTanhProjectionLaunchArgs_Good(t *testing.T) {
 	want := expectedGELUTanhProjectionFromQ4(t, req, []float32{2, 3})
 	assertFloat32SlicesNear(t, want, outputValues, 0.0001)
 
-	activated, err := hipRunMLXQ4GELUTanhProjectionKernelWithDeviceMultiplier(context.Background(), driver, buffers.Input, multiplier, hipMLXQ4DeviceWeightConfig{
+	cfg := hipMLXQ4DeviceWeightConfig{
 		WeightPointer: buffers.Weight.Pointer(),
 		ScalePointer:  buffers.Scales.Pointer(),
 		BiasPointer:   buffers.Biases.Pointer(),
@@ -1115,12 +1126,22 @@ func TestHIPKernels_MLXQ4GELUTanhProjectionLaunchArgs_Good(t *testing.T) {
 		Rows:          req.Rows,
 		Cols:          req.Cols,
 		GroupSize:     req.GroupSize,
-	})
+	}
+	activated, err := hipRunMLXQ4GELUTanhProjectionKernelWithDeviceMultiplier(context.Background(), driver, buffers.Input, multiplier, cfg)
 	core.AssertNoError(t, err)
 	defer activated.Close()
 	activatedValues, err := hipReadFloat32DeviceOutput(activated, "rocm.hip.MLXQ4GELUTanhProjectionLaunch", "MLX q4 GELU tanh projection output", req.Rows)
 	core.AssertNoError(t, err)
 	assertFloat32SlicesNear(t, want, activatedValues, 0.0001)
+	core.AssertEqual(t, hipKernelNameMLXQ4GELUTanhProj, driver.launches[len(driver.launches)-1].Name)
+
+	reusedActivated, err := hipAllocateByteBuffer(driver, "rocm.hip.MLXQ4GELUTanhProjectionLaunch", "reused MLX q4 GELU tanh projection output", uint64(req.Rows*4), req.Rows)
+	core.AssertNoError(t, err)
+	defer reusedActivated.Close()
+	core.AssertNoError(t, hipRunMLXQ4GELUTanhProjectionKernelWithDeviceMultiplierOutput(context.Background(), driver, buffers.Input, multiplier, cfg, reusedActivated))
+	reusedActivatedValues, err := hipReadFloat32DeviceOutput(reusedActivated, "rocm.hip.MLXQ4GELUTanhProjectionLaunch", "reused MLX q4 GELU tanh projection output", req.Rows)
+	core.AssertNoError(t, err)
+	assertFloat32SlicesNear(t, want, reusedActivatedValues, 0.0001)
 	core.AssertEqual(t, hipKernelNameMLXQ4GELUTanhProj, driver.launches[len(driver.launches)-1].Name)
 
 	secondReq := req

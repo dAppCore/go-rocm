@@ -2146,6 +2146,66 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_ProjectionOutputReused(b *testin
 	}
 }
 
+func BenchmarkHIPAttentionHeadsChunkedWorkspace_ActivationOutputReused(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	output, err := workspace.EnsureActivationOutput(driver, 9216)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if output.Count() != 9216 || output.SizeBytes() != 36864 {
+		b.Fatalf("activation output shape = %d/%d, want 9216/36864", output.Count(), output.SizeBytes())
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		output, err = workspace.EnsureActivationOutput(driver, 9216)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if output.Count() != 9216 || output.SizeBytes() != 36864 {
+			b.Fatalf("activation output shape = %d/%d, want 9216/36864", output.Count(), output.SizeBytes())
+		}
+	}
+}
+
+func BenchmarkHIPAttentionHeadsChunkedWorkspace_RMSOutputsReused(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	residualOutput, err := workspace.EnsureRMSResidualOutput(driver, 2304)
+	if err != nil {
+		b.Fatal(err)
+	}
+	normOutput, err := workspace.EnsureRMSNormOutput(driver, 2304)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if residualOutput.Count() != 2304 || residualOutput.SizeBytes() != 9216 {
+		b.Fatalf("RMS residual output shape = %d/%d, want 2304/9216", residualOutput.Count(), residualOutput.SizeBytes())
+	}
+	if normOutput.Count() != 2304 || normOutput.SizeBytes() != 9216 {
+		b.Fatalf("RMS norm output shape = %d/%d, want 2304/9216", normOutput.Count(), normOutput.SizeBytes())
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		residualOutput, err = workspace.EnsureRMSResidualOutput(driver, 2304)
+		if err != nil {
+			b.Fatal(err)
+		}
+		normOutput, err = workspace.EnsureRMSNormOutput(driver, 2304)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if residualOutput.Count() != 2304 || residualOutput.SizeBytes() != 9216 {
+			b.Fatalf("RMS residual output shape = %d/%d, want 2304/9216", residualOutput.Count(), residualOutput.SizeBytes())
+		}
+		if normOutput.Count() != 2304 || normOutput.SizeBytes() != 9216 {
+			b.Fatalf("RMS norm output shape = %d/%d, want 2304/9216", normOutput.Count(), normOutput.SizeBytes())
+		}
+	}
+}
+
 func BenchmarkHIPGemma4Q4PerLayerInputDeviceSetLayer_View(b *testing.B) {
 	driver := &fakeHIPDriver{available: true}
 	const (

@@ -170,8 +170,16 @@ route stayed green after these fast-loop batches at `40.68s` wall, `36.45s`
 decode, `3021` generated tokens, `74.26 tok/s` average, `64.68 tok/s` on turn
 10, empty stderr, no cap hits, and chapter-10 anchor hits of `3`, while
 dropping to `356470968 B/op` and `1835290 allocs/op`. This is the current best
-production-candidate route for the book endpoint, but not the final driver
-endpoint: later-turn decode is still only `64.7 tok/s`, below the
+production-candidate route for the book endpoint. A later workspace batch reused
+the MLP output, GELU-tanh activation, per-layer input projection, and first
+residual-add/norm outputs. The short guard now reports `19849179335 ns/op`,
+`103.2 tok/s`, `79731416 B/op`, and `731369 allocs/op`. The retained book route
+stayed green at `40.69s` wall, `36.45s` decode, `3021` generated tokens,
+`74.25 tok/s` average, `65.44 tok/s` on turn 10, empty stderr, no cap hits, and
+chapter-10 anchor hits of `3`, while dropping to `315658912 B/op` and
+`1198795 allocs/op`. This is the current best production-candidate route for
+the book endpoint, but not the final driver endpoint: later-turn decode is
+still only `65.4 tok/s`, below the
 `90-100+ tok/s` target, and the visible output remains repetitive. Keep tuning
 retained long-context attention and state quality until the later turns stay
 near the target.
@@ -189,7 +197,7 @@ max_new_tokens  route                    tok/s   B/op       allocs/op
 2048            chunked-128 device KV     90.53  314.81M     3426653
 4096            non-chunked value-fast    72.45  633.26M     6833550
 4096            chunked-128 query cache   80.33  885.71M     6749654
-2048 text:Hi    projection workspace     103.6   107.24M     1161227
+2048 text:Hi    workspace batch          103.2    79.73M      731369
 ```
 
 The earlier 256-token chunked route was rejected because it fell to `58.24
