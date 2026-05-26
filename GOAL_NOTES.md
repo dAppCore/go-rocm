@@ -23,6 +23,22 @@
   chapter-10 anchor hits of `3`, `232339832 B/op`, and `227919 allocs/op`.
   This is a real speed step, but not the final endpoint: later-turn decode still
   needs to move from the high-60s into the `90-100+ tok/s` band.
+- Rejected a q4 GELU gate/up pair-reduction helper. It kept the 2048-token
+  guards above threshold (`107.2 tok/s` short, `98.42 tok/s` chapter-shaped),
+  but the retained 10-turn book acceptance hit the context deadline at `89.61s`.
+  The separate gate/up row reductions are currently the safer production shape.
+- Kept a second stage-1 barrier cleanup that writes the dim0 and dim1 value
+  partials to separate shared buffers before one barrier, then reduces both in
+  the same pass. This preserves the existing per-dim addition order but avoids
+  the old second `scratch[tid] = partial1` shared-memory pass. Source guards now
+  cover both the ordered score-lane shuffle and the dual value scratch path.
+- Live RX 7800 XT checks after that second stage-1 cleanup:
+  short `2048` guard `107.9 tok/s`, `17640976 B/op`, `72290 allocs/op`;
+  chapter-shaped `2048` guard `98.90 tok/s`, `44638912 B/op`,
+  `87796 allocs/op`; retained 10-turn full-cap greedy book `38.34s` wall,
+  `34.09s` decode, `3021` generated tokens, `78.79 tok/s` average,
+  `68.29 tok/s` on turn 10, empty stderr, no cap hits, chapter-10 anchor hits
+  of `3`, `232419864 B/op`, and `227947 allocs/op`.
 
 ## 2026-05-26 Allocation/Transfer Step-Down Pass
 

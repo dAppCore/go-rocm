@@ -5401,6 +5401,7 @@ extern "C" __global__ void rocm_attention_heads_chunked_stage1(const unsigned ch
 	float *value_scales = reinterpret_cast<float *>(shared_bytes + value_scale_offset);
 	float *query_values = reinterpret_cast<float *>(shared_bytes + query_cache_offset);
 	__shared__ float scratch[ROCM_ATTENTION_HEADS_CHUNKED_BLOCK_SIZE];
+	__shared__ float value_scratch1[ROCM_ATTENTION_HEADS_CHUNKED_BLOCK_SIZE];
 	__shared__ float shared_max_score;
 	__shared__ float shared_sum;
 
@@ -5569,6 +5570,7 @@ extern "C" __global__ void rocm_attention_heads_chunked_stage1(const unsigned ch
 		}
 	}
 	scratch[tid] = partial0;
+	value_scratch1[tid] = partial1;
 	__syncthreads();
 	if (tid < pair_count) {
 		float out0 = 0.0f;
@@ -5576,16 +5578,11 @@ extern "C" __global__ void rocm_attention_heads_chunked_stage1(const unsigned ch
 			out0 += scratch[value_group * pair_count + tid];
 		}
 		partials[tid << 1u] = out0;
-	}
-	__syncthreads();
-	scratch[tid] = partial1;
-	__syncthreads();
-	if (tid < pair_count) {
 		const uint32_t output_dim = (tid << 1u) + 1u;
 		if (output_dim < args.dim) {
 			float out1 = 0.0f;
 			for (uint32_t value_group = 0; value_group < value_groups; ++value_group) {
-				out1 += scratch[value_group * pair_count + tid];
+				out1 += value_scratch1[value_group * pair_count + tid];
 			}
 			partials[output_dim] = out1;
 		}

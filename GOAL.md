@@ -247,11 +247,18 @@ chapter-shaped 2048-token guard moved to `20713968694 ns/op`, `98.87 tok/s`,
 `44673712 B/op`, and `87783 allocs/op`. The retained book route stayed green at
 `38.37s` wall, `34.12s` decode, `3021` generated tokens, `78.74 tok/s`
 average, `67.74 tok/s` on turn 10, empty stderr, no cap hits, and chapter-10
-anchor hits of `3`, with `232339832 B/op` and `227919 allocs/op`. This is still
-not the final driver endpoint: later-turn decode is only `67.74 tok/s`, below the
-`90-100+ tok/s` target, and the visible output remains repetitive. Keep tuning
-retained long-context attention and state quality until the later turns stay
-near the target.
+anchor hits of `3`, with `232339832 B/op` and `227919 allocs/op`. Folding the
+stage-1 dim0/dim1 value partials into one shared-memory pass then moved the
+short guard to `18985260922 ns/op`, `107.9 tok/s`, `17640976 B/op`, and
+`72290 allocs/op`; the chapter-shaped guard stayed at `20708006858 ns/op`,
+`98.90 tok/s`, `44638912 B/op`, and `87796 allocs/op`. The retained book route
+stayed green at `38.34s` wall, `34.09s` decode, `3021` generated tokens,
+`78.79 tok/s` average, `68.29 tok/s` on turn 10, empty stderr, no cap hits, and
+chapter-10 anchor hits of `3`, with `232419864 B/op` and `227947 allocs/op`.
+This is still not the final driver endpoint: later-turn decode is only
+`68.29 tok/s`, below the `90-100+ tok/s` target, and the visible output remains
+repetitive. Keep tuning retained long-context attention and state quality until
+the later turns stay near the target.
 
 Current decode-scaling status as of 2026-05-26: Gemma4 E2B/E4B context is
 `128k` tokens, not `128` tokens; the context-128 short decode numbers remain a
