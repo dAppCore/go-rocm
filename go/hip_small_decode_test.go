@@ -2123,6 +2123,34 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_AttentionOutputReused(b *testing
 	}
 }
 
+func BenchmarkHIPGemma4Q4PerLayerInputDeviceSetLayer_View(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	const (
+		layerCount = 32
+		inputSize  = 2304
+	)
+	set := &hipGemma4Q4PerLayerInputDeviceSet{
+		driver:           driver,
+		layerCount:       layerCount,
+		layerStrideBytes: uint64(inputSize * 4),
+		layerValueCount:  inputSize,
+		viewLabel:        "per-layer input slice",
+		Backing: []*hipDeviceByteBuffer{{
+			driver:    driver,
+			pointer:   0x100000,
+			count:     layerCount * inputSize,
+			sizeBytes: uint64(layerCount * inputSize * 4),
+		}},
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		layer := set.Layer(i % layerCount)
+		if layer == nil || layer.Pointer() == 0 || layer.Count() != inputSize {
+			b.Fatalf("layer view = %#v", layer)
+		}
+	}
+}
+
 func BenchmarkHIPMLXQ4TripleProjLaunchArgsBinary_Hot(b *testing.B) {
 	args := hipMLXQ4TripleProjLaunchArgs{
 		InputPointer:        0x1000,

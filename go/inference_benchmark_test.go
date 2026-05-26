@@ -1176,10 +1176,10 @@ func inferenceBenchmarkGemma4Q4PerLayerInput(b *testing.B, ctx context.Context, 
 	b.Cleanup(func() {
 		_ = set.Close()
 	})
-	if layerIndex >= len(set.Layers) {
-		b.Fatalf("per-layer input set has %d layers, want index %d", len(set.Layers), layerIndex)
+	if layerIndex >= set.LayerCount() {
+		b.Fatalf("per-layer input set has %d layers, want index %d", set.LayerCount(), layerIndex)
 	}
-	return set.Layers[layerIndex]
+	return set.Layer(layerIndex)
 }
 
 func inferenceBenchmarkGemma4Q4ForwardPrior(b *testing.B, ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4ForwardConfig, tokens []int32, epsilon float32) []*rocmDeviceKVCache {

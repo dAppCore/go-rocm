@@ -458,8 +458,12 @@ func hipRunGemma4Q4PrefillPerLayerInputDeviceSetBatch(ctx context.Context, drive
 		return nil, err
 	}
 	outputs := &hipGemma4Q4PerLayerInputDeviceSet{
-		Layers:  make([]*hipDeviceByteBuffer, 0, layerCount),
-		Backing: []*hipDeviceByteBuffer{transposed},
+		driver:           driver,
+		layerCount:       layerCount,
+		layerStrideBytes: uint64(len(tokens) * perLayer.InputSize * 4),
+		layerValueCount:  len(tokens) * perLayer.InputSize,
+		viewLabel:        "per-layer input batch slice",
+		Backing:          []*hipDeviceByteBuffer{transposed},
 	}
 	success := false
 	defer func() {
@@ -467,12 +471,6 @@ func hipRunGemma4Q4PrefillPerLayerInputDeviceSetBatch(ctx context.Context, drive
 			_ = outputs.Close()
 		}
 	}()
-	layerBytes := uint64(len(tokens) * perLayer.InputSize * 4)
-	layerCountValues := len(tokens) * perLayer.InputSize
-	for layer := 0; layer < layerCount; layer++ {
-		offset := nativeDevicePointer(layer * len(tokens) * perLayer.InputSize * 4)
-		outputs.Layers = append(outputs.Layers, hipBorrowDeviceByteBuffer(driver, "per-layer input batch slice", transposed.Pointer()+offset, layerBytes, layerCountValues))
-	}
 	success = true
 	return outputs, nil
 }
@@ -1114,7 +1112,6 @@ func hipRunGemma4Q4PrefillForwardBatchWithPrior(ctx context.Context, driver nati
 			return nil, err
 		}
 		defer generatedPerLayerInputs.Close()
-		perLayerInputs = generatedPerLayerInputs.Layers
 	}
 	tokenCount := len(tokens)
 	sharedSources := hipGemma4Q4SharedKVSourceByLayer(cfg)
@@ -1143,7 +1140,9 @@ func hipRunGemma4Q4PrefillForwardBatchWithPrior(ctx context.Context, driver nati
 		layerOut := hipGemma4Q4PrefillForwardLayerBatch{KV: layerKV}
 		out.Layers = append(out.Layers, layerOut)
 		perLayerInput := (*hipDeviceByteBuffer)(nil)
-		if len(perLayerInputs) > index {
+		if generatedPerLayerInputs != nil {
+			perLayerInput = generatedPerLayerInputs.Layer(index)
+		} else if len(perLayerInputs) > index {
 			perLayerInput = perLayerInputs[index]
 		}
 		queryStartToken := layerKV.DeviceKV.Cache.TokenCount() - tokenCount

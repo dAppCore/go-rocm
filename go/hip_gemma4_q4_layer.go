@@ -130,15 +130,37 @@ type hipGemma4Q4LayerKVState struct {
 }
 
 type hipGemma4Q4PerLayerInputDeviceSet struct {
-	Layers  []*hipDeviceByteBuffer
-	Backing []*hipDeviceByteBuffer
+	driver           nativeHIPDriver
+	layerCount       int
+	layerStrideBytes uint64
+	layerValueCount  int
+	viewLabel        string
+	view             hipDeviceByteBuffer
+	Backing          []*hipDeviceByteBuffer
+}
+
+func (set *hipGemma4Q4PerLayerInputDeviceSet) LayerCount() int {
+	if set == nil {
+		return 0
+	}
+	return set.layerCount
 }
 
 func (set *hipGemma4Q4PerLayerInputDeviceSet) Layer(index int) *hipDeviceByteBuffer {
-	if set == nil || index < 0 || index >= len(set.Layers) {
+	if set == nil || index < 0 || index >= set.layerCount || set.layerStrideBytes == 0 || set.layerValueCount <= 0 ||
+		len(set.Backing) == 0 || set.Backing[0] == nil || set.Backing[0].Pointer() == 0 {
 		return nil
 	}
-	return set.Layers[index]
+	offset := nativeDevicePointer(uint64(index) * set.layerStrideBytes)
+	set.view = hipDeviceByteBuffer{
+		driver:    set.driver,
+		pointer:   set.Backing[0].Pointer() + offset,
+		count:     set.layerValueCount,
+		sizeBytes: set.layerStrideBytes,
+		borrowed:  true,
+		label:     set.viewLabel,
+	}
+	return &set.view
 }
 
 func (set *hipGemma4Q4PerLayerInputDeviceSet) Close() error {
@@ -146,11 +168,6 @@ func (set *hipGemma4Q4PerLayerInputDeviceSet) Close() error {
 		return nil
 	}
 	var lastErr error
-	for _, layer := range set.Layers {
-		if err := layer.Close(); err != nil {
-			lastErr = err
-		}
-	}
 	for _, buffer := range set.Backing {
 		if err := buffer.Close(); err != nil {
 			lastErr = err
@@ -1039,18 +1056,21 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 	var queryBuffer *hipDeviceByteBuffer
 	var keyBuffer *hipDeviceByteBuffer
 	var valueBuffer *hipDeviceByteBuffer
+	var queryBufferView hipDeviceByteBuffer
+	var keyBufferView hipDeviceByteBuffer
+	var valueBufferView hipDeviceByteBuffer
 	projectLocalKV := req.SharedDeviceKV == nil && len(req.SharedKeys) == 0
 	if projectLocalKV &&
 		cfg.QueryProjection.Cols == cfg.KeyProjection.Cols && cfg.QueryProjection.Cols == cfg.ValueProjection.Cols &&
 		cfg.QueryProjection.GroupSize == cfg.KeyProjection.GroupSize && cfg.QueryProjection.GroupSize == cfg.ValueProjection.GroupSize {
-		qkvOutputBuffer, queryBuffer, keyBuffer, valueBuffer, err = hipRunMLXQ4TripleProjectionKernelWithDeviceInput(ctx, driver, layerInputBuffer, cfg.QueryProjection, cfg.KeyProjection, cfg.ValueProjection)
+		qkvOutputBuffer, queryBufferView, keyBufferView, valueBufferView, err = hipRunMLXQ4TripleProjectionKernelWithDeviceInputViews(ctx, driver, layerInputBuffer, cfg.QueryProjection, cfg.KeyProjection, cfg.ValueProjection)
 		if err != nil {
 			return hipGemma4Q4DecoderLayerResult{}, err
 		}
+		queryBuffer = &queryBufferView
+		keyBuffer = &keyBufferView
+		valueBuffer = &valueBufferView
 		defer qkvOutputBuffer.Close()
-		defer queryBuffer.Close()
-		defer keyBuffer.Close()
-		defer valueBuffer.Close()
 	} else {
 		queryBuffer, err = hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx, driver, layerInputBuffer, cfg.QueryProjection)
 		if err != nil {
@@ -2278,7 +2298,7 @@ func hipRunGemma4Q4PerLayerInputDeviceSet(ctx context.Context, driver nativeHIPD
 	if err != nil {
 		return nil, err
 	}
-	if len(inputs.Layers) < len(cfg.Layers) {
+	if inputs.LayerCount() < len(cfg.Layers) {
 		_ = inputs.Close()
 		return nil, core.E(hipGemma4Q4Layer0Operation, "computed per-layer input count is smaller than forward layer count", nil)
 	}
@@ -2357,8 +2377,12 @@ func hipRunGemma4Q4PerLayerInputConfigDeviceSet(ctx context.Context, driver nati
 	}
 
 	outputs := &hipGemma4Q4PerLayerInputDeviceSet{
-		Layers:  make([]*hipDeviceByteBuffer, 0, layerCount),
-		Backing: []*hipDeviceByteBuffer{scaled},
+		driver:           driver,
+		layerCount:       layerCount,
+		layerStrideBytes: uint64(cfg.InputSize * 4),
+		layerValueCount:  cfg.InputSize,
+		viewLabel:        "per-layer input slice",
+		Backing:          []*hipDeviceByteBuffer{scaled},
 	}
 	success := false
 	defer func() {
@@ -2366,11 +2390,6 @@ func hipRunGemma4Q4PerLayerInputConfigDeviceSet(ctx context.Context, driver nati
 			_ = outputs.Close()
 		}
 	}()
-	for layer := 0; layer < layerCount; layer++ {
-		offset := nativeDevicePointer(layer * cfg.InputSize * 4)
-		bytes := uint64(cfg.InputSize * 4)
-		outputs.Layers = append(outputs.Layers, hipBorrowDeviceByteBuffer(driver, "per-layer input slice", scaled.Pointer()+offset, bytes, cfg.InputSize))
-	}
 	success = true
 	return outputs, nil
 }

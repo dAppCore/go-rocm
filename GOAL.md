@@ -156,12 +156,18 @@ launch-validator map literals then kept the short guard at `103.3 tok/s` while
 dropping it to `146939376 B/op` and `1689861 allocs/op`; the retained book route
 stayed green at `41.19s` wall, `36.96s` decode, `73.34 tok/s` average,
 `63.67 tok/s` on turn 10, empty stderr, and chapter-10 anchor hits of `3`, with
-`418587400 B/op` and `2660797 allocs/op`. This is the current best
-production-candidate route for the book endpoint, but not the final driver
+`418587400 B/op` and `2660797 allocs/op`. A follow-up 2048-token fast-loop
+allocation batch stopped copying borrowed RMSNorm-head launch packets, reused a
+single per-layer input device view, and used stack-backed Q/K/V views for the
+fused triple projection. The short guard now reports `19783450849 ns/op`,
+`103.5 tok/s`, `117716864 B/op`, and `1314741 allocs/op`. The retained book
+route was not rerun for this fast-loop batch; the last green retained book
+metrics above remain the current book acceptance evidence. This is the current
+best production-candidate route for the book endpoint, but not the final driver
 endpoint: later-turn decode is still only `63.7 tok/s`, below the
-`90-100+ tok/s` target, and the visible output remains repetitive. Keep tuning
-retained long-context attention and state quality until the later turns stay
-near the target.
+`90-100+ tok/s` target, and the visible output remains repetitive. Keep tuning retained
+long-context attention and state quality until the later turns stay near the
+target.
 
 Current decode-scaling status as of 2026-05-26: Gemma4 E2B/E4B context is
 `128k` tokens, not `128` tokens; the context-128 short decode numbers remain a
@@ -176,7 +182,7 @@ max_new_tokens  route                    tok/s   B/op       allocs/op
 2048            chunked-128 device KV     90.53  314.81M     3426653
 4096            non-chunked value-fast    72.45  633.26M     6833550
 4096            chunked-128 query cache   80.33  885.71M     6749654
-2048 text:Hi    no-map launch checks     103.3   146.94M     1689861
+2048 text:Hi    batched view cleanup     103.5   117.72M     1314741
 ```
 
 The earlier 256-token chunked route was rejected because it fell to `58.24

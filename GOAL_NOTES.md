@@ -40,6 +40,15 @@
   chapter-10 anchor hits of `3`, `418587400 B/op`, and `2660797 allocs/op`.
   The short-guard sequence is now
   `3.40M -> 2.04M -> 1.98M -> 1.85M -> 1.78M -> 1.69M allocs/op`.
+- Batched another fast-loop cleanup on the 2048-token guard: passed borrowed
+  RMSNorm-head launch packets directly to the driver, replaced per-token
+  per-layer input borrowed-buffer slices with a reusable device view, and used
+  stack-backed views for the fused Q/K/V triple projection outputs. Added
+  `BenchmarkHIPGemma4Q4PerLayerInputDeviceSetLayer_View`, which reports
+  `6.283 ns/op`, `0 B/op`, and `0 allocs/op`. The live `text:Hi` 2048-token
+  guard now reports `103.5 tok/s`, `117716864 B/op`, and `1314741 allocs/op`.
+  The short-guard allocation sequence is now
+  `3.40M -> 2.04M -> 1.98M -> 1.85M -> 1.78M -> 1.69M -> 1.31M allocs/op`.
 
 ## 2026-05-26 Full-Chapter Book and Long-Attention Pass
 

@@ -1283,7 +1283,7 @@ func hipRunRMSNormHeadsKernelWithDeviceInputWeightConfig(ctx context.Context, dr
 	}
 	config := hipKernelLaunchConfig{
 		Name:   hipKernelNameRMSNormHeads,
-		Args:   append([]byte(nil), launchBytes...),
+		Args:   launchBytes,
 		GridX:  uint32(headCount),
 		GridY:  1,
 		GridZ:  1,
@@ -1349,7 +1349,7 @@ func hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfig(ctx context.Context
 	}
 	config := hipKernelLaunchConfig{
 		Name:   hipKernelNameRMSNormRoPEHeads,
-		Args:   append([]byte(nil), launchBytes...),
+		Args:   launchBytes,
 		GridX:  uint32(headCount),
 		GridY:  1,
 		GridZ:  1,
@@ -1416,7 +1416,7 @@ func hipRunRMSNormRoPEHeadsBatchKernelWithDeviceInputWeightConfig(ctx context.Co
 	}
 	config := hipKernelLaunchConfig{
 		Name:   hipKernelNameRMSNormRoPEHeadsBatch,
-		Args:   append([]byte(nil), launchBytes...),
+		Args:   launchBytes,
 		GridX:  uint32(headCount),
 		GridY:  uint32(batch),
 		GridZ:  1,
