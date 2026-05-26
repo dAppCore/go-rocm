@@ -33,8 +33,22 @@ var hipGemma4Q4DeviceLayerStatePool = struct {
 
 const hipGemma4Q4DeviceLayerStatePoolMax = 4096
 
+var hipGemma4Q4DeviceDecodeStatePool = sync.Pool{
+	New: func() any { return &hipGemma4Q4DeviceDecodeState{} },
+}
+
 func hipNewGemma4Q4DeviceDecodeState(mode string, layerCapacity int) *hipGemma4Q4DeviceDecodeState {
-	return &hipGemma4Q4DeviceDecodeState{mode: mode, layers: hipBorrowGemma4Q4DeviceLayerStates(layerCapacity)}
+	state := hipGemma4Q4DeviceDecodeStatePool.Get().(*hipGemma4Q4DeviceDecodeState)
+	*state = hipGemma4Q4DeviceDecodeState{mode: mode, layers: hipBorrowGemma4Q4DeviceLayerStates(layerCapacity)}
+	return state
+}
+
+func hipReleaseClosedGemma4Q4DeviceDecodeState(state *hipGemma4Q4DeviceDecodeState) {
+	if state == nil || !state.closed || len(state.layers) != 0 {
+		return
+	}
+	*state = hipGemma4Q4DeviceDecodeState{}
+	hipGemma4Q4DeviceDecodeStatePool.Put(state)
 }
 
 func hipBorrowGemma4Q4DeviceLayerStates(layerCapacity int) []hipGemma4Q4DeviceLayerKVState {

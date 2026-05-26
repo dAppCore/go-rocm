@@ -1124,8 +1124,10 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 						runErr = core.E(hipGemma4Q4Layer0Operation, "forward did not return device KV state", nil)
 						return
 					}
+					previousDeviceState := deviceState
 					deviceState = current.DeviceState
 					current.DeviceState = nil
+					hipReleaseClosedGemma4Q4DeviceDecodeState(previousDeviceState)
 					if outputToken {
 						if hostSampling {
 							current.Greedy, err = hipGemma4Q4HostSampleResult(current.Logits, generate, suppressTokens, history, rand.Float64())
@@ -1180,12 +1182,14 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 				runErr = closeErr
 				return
 			}
-			if err := hipFinalizeGemma4Q4ForwardDeviceState(deviceState, nextDeviceState); err != nil {
+			previousDeviceState := deviceState
+			if err := hipFinalizeGemma4Q4ForwardDeviceState(previousDeviceState, nextDeviceState); err != nil {
 				_ = nextDeviceState.Close()
 				runErr = err
 				return
 			}
 			deviceState = nextDeviceState
+			hipReleaseClosedGemma4Q4DeviceDecodeState(previousDeviceState)
 		}
 		if !haveCurrent {
 			runErr = core.E(hipGemma4Q4Layer0Operation, "prefill did not produce a final greedy token", nil)
@@ -1244,8 +1248,10 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 				runErr = core.E(hipGemma4Q4Layer0Operation, "forward did not return device KV state", nil)
 				return
 			}
+			previousDeviceState := deviceState
 			deviceState = current.DeviceState
 			current.DeviceState = nil
+			hipReleaseClosedGemma4Q4DeviceDecodeState(previousDeviceState)
 			if hostSampling {
 				current.Greedy, err = hipGemma4Q4HostSampleResult(current.Logits, generate, suppressTokens, history, rand.Float64())
 				if err != nil {

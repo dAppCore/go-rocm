@@ -2145,6 +2145,25 @@ func BenchmarkHIPReadDeviceUint64_DirectReader(b *testing.B) {
 	}
 }
 
+func BenchmarkHIPGemma4Q4DeviceDecodeStatePool_Reused(b *testing.B) {
+	state := hipNewGemma4Q4DeviceDecodeState(rocmKVCacheModeKQ8VQ4, 35)
+	hipReleaseGemma4Q4DeviceLayerStates(state.layers)
+	state.layers = nil
+	state.closed = true
+	hipReleaseClosedGemma4Q4DeviceDecodeState(state)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		state = hipNewGemma4Q4DeviceDecodeState(rocmKVCacheModeKQ8VQ4, 35)
+		if state == nil || state.mode != rocmKVCacheModeKQ8VQ4 || len(state.layers) != 0 || cap(state.layers) < 35 {
+			b.Fatal("decode state pool returned invalid state")
+		}
+		hipReleaseGemma4Q4DeviceLayerStates(state.layers)
+		state.layers = nil
+		state.closed = true
+		hipReleaseClosedGemma4Q4DeviceDecodeState(state)
+	}
+}
+
 func BenchmarkHIPAttentionHeadsChunkedWorkspace_AttentionOutputReused(b *testing.B) {
 	driver := &fakeHIPDriver{available: true}
 	workspace := &hipAttentionHeadsChunkedWorkspace{}

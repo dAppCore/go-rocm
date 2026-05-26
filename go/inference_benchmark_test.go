@@ -620,11 +620,13 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 				_ = nextDeviceState.Close()
 				return inferenceBenchmarkGemma4Q4RetainedTurn{}, closeErr
 			}
-			if err := hipFinalizeGemma4Q4ForwardDeviceState(session.deviceState, nextDeviceState); err != nil {
+			previousDeviceState := session.deviceState
+			if err := hipFinalizeGemma4Q4ForwardDeviceState(previousDeviceState, nextDeviceState); err != nil {
 				_ = nextDeviceState.Close()
 				return inferenceBenchmarkGemma4Q4RetainedTurn{}, err
 			}
 			session.deviceState = nextDeviceState
+			hipReleaseClosedGemma4Q4DeviceDecodeState(previousDeviceState)
 		}
 		session.position = prefillPlan.NextPosition()
 	}
@@ -659,8 +661,10 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 		}
 	}
 	session.hostState = nextHostState
+	previousDeviceState := session.deviceState
 	session.deviceState = finalForward.DeviceState
 	finalForward.DeviceState = nil
+	hipReleaseClosedGemma4Q4DeviceDecodeState(previousDeviceState)
 	session.position++
 	prefillDuration := time.Since(prefillStart)
 
@@ -708,8 +712,10 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 			return inferenceBenchmarkGemma4Q4RetainedTurn{}, fmt.Errorf("retained book decode did not return device KV state")
 		}
 		session.hostState = nextHostState
+		previousDeviceState := session.deviceState
 		session.deviceState = forward.DeviceState
 		forward.DeviceState = nil
+		hipReleaseClosedGemma4Q4DeviceDecodeState(previousDeviceState)
 		if generated+1 < generate.MaxTokens {
 			current = forward.Greedy
 			if hostSampling {

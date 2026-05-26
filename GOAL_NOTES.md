@@ -13909,3 +13909,61 @@ This is a small 2048-loop allocation/plumbing cleanup and quality-preserving
 acceptance pass. It is not a retained decode win: retained wall/decode metrics
 remain noise-flat, and turn 10 is still about `70 tok/s`. The next material
 target remains long-context attention/projection, not launch wrapper overhead.
+
+## 2026-05-26: Decode State Pool and Workspace RMSNorm Reuse
+
+This 2048-token fast-loop pass used exact 1-token-vs-2048-token memprofile
+deltas to remove two generation-scaling host allocation sources without changing
+kernel math:
+
+```text
+- Pool closed hipGemma4Q4DeviceDecodeState wrappers and release the closed
+  previous wrapper after hot decode/prefill state swaps.
+- Reuse the attention workspace RMSNorm buffer for the hot OmitDebugTensors
+  layer-input RMSNorm path via the existing device-to-device RMSNorm launcher.
+```
+
+The post-state-pool profile confirmed the wrapper allocation disappeared. The
+remaining large object counts were descriptor-table free/malloc wrappers and the
+RMSNorm output allocation; the workspace RMSNorm reuse removed that per-token
+buffer allocation from the 2048 fast loop.
+
+AX-11 microbenchmark:
+
+```text
+BenchmarkHIPGemma4Q4DeviceDecodeStatePool_Reused-32  44.20 ns/op  0 B/op  0 allocs/op
+```
+
+2048-token fast guards:
+
+```text
+2048 text:Hi:
+  18776895234 ns/op, 109.1 tok/s, 7129424 B/op, 4711 allocs/op
+
+2048 generated tokens, context_len=4096, chapter-1 lighthouse prompt:
+  20148794443 ns/op, 101.6 tok/s, 15165224 B/op, 6350 allocs/op
+```
+
+Retained-book acceptance:
+
+```text
+book_wall_s/op             37.76
+book_decode_s/op           33.54
+book_generated_tokens/op    3021
+book_tok/s                 80.01
+book_turn01_tok/s         110.1
+book_turn10_tok/s          69.24
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+stderr_bytes                   0
+B/op                    230620784
+allocs/op                  100506
+output: /tmp/go-rocm-book-10turn-fullcap-statepool-rmsworkspace.md
+```
+
+This is an accepted allocation/memory cleanup batch: compared with the prior
+launch-plumbing pass, the short 2048 guard moved from `8798` to `4711`
+allocs/op, the chapter guard moved from `10425` to `6350` allocs/op, and
+retained-book allocation count moved from `106651` to `100506` allocs/op.
+Retained decode remains noise-flat and below the late-turn target, so the next
+material speed target is still retained long-context attention/projection.

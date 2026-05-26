@@ -1572,6 +1572,13 @@ Remaining blocker:
   launch-plumbing pass is quality-preserving and flat on retained speed:
   `37.67s` wall, `80.20 tok/s` average, turn 10 `69.63 tok/s`,
   `230999296 B/op`, `106651 allocs/op`, `chapter10_arc_anchor_hits=3`.
+- The latest accepted allocation pass pools closed device decode state wrappers
+  and reuses the workspace RMSNorm buffer for the hot layer-input norm path.
+  Fast guards now measure `109.1 tok/s`, `7129424 B/op`, `4711 allocs/op` on
+  `text:Hi` and `101.6 tok/s`, `15165224 B/op`, `6350 allocs/op` on the
+  chapter-shaped 2048 run. Retained-book acceptance stayed quality-clean at
+  `37.76s` wall, `80.01 tok/s` average, turn 10 `69.24 tok/s`,
+  `230620784 B/op`, `100506 allocs/op`, `chapter10_arc_anchor_hits=3`.
 
 - [ ] Phase 0: Snapshot the tree and establish the baseline.
   - Run `git status --short`.

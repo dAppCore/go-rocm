@@ -982,15 +982,19 @@ func hipRunGemma4Q4GreedyDecode(ctx context.Context, driver nativeHIPDriver, cfg
 					_ = deviceState.Close()
 					return hipGemma4Q4GreedyDecodeResult{}, core.E(hipGemma4Q4Layer0Operation, "forward did not return device KV state", nil)
 				}
+				previousDeviceState := deviceState
 				deviceState = current.DeviceState
 				current.DeviceState = nil
+				hipReleaseClosedGemma4Q4DeviceDecodeState(previousDeviceState)
 			} else {
+				previousDeviceState := deviceState
 				nextDeviceState, err := hipUpdateGemma4Q4DeviceDecodeState(driver, cfg, previousState, state, deviceState, req.DeviceKVMode)
 				if err != nil {
 					_ = deviceState.Close()
 					return hipGemma4Q4GreedyDecodeResult{}, err
 				}
 				deviceState = nextDeviceState
+				hipReleaseClosedGemma4Q4DeviceDecodeState(previousDeviceState)
 			}
 		}
 		stepResults = append(stepResults, current)
@@ -1025,15 +1029,19 @@ func hipRunGemma4Q4GreedyDecode(ctx context.Context, driver nativeHIPDriver, cfg
 					_ = deviceState.Close()
 					return hipGemma4Q4GreedyDecodeResult{}, core.E(hipGemma4Q4Layer0Operation, "forward did not return device KV state", nil)
 				}
+				previousDeviceState := deviceState
 				deviceState = current.DeviceState
 				current.DeviceState = nil
+				hipReleaseClosedGemma4Q4DeviceDecodeState(previousDeviceState)
 			} else {
+				previousDeviceState := deviceState
 				nextDeviceState, err := hipUpdateGemma4Q4DeviceDecodeState(driver, cfg, previousState, state, deviceState, req.DeviceKVMode)
 				if err != nil {
 					_ = deviceState.Close()
 					return hipGemma4Q4GreedyDecodeResult{}, err
 				}
 				deviceState = nextDeviceState
+				hipReleaseClosedGemma4Q4DeviceDecodeState(previousDeviceState)
 			}
 		}
 		stepResults = append(stepResults, current)
@@ -1109,16 +1117,29 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 	inputNormCfg := cfg.InputNorm
 	inputNormCfg.Epsilon = req.Epsilon
 	var layerInputBuffer *hipDeviceByteBuffer
+	layerInputBorrowed := false
 	if req.LayerInputDevice != nil {
 		if req.LayerInputDevice.Pointer() == 0 || req.LayerInputDevice.Count() != cfg.HiddenSize || req.LayerInputDevice.SizeBytes() != uint64(cfg.HiddenSize*4) {
 			return hipGemma4Q4DecoderLayerResult{}, core.E(hipGemma4Q4Layer0Operation, "decoder layer precomputed input norm shape mismatch", nil)
 		}
 		layerInputBuffer = req.LayerInputDevice
+		layerInputBorrowed = true
+	} else if req.AttentionWorkspace != nil && req.OmitDebugTensors {
+		layerInputBuffer, err = req.AttentionWorkspace.EnsureRMSNormOutput(driver, inputNormCfg.Count)
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+		if err := hipRunRMSNormDeviceToDeviceKernel(ctx, driver, inputBuffer.Pointer(), inputBuffer.SizeBytes(), layerInputBuffer.Pointer(), layerInputBuffer.SizeBytes(), inputNormCfg); err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+		layerInputBorrowed = true
 	} else {
 		layerInputBuffer, err = hipRunRMSNormKernelWithDeviceInputWeightConfig(ctx, driver, inputBuffer, inputNormCfg)
 		if err != nil {
 			return hipGemma4Q4DecoderLayerResult{}, err
 		}
+	}
+	if !layerInputBorrowed {
 		defer layerInputBuffer.Close()
 	}
 	var layerInput []float32
