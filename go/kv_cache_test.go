@@ -591,6 +591,54 @@ func TestKVCache_Good_DeviceMirrorWindowAppendTrimsAndTransfersPages(t *testing.
 	core.RequireNoError(t, next.Close())
 }
 
+func TestKVCache_Good_DeviceTransferSharedPagesTrimmedSuffix(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	sourcePages := []rocmDeviceKVPage{
+		{
+			tokenStart: 0,
+			tokenCount: 1,
+			key:        rocmDeviceKVTensor{pointer: 0x1001, sizeBytes: 4, encoding: rocmKVEncodingQ8},
+			value:      rocmDeviceKVTensor{pointer: 0x1002, sizeBytes: 4, encoding: rocmKVEncodingQ4},
+			owned:      true,
+		},
+		{
+			tokenStart: 1,
+			tokenCount: 1,
+			key:        rocmDeviceKVTensor{pointer: 0x2001, sizeBytes: 4, encoding: rocmKVEncodingQ8},
+			value:      rocmDeviceKVTensor{pointer: 0x2002, sizeBytes: 4, encoding: rocmKVEncodingQ4},
+			owned:      true,
+		},
+		{
+			tokenStart: 2,
+			tokenCount: 1,
+			key:        rocmDeviceKVTensor{pointer: 0x3001, sizeBytes: 4, encoding: rocmKVEncodingQ8},
+			value:      rocmDeviceKVTensor{pointer: 0x3002, sizeBytes: 4, encoding: rocmKVEncodingQ4},
+			owned:      true,
+		},
+	}
+	targetPages := []rocmDeviceKVPage{
+		sourcePages[1],
+		sourcePages[2],
+	}
+	for index := range targetPages {
+		targetPages[index].tokenStart = index
+		targetPages[index].owned = false
+	}
+	source := rocmBorrowDeviceKVCache(driver, rocmKVCacheModeKQ8VQ4, 1, len(sourcePages), sourcePages, false)
+	target := rocmBorrowDeviceKVCache(driver, rocmKVCacheModeKQ8VQ4, 1, len(targetPages), targetPages, false)
+
+	core.RequireNoError(t, source.transferSharedPagesTo(target))
+
+	core.AssertEqual(t, true, source.closed)
+	core.AssertEqual(t, 0, len(source.pages))
+	core.AssertEqual(t, []nativeDevicePointer{0x1001, 0x1002}, driver.frees)
+	core.AssertEqual(t, true, target.pages[0].owned)
+	core.AssertEqual(t, true, target.pages[1].owned)
+	core.AssertEqual(t, nativeDevicePointer(0x2001), target.pages[0].key.pointer)
+	core.AssertEqual(t, nativeDevicePointer(0x3002), target.pages[1].value.pointer)
+	core.RequireNoError(t, target.Close())
+}
+
 func TestKVCache_Bad_DeviceMirrorAppendRollbackOnDescriptorFailure(t *testing.T) {
 	cache, err := newROCmKVCache(rocmKVCacheModeQ8, 2)
 	core.RequireNoError(t, err)

@@ -1,5 +1,57 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-26 Retained KV Transfer Fast Path
+
+- Kept the 2048-token fast loop as the edit gate and promoted only after the
+  retained 10-turn full-cap book acceptance passed.
+- `transferSharedPagesTo` now recognizes the two hot retained-state layouts
+  directly: prefix-preserving append pages and suffix-preserving sliding-window
+  trims. Those paths transfer page ownership with indexed loops and only fall
+  back to the old full scan for unusual layouts.
+- Added `TestKVCache_Good_DeviceTransferSharedPagesTrimmedSuffix` for the
+  trimmed local-window ownership case and an AX-11 benchmark for the same hot
+  shape. The refined direct suffix path reports:
+
+```text
+BenchmarkROCmDeviceKVTransferSharedPages_TrimmedSuffix-32  224.3 ns/op  5 B/op  0 allocs/op
+```
+
+- Rejected a q4 projection/GELU `__restrict__` codegen experiment. It compiled
+  cleanly, but the chapter-shaped 2048 guard stayed noise-flat/slightly worse
+  at about `100.1 tok/s`, so the kernel hint was reverted.
+- Live RX 7800 XT 2048-token guards after the kept transfer path:
+
+```text
+2048 text:Hi:
+  18846017215 ns/op, 108.7 tok/s, 7136904 B/op, 4711 allocs/op
+
+2048 generated tokens, context_len=4096, chapter-1 lighthouse prompt:
+  20415133705 ns/op, 100.3 tok/s, 16975704 B/op, 7186 allocs/op
+```
+
+- Retained 10-turn full-cap greedy book acceptance stayed green:
+
+```text
+book_wall_s/op             37.79
+book_decode_s/op           33.56
+book_generated_tokens/op    3021
+book_tok/s                 79.94
+book_turn01_tok/s         109.5
+book_turn10_tok/s          69.29
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+stderr_bytes                   0
+B/op                    230613032
+allocs/op                  100440
+output: /tmp/go-rocm-book-10turn-fullcap-transfer2.md
+stderr: /tmp/go-rocm-book-10turn-fullcap-transfer2.err
+```
+
+- This is accepted as a retained-state CPU-path cleanup with a visible
+  microbenchmark win. It is not a decode-throughput breakthrough: retained
+  average decode and turn 10 remain noise-flat, so the next material speed
+  target is still q4 projection/GELU or chunked stage-1 attention.
+
 ## 2026-05-26 VRAM Metrics Cache Pass
 
 - Collapsed `recordMetricsDurations` from two `nativePeakMemoryBytes` calls to

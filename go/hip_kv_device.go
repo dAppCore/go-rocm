@@ -1019,18 +1019,36 @@ func (cache *rocmDeviceKVCache) transferSharedPagesTo(next *rocmDeviceKVCache) e
 		return core.E("rocm.KVCache.DeviceAppend", "device KV cache ownership target does not match", nil)
 	}
 	var lastErr error
-	for sourceIndex := range cache.pages {
-		source := &cache.pages[sourceIndex]
+	sourcePages := cache.pages
+	targetPages := next.pages
+	if len(sourcePages) > 0 && len(targetPages) >= len(sourcePages) &&
+		rocmDeviceKVPagePointersEqual(&sourcePages[0], &targetPages[0]) &&
+		rocmDeviceKVPagePointersEqual(&sourcePages[len(sourcePages)-1], &targetPages[len(sourcePages)-1]) {
+		for index := range sourcePages {
+			rocmDeviceKVTransferPageOwnership(&sourcePages[index], &targetPages[index])
+		}
+		cache.finishTransferSharedPages()
+		return nil
+	}
+	if suffixOffset := len(sourcePages) - len(targetPages); suffixOffset > 0 && len(targetPages) > 0 &&
+		rocmDeviceKVPagePointersEqual(&sourcePages[suffixOffset], &targetPages[0]) &&
+		rocmDeviceKVPagePointersEqual(&sourcePages[len(sourcePages)-1], &targetPages[len(targetPages)-1]) {
+		for sourceIndex := 0; sourceIndex < suffixOffset; sourceIndex++ {
+			rocmDeviceKVFreeOwnedPage(cache.driver, &sourcePages[sourceIndex], &lastErr)
+		}
+		for targetIndex := range targetPages {
+			rocmDeviceKVTransferPageOwnership(&sourcePages[targetIndex+suffixOffset], &targetPages[targetIndex])
+		}
+		cache.finishTransferSharedPages()
+		return lastErr
+	}
+	for sourceIndex := range sourcePages {
+		source := &sourcePages[sourceIndex]
 		matched := false
-		for targetIndex := range next.pages {
-			target := &next.pages[targetIndex]
-			if source.key.pointer == target.key.pointer && source.value.pointer == target.value.pointer {
-				if source.owned {
-					target.owned = true
-					source.key.pointer = 0
-					source.value.pointer = 0
-				}
-				source.owned = false
+		for targetIndex := range targetPages {
+			target := &targetPages[targetIndex]
+			if rocmDeviceKVPagePointersEqual(source, target) {
+				rocmDeviceKVTransferPageOwnership(source, target)
 				matched = true
 				break
 			}
@@ -1038,26 +1056,52 @@ func (cache *rocmDeviceKVCache) transferSharedPagesTo(next *rocmDeviceKVCache) e
 		if matched || !source.owned {
 			continue
 		}
-		if source.key.pointer != 0 {
-			if err := rocmDeviceKVTensorFree(cache.driver, source.key.pointer, source.key.sizeBytes); err != nil {
-				lastErr = core.E("rocm.KVCache.DeviceAppend", "free trimmed KV key page", err)
-			}
-			source.key.pointer = 0
-		}
-		if source.value.pointer != 0 {
-			if err := rocmDeviceKVTensorFree(cache.driver, source.value.pointer, source.value.sizeBytes); err != nil {
-				lastErr = core.E("rocm.KVCache.DeviceAppend", "free trimmed KV value page", err)
-			}
-			source.value.pointer = 0
-		}
-		source.owned = false
+		rocmDeviceKVFreeOwnedPage(cache.driver, source, &lastErr)
 	}
+	cache.finishTransferSharedPages()
+	return lastErr
+}
+
+func (cache *rocmDeviceKVCache) finishTransferSharedPages() {
 	pages := cache.pages
 	cache.pages = nil
 	cache.tokenCount = 0
 	cache.closed = true
 	rocmDeviceKVReleasePageSlice(pages)
-	return lastErr
+}
+
+func rocmDeviceKVPagePointersEqual(source, target *rocmDeviceKVPage) bool {
+	return source != nil && target != nil &&
+		source.key.pointer == target.key.pointer &&
+		source.value.pointer == target.value.pointer
+}
+
+func rocmDeviceKVTransferPageOwnership(source, target *rocmDeviceKVPage) {
+	if source.owned {
+		target.owned = true
+		source.key.pointer = 0
+		source.value.pointer = 0
+	}
+	source.owned = false
+}
+
+func rocmDeviceKVFreeOwnedPage(driver nativeHIPDriver, page *rocmDeviceKVPage, lastErr *error) {
+	if page == nil || !page.owned {
+		return
+	}
+	if page.key.pointer != 0 {
+		if err := rocmDeviceKVTensorFree(driver, page.key.pointer, page.key.sizeBytes); err != nil && lastErr != nil {
+			*lastErr = core.E("rocm.KVCache.DeviceAppend", "free trimmed KV key page", err)
+		}
+		page.key.pointer = 0
+	}
+	if page.value.pointer != 0 {
+		if err := rocmDeviceKVTensorFree(driver, page.value.pointer, page.value.sizeBytes); err != nil && lastErr != nil {
+			*lastErr = core.E("rocm.KVCache.DeviceAppend", "free trimmed KV value page", err)
+		}
+		page.value.pointer = 0
+	}
+	page.owned = false
 }
 
 func (cache *rocmDeviceKVCache) borrowsPagesFrom(source *rocmDeviceKVCache) bool {

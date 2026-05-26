@@ -2844,6 +2844,37 @@ func BenchmarkROCmDeviceKVPageSlicePool_ReusedCapacity(b *testing.B) {
 	}
 }
 
+func BenchmarkROCmDeviceKVTransferSharedPages_TrimmedSuffix(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	sourcePages := make([]rocmDeviceKVPage, rocmDeviceKVHotPageCapacity+1, rocmDeviceKVPagePoolMaxCapacity+1)
+	targetPages := make([]rocmDeviceKVPage, rocmDeviceKVHotPageCapacity, rocmDeviceKVPagePoolMaxCapacity+1)
+	for index := range sourcePages {
+		pointerBase := nativeDevicePointer(0x100000 + index*0x100)
+		sourcePages[index] = rocmDeviceKVPage{
+			tokenStart: index,
+			tokenCount: 1,
+			keyWidth:   256,
+			valueWidth: 256,
+			key:        rocmDeviceKVTensor{pointer: pointerBase + 1, sizeBytes: 260, encoding: rocmKVEncodingQ8},
+			value:      rocmDeviceKVTensor{pointer: pointerBase + 2, sizeBytes: 132, encoding: rocmKVEncodingQ4},
+		}
+	}
+	for index := range targetPages {
+		targetPages[index] = sourcePages[index+1]
+		targetPages[index].tokenStart = index
+	}
+	var source rocmDeviceKVCache
+	var target rocmDeviceKVCache
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		source = rocmDeviceKVCache{driver: driver, mode: rocmKVCacheModeKQ8VQ4, blockSize: 1, tokenCount: len(sourcePages), pages: sourcePages}
+		target = rocmDeviceKVCache{driver: driver, mode: rocmKVCacheModeKQ8VQ4, blockSize: 1, tokenCount: len(targetPages), pages: targetPages}
+		if err := source.transferSharedPagesTo(&target); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func assertGemma4Q4DeviceStateMatchesQuantizedHost(t *testing.T, cfg hipGemma4Q4ForwardConfig, hostState, restoredState hipGemma4Q4DecodeState, deviceState *hipGemma4Q4DeviceDecodeState, mode string) {
 	t.Helper()
 	core.AssertEqual(t, len(hostState.Layers), len(restoredState.Layers))
