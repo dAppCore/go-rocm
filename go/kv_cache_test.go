@@ -942,6 +942,23 @@ func BenchmarkROCmDeviceKVPageFromRawPayload_KQ8VQ4PinnedCopy(b *testing.B) {
 	}
 }
 
+func BenchmarkROCmDeviceKVDescriptorTablePool_Reused(b *testing.B) {
+	rocmDeviceKVDescriptorTablePool.Lock()
+	rocmDeviceKVDescriptorTablePool.entries = nil
+	rocmDeviceKVDescriptorTablePool.Unlock()
+	driver := &fakeHIPDriver{available: true}
+	table := rocmBorrowDeviceKVDescriptorTable(driver, 4096, rocmDeviceKVDescriptorHeaderBytes+rocmDeviceKVDescriptorPageBytes, rocmDeviceKVDescriptorVersion, 1, false, true)
+	rocmReleaseDeviceKVDescriptorTable(table)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		table = rocmBorrowDeviceKVDescriptorTable(driver, 4096, rocmDeviceKVDescriptorHeaderBytes+rocmDeviceKVDescriptorPageBytes, rocmDeviceKVDescriptorVersion, 1, false, true)
+		if table.Pointer() != 4096 || table.SizeBytes() != rocmDeviceKVDescriptorHeaderBytes+rocmDeviceKVDescriptorPageBytes || table.pageCount != 1 {
+			b.Fatalf("descriptor table = ptr:%d bytes:%d pages:%d", table.Pointer(), table.SizeBytes(), table.pageCount)
+		}
+		rocmReleaseDeviceKVDescriptorTable(table)
+	}
+}
+
 func benchmarkROCmKVRawPayload(tb testing.TB) []byte {
 	tb.Helper()
 	const (

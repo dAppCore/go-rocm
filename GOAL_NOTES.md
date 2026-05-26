@@ -13136,3 +13136,54 @@ refresh (`KernelDescriptorTableFromAppendedToken`). It is now one of the
 clearest timed per-token clusters, but the real endpoint remains decode
 scaling: turn 10 is still only about `65 tok/s`, below the `90-100+ tok/s`
 target.
+
+## 2026-05-26: Appended Descriptor-Table Wrapper Pool
+
+The follow-up 2048-token pass targeted the object allocated at the return of
+`KernelDescriptorTableFromAppendedToken`. API-visible descriptor tables keep the
+old stable close semantics, but internal appended-token tables are now marked
+poolable and reuse their Go wrapper after close. Device table memory ownership
+is unchanged.
+
+AX-11 benchmark:
+
+```text
+BenchmarkROCmDeviceKVDescriptorTablePool_Reused-32  21.65 ns/op  0 B/op  0 allocs/op
+```
+
+Short generation guard after descriptor-table wrapper pooling:
+
+```text
+2048 text:Hi, descriptor wrapper pool:
+  19808234851 ns/op, 103.4 tok/s, 50908888 B/op, 281087 allocs/op
+  stderr_bytes=0
+```
+
+Retained-book acceptance after descriptor-table wrapper pooling:
+
+```text
+book_wall_s/op             41.23
+book_decode_s/op           36.96
+book_generated_tokens/op    3021
+book_tok/s                 73.28
+book_turn01_tok/s         103.7
+book_turn10_tok/s          64.02
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+stderr_bytes                   0
+B/op                    273063984
+allocs/op                  532044
+```
+
+The allocation step-down is now:
+
+```text
+3.40M -> 2.04M -> 1.98M -> 1.85M -> 1.78M -> 1.69M -> 1.31M
+  -> 1.23M -> 1.16M -> 0.73M -> 0.53M -> 0.46M -> 0.31M
+  -> 0.28M allocs/op
+```
+
+This is useful allocation cleanup, not the decode breakthrough. The retained
+book wall time stayed within the `<=90s` success band, but turn 10 remained
+near `64 tok/s`; the next meaningful speed target is still chunked attention
+stage 1 and q4 projection.
