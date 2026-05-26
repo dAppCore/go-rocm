@@ -2123,6 +2123,29 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_AttentionOutputReused(b *testing
 	}
 }
 
+func BenchmarkHIPAttentionHeadsChunkedWorkspace_ProjectionOutputReused(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	output, err := workspace.EnsureProjectionOutput(driver, 2304)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if output.Count() != 2304 || output.SizeBytes() != 9216 {
+		b.Fatalf("projection output shape = %d/%d, want 2304/9216", output.Count(), output.SizeBytes())
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		output, err = workspace.EnsureProjectionOutput(driver, 2304)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if output.Count() != 2304 || output.SizeBytes() != 9216 {
+			b.Fatalf("projection output shape = %d/%d, want 2304/9216", output.Count(), output.SizeBytes())
+		}
+	}
+}
+
 func BenchmarkHIPGemma4Q4PerLayerInputDeviceSetLayer_View(b *testing.B) {
 	driver := &fakeHIPDriver{available: true}
 	const (

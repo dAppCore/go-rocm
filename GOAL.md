@@ -163,15 +163,18 @@ fused triple projection. The short guard now reports `19783450849 ns/op`,
 `103.5 tok/s`, `117716864 B/op`, and `1314741 allocs/op`. Replacing shared-KV
 alias objects with explicit borrowed ownership flags then moved the short guard
 to `19806588088 ns/op`, `103.4 tok/s`, `111822000 B/op`, and
-`1232865 allocs/op`. The retained book route stayed green after both fast-loop
-batches at `41.38s` wall, `37.15s` decode, `3021` generated tokens,
-`73.01 tok/s` average, `64.10 tok/s` on turn 10, empty stderr, no cap hits, and
-chapter-10 anchor hits of `3`, while dropping to `363260200 B/op` and
-`1941374 allocs/op`. This is the current best production-candidate route for
-the book endpoint, but not the final driver endpoint: later-turn decode is
-still only `64.1 tok/s`, below the `90-100+ tok/s` target, and the visible
-output remains repetitive. Keep tuning retained long-context attention and
-state quality until the later turns stay near the target.
+`1232865 allocs/op`. Reusing the hidden-size attention projection output from
+the decode workspace then moved the short guard to `19777223686 ns/op`,
+`103.6 tok/s`, `107241912 B/op`, and `1161227 allocs/op`. The retained book
+route stayed green after these fast-loop batches at `40.68s` wall, `36.45s`
+decode, `3021` generated tokens, `74.26 tok/s` average, `64.68 tok/s` on turn
+10, empty stderr, no cap hits, and chapter-10 anchor hits of `3`, while
+dropping to `356470968 B/op` and `1835290 allocs/op`. This is the current best
+production-candidate route for the book endpoint, but not the final driver
+endpoint: later-turn decode is still only `64.7 tok/s`, below the
+`90-100+ tok/s` target, and the visible output remains repetitive. Keep tuning
+retained long-context attention and state quality until the later turns stay
+near the target.
 
 Current decode-scaling status as of 2026-05-26: Gemma4 E2B/E4B context is
 `128k` tokens, not `128` tokens; the context-128 short decode numbers remain a
@@ -186,7 +189,7 @@ max_new_tokens  route                    tok/s   B/op       allocs/op
 2048            chunked-128 device KV     90.53  314.81M     3426653
 4096            non-chunked value-fast    72.45  633.26M     6833550
 4096            chunked-128 query cache   80.33  885.71M     6749654
-2048 text:Hi    borrowed shared KV refs  103.4   111.82M     1232865
+2048 text:Hi    projection workspace     103.6   107.24M     1161227
 ```
 
 The earlier 256-token chunked route was rejected because it fell to `58.24

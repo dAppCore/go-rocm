@@ -1942,11 +1942,12 @@ func hipRunAttentionHeadsBatchCausalOutputFromDeviceQueryToDeviceKernel(ctx cont
 }
 
 type hipAttentionHeadsChunkedWorkspace struct {
-	Partial          *hipDeviceByteBuffer
-	Stats            *hipDeviceByteBuffer
-	AttentionOutputs map[int]*hipDeviceByteBuffer
-	partialCap       int
-	statsCap         int
+	Partial           *hipDeviceByteBuffer
+	Stats             *hipDeviceByteBuffer
+	AttentionOutputs  map[int]*hipDeviceByteBuffer
+	ProjectionOutputs map[int]*hipDeviceByteBuffer
+	partialCap        int
+	statsCap          int
 }
 
 func (workspace *hipAttentionHeadsChunkedWorkspace) Ensure(driver nativeHIPDriver, headCount, dim, tokenCount, chunkSize int) error {
@@ -2009,6 +2010,30 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureAttentionOutput(driver
 	return output, nil
 }
 
+func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureProjectionOutput(driver nativeHIPDriver, count int) (*hipDeviceByteBuffer, error) {
+	if workspace == nil {
+		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "attention workspace is required", nil)
+	}
+	if count <= 0 {
+		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "projection output count must be positive", nil)
+	}
+	if workspace.ProjectionOutputs == nil {
+		workspace.ProjectionOutputs = make(map[int]*hipDeviceByteBuffer, 2)
+	}
+	if output := workspace.ProjectionOutputs[count]; output != nil && output.Pointer() != 0 && output.Count() == count && output.SizeBytes() == uint64(count*4) {
+		return output, nil
+	}
+	if err := workspace.ProjectionOutputs[count].Close(); err != nil {
+		return nil, err
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.AttentionHeadsChunkedLaunch", "attention projection output", uint64(count*4), count)
+	if err != nil {
+		return nil, err
+	}
+	workspace.ProjectionOutputs[count] = output
+	return output, nil
+}
+
 func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 	if workspace == nil {
 		return nil
@@ -2025,7 +2050,13 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 			lastErr = err
 		}
 	}
+	for _, output := range workspace.ProjectionOutputs {
+		if err := output.Close(); err != nil {
+			lastErr = err
+		}
+	}
 	workspace.AttentionOutputs = nil
+	workspace.ProjectionOutputs = nil
 	return lastErr
 }
 

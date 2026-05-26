@@ -1568,11 +1568,11 @@ func hipRunMLXQ4ProjectionKernelWithDeviceWeightConfig(ctx context.Context, driv
 }
 
 func hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig) (*hipDeviceByteBuffer, error) {
-	if err := hipContextErr(ctx); err != nil {
-		return nil, err
-	}
 	if input == nil || input.Pointer() == 0 {
 		return nil, core.E("rocm.hip.MLXQ4ProjectionLaunch", "MLX q4 projection device input is required", nil)
+	}
+	if err := hipContextErr(ctx); err != nil {
+		return nil, err
 	}
 	if err := cfg.validateInputCount(input.Count()); err != nil {
 		return nil, err
@@ -1590,6 +1590,32 @@ func hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx context.Context, driver nati
 			_ = output.Close()
 		}
 	}()
+	if err := hipRunMLXQ4ProjectionKernelWithDeviceInputOutput(ctx, driver, input, cfg, output); err != nil {
+		return nil, err
+	}
+	success = true
+	return output, nil
+}
+
+func hipRunMLXQ4ProjectionKernelWithDeviceInputOutput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, output *hipDeviceByteBuffer) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	if driver == nil || !driver.Available() {
+		return core.E("rocm.hip.MLXQ4ProjectionLaunch", "HIP driver is not available", nil)
+	}
+	if input == nil || input.Pointer() == 0 {
+		return core.E("rocm.hip.MLXQ4ProjectionLaunch", "MLX q4 projection device input is required", nil)
+	}
+	if err := cfg.validateInputCount(input.Count()); err != nil {
+		return err
+	}
+	if input.SizeBytes() != uint64(cfg.Cols*4) {
+		return core.E("rocm.hip.MLXQ4ProjectionLaunch", "MLX q4 projection device input byte count mismatch", nil)
+	}
+	if output == nil || output.Pointer() == 0 || output.Count() != cfg.Rows || output.SizeBytes() != uint64(cfg.Rows*4) {
+		return core.E("rocm.hip.MLXQ4ProjectionLaunch", "MLX q4 projection output shape mismatch", nil)
+	}
 	launchBytes, err := (hipMLXQ4ProjectionLaunchArgs{
 		InputPointer:  input.Pointer(),
 		WeightPointer: cfg.WeightPointer,
@@ -1607,17 +1633,16 @@ func hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx context.Context, driver nati
 		OutputBytes:   output.SizeBytes(),
 	}).Binary()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	config, err := hipMLXQ4ProjectionLaunchConfig(launchBytes, cfg.Rows)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if err := hipLaunchKernel(driver, config); err != nil {
-		return nil, err
+		return err
 	}
-	success = true
-	return output, nil
+	return nil
 }
 
 func hipRunMLXQ4ProjectionBatchKernelWithDeviceInput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, batch int) (*hipDeviceByteBuffer, error) {

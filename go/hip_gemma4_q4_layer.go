@@ -1362,11 +1362,22 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 	if err := hipRunAttentionHeadsOutputFromDeviceQueryToDeviceKernelWithWorkspace(ctx, driver, attentionReq, ropeQueryBuffer, cfg.QueryHeads, attentionOutputBuffer, req.AttentionWorkspace); err != nil {
 		return hipGemma4Q4DecoderLayerResult{}, err
 	}
-	attentionProjectionBuffer, err := hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx, driver, attentionOutputBuffer, cfg.OutputProjection)
-	if err != nil {
-		return hipGemma4Q4DecoderLayerResult{}, err
+	var attentionProjectionBuffer *hipDeviceByteBuffer
+	if req.AttentionWorkspace != nil && req.OmitDebugTensors {
+		attentionProjectionBuffer, err = req.AttentionWorkspace.EnsureProjectionOutput(driver, cfg.OutputProjection.Rows)
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+		if err := hipRunMLXQ4ProjectionKernelWithDeviceInputOutput(ctx, driver, attentionOutputBuffer, cfg.OutputProjection, attentionProjectionBuffer); err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+	} else {
+		attentionProjectionBuffer, err = hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx, driver, attentionOutputBuffer, cfg.OutputProjection)
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+		defer attentionProjectionBuffer.Close()
 	}
-	defer attentionProjectionBuffer.Close()
 	var attentionProjection []float32
 	var attentionOutput []float32
 	if !req.OmitDebugTensors {

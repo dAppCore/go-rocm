@@ -64,6 +64,16 @@
   chapter-10 anchor hits of `3`, `363260200 B/op`, and `1941374 allocs/op`.
   Wall/decode are roughly flat versus the prior route, while allocation volume
   stepped down from `418587400 B/op` and `2660797 allocs/op`.
+- Reused the hidden-size attention projection output through the decode
+  workspace and added `BenchmarkHIPAttentionHeadsChunkedWorkspace_ProjectionOutputReused`,
+  which reports `3.016 ns/op`, `0 B/op`, and `0 allocs/op`. The live `text:Hi`
+  2048-token guard now reports `103.6 tok/s`, `107241912 B/op`, and
+  `1161227 allocs/op`. The retained 10-turn full-cap greedy book route stayed
+  green and improved to `40.68s` wall, `36.45s` decode, `3021` generated
+  tokens, `74.26 tok/s` average, `64.68 tok/s` on turn 10, empty stderr, no cap
+  hits, chapter-10 anchor hits of `3`, `356470968 B/op`, and
+  `1835290 allocs/op`. The short-guard allocation sequence is now
+  `3.40M -> 2.04M -> 1.98M -> 1.85M -> 1.78M -> 1.69M -> 1.31M -> 1.23M -> 1.16M allocs/op`.
 
 ## 2026-05-26 Full-Chapter Book and Long-Attention Pass
 
