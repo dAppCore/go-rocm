@@ -137,6 +137,7 @@ type hipGemma4Q4PerLayerInputDeviceSet struct {
 	layerStrideBytes uint64
 	layerValueCount  int
 	viewLabel        string
+	borrowedBacking  bool
 	view             hipDeviceByteBuffer
 	Backing          []*hipDeviceByteBuffer
 }
@@ -170,9 +171,11 @@ func (set *hipGemma4Q4PerLayerInputDeviceSet) Close() error {
 		return nil
 	}
 	var lastErr error
-	for _, buffer := range set.Backing {
-		if err := buffer.Close(); err != nil {
-			lastErr = err
+	if !set.borrowedBacking {
+		for _, buffer := range set.Backing {
+			if err := buffer.Close(); err != nil {
+				lastErr = err
+			}
 		}
 	}
 	return lastErr
@@ -579,19 +582,42 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 	var scaledEmbedding []float32
 	var hidden []float32
 	var hiddenBuffer *hipDeviceByteBuffer
+	hiddenBufferBorrowed := false
 	var perLayerInputs [][]float32
 	var perLayerInputDevices *hipGemma4Q4PerLayerInputDeviceSet
 	if req.OmitDebugTensors {
-		embeddingBuffer, err := hipRunEmbeddingLookupKernelWithDeviceTableBuffer(ctx, driver, []int32{req.TokenID}, first.Embedding)
+		var embeddingBuffer *hipDeviceByteBuffer
+		if req.AttentionWorkspace != nil {
+			tokenBuffer, tokenErr := req.AttentionWorkspace.EnsureTokenIDBuffer(driver)
+			if tokenErr != nil {
+				return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, tokenErr
+			}
+			embeddingBuffer, err = req.AttentionWorkspace.EnsureEmbeddingOutput(driver, first.HiddenSize)
+			if err == nil {
+				err = hipRunEmbeddingLookupKernelWithDeviceTableSingleTokenBufferOutput(ctx, driver, req.TokenID, first.Embedding, tokenBuffer, embeddingBuffer)
+			}
+		} else {
+			embeddingBuffer, err = hipRunEmbeddingLookupKernelWithDeviceTableBuffer(ctx, driver, []int32{req.TokenID}, first.Embedding)
+		}
 		if err != nil {
 			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
 		}
-		defer embeddingBuffer.Close()
-		hiddenBuffer, err = hipRunVectorScaleDeviceKernel(ctx, driver, embeddingBuffer, float32(math.Sqrt(float64(first.HiddenSize))))
+		if req.AttentionWorkspace == nil {
+			defer embeddingBuffer.Close()
+		}
+		if req.AttentionWorkspace != nil {
+			hiddenBuffer, err = req.AttentionWorkspace.EnsureScaledEmbedding(driver, first.HiddenSize)
+			if err == nil {
+				err = hipRunVectorScaleDeviceKernelOutput(ctx, driver, embeddingBuffer, float32(math.Sqrt(float64(first.HiddenSize))), hiddenBuffer)
+				hiddenBufferBorrowed = err == nil
+			}
+		} else {
+			hiddenBuffer, err = hipRunVectorScaleDeviceKernel(ctx, driver, embeddingBuffer, float32(math.Sqrt(float64(first.HiddenSize))))
+		}
 		if err != nil {
 			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
 		}
-		perLayerInputDevices, err = hipRunGemma4Q4PerLayerInputDeviceSet(ctx, driver, cfg, req.TokenID, hiddenBuffer, req.Epsilon)
+		perLayerInputDevices, err = hipRunGemma4Q4PerLayerInputDeviceSet(ctx, driver, cfg, req.TokenID, hiddenBuffer, req.Epsilon, req.AttentionWorkspace)
 		if err != nil {
 			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
 		}
@@ -615,7 +641,6 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 		hidden = scaledEmbedding
 	}
 	sharedSources := hipGemma4Q4SharedKVSourceByLayer(cfg)
-	hiddenBufferBorrowed := false
 	defer func() {
 		if hiddenBuffer != nil && !hiddenBufferBorrowed {
 			_ = hiddenBuffer.Close()
@@ -2608,11 +2633,11 @@ func hipRunGemma4Q4PerLayerInputSet(ctx context.Context, driver nativeHIPDriver,
 	return outputs, nil
 }
 
-func hipRunGemma4Q4PerLayerInputDeviceSet(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4ForwardConfig, tokenID int32, hidden *hipDeviceByteBuffer, epsilon float32) (*hipGemma4Q4PerLayerInputDeviceSet, error) {
+func hipRunGemma4Q4PerLayerInputDeviceSet(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4ForwardConfig, tokenID int32, hidden *hipDeviceByteBuffer, epsilon float32, workspace *hipAttentionHeadsChunkedWorkspace) (*hipGemma4Q4PerLayerInputDeviceSet, error) {
 	if len(cfg.Layers) == 0 || !cfg.Layers[0].PerLayerInput.hasGlobalPrecompute() {
 		return nil, nil
 	}
-	inputs, err := hipRunGemma4Q4PerLayerInputConfigDeviceSet(ctx, driver, cfg.Layers[0].PerLayerInput, tokenID, hidden, epsilon)
+	inputs, err := hipRunGemma4Q4PerLayerInputConfigDeviceSet(ctx, driver, cfg.Layers[0].PerLayerInput, tokenID, hidden, epsilon, workspace)
 	if err != nil {
 		return nil, err
 	}
@@ -2623,7 +2648,7 @@ func hipRunGemma4Q4PerLayerInputDeviceSet(ctx context.Context, driver nativeHIPD
 	return inputs, nil
 }
 
-func hipRunGemma4Q4PerLayerInputConfigDeviceSet(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4PerLayerInputConfig, tokenID int32, hidden *hipDeviceByteBuffer, epsilon float32) (*hipGemma4Q4PerLayerInputDeviceSet, error) {
+func hipRunGemma4Q4PerLayerInputConfigDeviceSet(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4PerLayerInputConfig, tokenID int32, hidden *hipDeviceByteBuffer, epsilon float32, workspace *hipAttentionHeadsChunkedWorkspace) (*hipGemma4Q4PerLayerInputDeviceSet, error) {
 	if err := hipContextErr(ctx); err != nil {
 		return nil, err
 	}
@@ -2646,50 +2671,134 @@ func hipRunGemma4Q4PerLayerInputConfigDeviceSet(ctx context.Context, driver nati
 	if layerCount <= 0 || cfg.Embedding.HiddenSize != cfg.ModelProjection.Rows {
 		return nil, core.E(hipGemma4Q4Layer0Operation, "per-layer input global shape mismatch", nil)
 	}
-	perLayerEmbedding, err := hipRunEmbeddingLookupKernelWithDeviceTableBuffer(ctx, driver, []int32{tokenID}, cfg.Embedding)
+	var err error
+	var perLayerEmbedding *hipDeviceByteBuffer
+	if workspace != nil {
+		tokenBuffer, err := workspace.EnsureTokenIDBuffer(driver)
+		if err != nil {
+			return nil, err
+		}
+		perLayerEmbedding, err = workspace.EnsurePerLayerEmbedding(driver, cfg.ModelProjection.Rows)
+		if err == nil {
+			err = hipRunEmbeddingLookupKernelWithDeviceTableSingleTokenBufferOutput(ctx, driver, tokenID, cfg.Embedding, tokenBuffer, perLayerEmbedding)
+		}
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		perLayerEmbedding, err = hipRunEmbeddingLookupKernelWithDeviceTableBuffer(ctx, driver, []int32{tokenID}, cfg.Embedding)
+		if err != nil {
+			return nil, err
+		}
+		defer perLayerEmbedding.Close()
+	}
+	var perLayerEmbeddingScaled *hipDeviceByteBuffer
+	if workspace != nil {
+		perLayerEmbeddingScaled, err = workspace.EnsurePerLayerScaled(driver, cfg.ModelProjection.Rows)
+		if err == nil {
+			err = hipRunVectorScaleDeviceKernelOutput(ctx, driver, perLayerEmbedding, float32(math.Sqrt(float64(cfg.InputSize))), perLayerEmbeddingScaled)
+		}
+	} else {
+		perLayerEmbeddingScaled, err = hipRunVectorScaleDeviceKernel(ctx, driver, perLayerEmbedding, float32(math.Sqrt(float64(cfg.InputSize))))
+	}
 	if err != nil {
 		return nil, err
 	}
-	defer perLayerEmbedding.Close()
-	perLayerEmbeddingScaled, err := hipRunVectorScaleDeviceKernel(ctx, driver, perLayerEmbedding, float32(math.Sqrt(float64(cfg.InputSize))))
+	if workspace == nil {
+		defer perLayerEmbeddingScaled.Close()
+	}
+	var projected *hipDeviceByteBuffer
+	if workspace != nil {
+		projected, err = workspace.EnsurePerLayerProjected(driver, cfg.ModelProjection.Rows)
+		if err == nil {
+			err = hipRunProjectionKernelWithDeviceInputWeightEncodingOutput(
+				ctx,
+				driver,
+				hidden,
+				cfg.ModelProjection.WeightPointer,
+				cfg.ModelProjection.WeightBytes,
+				cfg.ModelProjection.Rows,
+				cfg.ModelProjection.Cols,
+				hipProjectionWeightEncodingBF16,
+				projected,
+			)
+		}
+	} else {
+		projected, err = hipRunProjectionKernelWithDeviceInputWeightEncoding(
+			ctx,
+			driver,
+			hidden,
+			cfg.ModelProjection.WeightPointer,
+			cfg.ModelProjection.WeightBytes,
+			cfg.ModelProjection.Rows,
+			cfg.ModelProjection.Cols,
+			hipProjectionWeightEncodingBF16,
+		)
+	}
 	if err != nil {
 		return nil, err
 	}
-	defer perLayerEmbeddingScaled.Close()
-	projected, err := hipRunProjectionKernelWithDeviceInputWeightEncoding(
-		ctx,
-		driver,
-		hidden,
-		cfg.ModelProjection.WeightPointer,
-		cfg.ModelProjection.WeightBytes,
-		cfg.ModelProjection.Rows,
-		cfg.ModelProjection.Cols,
-		hipProjectionWeightEncodingBF16,
-	)
+	if workspace == nil {
+		defer projected.Close()
+	}
+	var projectedScaled *hipDeviceByteBuffer
+	if workspace != nil {
+		projectedScaled, err = workspace.EnsurePerLayerProjectedScaled(driver, cfg.ModelProjection.Rows)
+		if err == nil {
+			err = hipRunVectorScaleDeviceKernelOutput(ctx, driver, projected, float32(math.Pow(float64(cfg.ModelProjection.Cols), -0.5)), projectedScaled)
+		}
+	} else {
+		projectedScaled, err = hipRunVectorScaleDeviceKernel(ctx, driver, projected, float32(math.Pow(float64(cfg.ModelProjection.Cols), -0.5)))
+	}
 	if err != nil {
 		return nil, err
 	}
-	defer projected.Close()
-	projectedScaled, err := hipRunVectorScaleDeviceKernel(ctx, driver, projected, float32(math.Pow(float64(cfg.ModelProjection.Cols), -0.5)))
-	if err != nil {
-		return nil, err
+	if workspace == nil {
+		defer projectedScaled.Close()
 	}
-	defer projectedScaled.Close()
 
 	normCfg := cfg.ProjectionNorm
 	normCfg.Epsilon = epsilon
 	normCfg.Count = cfg.InputSize
-	projectedNorm, err := hipRunRMSNormHeadsKernelWithDeviceInputWeightConfig(ctx, driver, projectedScaled, normCfg, layerCount)
+	var projectedNorm *hipDeviceByteBuffer
+	if workspace != nil {
+		projectedNorm, err = workspace.EnsurePerLayerNorm(driver, cfg.ModelProjection.Rows)
+		if err == nil {
+			err = hipRunRMSNormHeadsKernelWithDeviceInputWeightConfigOutput(ctx, driver, projectedScaled, normCfg, layerCount, projectedNorm)
+		}
+	} else {
+		projectedNorm, err = hipRunRMSNormHeadsKernelWithDeviceInputWeightConfig(ctx, driver, projectedScaled, normCfg, layerCount)
+	}
 	if err != nil {
 		return nil, err
 	}
-	defer projectedNorm.Close()
-	combined, err := hipRunVectorAddDeviceKernel(ctx, driver, projectedNorm, perLayerEmbeddingScaled)
+	if workspace == nil {
+		defer projectedNorm.Close()
+	}
+	var combined *hipDeviceByteBuffer
+	if workspace != nil {
+		combined, err = workspace.EnsurePerLayerCombined(driver, cfg.ModelProjection.Rows)
+		if err == nil {
+			err = hipRunVectorAddDeviceKernelOutput(ctx, driver, projectedNorm, perLayerEmbeddingScaled, combined)
+		}
+	} else {
+		combined, err = hipRunVectorAddDeviceKernel(ctx, driver, projectedNorm, perLayerEmbeddingScaled)
+	}
 	if err != nil {
 		return nil, err
 	}
-	defer combined.Close()
-	scaled, err := hipRunVectorScaleDeviceKernel(ctx, driver, combined, float32(math.Sqrt(0.5)))
+	if workspace == nil {
+		defer combined.Close()
+	}
+	var scaled *hipDeviceByteBuffer
+	if workspace != nil {
+		scaled, err = workspace.EnsurePerLayerOutput(driver, cfg.ModelProjection.Rows)
+		if err == nil {
+			err = hipRunVectorScaleDeviceKernelOutput(ctx, driver, combined, float32(math.Sqrt(0.5)), scaled)
+		}
+	} else {
+		scaled, err = hipRunVectorScaleDeviceKernel(ctx, driver, combined, float32(math.Sqrt(0.5)))
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -2700,6 +2809,7 @@ func hipRunGemma4Q4PerLayerInputConfigDeviceSet(ctx context.Context, driver nati
 		layerStrideBytes: uint64(cfg.InputSize * 4),
 		layerValueCount:  cfg.InputSize,
 		viewLabel:        "per-layer input slice",
+		borrowedBacking:  workspace != nil,
 		Backing:          []*hipDeviceByteBuffer{scaled},
 	}
 	success := false

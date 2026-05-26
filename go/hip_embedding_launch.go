@@ -112,16 +112,33 @@ func (cfg hipDeviceEmbeddingLookupConfig) validate(tokenIDs []int32) error {
 	if len(tokenIDs) == 0 {
 		return core.E("rocm.hip.EmbeddingLookupLaunch", "token IDs are required", nil)
 	}
-	if cfg.VocabSize <= 0 || cfg.HiddenSize <= 0 {
-		return core.E("rocm.hip.EmbeddingLookupLaunch", "vocab and hidden sizes must be positive", nil)
-	}
-	if cfg.EmbeddingPointer == 0 {
-		return core.E("rocm.hip.EmbeddingLookupLaunch", "embedding pointer is required", nil)
+	if err := cfg.validateShape(); err != nil {
+		return err
 	}
 	for _, id := range tokenIDs {
 		if id < 0 || int(id) >= cfg.VocabSize {
 			return core.E("rocm.hip.EmbeddingLookupLaunch", "token ID is outside vocabulary", nil)
 		}
+	}
+	return nil
+}
+
+func (cfg hipDeviceEmbeddingLookupConfig) validateSingleToken(tokenID int32) error {
+	if err := cfg.validateShape(); err != nil {
+		return err
+	}
+	if tokenID < 0 || int(tokenID) >= cfg.VocabSize {
+		return core.E("rocm.hip.EmbeddingLookupLaunch", "token ID is outside vocabulary", nil)
+	}
+	return nil
+}
+
+func (cfg hipDeviceEmbeddingLookupConfig) validateShape() error {
+	if cfg.VocabSize <= 0 || cfg.HiddenSize <= 0 {
+		return core.E("rocm.hip.EmbeddingLookupLaunch", "vocab and hidden sizes must be positive", nil)
+	}
+	if cfg.EmbeddingPointer == 0 {
+		return core.E("rocm.hip.EmbeddingLookupLaunch", "embedding pointer is required", nil)
 	}
 	tableCount := uint64(cfg.VocabSize) * uint64(cfg.HiddenSize)
 	switch cfg.TableEncoding {
@@ -736,6 +753,85 @@ func hipRunEmbeddingLookupKernelWithDeviceTableBuffer(ctx context.Context, drive
 	}
 	success = true
 	return output, nil
+}
+
+func hipRunEmbeddingLookupKernelWithDeviceTableSingleTokenBuffer(ctx context.Context, driver nativeHIPDriver, tokenID int32, cfg hipDeviceEmbeddingLookupConfig, tokenBuffer *hipDeviceByteBuffer) (*hipDeviceByteBuffer, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return nil, err
+	}
+	if driver == nil || !driver.Available() {
+		return nil, core.E("rocm.hip.EmbeddingLookupLaunch", "HIP driver is not available", nil)
+	}
+	if tokenBuffer == nil || tokenBuffer.Pointer() == 0 || tokenBuffer.Count() != 1 || tokenBuffer.SizeBytes() != 4 {
+		return nil, core.E("rocm.hip.EmbeddingLookupLaunch", "single-token workspace buffer is required", nil)
+	}
+	if err := cfg.validateSingleToken(tokenID); err != nil {
+		return nil, err
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.EmbeddingLookupLaunch", "embedding lookup output", uint64(cfg.HiddenSize*4), cfg.HiddenSize)
+	if err != nil {
+		return nil, err
+	}
+	success := false
+	defer func() {
+		if !success {
+			_ = output.Close()
+		}
+	}()
+	if err := hipRunEmbeddingLookupKernelWithDeviceTableSingleTokenBufferOutput(ctx, driver, tokenID, cfg, tokenBuffer, output); err != nil {
+		return nil, err
+	}
+	success = true
+	return output, nil
+}
+
+func hipRunEmbeddingLookupKernelWithDeviceTableSingleTokenBufferOutput(ctx context.Context, driver nativeHIPDriver, tokenID int32, cfg hipDeviceEmbeddingLookupConfig, tokenBuffer, output *hipDeviceByteBuffer) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	if driver == nil || !driver.Available() {
+		return core.E("rocm.hip.EmbeddingLookupLaunch", "HIP driver is not available", nil)
+	}
+	if tokenBuffer == nil || tokenBuffer.Pointer() == 0 || tokenBuffer.Count() != 1 || tokenBuffer.SizeBytes() != 4 {
+		return core.E("rocm.hip.EmbeddingLookupLaunch", "single-token workspace buffer is required", nil)
+	}
+	if output == nil || output.Pointer() == 0 || output.Count() != cfg.HiddenSize || output.SizeBytes() != uint64(cfg.HiddenSize*4) {
+		return core.E("rocm.hip.EmbeddingLookupLaunch", "single-token output buffer shape mismatch", nil)
+	}
+	if err := cfg.validateSingleToken(tokenID); err != nil {
+		return err
+	}
+	if err := hipWriteSingleTokenID(driver, tokenBuffer.Pointer(), tokenID); err != nil {
+		return err
+	}
+	launchBytes, err := (hipEmbeddingLookupLaunchArgs{
+		TokenPointer:     tokenBuffer.Pointer(),
+		EmbeddingPointer: cfg.EmbeddingPointer,
+		OutputPointer:    output.Pointer(),
+		TokenCount:       1,
+		VocabSize:        cfg.VocabSize,
+		HiddenSize:       cfg.HiddenSize,
+		TokenBytes:       tokenBuffer.SizeBytes(),
+		EmbeddingBytes:   cfg.EmbeddingBytes,
+		OutputBytes:      output.SizeBytes(),
+		TableEncoding:    cfg.TableEncoding,
+		GroupSize:        cfg.GroupSize,
+		ScalePointer:     cfg.ScalePointer,
+		BiasPointer:      cfg.BiasPointer,
+		ScaleBytes:       cfg.ScaleBytes,
+		BiasBytes:        cfg.BiasBytes,
+	}).Binary()
+	if err != nil {
+		return err
+	}
+	config, err := hipOneDimensionalLaunchConfig(hipKernelNameEmbedLookup, launchBytes, cfg.HiddenSize)
+	if err != nil {
+		return err
+	}
+	if err := hipLaunchKernel(driver, config); err != nil {
+		return err
+	}
+	return nil
 }
 
 func hipEmbeddingLookupEncoding(req hipEmbeddingLookupRequest) (uint32, error) {

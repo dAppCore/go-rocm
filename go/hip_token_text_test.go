@@ -128,3 +128,16 @@ func TestHIPTokenTextDecoder_Bad_MergeAndFallbackEdges(t *testing.T) {
 	core.AssertEqual(t, "", (*hipTokenTextDecoder)(nil).Decode([]int32{1}))
 	core.AssertEqual(t, "", decoder.DecodeToken(404))
 }
+
+func BenchmarkHIPTokenTextDecoder_DecodeTokenCached(b *testing.B) {
+	decoder := &hipTokenTextDecoder{
+		pieces:  map[int32]string{7: "hello", 8: "▁world", 9: "<0x0A>"},
+		special: map[int32]bool{},
+	}
+	decoder.precomputeDecodedPieces()
+	ids := []int32{7, 8, 9}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = decoder.DecodeToken(ids[i%len(ids)])
+	}
+}

@@ -13187,3 +13187,59 @@ This is useful allocation cleanup, not the decode breakthrough. The retained
 book wall time stayed within the `<=90s` success band, but turn 10 remained
 near `64 tok/s`; the next meaningful speed target is still chunked attention
 stage 1 and q4 projection.
+
+## 2026-05-26: Token Entry and PLE Workspace Reuse
+
+The next 2048-token fast-loop batch targeted the token-entry side of each decode
+step rather than the attention kernels. Loaded tokenizers now precompute
+single-token decoded text, the Gemma4 q4 decode path reuses a workspace
+single-token ID buffer plus embedding/scaled-embedding outputs, and the
+per-layer embedding precompute path writes its temporary embedding/projection/
+norm/add/scale buffers into the generation workspace. The public token upload
+helper keeps its old close semantics; the reuse path is explicit to the retained
+generation workspace.
+
+AX-11 microbenchmarks:
+
+```text
+BenchmarkHIPTokenTextDecoder_DecodeTokenCached-32  1.847 ns/op  0 B/op  0 allocs/op
+BenchmarkHIPWriteSingleTokenID_ReusedBuffer-32    17.95 ns/op 53 B/op  1 allocs/op
+```
+
+Short generation guard after the token-entry and PLE workspace batch:
+
+```text
+2048 text:Hi, token/PLE workspace:
+  19785395783 ns/op, 103.5 tok/s, 49536176 B/op, 255531 allocs/op
+  stderr_bytes=0
+```
+
+Retained-book acceptance after the batch:
+
+```text
+book_wall_s/op             41.22
+book_decode_s/op           36.98
+book_generated_tokens/op    3021
+book_tok/s                 73.28
+book_turn01_tok/s         103.9
+book_turn10_tok/s          64.26
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+stderr_bytes                   0
+B/op                    271027784
+allocs/op                  492943
+output: /tmp/go-rocm-book-10turn-fullcap-greedy-workspace-entry.md
+```
+
+The allocation step-down is now:
+
+```text
+3.40M -> 2.04M -> 1.98M -> 1.85M -> 1.78M -> 1.69M -> 1.31M
+  -> 1.23M -> 1.16M -> 0.73M -> 0.53M -> 0.46M -> 0.31M
+  -> 0.28M -> 0.26M allocs/op
+```
+
+This confirms the 2048-token fast loop is still useful for finding allocation
+and transfer cleanup. It did not change the retained long-context decode
+ceiling: turn 10 stayed near `64 tok/s`, so the next speed work still needs to
+target `rocm_attention_heads_chunked_stage1` and `rocm_mlx_q4_projection`.

@@ -201,9 +201,16 @@ descriptor table wrappers then moved the short guard to `19808234851 ns/op`,
 route stayed green at `41.23s` wall, `36.96s` decode, `3021` generated tokens,
 `73.28 tok/s` average, `64.02 tok/s` on turn 10, empty stderr, no cap hits, and
 chapter-10 anchor hits of `3`, while dropping to `273063984 B/op` and
-`532044 allocs/op`. This is the current best allocation route for the book
-endpoint, but not the final driver endpoint: later-turn decode is still only
-`64.0 tok/s`, below the
+`532044 allocs/op`. Caching decoded token text, reusing a workspace token-ID
+buffer plus embedding/scaled-embedding outputs, and moving Gemma4 per-layer
+embedding precompute temporaries into the workspace then moved the short guard
+to `19785395783 ns/op`, `103.5 tok/s`, `49536176 B/op`, and `255531 allocs/op`.
+The retained book route stayed green at `41.22s` wall, `36.98s` decode,
+`3021` generated tokens, `73.28 tok/s` average, `64.26 tok/s` on turn 10,
+empty stderr, no cap hits, and chapter-10 anchor hits of `3`, while dropping to
+`271027784 B/op` and `492943 allocs/op`. This is the current best allocation
+route for the book endpoint, but not the final driver endpoint: later-turn
+decode is still only `64.3 tok/s`, below the
 `90-100+ tok/s` target, and the visible output remains repetitive. Keep tuning
 retained long-context attention and state quality until the later turns stay
 near the target.
@@ -222,6 +229,7 @@ max_new_tokens  route                    tok/s   B/op       allocs/op
 4096            non-chunked value-fast    72.45  633.26M     6833550
 4096            chunked-128 query cache   80.33  885.71M     6749654
 2048 text:Hi    descriptor wrapper pool  103.4    50.91M      281087
+2048 text:Hi    token/PLE workspace      103.5    49.54M      255531
 ```
 
 The earlier 256-token chunked route was rejected because it fell to `58.24

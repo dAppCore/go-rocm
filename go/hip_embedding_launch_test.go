@@ -111,6 +111,21 @@ func TestHIPEmbeddingLookupLaunch_Good(t *testing.T) {
 	})
 	core.RequireNoError(t, err)
 	assertFloat32SlicesNear(t, []float32{-1, 3, 1, -2}, deviceBF16Got, 0)
+	tokenWorkspace, err := hipAllocateByteBuffer(deviceBF16Driver, "rocm.hip.EmbeddingLookupLaunch", "single token id", 4, 1)
+	core.RequireNoError(t, err)
+	defer tokenWorkspace.Close()
+	deviceBF16Single, err := hipRunEmbeddingLookupKernelWithDeviceTableSingleTokenBuffer(context.Background(), deviceBF16Driver, 2, hipDeviceEmbeddingLookupConfig{
+		EmbeddingPointer: deviceBF16.Pointer(),
+		EmbeddingBytes:   deviceBF16.SizeBytes(),
+		TableEncoding:    hipEmbeddingTableEncodingBF16,
+		VocabSize:        bf16Req.VocabSize,
+		HiddenSize:       bf16Req.HiddenSize,
+	}, tokenWorkspace)
+	core.RequireNoError(t, err)
+	defer deviceBF16Single.Close()
+	singleValues, err := (&hipEmbeddingLookupDeviceBuffers{Output: deviceBF16Single, TokenCount: 1, HiddenSize: bf16Req.HiddenSize}).ReadOutput()
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{-1, 3}, singleValues, 0)
 
 	q4Req := hipEmbeddingLookupRequest{
 		TokenIDs:    []int32{2, 0},
@@ -272,6 +287,19 @@ func TestHIPEmbeddingAndRerankLaunch_Bad(t *testing.T) {
 	})
 	core.AssertError(t, err)
 	core.AssertContains(t, err.Error(), "outside vocabulary")
+}
+
+func BenchmarkHIPWriteSingleTokenID_ReusedBuffer(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	buffer, err := hipAllocateByteBuffer(driver, "rocm.hip.Tokens", "single token id", 4, 1)
+	core.RequireNoError(b, err)
+	defer buffer.Close()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := hipWriteSingleTokenID(driver, buffer.Pointer(), int32(i&1023)); err != nil {
+			b.Fatalf("write token id: %v", err)
+		}
+	}
 }
 
 func TestHIPEmbeddingMeanPoolReadOutputValidation_Bad(t *testing.T) {

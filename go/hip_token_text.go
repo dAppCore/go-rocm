@@ -13,15 +13,16 @@ import (
 )
 
 type hipTokenTextDecoder struct {
-	vocab       map[string]int32
-	pieces      map[int32]string
-	mergeRanks  map[string]int
-	special     map[int32]bool
-	specialText map[string]int32
-	bosID       int32
-	hasBOS      bool
-	unknownID   int32
-	hasUnknown  bool
+	vocab         map[string]int32
+	pieces        map[int32]string
+	decodedPieces []string
+	mergeRanks    map[string]int
+	special       map[int32]bool
+	specialText   map[string]int32
+	bosID         int32
+	hasBOS        bool
+	unknownID     int32
+	hasUnknown    bool
 }
 
 type hipTokenTextDecoderJSON struct {
@@ -84,7 +85,31 @@ func loadHIPTokenTextDecoder(path string) (*hipTokenTextDecoder, error) {
 		decoder.bosID = bosID
 		decoder.hasBOS = true
 	}
+	decoder.precomputeDecodedPieces()
 	return decoder, nil
+}
+
+func (decoder *hipTokenTextDecoder) precomputeDecodedPieces() {
+	if decoder == nil || len(decoder.pieces) == 0 {
+		return
+	}
+	maxID := int32(-1)
+	for id := range decoder.pieces {
+		if id > maxID {
+			maxID = id
+		}
+	}
+	if maxID < 0 {
+		return
+	}
+	decoded := make([]string, int(maxID)+1)
+	for id, piece := range decoder.pieces {
+		if id < 0 || decoder.special[id] {
+			continue
+		}
+		decoded[id] = hipDecodeTokenTextRaw(piece)
+	}
+	decoder.decodedPieces = decoded
 }
 
 func hipTokenTextMergeRanks(raw json.RawMessage) map[string]int {
@@ -245,6 +270,11 @@ func (decoder *hipTokenTextDecoder) DecodeToken(id int32) string {
 	if decoder == nil || decoder.special[id] {
 		return ""
 	}
+	if id >= 0 && int(id) < len(decoder.decodedPieces) {
+		if text := decoder.decodedPieces[id]; text != "" {
+			return text
+		}
+	}
 	piece, ok := decoder.pieces[id]
 	if !ok {
 		return ""
@@ -258,6 +288,9 @@ func hipDecodeTokenTextRaw(raw string) string {
 }
 
 func hipDecodeTokenTextByteFallback(raw string) string {
+	if !strings.Contains(raw, "<0x") {
+		return raw
+	}
 	var out strings.Builder
 	for index := 0; index < len(raw); {
 		if index+6 <= len(raw) &&

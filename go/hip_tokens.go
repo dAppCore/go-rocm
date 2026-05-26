@@ -59,6 +59,27 @@ func hipUploadTokenIDs(driver nativeHIPDriver, tokenIDs []int32) (*hipDeviceToke
 	}, nil
 }
 
+func hipWriteSingleTokenID(driver nativeHIPDriver, pointer nativeDevicePointer, tokenID int32) error {
+	if driver == nil {
+		return core.E("rocm.hip.Tokens", "HIP driver is nil", nil)
+	}
+	if !driver.Available() {
+		return core.E("rocm.hip.Tokens", "HIP driver is not available", nil)
+	}
+	if pointer == 0 {
+		return core.E("rocm.hip.Tokens", "token buffer is required", nil)
+	}
+	if tokenID < 0 {
+		return core.E("rocm.hip.Tokens", "token IDs must be non-negative", nil)
+	}
+	var payload [4]byte
+	binary.LittleEndian.PutUint32(payload[:], uint32(tokenID))
+	if err := hipCopyHostToDevice(driver, pointer, payload[:]); err != nil {
+		return core.E("rocm.hip.Tokens", "copy token buffer", err)
+	}
+	return nil
+}
+
 func (buffer *hipDeviceTokenBuffer) Pointer() nativeDevicePointer {
 	if buffer == nil || buffer.closed {
 		return 0
