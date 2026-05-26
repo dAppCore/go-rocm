@@ -1214,22 +1214,27 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 			if generated == generate.MaxTokens-1 {
 				return
 			}
+			var tokenIDDeviceBuffer *hipDeviceByteBuffer
+			if !hostSampling {
+				tokenIDDeviceBuffer = finalGreedyBuffer
+			}
 			var err error
 			current, state, err = hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx, model.driver, cfg, state, hipGemma4Q4ForwardRequest{
-				TokenID:            tokenID,
-				Position:           position,
-				Epsilon:            req.Epsilon,
-				DeviceKVAttention:  true,
-				DeviceKVMode:       deviceKVMode,
-				PriorDeviceState:   deviceState,
-				ReturnDeviceState:  true,
-				DeviceFinalSample:  !hostSampling,
-				FinalGreedyBuffer:  finalGreedyBuffer,
-				SuppressTokens:     suppressTokens,
-				AttentionWorkspace: attentionWorkspace,
-				OmitDebugTensors:   true,
-				OmitLabels:         true,
-				OmitHostState:      true,
+				TokenID:             tokenID,
+				Position:            position,
+				Epsilon:             req.Epsilon,
+				DeviceKVAttention:   true,
+				DeviceKVMode:        deviceKVMode,
+				PriorDeviceState:    deviceState,
+				ReturnDeviceState:   true,
+				DeviceFinalSample:   !hostSampling,
+				FinalGreedyBuffer:   finalGreedyBuffer,
+				TokenIDDeviceBuffer: tokenIDDeviceBuffer,
+				SuppressTokens:      suppressTokens,
+				AttentionWorkspace:  attentionWorkspace,
+				OmitDebugTensors:    true,
+				OmitLabels:          true,
+				OmitHostState:       true,
 			}, false)
 			if err != nil {
 				runErr = err

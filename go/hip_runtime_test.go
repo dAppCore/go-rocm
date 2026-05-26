@@ -2338,7 +2338,9 @@ func (driver *fakeHIPDriver) LaunchKernel(config hipKernelLaunchConfig) error {
 	case hipKernelNameLoRA:
 		return driver.launchLoRAProjection(config.Args)
 	case hipKernelNameEmbedLookup:
-		return driver.launchEmbeddingLookup(config.Args)
+		return driver.launchEmbeddingLookup(config.Args, false)
+	case hipKernelNameEmbedLookupGreedyToken:
+		return driver.launchEmbeddingLookup(config.Args, true)
 	case hipKernelNameEmbedMean:
 		return driver.launchEmbeddingMeanPool(config.Args)
 	case hipKernelNameRerank:
@@ -3900,7 +3902,7 @@ func (driver *fakeHIPDriver) launchLoRAProjection(args []byte) error {
 	return nil
 }
 
-func (driver *fakeHIPDriver) launchEmbeddingLookup(args []byte) error {
+func (driver *fakeHIPDriver) launchEmbeddingLookup(args []byte, greedyToken bool) error {
 	if len(args) != hipEmbeddingLookupLaunchArgsBytes {
 		return core.E("rocm.hip.FakeLaunch", "embedding lookup launch args size mismatch", nil)
 	}
@@ -3923,8 +3925,15 @@ func (driver *fakeHIPDriver) launchEmbeddingLookup(args []byte) error {
 	biasPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[80:]))
 	scaleBytes := int(binary.LittleEndian.Uint32(args[88:]))
 	biasBytes := int(binary.LittleEndian.Uint32(args[92:]))
-	if tokenCount <= 0 || vocabSize <= 0 || hiddenSize <= 0 || tokenBytes != tokenCount*4 || outputBytes != tokenCount*hiddenSize*4 {
+	wantTokenBytes := tokenCount * 4
+	if greedyToken {
+		wantTokenBytes = hipMLXQ4ProjectionBestBytes
+	}
+	if tokenCount <= 0 || vocabSize <= 0 || hiddenSize <= 0 || tokenBytes != wantTokenBytes || outputBytes != tokenCount*hiddenSize*4 {
 		return core.E("rocm.hip.FakeLaunch", "embedding lookup shape metadata mismatch", nil)
+	}
+	if greedyToken && tokenCount != 1 {
+		return core.E("rocm.hip.FakeLaunch", "embedding lookup greedy token count mismatch", nil)
 	}
 	tokenData, tokenOffset, ok := driver.memoryForPointer(tokenPointer, tokenBytes)
 	if !ok {
@@ -3962,6 +3971,9 @@ func (driver *fakeHIPDriver) launchEmbeddingLookup(args []byte) error {
 	output := make([]float32, tokenCount*hiddenSize)
 	for tokenIndex := 0; tokenIndex < tokenCount; tokenIndex++ {
 		id := int(int32(binary.LittleEndian.Uint32(tokenData[tokenOffset+tokenIndex*4:])))
+		if greedyToken {
+			id = int(^uint32(binary.LittleEndian.Uint64(tokenData[tokenOffset:])))
+		}
 		if id < 0 || id >= vocabSize {
 			return core.E("rocm.hip.FakeLaunch", "embedding lookup token ID is outside vocabulary", nil)
 		}

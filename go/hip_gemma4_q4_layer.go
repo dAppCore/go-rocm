@@ -111,22 +111,23 @@ type hipGemma4Q4ForwardConfig struct {
 }
 
 type hipGemma4Q4ForwardRequest struct {
-	TokenID            int32
-	Position           int
-	RoPEBase           float32
-	Epsilon            float32
-	DeviceKVAttention  bool
-	DeviceKVMode       string
-	PriorDeviceState   *hipGemma4Q4DeviceDecodeState
-	ReturnDeviceState  bool
-	DeviceFinalSample  bool
-	SkipFinalSample    bool
-	FinalGreedyBuffer  *hipDeviceByteBuffer
-	SuppressTokens     []int32
-	AttentionWorkspace *hipAttentionHeadsChunkedWorkspace
-	OmitDebugTensors   bool
-	OmitLabels         bool
-	OmitHostState      bool
+	TokenID             int32
+	Position            int
+	RoPEBase            float32
+	Epsilon             float32
+	DeviceKVAttention   bool
+	DeviceKVMode        string
+	PriorDeviceState    *hipGemma4Q4DeviceDecodeState
+	ReturnDeviceState   bool
+	DeviceFinalSample   bool
+	SkipFinalSample     bool
+	FinalGreedyBuffer   *hipDeviceByteBuffer
+	TokenIDDeviceBuffer *hipDeviceByteBuffer
+	SuppressTokens      []int32
+	AttentionWorkspace  *hipAttentionHeadsChunkedWorkspace
+	OmitDebugTensors    bool
+	OmitLabels          bool
+	OmitHostState       bool
 }
 
 type hipGemma4Q4LayerKVState struct {
@@ -593,12 +594,14 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 	if req.OmitDebugTensors {
 		var embeddingBuffer *hipDeviceByteBuffer
 		if req.AttentionWorkspace != nil {
-			tokenBuffer, tokenErr := req.AttentionWorkspace.EnsureTokenIDValue(driver, req.TokenID, first.Embedding.VocabSize)
-			if tokenErr != nil {
-				return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, tokenErr
-			}
 			embeddingBuffer, err = req.AttentionWorkspace.EnsureEmbeddingOutput(driver, first.HiddenSize)
-			if err == nil {
+			if err == nil && req.TokenIDDeviceBuffer != nil {
+				err = hipRunEmbeddingLookupKernelWithDeviceTableGreedyTokenOutput(ctx, driver, first.Embedding, req.TokenIDDeviceBuffer, embeddingBuffer)
+			} else if err == nil {
+				tokenBuffer, tokenErr := req.AttentionWorkspace.EnsureTokenIDValue(driver, req.TokenID, first.Embedding.VocabSize)
+				if tokenErr != nil {
+					return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, tokenErr
+				}
 				err = hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferOutput(ctx, driver, first.Embedding, tokenBuffer, embeddingBuffer)
 			}
 		} else {
@@ -622,7 +625,7 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 		if err != nil {
 			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
 		}
-		perLayerInputDevices, err = hipRunGemma4Q4PerLayerInputDeviceSet(ctx, driver, cfg, req.TokenID, hiddenBuffer, req.Epsilon, req.AttentionWorkspace)
+		perLayerInputDevices, err = hipRunGemma4Q4PerLayerInputDeviceSet(ctx, driver, cfg, req.TokenID, req.TokenIDDeviceBuffer, hiddenBuffer, req.Epsilon, req.AttentionWorkspace)
 		if err != nil {
 			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
 		}
@@ -2671,11 +2674,11 @@ func hipRunGemma4Q4PerLayerInputSet(ctx context.Context, driver nativeHIPDriver,
 	return outputs, nil
 }
 
-func hipRunGemma4Q4PerLayerInputDeviceSet(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4ForwardConfig, tokenID int32, hidden *hipDeviceByteBuffer, epsilon float32, workspace *hipAttentionHeadsChunkedWorkspace) (*hipGemma4Q4PerLayerInputDeviceSet, error) {
+func hipRunGemma4Q4PerLayerInputDeviceSet(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4ForwardConfig, tokenID int32, tokenIDDeviceBuffer, hidden *hipDeviceByteBuffer, epsilon float32, workspace *hipAttentionHeadsChunkedWorkspace) (*hipGemma4Q4PerLayerInputDeviceSet, error) {
 	if len(cfg.Layers) == 0 || !cfg.Layers[0].PerLayerInput.hasGlobalPrecompute() {
 		return nil, nil
 	}
-	inputs, err := hipRunGemma4Q4PerLayerInputConfigDeviceSet(ctx, driver, cfg.Layers[0].PerLayerInput, tokenID, hidden, epsilon, workspace)
+	inputs, err := hipRunGemma4Q4PerLayerInputConfigDeviceSet(ctx, driver, cfg.Layers[0].PerLayerInput, tokenID, tokenIDDeviceBuffer, hidden, epsilon, workspace)
 	if err != nil {
 		return nil, err
 	}
@@ -2686,7 +2689,7 @@ func hipRunGemma4Q4PerLayerInputDeviceSet(ctx context.Context, driver nativeHIPD
 	return inputs, nil
 }
 
-func hipRunGemma4Q4PerLayerInputConfigDeviceSet(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4PerLayerInputConfig, tokenID int32, hidden *hipDeviceByteBuffer, epsilon float32, workspace *hipAttentionHeadsChunkedWorkspace) (*hipGemma4Q4PerLayerInputDeviceSet, error) {
+func hipRunGemma4Q4PerLayerInputConfigDeviceSet(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4PerLayerInputConfig, tokenID int32, tokenIDDeviceBuffer, hidden *hipDeviceByteBuffer, epsilon float32, workspace *hipAttentionHeadsChunkedWorkspace) (*hipGemma4Q4PerLayerInputDeviceSet, error) {
 	if err := hipContextErr(ctx); err != nil {
 		return nil, err
 	}
@@ -2712,12 +2715,14 @@ func hipRunGemma4Q4PerLayerInputConfigDeviceSet(ctx context.Context, driver nati
 	var err error
 	var perLayerEmbedding *hipDeviceByteBuffer
 	if workspace != nil {
-		tokenBuffer, err := workspace.EnsureTokenIDValue(driver, tokenID, cfg.Embedding.VocabSize)
-		if err != nil {
-			return nil, err
-		}
 		perLayerEmbedding, err = workspace.EnsurePerLayerEmbedding(driver, cfg.ModelProjection.Rows)
-		if err == nil {
+		if err == nil && tokenIDDeviceBuffer != nil {
+			err = hipRunEmbeddingLookupKernelWithDeviceTableGreedyTokenOutput(ctx, driver, cfg.Embedding, tokenIDDeviceBuffer, perLayerEmbedding)
+		} else if err == nil {
+			tokenBuffer, tokenErr := workspace.EnsureTokenIDValue(driver, tokenID, cfg.Embedding.VocabSize)
+			if tokenErr != nil {
+				return nil, tokenErr
+			}
 			err = hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferOutput(ctx, driver, cfg.Embedding, tokenBuffer, perLayerEmbedding)
 		}
 		if err != nil {

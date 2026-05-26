@@ -1,5 +1,48 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-26 Greedy-Token Device Embedding Pass
+
+- Kept the 2048-token fast loop as the edit gate and promoted only after the
+  retained 10-turn full-cap book acceptance passed.
+- Added `rocm_embedding_lookup_greedy_token`, a single-token embedding variant
+  that reads the packed q4 greedy result already resident in the final greedy
+  device buffer and unpacks the token ID on device. The public stream still
+  reads the greedy result to host for stop/yield accounting, but the next decode
+  step no longer uploads that token ID back to the GPU for base/per-layer
+  embeddings.
+- Wired the greedy-token buffer through `hipGemma4Q4ForwardRequest` only for
+  non-host-sampling decode steps. Host sampling and prompt prefill keep the old
+  explicit token-buffer path.
+- Left `GO_ROCM_ENABLE_LAUNCH_ARG_EVENTS` behavior intact but stopped creating
+  per-slot HIP launch-arg events on the default ring-wrap synchronization path,
+  where those events are never recorded.
+- Rebuilt the live `gfx1100` HSACO with `hipcc --std=c++23 --genco
+  --offload-arch=gfx1100 -O2`.
+- Live RX 7800 XT 2048-token guards after this batch:
+  short `text:Hi` reports `109.0 tok/s`, `7770440 B/op`, and
+  `55915 allocs/op`; chapter-shaped prompt reports `101.5 tok/s`,
+  `15932504 B/op`, and `71533 allocs/op`.
+- Retained 10-turn full-cap greedy book acceptance stayed green:
+  `37.68s` wall, `33.46s` decode, `3021` generated tokens, `80.17 tok/s`
+  average, `69.77 tok/s` on turn 10, empty stderr, no cap hits, chapter-10
+  anchor hits of `3`, `231837680 B/op`, and `212770 allocs/op`.
+- This is accepted as a real hot-path host-transfer/allocation cleanup. It is
+  not the final endpoint: retained turn 10 remains below the `90-100+ tok/s`
+  late-turn target.
+
+## 2026-05-26 Rejected Shared-Input Q4 Projection Cache
+
+- Rejected both broad and narrow attempts to stage q4 projection input vectors
+  into dynamic shared memory. The broad in-place version collapsed the short
+  2048-token guard to `55.46 tok/s`.
+- The safer separate-kernel version only routed projections with `cols <= 4096`
+  through a dynamic shared-input cache and left the original kernel untouched,
+  but the short 2048-token guard still regressed to `85.35 tok/s`,
+  `7834024 B/op`, and `62072 allocs/op`.
+- The result points to shared-memory occupancy/barrier cost dominating any
+  input reread reduction for this shape. Do not retry this exact row-block
+  input-cache design without a different tiling model.
+
 ## 2026-05-26 Workspace Token Value Cache Pass
 
 - Kept the accepted device q4 greedy path and added a workspace token-value

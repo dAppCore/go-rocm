@@ -302,9 +302,17 @@ guards stayed above the speed floor at `108.8 tok/s`, `7821264 B/op`, and
 `77529 allocs/op` for the chapter-shaped prompt. The retained book route stayed
 green at `38.21s` wall, `33.99s` decode, `3021` generated tokens, `79.06 tok/s`
 average, `67.79 tok/s` on turn 10, empty stderr, no cap hits, and chapter-10
-anchor hits of `3`, with `231843976 B/op` and `212778 allocs/op`.
+anchor hits of `3`, with `231843976 B/op` and `212778 allocs/op`. Reading the
+packed q4 greedy result directly from the embedding kernels then removed the
+per-token host-to-device token upload on the greedy decode path. The
+2048-token guards stayed green at `109.0 tok/s`, `7770440 B/op`, and
+`55915 allocs/op` for `text:Hi`, and `101.5 tok/s`, `15932504 B/op`, and
+`71533 allocs/op` for the chapter-shaped prompt. The retained book route stayed
+green at `37.68s` wall, `33.46s` decode, `3021` generated tokens,
+`80.17 tok/s` average, `69.77 tok/s` on turn 10, empty stderr, no cap hits, and
+chapter-10 anchor hits of `3`, with `231837680 B/op` and `212770 allocs/op`.
 This is still not the final driver endpoint: later-turn decode is only
-`67.79 tok/s`, below the `90-100+ tok/s` target, and the visible output remains
+`69.77 tok/s`, below the `90-100+ tok/s` target, and the visible output remains
 repetitive. Keep tuning retained long-context attention and state quality until
 the later turns stay near the target.
 
@@ -333,6 +341,8 @@ max_new_tokens  route                    tok/s   B/op       allocs/op
 2048 chapter    device suppress fallback 101.5    15.99M       83672
 2048 text:Hi    token value cache       108.8     7.82M       62060
 2048 chapter    token value cache       100.0    15.94M       77529
+2048 text:Hi    greedy-token embedding 109.0     7.77M       55915
+2048 chapter    greedy-token embedding 101.5    15.93M       71533
 ```
 
 The earlier 256-token chunked route was rejected because it fell to `58.24

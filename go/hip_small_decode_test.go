@@ -320,7 +320,7 @@ func TestHIPGemma4Q4Layer0_Good(t *testing.T) {
 		t.Helper()
 		var count int
 		for _, launch := range driver.launches[start:] {
-			if launch.Name == hipKernelNameEmbedLookup {
+			if launch.Name == hipKernelNameEmbedLookup || launch.Name == hipKernelNameEmbedLookupGreedyToken {
 				count++
 			}
 		}

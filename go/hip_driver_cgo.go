@@ -869,7 +869,7 @@ func (driver cgoHIPDriver) launchArgPointerSync(args []byte) (cgoHIPLaunchArgLea
 
 func (driver cgoHIPDriver) launchArgPointerAsync(args []byte) (cgoHIPLaunchArgLease, error) {
 	cgoHIPLaunchArgRing.Lock()
-	syncOnWrap := os.Getenv("GO_ROCM_ENABLE_LAUNCH_ARG_EVENTS") == ""
+	syncOnWrap := !cgoHIPLaunchArgEventsEnabled()
 	slotIndex := cgoHIPLaunchArgRing.next
 	cgoHIPLaunchArgRing.next = (cgoHIPLaunchArgRing.next + 1) % len(cgoHIPLaunchArgRing.slots)
 	if cgoHIPLaunchArgRing.next == 0 {
@@ -912,6 +912,10 @@ func (driver cgoHIPDriver) launchArgPointerAsync(args []byte) (cgoHIPLaunchArgLe
 		}
 	}
 	return cgoHIPLaunchArgLease{pointer: slot.pointer, asyncSlot: slot, noEvent: syncOnWrap}, nil
+}
+
+func cgoHIPLaunchArgEventsEnabled() bool {
+	return os.Getenv("GO_ROCM_ENABLE_LAUNCH_ARG_EVENTS") != ""
 }
 
 func (lease cgoHIPLaunchArgLease) finish(success bool) error {
@@ -970,9 +974,11 @@ func (driver cgoHIPDriver) resizeLaunchArgSlot(slot *cgoHIPLaunchArgSlot, size u
 		var device C.uintptr_t
 		if rc := C.core_rocm_hip_host_malloc_mapped(&host, &device, C.size_t(size)); rc == 0 {
 			var event C.uintptr_t
-			if eventRC := C.core_rocm_hip_event_create(&event); eventRC != 0 {
-				_ = C.core_rocm_hip_host_free(host)
-				return hipReturnError("hipEventCreateWithFlags", int(eventRC))
+			if cgoHIPLaunchArgEventsEnabled() {
+				if eventRC := C.core_rocm_hip_event_create(&event); eventRC != 0 {
+					_ = C.core_rocm_hip_host_free(host)
+					return hipReturnError("hipEventCreateWithFlags", int(eventRC))
+				}
 			}
 			slot.host = unsafe.Pointer(uintptr(host))
 			slot.pointer = nativeDevicePointer(device)
@@ -992,10 +998,12 @@ func (driver cgoHIPDriver) resizeLaunchArgSlot(slot *cgoHIPLaunchArgSlot, size u
 		return err
 	}
 	var event C.uintptr_t
-	if rc := C.core_rocm_hip_event_create(&event); rc != 0 {
-		_ = C.core_rocm_hip_host_free(host)
-		_ = driver.Free(pointer)
-		return hipReturnError("hipEventCreateWithFlags", int(rc))
+	if cgoHIPLaunchArgEventsEnabled() {
+		if rc := C.core_rocm_hip_event_create(&event); rc != 0 {
+			_ = C.core_rocm_hip_host_free(host)
+			_ = driver.Free(pointer)
+			return hipReturnError("hipEventCreateWithFlags", int(rc))
+		}
 	}
 	slot.host = unsafe.Pointer(uintptr(host))
 	slot.pointer = pointer

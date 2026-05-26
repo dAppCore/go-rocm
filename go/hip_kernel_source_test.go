@@ -60,6 +60,7 @@ func TestHIPKernelSource_ExportsLaunchABI_Good(t *testing.T) {
 		`extern "C" __global__ void rocm_codebook_lookup`,
 		`extern "C" __global__ void rocm_lora_projection`,
 		`extern "C" __global__ void rocm_embedding_lookup`,
+		`extern "C" __global__ void rocm_embedding_lookup_greedy_token`,
 		`extern "C" __global__ void rocm_embedding_mean_pool`,
 		`extern "C" __global__ void rocm_rerank_cosine`,
 		`extern "C" __global__ void rocm_tiny_prefill`,
@@ -258,6 +259,18 @@ func TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good(t *test
 	core.AssertTrue(t, strings.Contains(greedy, `!rocm_mlx_q4_token_suppressed(row, suppress_tokens, args.suppress_count)`), "greedy fallback must filter suppressed rows on device")
 	core.AssertTrue(t, strings.Contains(greedy, `for (uint32_t index = 1u; index < ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK; ++index)`), "greedy best reduction uses one post-sync serial pass")
 	core.AssertTrue(t, !strings.Contains(greedy, `ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK / 2u`), "greedy best reduction must not reintroduce repeated block barriers")
+}
+
+func TestHIPKernelSource_EmbeddingGreedyTokenReadsPackedBest_Good(t *testing.T) {
+	sourceBytes, err := os.ReadFile("../kernels/rocm_kernels.hip")
+	core.RequireNoError(t, err)
+	source := string(sourceBytes)
+
+	embedding := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_embedding_lookup_greedy_token`)
+	core.AssertTrue(t, strings.Contains(embedding, `rocm_valid_embedding_lookup_greedy_token_args(args)`), "greedy-token embedding must validate the packed-token launch shape")
+	core.AssertTrue(t, strings.Contains(embedding, `const uint64_t *best`), "greedy-token embedding must read the packed q4 greedy result")
+	core.AssertTrue(t, strings.Contains(embedding, `~static_cast<uint32_t>(*best)`), "greedy-token embedding must unpack the token ID from the q4 greedy result")
+	core.AssertTrue(t, strings.Contains(embedding, `rocm_embedding_lookup_store(args, index, token_id, index)`), "greedy-token embedding must reuse the normal embedding table path")
 }
 
 func TestHIPKernelSource_AttentionChunkedStage1ScoreLaneReduction_Good(t *testing.T) {

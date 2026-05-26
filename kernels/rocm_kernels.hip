@@ -1645,6 +1645,16 @@ __device__ bool rocm_valid_embedding_lookup_args(const rocm_embedding_lookup_lau
 	return false;
 }
 
+__device__ bool rocm_valid_embedding_lookup_greedy_token_args(const rocm_embedding_lookup_launch_args &args)
+{
+	if (args.token_count != 1u || args.token_bytes != sizeof(uint64_t)) {
+		return false;
+	}
+	rocm_embedding_lookup_launch_args normalized = args;
+	normalized.token_bytes = sizeof(int32_t);
+	return rocm_valid_embedding_lookup_args(normalized);
+}
+
 __device__ bool rocm_valid_rerank_cosine_args(const rocm_rerank_cosine_launch_args &args)
 {
 	return args.version == ROCM_RERANK_COSINE_LAUNCH_ARGS_VERSION &&
@@ -3740,28 +3750,12 @@ extern "C" __global__ void rocm_lora_projection(const unsigned char *packet)
 	output[row] = sum + scale * delta;
 }
 
-extern "C" __global__ void rocm_embedding_lookup(const unsigned char *packet)
+__device__ void rocm_embedding_lookup_store(const rocm_embedding_lookup_launch_args &args, uint32_t index, int32_t token_id, uint32_t dim)
 {
-	if (packet == nullptr) {
-		return;
-	}
-	const rocm_embedding_lookup_launch_args &args = *reinterpret_cast<const rocm_embedding_lookup_launch_args *>(packet);
-	if (!rocm_valid_embedding_lookup_args(args)) {
-		return;
-	}
-	const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-	const uint64_t total = static_cast<uint64_t>(args.token_count) * args.hidden_size;
-	if (index >= total) {
-		return;
-	}
-	const int32_t *tokens = reinterpret_cast<const int32_t *>(static_cast<uintptr_t>(args.token_pointer));
-	float *output = reinterpret_cast<float *>(static_cast<uintptr_t>(args.output_pointer));
-	const uint32_t token_index = index / args.hidden_size;
-	const uint32_t dim = index - token_index * args.hidden_size;
-	const int32_t token_id = tokens[token_index];
 	if (token_id < 0 || static_cast<uint32_t>(token_id) >= args.vocab_size) {
 		return;
 	}
+	float *output = reinterpret_cast<float *>(static_cast<uintptr_t>(args.output_pointer));
 	if (args.table_encoding == ROCM_EMBEDDING_TABLE_ENCODING_MLX_Q4) {
 		const uint32_t *embedding = reinterpret_cast<const uint32_t *>(static_cast<uintptr_t>(args.embedding_pointer));
 		const uint16_t *scales = reinterpret_cast<const uint16_t *>(static_cast<uintptr_t>(args.scale_pointer));
@@ -3783,6 +3777,45 @@ extern "C" __global__ void rocm_embedding_lookup(const unsigned char *packet)
 		const float *embedding = reinterpret_cast<const float *>(static_cast<uintptr_t>(args.embedding_pointer));
 		output[index] = embedding[table_index];
 	}
+}
+
+extern "C" __global__ void rocm_embedding_lookup(const unsigned char *packet)
+{
+	if (packet == nullptr) {
+		return;
+	}
+	const rocm_embedding_lookup_launch_args &args = *reinterpret_cast<const rocm_embedding_lookup_launch_args *>(packet);
+	if (!rocm_valid_embedding_lookup_args(args)) {
+		return;
+	}
+	const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+	const uint64_t total = static_cast<uint64_t>(args.token_count) * args.hidden_size;
+	if (index >= total) {
+		return;
+	}
+	const int32_t *tokens = reinterpret_cast<const int32_t *>(static_cast<uintptr_t>(args.token_pointer));
+	const uint32_t token_index = index / args.hidden_size;
+	const uint32_t dim = index - token_index * args.hidden_size;
+	const int32_t token_id = tokens[token_index];
+	rocm_embedding_lookup_store(args, index, token_id, dim);
+}
+
+extern "C" __global__ void rocm_embedding_lookup_greedy_token(const unsigned char *packet)
+{
+	if (packet == nullptr) {
+		return;
+	}
+	const rocm_embedding_lookup_launch_args &args = *reinterpret_cast<const rocm_embedding_lookup_launch_args *>(packet);
+	if (!rocm_valid_embedding_lookup_greedy_token_args(args)) {
+		return;
+	}
+	const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+	if (index >= args.hidden_size) {
+		return;
+	}
+	const uint64_t *best = reinterpret_cast<const uint64_t *>(static_cast<uintptr_t>(args.token_pointer));
+	const int32_t token_id = static_cast<int32_t>(~static_cast<uint32_t>(*best));
+	rocm_embedding_lookup_store(args, index, token_id, index);
 }
 
 extern "C" __global__ void rocm_embedding_mean_pool(const unsigned char *packet)

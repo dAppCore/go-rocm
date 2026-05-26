@@ -51,6 +51,7 @@ const (
 	hipKernelNameCodebook                    = "rocm_codebook_lookup"
 	hipKernelNameLoRA                        = "rocm_lora_projection"
 	hipKernelNameEmbedLookup                 = "rocm_embedding_lookup"
+	hipKernelNameEmbedLookupGreedyToken      = "rocm_embedding_lookup_greedy_token"
 	hipKernelNameEmbedMean                   = "rocm_embedding_mean_pool"
 	hipKernelNameRerank                      = "rocm_rerank_cosine"
 	hipKernelNameTinyPrefill                 = "rocm_tiny_prefill"
