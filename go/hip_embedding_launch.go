@@ -789,6 +789,22 @@ func hipRunEmbeddingLookupKernelWithDeviceTableSingleTokenBufferOutput(ctx conte
 	if err := hipContextErr(ctx); err != nil {
 		return err
 	}
+	if err := cfg.validateSingleToken(tokenID); err != nil {
+		return err
+	}
+	if tokenBuffer == nil || tokenBuffer.Pointer() == 0 || tokenBuffer.Count() != 1 || tokenBuffer.SizeBytes() != 4 {
+		return core.E("rocm.hip.EmbeddingLookupLaunch", "single-token workspace buffer is required", nil)
+	}
+	if err := hipWriteSingleTokenID(driver, tokenBuffer.Pointer(), tokenID); err != nil {
+		return err
+	}
+	return hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferOutput(ctx, driver, cfg, tokenBuffer, output)
+}
+
+func hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferOutput(ctx context.Context, driver nativeHIPDriver, cfg hipDeviceEmbeddingLookupConfig, tokenBuffer, output *hipDeviceByteBuffer) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
 	if driver == nil || !driver.Available() {
 		return core.E("rocm.hip.EmbeddingLookupLaunch", "HIP driver is not available", nil)
 	}
@@ -797,12 +813,6 @@ func hipRunEmbeddingLookupKernelWithDeviceTableSingleTokenBufferOutput(ctx conte
 	}
 	if output == nil || output.Pointer() == 0 || output.Count() != cfg.HiddenSize || output.SizeBytes() != uint64(cfg.HiddenSize*4) {
 		return core.E("rocm.hip.EmbeddingLookupLaunch", "single-token output buffer shape mismatch", nil)
-	}
-	if err := cfg.validateSingleToken(tokenID); err != nil {
-		return err
-	}
-	if err := hipWriteSingleTokenID(driver, tokenBuffer.Pointer(), tokenID); err != nil {
-		return err
 	}
 	launchBytes, err := (hipEmbeddingLookupLaunchArgs{
 		TokenPointer:     tokenBuffer.Pointer(),

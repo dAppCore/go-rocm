@@ -593,13 +593,13 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 	if req.OmitDebugTensors {
 		var embeddingBuffer *hipDeviceByteBuffer
 		if req.AttentionWorkspace != nil {
-			tokenBuffer, tokenErr := req.AttentionWorkspace.EnsureTokenIDBuffer(driver)
+			tokenBuffer, tokenErr := req.AttentionWorkspace.EnsureTokenIDValue(driver, req.TokenID, first.Embedding.VocabSize)
 			if tokenErr != nil {
 				return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, tokenErr
 			}
 			embeddingBuffer, err = req.AttentionWorkspace.EnsureEmbeddingOutput(driver, first.HiddenSize)
 			if err == nil {
-				err = hipRunEmbeddingLookupKernelWithDeviceTableSingleTokenBufferOutput(ctx, driver, req.TokenID, first.Embedding, tokenBuffer, embeddingBuffer)
+				err = hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferOutput(ctx, driver, first.Embedding, tokenBuffer, embeddingBuffer)
 			}
 		} else {
 			embeddingBuffer, err = hipRunEmbeddingLookupKernelWithDeviceTableBuffer(ctx, driver, []int32{req.TokenID}, first.Embedding)
@@ -2712,13 +2712,13 @@ func hipRunGemma4Q4PerLayerInputConfigDeviceSet(ctx context.Context, driver nati
 	var err error
 	var perLayerEmbedding *hipDeviceByteBuffer
 	if workspace != nil {
-		tokenBuffer, err := workspace.EnsureTokenIDBuffer(driver)
+		tokenBuffer, err := workspace.EnsureTokenIDValue(driver, tokenID, cfg.Embedding.VocabSize)
 		if err != nil {
 			return nil, err
 		}
 		perLayerEmbedding, err = workspace.EnsurePerLayerEmbedding(driver, cfg.ModelProjection.Rows)
 		if err == nil {
-			err = hipRunEmbeddingLookupKernelWithDeviceTableSingleTokenBufferOutput(ctx, driver, tokenID, cfg.Embedding, tokenBuffer, perLayerEmbedding)
+			err = hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferOutput(ctx, driver, cfg.Embedding, tokenBuffer, perLayerEmbedding)
 		}
 		if err != nil {
 			return nil, err

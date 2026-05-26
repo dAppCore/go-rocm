@@ -2435,6 +2435,50 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_SuppressTokenBufferReused(b *tes
 	}
 }
 
+func TestHIPAttentionHeadsChunkedWorkspace_TokenIDValueCached_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	buffer, err := workspace.EnsureTokenIDValue(driver, 42, 128)
+	core.RequireNoError(t, err)
+	if buffer == nil || buffer.Count() != 1 {
+		t.Fatalf("token buffer = %#v, want one token", buffer)
+	}
+	copiesAfterFirst := len(driver.copies)
+	_, err = workspace.EnsureTokenIDValue(driver, 42, 128)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, copiesAfterFirst, len(driver.copies))
+	_, err = workspace.EnsureTokenIDValue(driver, 43, 128)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, copiesAfterFirst+1, len(driver.copies))
+	_, err = workspace.EnsureTokenIDValue(driver, 128, 128)
+	core.AssertError(t, err)
+	core.AssertEqual(t, copiesAfterFirst+1, len(driver.copies))
+}
+
+func BenchmarkHIPAttentionHeadsChunkedWorkspace_TokenIDValueCached(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	buffer, err := workspace.EnsureTokenIDValue(driver, 42, 128)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if buffer == nil || buffer.Count() != 1 {
+		b.Fatalf("token buffer = %#v, want one token", buffer)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		buffer, err = workspace.EnsureTokenIDValue(driver, 42, 128)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if buffer == nil || buffer.Count() != 1 {
+			b.Fatalf("token buffer = %#v, want one token", buffer)
+		}
+	}
+}
+
 func BenchmarkHIPGemma4Q4SharedKVSourceByLayer_Cached(b *testing.B) {
 	const layerCount = 32
 	layers := make([]hipGemma4Q4Layer0Config, layerCount)

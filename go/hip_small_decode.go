@@ -2107,6 +2107,8 @@ type hipAttentionHeadsChunkedWorkspace struct {
 	Partial              *hipDeviceByteBuffer
 	Stats                *hipDeviceByteBuffer
 	TokenID              *hipDeviceByteBuffer
+	TokenIDLoaded        bool
+	TokenIDValue         int32
 	EmbeddingOutputs     map[int]*hipDeviceByteBuffer
 	ScaledEmbeddings     map[int]*hipDeviceByteBuffer
 	PerLayerEmbeddings   map[int]*hipDeviceByteBuffer
@@ -2180,12 +2182,33 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureTokenIDBuffer(driver n
 	if err := workspace.TokenID.Close(); err != nil {
 		return nil, err
 	}
+	workspace.TokenIDLoaded = false
 	tokenID, err := hipAllocateByteBuffer(driver, "rocm.hip.AttentionHeadsChunkedLaunch", "single token id", 4, 1)
 	if err != nil {
 		return nil, err
 	}
 	workspace.TokenID = tokenID
 	return tokenID, nil
+}
+
+func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureTokenIDValue(driver nativeHIPDriver, tokenID int32, vocabSize int) (*hipDeviceByteBuffer, error) {
+	if tokenID < 0 || vocabSize <= 0 || int(tokenID) >= vocabSize {
+		return nil, core.E("rocm.hip.EmbeddingLookupLaunch", "token ID is outside vocabulary", nil)
+	}
+	tokenBuffer, err := workspace.EnsureTokenIDBuffer(driver)
+	if err != nil {
+		return nil, err
+	}
+	if workspace.TokenIDLoaded && workspace.TokenIDValue == tokenID {
+		return tokenBuffer, nil
+	}
+	if err := hipWriteSingleTokenID(driver, tokenBuffer.Pointer(), tokenID); err != nil {
+		workspace.TokenIDLoaded = false
+		return nil, err
+	}
+	workspace.TokenIDLoaded = true
+	workspace.TokenIDValue = tokenID
+	return tokenBuffer, nil
 }
 
 func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureEmbeddingOutput(driver nativeHIPDriver, count int) (*hipDeviceByteBuffer, error) {
@@ -2705,6 +2728,9 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 	workspace.NextInputOutputs = [2]map[int]*hipDeviceByteBuffer{}
 	workspace.PerLayerInputSet = hipGemma4Q4PerLayerInputDeviceSet{}
 	workspace.PerLayerInputBacking[0] = nil
+	workspace.TokenID = nil
+	workspace.TokenIDLoaded = false
+	workspace.TokenIDValue = 0
 	workspace.SuppressTokenBuffer = nil
 	workspace.SuppressTokenIDs = nil
 	return lastErr

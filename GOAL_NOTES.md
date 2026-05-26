@@ -1,5 +1,33 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-26 Workspace Token Value Cache Pass
+
+- Kept the accepted device q4 greedy path and added a workspace token-value
+  cache so the base embedding lookup and per-layer embedding lookup do not both
+  upload the same single token ID during one forward step.
+- Added `hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferOutput` for the
+  already-loaded-token-buffer case while preserving range validation in the
+  workspace cache. Added `TestHIPAttentionHeadsChunkedWorkspace_TokenIDValueCached_Good`
+  and `BenchmarkHIPAttentionHeadsChunkedWorkspace_TokenIDValueCached`, which
+  reports about `2.58 ns/op`, `0 B/op`, and `0 allocs/op`.
+- Rejected the experimental direct device next-token write from the q4 greedy
+  kernel: retained book acceptance failed with chapter-10 anchor hits of `0`.
+  The failure is consistent with a race between per-block `atomicMax` updates
+  and a separate token-buffer store, so that path is not included.
+- Rebuilt the live `gfx1100` HSACO with `hipcc --std=c++23 --genco
+  --offload-arch=gfx1100 -O2`.
+- Live RX 7800 XT 2048-token guards after the accepted cache batch:
+  short `text:Hi` reports `108.8 tok/s`, `7821264 B/op`, and `62060 allocs/op`;
+  chapter-shaped prompt reports `100.0 tok/s`, `15935904 B/op`, and
+  `77529 allocs/op`.
+- Retained 10-turn full-cap greedy book acceptance stayed green:
+  `38.21s` wall, `33.99s` decode, `3021` generated tokens, `79.06 tok/s`
+  average, `67.79 tok/s` on turn 10, empty stderr, no cap hits, chapter-10
+  anchor hits of `3`, `231843976 B/op`, and `212778 allocs/op`.
+- This is accepted as an allocation/host-transfer cleanup step. It is not a
+  late-turn decode win; retained turn 10 remains below the `90-100+ tok/s`
+  target.
+
 ## 2026-05-26 Device Greedy Suppression Fallback Pass
 
 - Kept the normal q4 greedy path unchanged. If the first device greedy winner

@@ -294,9 +294,17 @@ chapter-shaped guard to `15985280 B/op` while keeping decode at `108.9 tok/s`
 and `101.5 tok/s` respectively. The retained book route stayed green at
 `37.64s` wall, `33.43s` decode, `3021` generated tokens, `80.26 tok/s` average,
 `69.56 tok/s` on turn 10, empty stderr, no cap hits, and chapter-10 anchor hits
-of `3`, with `231896312 B/op` and `221840 allocs/op`.
+of `3`, with `231896312 B/op` and `221840 allocs/op`. Caching the workspace
+single-token device buffer value then removed the duplicate per-forward token
+upload used by the base embedding and per-layer embedding paths. The 2048-token
+guards stayed above the speed floor at `108.8 tok/s`, `7821264 B/op`, and
+`62060 allocs/op` for `text:Hi`, and `100.0 tok/s`, `15935904 B/op`, and
+`77529 allocs/op` for the chapter-shaped prompt. The retained book route stayed
+green at `38.21s` wall, `33.99s` decode, `3021` generated tokens, `79.06 tok/s`
+average, `67.79 tok/s` on turn 10, empty stderr, no cap hits, and chapter-10
+anchor hits of `3`, with `231843976 B/op` and `212778 allocs/op`.
 This is still not the final driver endpoint: later-turn decode is only
-`69.56 tok/s`, below the `90-100+ tok/s` target, and the visible output remains
+`67.79 tok/s`, below the `90-100+ tok/s` target, and the visible output remains
 repetitive. Keep tuning retained long-context attention and state quality until
 the later turns stay near the target.
 
@@ -323,6 +331,8 @@ max_new_tokens  route                    tok/s   B/op       allocs/op
 2048 chapter    per-layer set workspace  101.2    44.34M       83691
 2048 text:Hi    device suppress fallback 108.9     7.87M       68194
 2048 chapter    device suppress fallback 101.5    15.99M       83672
+2048 text:Hi    token value cache       108.8     7.82M       62060
+2048 chapter    token value cache       100.0    15.94M       77529
 ```
 
 The earlier 256-token chunked route was rejected because it fell to `58.24

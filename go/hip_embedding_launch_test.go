@@ -126,6 +126,20 @@ func TestHIPEmbeddingLookupLaunch_Good(t *testing.T) {
 	singleValues, err := (&hipEmbeddingLookupDeviceBuffers{Output: deviceBF16Single, TokenCount: 1, HiddenSize: bf16Req.HiddenSize}).ReadOutput()
 	core.RequireNoError(t, err)
 	assertFloat32SlicesNear(t, []float32{-1, 3}, singleValues, 0)
+	deviceBF16NoWriteOutput, err := hipAllocateByteBuffer(deviceBF16Driver, "rocm.hip.EmbeddingLookupLaunch", "single token no-write output", uint64(bf16Req.HiddenSize*4), bf16Req.HiddenSize)
+	core.RequireNoError(t, err)
+	defer deviceBF16NoWriteOutput.Close()
+	err = hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferOutput(context.Background(), deviceBF16Driver, hipDeviceEmbeddingLookupConfig{
+		EmbeddingPointer: deviceBF16.Pointer(),
+		EmbeddingBytes:   deviceBF16.SizeBytes(),
+		TableEncoding:    hipEmbeddingTableEncodingBF16,
+		VocabSize:        bf16Req.VocabSize,
+		HiddenSize:       bf16Req.HiddenSize,
+	}, tokenWorkspace, deviceBF16NoWriteOutput)
+	core.RequireNoError(t, err)
+	noWriteValues, err := (&hipEmbeddingLookupDeviceBuffers{Output: deviceBF16NoWriteOutput, TokenCount: 1, HiddenSize: bf16Req.HiddenSize}).ReadOutput()
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{-1, 3}, noWriteValues, 0)
 
 	q4Req := hipEmbeddingLookupRequest{
 		TokenIDs:    []int32{2, 0},
