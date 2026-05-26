@@ -273,6 +273,33 @@ func TestHIPKernelSource_EmbeddingGreedyTokenReadsPackedBest_Good(t *testing.T) 
 	core.AssertTrue(t, strings.Contains(embedding, `rocm_embedding_lookup_store(args, index, token_id, index)`), "greedy-token embedding must reuse the normal embedding table path")
 }
 
+func TestHIPDriverCGOSource_HotOutputPointersUseResultWrappers_Good(t *testing.T) {
+	sourceBytes, err := os.ReadFile("hip_driver_cgo.go")
+	core.RequireNoError(t, err)
+	source := string(sourceBytes)
+
+	for _, symbol := range []string{
+		`core_rocm_hip_malloc_result`,
+		`core_rocm_hip_host_malloc_mapped_result`,
+		`core_rocm_hip_host_malloc_pinned_result`,
+		`core_rocm_hip_event_create_result`,
+		`core_rocm_hip_module_load_data_result`,
+		`core_rocm_hip_module_get_function_result`,
+	} {
+		core.AssertTrue(t, strings.Contains(source, symbol), "cgo driver must keep result-return wrapper "+symbol)
+	}
+	for _, goSideCall := range []string{
+		`C.core_rocm_hip_malloc(&`,
+		`C.core_rocm_hip_host_malloc_mapped(&`,
+		`C.core_rocm_hip_host_malloc_pinned(&`,
+		`C.core_rocm_hip_event_create(&`,
+		`C.core_rocm_hip_module_load_data(&`,
+		`C.core_rocm_hip_module_get_function(&`,
+	} {
+		core.AssertTrue(t, !strings.Contains(source, goSideCall), "hot cgo output pointer call must stay inside C wrapper: "+goSideCall)
+	}
+}
+
 func TestHIPKernelSource_AttentionChunkedStage1ScoreLaneReduction_Good(t *testing.T) {
 	sourceBytes, err := os.ReadFile("../kernels/rocm_kernels.hip")
 	core.RequireNoError(t, err)

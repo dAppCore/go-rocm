@@ -33,6 +33,12 @@ typedef int (*hipEventRecord_t)(void*, void*);
 typedef int (*hipEventSynchronize_t)(void*);
 typedef int (*hipEventDestroy_t)(void*);
 
+typedef struct {
+	int rc;
+	uintptr_t first;
+	uintptr_t second;
+} core_rocm_hip_uintptr2_result;
+
 static void* core_rocm_hip_lib = NULL;
 
 static void* core_rocm_open_hip() {
@@ -139,6 +145,14 @@ static int core_rocm_hip_malloc(uintptr_t* out, size_t size) {
 	int rc = fn(&ptr, size);
 	*out = (uintptr_t)ptr;
 	return rc;
+}
+
+static core_rocm_hip_uintptr2_result core_rocm_hip_malloc_result(size_t size) {
+	core_rocm_hip_uintptr2_result result = {0, 0, 0};
+	uintptr_t ptr = 0;
+	result.rc = core_rocm_hip_malloc(&ptr, size);
+	result.first = ptr;
+	return result;
 }
 
 static int core_rocm_hip_free(uintptr_t ptr) {
@@ -249,6 +263,14 @@ static int core_rocm_hip_module_load_data(uintptr_t* out, void* image) {
 	return rc;
 }
 
+static core_rocm_hip_uintptr2_result core_rocm_hip_module_load_data_result(void* image) {
+	core_rocm_hip_uintptr2_result result = {0, 0, 0};
+	uintptr_t module = 0;
+	result.rc = core_rocm_hip_module_load_data(&module, image);
+	result.first = module;
+	return result;
+}
+
 static int core_rocm_hip_module_unload(uintptr_t module) {
 	static hipModuleUnload_t cached = NULL;
 	hipModuleUnload_t fn = cached;
@@ -280,6 +302,14 @@ static int core_rocm_hip_module_get_function(uintptr_t* out, uintptr_t module, c
 	int rc = fn(&function, (void*)module, name);
 	*out = (uintptr_t)function;
 	return rc;
+}
+
+static core_rocm_hip_uintptr2_result core_rocm_hip_module_get_function_result(uintptr_t module, const char* name) {
+	core_rocm_hip_uintptr2_result result = {0, 0, 0};
+	uintptr_t function = 0;
+	result.rc = core_rocm_hip_module_get_function(&function, module, name);
+	result.first = function;
+	return result;
 }
 
 static int core_rocm_hip_module_launch_kernel(
@@ -368,6 +398,16 @@ static int core_rocm_hip_host_malloc_mapped(uintptr_t* host_out, uintptr_t* devi
 	return 0;
 }
 
+static core_rocm_hip_uintptr2_result core_rocm_hip_host_malloc_mapped_result(size_t size) {
+	core_rocm_hip_uintptr2_result result = {0, 0, 0};
+	uintptr_t host = 0;
+	uintptr_t device = 0;
+	result.rc = core_rocm_hip_host_malloc_mapped(&host, &device, size);
+	result.first = host;
+	result.second = device;
+	return result;
+}
+
 static int core_rocm_hip_host_free(uintptr_t host) {
 	static hipHostFree_t cached = NULL;
 	hipHostFree_t fn = cached;
@@ -404,6 +444,14 @@ static int core_rocm_hip_host_malloc_pinned(uintptr_t* host_out, size_t size) {
 	return 0;
 }
 
+static core_rocm_hip_uintptr2_result core_rocm_hip_host_malloc_pinned_result(size_t size) {
+	core_rocm_hip_uintptr2_result result = {0, 0, 0};
+	uintptr_t host = 0;
+	result.rc = core_rocm_hip_host_malloc_pinned(&host, size);
+	result.first = host;
+	return result;
+}
+
 static int core_rocm_hip_event_create(uintptr_t* out) {
 	static hipEventCreateWithFlags_t cached = NULL;
 	hipEventCreateWithFlags_t fn = cached;
@@ -420,6 +468,14 @@ static int core_rocm_hip_event_create(uintptr_t* out) {
 	int rc = fn(&event, 0x2);
 	*out = (uintptr_t)event;
 	return rc;
+}
+
+static core_rocm_hip_uintptr2_result core_rocm_hip_event_create_result() {
+	core_rocm_hip_uintptr2_result result = {0, 0, 0};
+	uintptr_t event = 0;
+	result.rc = core_rocm_hip_event_create(&event);
+	result.first = event;
+	return result;
 }
 
 static int core_rocm_hip_event_record(uintptr_t event) {
@@ -492,6 +548,7 @@ const (
 	cgoHIPPoolMaxBufferBytes = 8 << 20
 	cgoHIPPoolMaxTotalBytes  = 512 << 20
 	cgoHIPPoolMaxPerSize     = 512
+	cgoHIPPoolInitialPerSize = 8
 	cgoHIPLaunchArgRingSize  = 8192
 	cgoHIPAsyncCopyRingSize  = 8192
 	cgoHIPAsyncCopyMaxBytes  = 1 << 20
@@ -619,11 +676,11 @@ func (cgoHIPDriver) Malloc(size uint64) (nativeDevicePointer, error) {
 		}
 		cgoHIPMemoryPool.Unlock()
 	}
-	var ptr C.uintptr_t
-	if rc := C.core_rocm_hip_malloc(&ptr, C.size_t(size)); rc != 0 {
-		return 0, hipReturnError("hipMalloc", int(rc))
+	result := C.core_rocm_hip_malloc_result(C.size_t(size))
+	if result.rc != 0 {
+		return 0, hipReturnError("hipMalloc", int(result.rc))
 	}
-	pointer := nativeDevicePointer(ptr)
+	pointer := nativeDevicePointer(result.first)
 	cgoHIPMemoryPool.Lock()
 	cgoHIPMemoryPool.live[pointer] = size
 	cgoHIPMemoryPool.Unlock()
@@ -643,7 +700,11 @@ func (cgoHIPDriver) Free(pointer nativeDevicePointer) error {
 		size <= cgoHIPPoolMaxBufferBytes &&
 		cgoHIPMemoryPool.freeBytes+size <= cgoHIPPoolMaxTotalBytes &&
 		len(cgoHIPMemoryPool.free[size]) < cgoHIPPoolMaxPerSize {
-		cgoHIPMemoryPool.free[size] = append(cgoHIPMemoryPool.free[size], pointer)
+		free := cgoHIPMemoryPool.free[size]
+		if free == nil {
+			free = make([]nativeDevicePointer, 0, cgoHIPPoolInitialPerSize)
+		}
+		cgoHIPMemoryPool.free[size] = append(free, pointer)
 		cgoHIPMemoryPool.freeBytes += size
 		cgoHIPMemoryPool.Unlock()
 		return nil
@@ -943,10 +1004,9 @@ func (lease cgoHIPLaunchArgLease) finish(success bool) error {
 
 func (driver cgoHIPDriver) allocateLaunchArgBuffer(size uint64) (unsafe.Pointer, nativeDevicePointer, bool, error) {
 	if os.Getenv("GO_ROCM_DISABLE_MAPPED_LAUNCH_ARGS") == "" {
-		var host C.uintptr_t
-		var device C.uintptr_t
-		if rc := C.core_rocm_hip_host_malloc_mapped(&host, &device, C.size_t(size)); rc == 0 {
-			return unsafe.Pointer(uintptr(host)), nativeDevicePointer(device), true, nil
+		result := C.core_rocm_hip_host_malloc_mapped_result(C.size_t(size))
+		if result.rc == 0 {
+			return unsafe.Pointer(uintptr(result.first)), nativeDevicePointer(result.second), true, nil
 		}
 	}
 	pointer, err := driver.Malloc(size)
@@ -970,42 +1030,45 @@ func (driver cgoHIPDriver) resizeLaunchArgSlot(slot *cgoHIPLaunchArgSlot, size u
 		return err
 	}
 	if os.Getenv("GO_ROCM_DISABLE_MAPPED_LAUNCH_ARGS") == "" {
-		var host C.uintptr_t
-		var device C.uintptr_t
-		if rc := C.core_rocm_hip_host_malloc_mapped(&host, &device, C.size_t(size)); rc == 0 {
-			var event C.uintptr_t
+		result := C.core_rocm_hip_host_malloc_mapped_result(C.size_t(size))
+		if result.rc == 0 {
+			event := C.uintptr_t(0)
 			if cgoHIPLaunchArgEventsEnabled() {
-				if eventRC := C.core_rocm_hip_event_create(&event); eventRC != 0 {
-					_ = C.core_rocm_hip_host_free(host)
-					return hipReturnError("hipEventCreateWithFlags", int(eventRC))
+				eventResult := C.core_rocm_hip_event_create_result()
+				if eventResult.rc != 0 {
+					_ = C.core_rocm_hip_host_free(result.first)
+					return hipReturnError("hipEventCreateWithFlags", int(eventResult.rc))
 				}
+				event = eventResult.first
 			}
-			slot.host = unsafe.Pointer(uintptr(host))
-			slot.pointer = nativeDevicePointer(device)
+			slot.host = unsafe.Pointer(uintptr(result.first))
+			slot.pointer = nativeDevicePointer(result.second)
 			slot.event = event
 			slot.bytes = size
 			slot.mapped = true
 			return nil
 		}
 	}
-	var host C.uintptr_t
-	if rc := C.core_rocm_hip_host_malloc_pinned(&host, C.size_t(size)); rc != 0 {
-		return hipReturnError("hipHostMalloc", int(rc))
+	hostResult := C.core_rocm_hip_host_malloc_pinned_result(C.size_t(size))
+	if hostResult.rc != 0 {
+		return hipReturnError("hipHostMalloc", int(hostResult.rc))
 	}
 	pointer, err := driver.Malloc(size)
 	if err != nil {
-		_ = C.core_rocm_hip_host_free(host)
+		_ = C.core_rocm_hip_host_free(hostResult.first)
 		return err
 	}
-	var event C.uintptr_t
+	event := C.uintptr_t(0)
 	if cgoHIPLaunchArgEventsEnabled() {
-		if rc := C.core_rocm_hip_event_create(&event); rc != 0 {
-			_ = C.core_rocm_hip_host_free(host)
+		eventResult := C.core_rocm_hip_event_create_result()
+		if eventResult.rc != 0 {
+			_ = C.core_rocm_hip_host_free(hostResult.first)
 			_ = driver.Free(pointer)
-			return hipReturnError("hipEventCreateWithFlags", int(rc))
+			return hipReturnError("hipEventCreateWithFlags", int(eventResult.rc))
 		}
+		event = eventResult.first
 	}
-	slot.host = unsafe.Pointer(uintptr(host))
+	slot.host = unsafe.Pointer(uintptr(hostResult.first))
 	slot.pointer = pointer
 	slot.event = event
 	slot.bytes = size
@@ -1060,17 +1123,17 @@ func (driver cgoHIPDriver) resizeAsyncCopySlot(slot *cgoHIPAsyncCopySlot, size u
 	if err := driver.freeAsyncCopySlot(slot); err != nil {
 		return err
 	}
-	var host C.uintptr_t
-	if rc := C.core_rocm_hip_host_malloc_pinned(&host, C.size_t(size)); rc != 0 {
-		return hipReturnError("hipHostMalloc", int(rc))
+	hostResult := C.core_rocm_hip_host_malloc_pinned_result(C.size_t(size))
+	if hostResult.rc != 0 {
+		return hipReturnError("hipHostMalloc", int(hostResult.rc))
 	}
-	var event C.uintptr_t
-	if rc := C.core_rocm_hip_event_create(&event); rc != 0 {
-		_ = C.core_rocm_hip_host_free(host)
-		return hipReturnError("hipEventCreateWithFlags", int(rc))
+	eventResult := C.core_rocm_hip_event_create_result()
+	if eventResult.rc != 0 {
+		_ = C.core_rocm_hip_host_free(hostResult.first)
+		return hipReturnError("hipEventCreateWithFlags", int(eventResult.rc))
 	}
-	slot.host = unsafe.Pointer(uintptr(host))
-	slot.event = event
+	slot.host = unsafe.Pointer(uintptr(hostResult.first))
+	slot.event = eventResult.first
 	slot.bytes = size
 	return nil
 }
@@ -1152,22 +1215,22 @@ func cgoHIPLoadModule(modulePath string) (*cgoHIPCachedModule, error) {
 	scope := corecgo.NewScope()
 	imageView := corecgo.PinIn(scope, image)
 
-	var module C.uintptr_t
-	if rc := C.core_rocm_hip_module_load_data(&module, imageView.Ptr()); rc != 0 {
+	moduleResult := C.core_rocm_hip_module_load_data_result(imageView.Ptr())
+	if moduleResult.rc != 0 {
 		scope.FreeAll()
-		return nil, hipReturnError("hipModuleLoadData", int(rc))
+		return nil, hipReturnError("hipModuleLoadData", int(moduleResult.rc))
 	}
-	return &cgoHIPCachedModule{module: module, image: image, scope: scope, functions: map[string]C.uintptr_t{}}, nil
+	return &cgoHIPCachedModule{module: moduleResult.first, image: image, scope: scope, functions: map[string]C.uintptr_t{}}, nil
 }
 
 func cgoHIPModuleFunction(module C.uintptr_t, kernelName string) (C.uintptr_t, error) {
 	cName := corecgo.CStringPtr(kernelName)
 	defer corecgo.Free(cName)
-	var function C.uintptr_t
-	if rc := C.core_rocm_hip_module_get_function(&function, module, (*C.char)(cName)); rc != 0 {
-		return 0, hipReturnError("hipModuleGetFunction", int(rc))
+	functionResult := C.core_rocm_hip_module_get_function_result(module, (*C.char)(cName))
+	if functionResult.rc != 0 {
+		return 0, hipReturnError("hipModuleGetFunction", int(functionResult.rc))
 	}
-	return function, nil
+	return functionResult.first, nil
 }
 
 func hipReturnError(op string, code int) error {

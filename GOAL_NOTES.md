@@ -1,5 +1,31 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-26 CGo Result-Return HIP Bridge Pass
+
+- Kept the 2048-token fast loop as the edit gate and promoted only after the
+  retained 10-turn full-cap book acceptance passed.
+- Replaced Go-side cgo output pointer calls in the hot HIP bridge with
+  result-return C wrappers for `hipMalloc`, mapped/pinned host allocation,
+  event creation, module load, and module function lookup. This keeps HIP
+  behavior unchanged but avoids cgo forcing tiny Go heap objects for output
+  parameters during launch-packet setup and device-buffer allocation.
+- Pre-sized new cgo device-memory-pool free lists with a small 8-entry bucket.
+  Larger 64/512-entry buckets reduced object count further but increased
+  `B/op`, so they were rejected.
+- Added a source guard so the hot bridge paths do not silently return to
+  `C.core_rocm_hip_*(&out, ...)` calls from Go.
+- Live RX 7800 XT 2048-token guards after this batch:
+  short `text:Hi` reports `109.0 tok/s`, `7393992 B/op`, and
+  `11646 allocs/op`; chapter-shaped prompt reports `101.4 tok/s`,
+  `15387256 B/op`, and `13344 allocs/op`.
+- Retained 10-turn full-cap greedy book acceptance stayed green:
+  `37.65s` wall, `33.43s` decode, `3021` generated tokens, `80.24 tok/s`
+  average, `69.97 tok/s` on turn 10, empty stderr, no cap hits, chapter-10
+  anchor hits of `3`, `230971104 B/op`, and `109680 allocs/op`.
+- This is accepted as a real hot-path allocation cleanup. It does not solve the
+  retained late-turn decode target: turn 10 is still below the `90-100+ tok/s`
+  band.
+
 ## 2026-05-26 Greedy-Token Device Embedding Pass
 
 - Kept the 2048-token fast loop as the edit gate and promoted only after the

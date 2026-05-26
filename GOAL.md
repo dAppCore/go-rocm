@@ -311,8 +311,19 @@ per-token host-to-device token upload on the greedy decode path. The
 green at `37.68s` wall, `33.46s` decode, `3021` generated tokens,
 `80.17 tok/s` average, `69.77 tok/s` on turn 10, empty stderr, no cap hits, and
 chapter-10 anchor hits of `3`, with `231837680 B/op` and `212770 allocs/op`.
+Replacing Go-side cgo output pointer calls in the hot HIP bridge with
+result-return C wrappers then removed a large class of per-launch/per-allocation
+Go heap objects without changing HIP behavior. A small 8-entry initial free-list
+bucket for the cgo device-memory pool then cut a few thousand more objects
+without the `B/op` bloat of the rejected 64/512-entry buckets. The 2048-token
+guards stayed green at `109.0 tok/s`, `7393992 B/op`, and `11646 allocs/op` for
+`text:Hi`, and `101.4 tok/s`, `15387256 B/op`, and `13344 allocs/op` for the
+chapter-shaped prompt. The retained book route stayed green at `37.65s` wall,
+`33.43s` decode, `3021` generated tokens, `80.24 tok/s` average,
+`69.97 tok/s` on turn 10, empty stderr, no cap hits, and chapter-10 anchor hits
+of `3`, with `230971104 B/op` and `109680 allocs/op`.
 This is still not the final driver endpoint: later-turn decode is only
-`69.77 tok/s`, below the `90-100+ tok/s` target, and the visible output remains
+`69.97 tok/s`, below the `90-100+ tok/s` target, and the visible output remains
 repetitive. Keep tuning retained long-context attention and state quality until
 the later turns stay near the target.
 
@@ -343,6 +354,8 @@ max_new_tokens  route                    tok/s   B/op       allocs/op
 2048 chapter    token value cache       100.0    15.94M       77529
 2048 text:Hi    greedy-token embedding 109.0     7.77M       55915
 2048 chapter    greedy-token embedding 101.5    15.93M       71533
+2048 text:Hi    cgo/free-list cleanup  109.0     7.39M       11646
+2048 chapter    cgo/free-list cleanup  101.4    15.39M       13344
 ```
 
 The earlier 256-token chunked route was rejected because it fell to `58.24
