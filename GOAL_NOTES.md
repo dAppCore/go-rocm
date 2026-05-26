@@ -43,6 +43,21 @@
   loops. The short 2048-token guard regressed to `107.4 tok/s` and
   `17674224 B/op`, so it was reverted before running the retained book
   acceptance.
+- Fresh `rocprof --stats` after the two accepted stage-1 barrier cleanups shows
+  the hotspot moved: `rocm_mlx_q4_projection.kd` is now `27.82%`,
+  `rocm_mlx_q4_gelu_tanh_multiply.kd` is `16.16%`, and
+  `rocm_attention_heads_chunked_stage1.kd` is down to `15.01%`.
+- Kept a final q4 projection+greedy cleanup that reduces the 32 per-block row
+  winners with one post-sync serial pass on thread 0 instead of five
+  block-wide shared-memory reduction barriers. Source guards now reject the old
+  `ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK / 2u` stride loop.
+- Live RX 7800 XT checks after that greedy cleanup:
+  short `2048` guard `107.6 tok/s`, `17649968 B/op`, `72291 allocs/op`;
+  chapter-shaped `2048` guard `99.27 tok/s`, `44795392 B/op`,
+  `87813 allocs/op`; retained 10-turn full-cap greedy book `38.34s` wall,
+  `34.10s` decode, `3021` generated tokens, `78.80 tok/s` average,
+  `68.61 tok/s` on turn 10, empty stderr, no cap hits, chapter-10 anchor hits
+  of `3`, `232424184 B/op`, and `227934 allocs/op`.
 
 ## 2026-05-26 Allocation/Transfer Step-Down Pass
 

@@ -3217,18 +3217,18 @@ extern "C" __global__ void rocm_mlx_q4_projection_greedy(const unsigned char *pa
 		block_best[row_lane] = packed;
 	}
 	__syncthreads();
-	for (uint32_t stride = ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK / 2u; stride > 0u; stride >>= 1u) {
-		if (threadIdx.x < stride) {
-			const unsigned long long other = block_best[threadIdx.x + stride];
-			if (other > block_best[threadIdx.x]) {
-				block_best[threadIdx.x] = other;
+	if (threadIdx.x == 0) {
+		unsigned long long best_value = block_best[0];
+		for (uint32_t index = 1u; index < ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK; ++index) {
+			const unsigned long long other = block_best[index];
+			if (other > best_value) {
+				best_value = other;
 			}
 		}
-		__syncthreads();
-	}
-	if (threadIdx.x == 0 && block_best[0] != 0) {
-		unsigned long long *best = reinterpret_cast<unsigned long long *>(static_cast<uintptr_t>(args.output_pointer));
-		atomicMax(best, block_best[0]);
+		if (best_value != 0) {
+			unsigned long long *best = reinterpret_cast<unsigned long long *>(static_cast<uintptr_t>(args.output_pointer));
+			atomicMax(best, best_value);
+		}
 	}
 }
 

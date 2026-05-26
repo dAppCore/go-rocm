@@ -255,8 +255,19 @@ short guard to `18985260922 ns/op`, `107.9 tok/s`, `17640976 B/op`, and
 stayed green at `38.34s` wall, `34.09s` decode, `3021` generated tokens,
 `78.79 tok/s` average, `68.29 tok/s` on turn 10, empty stderr, no cap hits, and
 chapter-10 anchor hits of `3`, with `232419864 B/op` and `227947 allocs/op`.
-This is still not the final driver endpoint: later-turn decode is only
-`68.29 tok/s`, below the `90-100+ tok/s` target, and the visible output remains
+Fresh `rocprof --stats` after those stage-1 reductions shows the hotspot moved:
+`rocm_mlx_q4_projection` is now `27.82%`, q4 GELU multiply is `16.16%`, and
+chunked stage 1 is down to `15.01%`. Replacing the final q4 projection+greedy
+block reduction's repeated shared-memory barriers with one post-sync serial
+32-row pass then kept the short guard green at `19034192118 ns/op`,
+`107.6 tok/s`, `17649968 B/op`, and `72291 allocs/op`; moved the
+chapter-shaped guard to `20630704555 ns/op`, `99.27 tok/s`, `44795392 B/op`,
+and `87813 allocs/op`; and kept the retained book route green at `38.34s` wall,
+`34.10s` decode, `3021` generated tokens, `78.80 tok/s` average,
+`68.61 tok/s` on turn 10, empty stderr, no cap hits, and chapter-10 anchor hits
+of `3`, with `232424184 B/op` and `227934 allocs/op`. This is still not the
+final driver endpoint: later-turn decode is only `68.61 tok/s`, below the
+`90-100+ tok/s` target, and the visible output remains
 repetitive. Keep tuning retained long-context attention and state quality until
 the later turns stay near the target.
 
