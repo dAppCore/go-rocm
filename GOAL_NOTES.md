@@ -39,6 +39,10 @@
   `34.09s` decode, `3021` generated tokens, `78.79 tok/s` average,
   `68.29 tok/s` on turn 10, empty stderr, no cap hits, chapter-10 anchor hits
   of `3`, `232419864 B/op`, and `227947 allocs/op`.
+- Rejected explicit `#pragma unroll 8` hints on q4 projection packed-group
+  loops. The short 2048-token guard regressed to `107.4 tok/s` and
+  `17674224 B/op`, so it was reverted before running the retained book
+  acceptance.
 
 ## 2026-05-26 Allocation/Transfer Step-Down Pass
 
