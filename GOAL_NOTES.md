@@ -30,6 +30,16 @@
   `3.40M -> 2.04M -> 1.98M -> 1.85M -> 1.78M allocs/op`. Continue chasing
   buffer/transfer reductions while keeping decode above the short `100 tok/s`
   guard and improving late book-turn decode toward `90-100+ tok/s`.
+- Removed the remaining q4 projection-family per-call map literals from hot
+  launch-argument validators and added benchmarks for the q4 triple-projection
+  and GELU-tanh multiply packet builders. Both report `0 B/op` and
+  `0 allocs/op`. The live `text:Hi` 2048-token guard stayed at `103.3 tok/s`
+  and moved to `146939376 B/op`, `1689861 allocs/op`. The retained 10-turn
+  full-cap greedy book route stayed green at `41.19s` wall, `36.96s` decode,
+  `73.34 tok/s` average, `63.67 tok/s` on turn 10, empty stderr, no cap hits,
+  chapter-10 anchor hits of `3`, `418587400 B/op`, and `2660797 allocs/op`.
+  The short-guard sequence is now
+  `3.40M -> 2.04M -> 1.98M -> 1.85M -> 1.78M -> 1.69M allocs/op`.
 
 ## 2026-05-26 Full-Chapter Book and Long-Attention Pass
 

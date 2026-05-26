@@ -151,7 +151,12 @@ stage-2 launch packet copy. The short 2048-token guard now reports
 The retained 10-turn full-cap book route stayed green at `41.21s` wall,
 `36.98s` decode, `73.31 tok/s` average, `63.65 tok/s` on turn 10, empty
 stderr, and chapter-10 anchor hits of `3`, while reducing the book benchmark to
-`439319760 B/op` and `2797196 allocs/op`. This is the current best
+`439319760 B/op` and `2797196 allocs/op`. Removing per-call q4 projection
+launch-validator map literals then kept the short guard at `103.3 tok/s` while
+dropping it to `146939376 B/op` and `1689861 allocs/op`; the retained book route
+stayed green at `41.19s` wall, `36.96s` decode, `73.34 tok/s` average,
+`63.67 tok/s` on turn 10, empty stderr, and chapter-10 anchor hits of `3`, with
+`418587400 B/op` and `2660797 allocs/op`. This is the current best
 production-candidate route for the book endpoint, but not the final driver
 endpoint: later-turn decode is still only `63.7 tok/s`, below the
 `90-100+ tok/s` target, and the visible output remains repetitive. Keep tuning
@@ -171,7 +176,7 @@ max_new_tokens  route                    tok/s   B/op       allocs/op
 2048            chunked-128 device KV     90.53  314.81M     3426653
 4096            non-chunked value-fast    72.45  633.26M     6833550
 4096            chunked-128 query cache   80.33  885.71M     6749654
-2048 text:Hi    workspace + pools        103.2   160.95M     1781980
+2048 text:Hi    no-map launch checks     103.3   146.94M     1689861
 ```
 
 The earlier 256-token chunked route was rejected because it fell to `58.24

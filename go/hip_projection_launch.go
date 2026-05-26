@@ -79,6 +79,13 @@ const (
 	hipDeviceByteBufferPoolMaxPerSize = 512
 )
 
+func hipProjectionUint32Bytes(operation, label string, value uint64) error {
+	if value > uint64(^uint32(0)) {
+		return core.E(operation, label+" are out of uint32 range", nil)
+	}
+	return nil
+}
+
 type hipProjectionDeviceBuffers struct {
 	Input    *hipDeviceByteBuffer
 	Weights  *hipDeviceByteBuffer
@@ -800,16 +807,20 @@ func (args hipMLXQ4ProjectionLaunchArgs) binary(outputKind int) ([]byte, error) 
 	if args.OutputBytes != wantOutputBytes {
 		return nil, core.E("rocm.hip.MLXQ4ProjectionLaunch", "output byte count mismatch", nil)
 	}
-	for label, value := range map[string]uint64{
-		"input bytes":  args.InputBytes,
-		"weight bytes": args.WeightBytes,
-		"scale bytes":  args.ScaleBytes,
-		"bias bytes":   args.BiasBytes,
-		"output bytes": args.OutputBytes,
-	} {
-		if value > uint64(^uint32(0)) {
-			return nil, core.E("rocm.hip.MLXQ4ProjectionLaunch", label+" are out of uint32 range", nil)
-		}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4ProjectionLaunch", "input bytes", args.InputBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4ProjectionLaunch", "weight bytes", args.WeightBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4ProjectionLaunch", "scale bytes", args.ScaleBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4ProjectionLaunch", "bias bytes", args.BiasBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4ProjectionLaunch", "output bytes", args.OutputBytes); err != nil {
+		return nil, err
 	}
 	payload := hipBorrowLaunchPacket(hipMLXQ4ProjectionLaunchArgsBytes)
 	binary.LittleEndian.PutUint32(payload[0:], hipMLXQ4ProjectionLaunchArgsVersion)
@@ -878,16 +889,20 @@ func (args hipMLXQ4ProjectionBatchLaunchArgs) Binary() ([]byte, error) {
 	if args.OutputBytes != uint64(batch)*uint64(rows)*4 {
 		return nil, core.E("rocm.hip.MLXQ4ProjectionBatchLaunch", "output byte count mismatch", nil)
 	}
-	for label, value := range map[string]uint64{
-		"input bytes":  args.InputBytes,
-		"weight bytes": args.WeightBytes,
-		"scale bytes":  args.ScaleBytes,
-		"bias bytes":   args.BiasBytes,
-		"output bytes": args.OutputBytes,
-	} {
-		if value > uint64(^uint32(0)) {
-			return nil, core.E("rocm.hip.MLXQ4ProjectionBatchLaunch", label+" are out of uint32 range", nil)
-		}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4ProjectionBatchLaunch", "input bytes", args.InputBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4ProjectionBatchLaunch", "weight bytes", args.WeightBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4ProjectionBatchLaunch", "scale bytes", args.ScaleBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4ProjectionBatchLaunch", "bias bytes", args.BiasBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4ProjectionBatchLaunch", "output bytes", args.OutputBytes); err != nil {
+		return nil, err
 	}
 	payload := hipBorrowLaunchPacket(hipMLXQ4ProjectionBatchLaunchArgsBytes)
 	binary.LittleEndian.PutUint32(payload[0:], hipMLXQ4ProjectionBatchLaunchArgsVersion)
@@ -978,22 +993,38 @@ func (args hipMLXQ4TripleProjLaunchArgs) Binary() ([]byte, error) {
 	if err := checkPart("third", thirdRows, args.ThirdWeightBytes, args.ThirdScaleBytes, args.ThirdBiasBytes); err != nil {
 		return nil, err
 	}
-	for label, value := range map[string]uint64{
-		"input bytes":         args.InputBytes,
-		"output bytes":        args.OutputBytes,
-		"first weight bytes":  args.FirstWeightBytes,
-		"first scale bytes":   args.FirstScaleBytes,
-		"first bias bytes":    args.FirstBiasBytes,
-		"second weight bytes": args.SecondWeightBytes,
-		"second scale bytes":  args.SecondScaleBytes,
-		"second bias bytes":   args.SecondBiasBytes,
-		"third weight bytes":  args.ThirdWeightBytes,
-		"third scale bytes":   args.ThirdScaleBytes,
-		"third bias bytes":    args.ThirdBiasBytes,
-	} {
-		if value > uint64(^uint32(0)) {
-			return nil, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", label+" are out of uint32 range", nil)
-		}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4TripleProjectionLaunch", "input bytes", args.InputBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4TripleProjectionLaunch", "output bytes", args.OutputBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4TripleProjectionLaunch", "first weight bytes", args.FirstWeightBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4TripleProjectionLaunch", "first scale bytes", args.FirstScaleBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4TripleProjectionLaunch", "first bias bytes", args.FirstBiasBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4TripleProjectionLaunch", "second weight bytes", args.SecondWeightBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4TripleProjectionLaunch", "second scale bytes", args.SecondScaleBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4TripleProjectionLaunch", "second bias bytes", args.SecondBiasBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4TripleProjectionLaunch", "third weight bytes", args.ThirdWeightBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4TripleProjectionLaunch", "third scale bytes", args.ThirdScaleBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4TripleProjectionLaunch", "third bias bytes", args.ThirdBiasBytes); err != nil {
+		return nil, err
 	}
 	payload := hipBorrowLaunchPacket(hipMLXQ4TripleProjLaunchArgsBytes)
 	binary.LittleEndian.PutUint32(payload[0:], hipMLXQ4TripleProjLaunchArgsVersion)
@@ -1077,19 +1108,29 @@ func (args hipMLXQ4GELUTanhMulLaunchArgs) Binary() ([]byte, error) {
 	if args.OutputBytes != uint64(rows)*4 {
 		return nil, core.E("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "output byte count mismatch", nil)
 	}
-	for label, value := range map[string]uint64{
-		"input bytes":       args.InputBytes,
-		"gate weight bytes": args.GateWeightBytes,
-		"gate scale bytes":  args.GateScaleBytes,
-		"gate bias bytes":   args.GateBiasBytes,
-		"up weight bytes":   args.UpWeightBytes,
-		"up scale bytes":    args.UpScaleBytes,
-		"up bias bytes":     args.UpBiasBytes,
-		"output bytes":      args.OutputBytes,
-	} {
-		if value > uint64(^uint32(0)) {
-			return nil, core.E("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", label+" are out of uint32 range", nil)
-		}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "input bytes", args.InputBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "gate weight bytes", args.GateWeightBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "gate scale bytes", args.GateScaleBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "gate bias bytes", args.GateBiasBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "up weight bytes", args.UpWeightBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "up scale bytes", args.UpScaleBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "up bias bytes", args.UpBiasBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "output bytes", args.OutputBytes); err != nil {
+		return nil, err
 	}
 	payload := hipBorrowLaunchPacket(hipMLXQ4GELUTanhMulLaunchArgsBytes)
 	binary.LittleEndian.PutUint32(payload[0:], hipMLXQ4GELUTanhMulLaunchArgsVersion)
@@ -1169,19 +1210,29 @@ func (args hipMLXQ4GELUTanhMulBatchLaunchArgs) Binary() ([]byte, error) {
 	if args.OutputBytes != uint64(batch)*uint64(rows)*4 {
 		return nil, core.E("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "output byte count mismatch", nil)
 	}
-	for label, value := range map[string]uint64{
-		"input bytes":       args.InputBytes,
-		"gate weight bytes": args.GateWeightBytes,
-		"gate scale bytes":  args.GateScaleBytes,
-		"gate bias bytes":   args.GateBiasBytes,
-		"up weight bytes":   args.UpWeightBytes,
-		"up scale bytes":    args.UpScaleBytes,
-		"up bias bytes":     args.UpBiasBytes,
-		"output bytes":      args.OutputBytes,
-	} {
-		if value > uint64(^uint32(0)) {
-			return nil, core.E("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", label+" are out of uint32 range", nil)
-		}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "input bytes", args.InputBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "gate weight bytes", args.GateWeightBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "gate scale bytes", args.GateScaleBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "gate bias bytes", args.GateBiasBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "up weight bytes", args.UpWeightBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "up scale bytes", args.UpScaleBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "up bias bytes", args.UpBiasBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "output bytes", args.OutputBytes); err != nil {
+		return nil, err
 	}
 	payload := hipBorrowLaunchPacket(hipMLXQ4GELUTanhMulBatchLaunchArgsBytes)
 	binary.LittleEndian.PutUint32(payload[0:], hipMLXQ4GELUTanhMulBatchLaunchArgsVersion)
@@ -1254,17 +1305,23 @@ func (args hipMLXQ4GELUTanhProjLaunchArgs) Binary() ([]byte, error) {
 	if args.MultiplierBytes != uint64(rows)*4 || args.OutputBytes != uint64(rows)*4 {
 		return nil, core.E("rocm.hip.MLXQ4GELUTanhProjectionLaunch", "multiplier/output byte count mismatch", nil)
 	}
-	for label, value := range map[string]uint64{
-		"input bytes":      args.InputBytes,
-		"weight bytes":     args.WeightBytes,
-		"scale bytes":      args.ScaleBytes,
-		"bias bytes":       args.BiasBytes,
-		"multiplier bytes": args.MultiplierBytes,
-		"output bytes":     args.OutputBytes,
-	} {
-		if value > uint64(^uint32(0)) {
-			return nil, core.E("rocm.hip.MLXQ4GELUTanhProjectionLaunch", label+" are out of uint32 range", nil)
-		}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhProjectionLaunch", "input bytes", args.InputBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhProjectionLaunch", "weight bytes", args.WeightBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhProjectionLaunch", "scale bytes", args.ScaleBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhProjectionLaunch", "bias bytes", args.BiasBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhProjectionLaunch", "multiplier bytes", args.MultiplierBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhProjectionLaunch", "output bytes", args.OutputBytes); err != nil {
+		return nil, err
 	}
 	payload := hipBorrowLaunchPacket(hipMLXQ4GELUTanhProjLaunchArgsBytes)
 	binary.LittleEndian.PutUint32(payload[0:], hipMLXQ4GELUTanhProjLaunchArgsVersion)
@@ -1336,17 +1393,23 @@ func (args hipMLXQ4GELUTanhProjBatchLaunchArgs) Binary() ([]byte, error) {
 	if args.MultiplierBytes != uint64(batch)*uint64(rows)*4 || args.OutputBytes != uint64(batch)*uint64(rows)*4 {
 		return nil, core.E("rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "multiplier/output byte count mismatch", nil)
 	}
-	for label, value := range map[string]uint64{
-		"input bytes":      args.InputBytes,
-		"weight bytes":     args.WeightBytes,
-		"scale bytes":      args.ScaleBytes,
-		"bias bytes":       args.BiasBytes,
-		"multiplier bytes": args.MultiplierBytes,
-		"output bytes":     args.OutputBytes,
-	} {
-		if value > uint64(^uint32(0)) {
-			return nil, core.E("rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", label+" are out of uint32 range", nil)
-		}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "input bytes", args.InputBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "weight bytes", args.WeightBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "scale bytes", args.ScaleBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "bias bytes", args.BiasBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "multiplier bytes", args.MultiplierBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "output bytes", args.OutputBytes); err != nil {
+		return nil, err
 	}
 	payload := hipBorrowLaunchPacket(hipMLXQ4GELUTanhProjBatchLaunchArgsBytes)
 	binary.LittleEndian.PutUint32(payload[0:], hipMLXQ4GELUTanhProjBatchLaunchArgsVersion)

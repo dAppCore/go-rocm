@@ -2123,6 +2123,96 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_AttentionOutputReused(b *testing
 	}
 }
 
+func BenchmarkHIPMLXQ4TripleProjLaunchArgsBinary_Hot(b *testing.B) {
+	args := hipMLXQ4TripleProjLaunchArgs{
+		InputPointer:        0x1000,
+		OutputPointer:       0x2000,
+		FirstWeightPointer:  0x3000,
+		FirstScalePointer:   0x4000,
+		FirstBiasPointer:    0x5000,
+		SecondWeightPointer: 0x6000,
+		SecondScalePointer:  0x7000,
+		SecondBiasPointer:   0x8000,
+		ThirdWeightPointer:  0x9000,
+		ThirdScalePointer:   0xa000,
+		ThirdBiasPointer:    0xb000,
+		FirstRows:           16,
+		SecondRows:          4,
+		ThirdRows:           4,
+		Cols:                16,
+		GroupSize:           8,
+		Bits:                hipMLXQ4ProjectionBits,
+		InputBytes:          64,
+		OutputBytes:         96,
+		FirstWeightBytes:    128,
+		FirstScaleBytes:     64,
+		FirstBiasBytes:      64,
+		SecondWeightBytes:   32,
+		SecondScaleBytes:    16,
+		SecondBiasBytes:     16,
+		ThirdWeightBytes:    32,
+		ThirdScaleBytes:     16,
+		ThirdBiasBytes:      16,
+	}
+	packet, err := args.Binary()
+	if err != nil {
+		b.Fatal(err)
+	}
+	hipReleaseLaunchPacket(packet)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		packet, err = args.Binary()
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(packet) != hipMLXQ4TripleProjLaunchArgsBytes {
+			b.Fatalf("packet len = %d, want %d", len(packet), hipMLXQ4TripleProjLaunchArgsBytes)
+		}
+		hipReleaseLaunchPacket(packet)
+	}
+}
+
+func BenchmarkHIPMLXQ4GELUTanhMultiplyLaunchArgsBinary_Hot(b *testing.B) {
+	args := hipMLXQ4GELUTanhMulLaunchArgs{
+		InputPointer:      0x1000,
+		GateWeightPointer: 0x2000,
+		GateScalePointer:  0x3000,
+		GateBiasPointer:   0x4000,
+		UpWeightPointer:   0x5000,
+		UpScalePointer:    0x6000,
+		UpBiasPointer:     0x7000,
+		OutputPointer:     0x8000,
+		Rows:              32,
+		Cols:              16,
+		GroupSize:         8,
+		Bits:              hipMLXQ4ProjectionBits,
+		InputBytes:        64,
+		GateWeightBytes:   256,
+		GateScaleBytes:    128,
+		GateBiasBytes:     128,
+		UpWeightBytes:     256,
+		UpScaleBytes:      128,
+		UpBiasBytes:       128,
+		OutputBytes:       128,
+	}
+	packet, err := args.Binary()
+	if err != nil {
+		b.Fatal(err)
+	}
+	hipReleaseLaunchPacket(packet)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		packet, err = args.Binary()
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(packet) != hipMLXQ4GELUTanhMulLaunchArgsBytes {
+			b.Fatalf("packet len = %d, want %d", len(packet), hipMLXQ4GELUTanhMulLaunchArgsBytes)
+		}
+		hipReleaseLaunchPacket(packet)
+	}
+}
+
 func BenchmarkROCmDeviceKVPageSlicePool_ReusedCapacity(b *testing.B) {
 	rocmDeviceKVPageSlicePools.Range(func(key, _ any) bool {
 		rocmDeviceKVPageSlicePools.Delete(key)
