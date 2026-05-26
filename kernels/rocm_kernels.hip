@@ -2922,8 +2922,44 @@ __device__ float rocm_mlx_q4_projection_row_sum(
 	uint32_t threads_per_row)
 {
 	const uint32_t packed_per_row = cols / 8u;
-	const uint32_t groups_per_row = cols / group_size;
 	float sum = 0.0f;
+	if (group_size == 64u) {
+		const uint32_t groups_per_row = cols >> 6u;
+		for (uint32_t group_col = col_lane; group_col < groups_per_row; group_col += threads_per_row) {
+			const uint32_t group = row * groups_per_row + group_col;
+			const float scale = rocm_bfloat16_to_float(scales[group]);
+			const float bias = rocm_bfloat16_to_float(biases[group]);
+			const uint32_t first_packed = group_col << 3u;
+			float q_dot_sum = 0.0f;
+			float input_sum = 0.0f;
+			for (uint32_t group_packed = 0; group_packed < 8u; ++group_packed) {
+				const uint32_t packed = first_packed + group_packed;
+				const uint32_t word = weights[row * packed_per_row + packed];
+				const uint32_t col = packed << 3;
+				const float in0 = input[col];
+				const float in1 = input[col + 1u];
+				const float in2 = input[col + 2u];
+				const float in3 = input[col + 3u];
+				const float in4 = input[col + 4u];
+				const float in5 = input[col + 5u];
+				const float in6 = input[col + 6u];
+				const float in7 = input[col + 7u];
+				input_sum += in0 + in1 + in2 + in3 + in4 + in5 + in6 + in7;
+				q_dot_sum +=
+					static_cast<float>(word & 0x0fu) * in0 +
+					static_cast<float>((word >> 4) & 0x0fu) * in1 +
+					static_cast<float>((word >> 8) & 0x0fu) * in2 +
+					static_cast<float>((word >> 12) & 0x0fu) * in3 +
+					static_cast<float>((word >> 16) & 0x0fu) * in4 +
+					static_cast<float>((word >> 20) & 0x0fu) * in5 +
+					static_cast<float>((word >> 24) & 0x0fu) * in6 +
+					static_cast<float>((word >> 28) & 0x0fu) * in7;
+			}
+			sum += scale * q_dot_sum + bias * input_sum;
+		}
+		return sum;
+	}
+	const uint32_t groups_per_row = cols / group_size;
 	if ((group_size & 7u) == 0u) {
 		const uint32_t packed_per_group = group_size >> 3u;
 		for (uint32_t group_col = col_lane; group_col < groups_per_row; group_col += threads_per_row) {

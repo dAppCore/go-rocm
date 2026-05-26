@@ -61,6 +61,19 @@
 - Rejected vectorized `float4` input loads in the shared q4 projection row-sum
   helper. The short 2048-token guard was neutral at `107.6 tok/s`, but the
   chapter-shaped guard regressed to `98.86 tok/s` versus the kept `99.27 tok/s`.
+- Kept a Gemma-specific `group_size == 64` specialization in the shared q4
+  projection row-sum helper. This leaves row geometry and arithmetic intact but
+  makes the common packed-group shape explicit (`cols >> 6`, eight packed words
+  per group) for `rocm_mlx_q4_projection`, triple projection, final
+  projection+greedy, and q4 GELU projection. Source guards now require the
+  group64 branch.
+- Live RX 7800 XT checks after the group64 specialization:
+  short `2048` guard `108.6 tok/s`, `17649904 B/op`, `72289 allocs/op`;
+  chapter-shaped `2048` guard `99.01 tok/s`, `44639832 B/op`,
+  `87777 allocs/op`; retained 10-turn full-cap greedy book `38.24s` wall,
+  `33.98s` decode, `3021` generated tokens, `79.00 tok/s` average,
+  `68.71 tok/s` on turn 10, empty stderr, no cap hits, chapter-10 anchor hits
+  of `3`, `232424368 B/op`, and `227952 allocs/op`.
 
 ## 2026-05-26 Allocation/Transfer Step-Down Pass
 

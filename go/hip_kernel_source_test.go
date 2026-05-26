@@ -213,6 +213,10 @@ func TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good(t *test
 	core.RequireNoError(t, err)
 	source := string(sourceBytes)
 
+	core.AssertTrue(t, strings.Contains(source, `if (group_size == 64u)`), "q4 row-sum must keep the Gemma group64 fast path")
+	core.AssertTrue(t, strings.Contains(source, `const uint32_t groups_per_row = cols >> 6u`), "q4 group64 fast path must use shift-derived group count")
+	core.AssertTrue(t, strings.Contains(source, `for (uint32_t group_packed = 0; group_packed < 8u; ++group_packed)`), "q4 group64 fast path must use fixed packed-word groups")
+
 	projection := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_projection`)
 	core.AssertTrue(t, strings.Contains(projection, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_THREADS_PER_ROW`), "projection rows use normal row geometry")
 	core.AssertTrue(t, strings.Contains(projection, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_ROWS_PER_BLOCK + row_lane`), "projection grid uses normal row blocks")

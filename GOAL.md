@@ -265,9 +265,16 @@ chapter-shaped guard to `20630704555 ns/op`, `99.27 tok/s`, `44795392 B/op`,
 and `87813 allocs/op`; and kept the retained book route green at `38.34s` wall,
 `34.10s` decode, `3021` generated tokens, `78.80 tok/s` average,
 `68.61 tok/s` on turn 10, empty stderr, no cap hits, and chapter-10 anchor hits
-of `3`, with `232424184 B/op` and `227934 allocs/op`. This is still not the
-final driver endpoint: later-turn decode is only `68.61 tok/s`, below the
-`90-100+ tok/s` target, and the visible output remains
+of `3`, with `232424184 B/op` and `227934 allocs/op`. Specializing the shared
+q4 projection row-sum helper for Gemma's `group_size == 64` then moved the
+short guard to `18851151583 ns/op`, `108.6 tok/s`, `17649904 B/op`, and
+`72289 allocs/op`; kept the chapter-shaped guard green at `20684218707 ns/op`,
+`99.01 tok/s`, `44639832 B/op`, and `87777 allocs/op`; and kept the retained
+book route green at `38.24s` wall, `33.98s` decode, `3021` generated tokens,
+`79.00 tok/s` average, `68.71 tok/s` on turn 10, empty stderr, no cap hits, and
+chapter-10 anchor hits of `3`, with `232424368 B/op` and `227952 allocs/op`.
+This is still not the final driver endpoint: later-turn decode is only
+`68.71 tok/s`, below the `90-100+ tok/s` target, and the visible output remains
 repetitive. Keep tuning retained long-context attention and state quality until
 the later turns stay near the target.
 
