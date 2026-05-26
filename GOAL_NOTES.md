@@ -89,6 +89,10 @@
 - Rejected explicit row-base offset locals in the q4 group64 row-sum/GELU
   branches. The short guard was neutral at `108.9 tok/s`, but the
   chapter-shaped guard regressed to `98.89 tok/s`.
+- Rejected a register-retained residual path in
+  `rocm_rms_norm_residual_add_norm`. Avoiding the final global reload increased
+  register pressure enough to regress the short 2048-token guard to
+  `108.3 tok/s` and the chapter-shaped guard to `99.28 tok/s`.
 
 ## 2026-05-26 Allocation/Transfer Step-Down Pass
 
