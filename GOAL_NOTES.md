@@ -74,6 +74,18 @@
   `33.98s` decode, `3021` generated tokens, `79.00 tok/s` average,
   `68.71 tok/s` on turn 10, empty stderr, no cap hits, chapter-10 anchor hits
   of `3`, `232424368 B/op`, and `227952 allocs/op`.
+- Kept a separate `group_size == 64` index specialization in the q4 GELU
+  multiply kernel's existing per-packed path. This is intentionally not the
+  previously rejected group-tiled GELU accumulation; it only replaces
+  `col / args.group_size` with `(packed >> 3u)` for the Gemma q4 layout.
+  Source guards now require this path.
+- Live RX 7800 XT checks after the q4 GELU group64 specialization:
+  short `2048` guard `108.9 tok/s`, `17649344 B/op`, `72291 allocs/op`;
+  chapter-shaped `2048` guard `99.36 tok/s`, `44639752 B/op`,
+  `87777 allocs/op`; retained 10-turn full-cap greedy book `38.18s` wall,
+  `33.96s` decode, `3021` generated tokens, `79.12 tok/s` average,
+  `68.81 tok/s` on turn 10, empty stderr, no cap hits, chapter-10 anchor hits
+  of `3`, `232416808 B/op`, and `227925 allocs/op`.
 
 ## 2026-05-26 Allocation/Transfer Step-Down Pass
 

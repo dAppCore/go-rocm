@@ -3297,7 +3297,47 @@ extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply(const unsigned char *p
 	const uint32_t groups_per_row = args.cols / args.group_size;
 	float gate_sum = 0.0f;
 	float up_sum = 0.0f;
-	if (row < args.rows && (args.group_size & 7u) == 0u) {
+	if (row < args.rows && args.group_size == 64u) {
+		for (uint32_t packed = col_lane; packed < packed_per_row; packed += ROCM_MLX_Q4_PROJECTION_THREADS_PER_ROW) {
+			const uint32_t gate_word = gate_weights[row * packed_per_row + packed];
+			const uint32_t up_word = up_weights[row * packed_per_row + packed];
+			const uint32_t col = packed << 3;
+			const uint32_t group = row * groups_per_row + (packed >> 3u);
+			const float gate_scale = rocm_bfloat16_to_float(gate_scales[group]);
+			const float gate_bias = rocm_bfloat16_to_float(gate_biases[group]);
+			const float up_scale = rocm_bfloat16_to_float(up_scales[group]);
+			const float up_bias = rocm_bfloat16_to_float(up_biases[group]);
+			const float in0 = input[col];
+			const float in1 = input[col + 1u];
+			const float in2 = input[col + 2u];
+			const float in3 = input[col + 3u];
+			const float in4 = input[col + 4u];
+			const float in5 = input[col + 5u];
+			const float in6 = input[col + 6u];
+			const float in7 = input[col + 7u];
+			const float input_sum = in0 + in1 + in2 + in3 + in4 + in5 + in6 + in7;
+			const float gate_q_dot =
+				static_cast<float>(gate_word & 0x0fu) * in0 +
+				static_cast<float>((gate_word >> 4) & 0x0fu) * in1 +
+				static_cast<float>((gate_word >> 8) & 0x0fu) * in2 +
+				static_cast<float>((gate_word >> 12) & 0x0fu) * in3 +
+				static_cast<float>((gate_word >> 16) & 0x0fu) * in4 +
+				static_cast<float>((gate_word >> 20) & 0x0fu) * in5 +
+				static_cast<float>((gate_word >> 24) & 0x0fu) * in6 +
+				static_cast<float>((gate_word >> 28) & 0x0fu) * in7;
+			const float up_q_dot =
+				static_cast<float>(up_word & 0x0fu) * in0 +
+				static_cast<float>((up_word >> 4) & 0x0fu) * in1 +
+				static_cast<float>((up_word >> 8) & 0x0fu) * in2 +
+				static_cast<float>((up_word >> 12) & 0x0fu) * in3 +
+				static_cast<float>((up_word >> 16) & 0x0fu) * in4 +
+				static_cast<float>((up_word >> 20) & 0x0fu) * in5 +
+				static_cast<float>((up_word >> 24) & 0x0fu) * in6 +
+				static_cast<float>((up_word >> 28) & 0x0fu) * in7;
+			gate_sum += gate_scale * gate_q_dot + gate_bias * input_sum;
+			up_sum += up_scale * up_q_dot + up_bias * input_sum;
+		}
+	} else if (row < args.rows && (args.group_size & 7u) == 0u) {
 		for (uint32_t packed = col_lane; packed < packed_per_row; packed += ROCM_MLX_Q4_PROJECTION_THREADS_PER_ROW) {
 			const uint32_t gate_word = gate_weights[row * packed_per_row + packed];
 			const uint32_t up_word = up_weights[row * packed_per_row + packed];
