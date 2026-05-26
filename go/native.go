@@ -511,7 +511,7 @@ func (m *rocmModel) gemma4Q4GenerateLinked() bool {
 	if !isROCmGemma4Architecture(loaded.modelInfo.Architecture) || loaded.modelInfo.QuantBits != 4 || loaded.modelInfo.NumLayers <= 0 {
 		return false
 	}
-	_, err := loaded.loadedGemma4Q4ForwardConfig(loaded.modelInfo.NumLayers)
+	_, err := loaded.cachedGemma4Q4ForwardConfig(loaded.modelInfo.NumLayers)
 	return err == nil
 }
 

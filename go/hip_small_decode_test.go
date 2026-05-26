@@ -2303,6 +2303,52 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_QKVOutputReused(b *testing.B) {
 	}
 }
 
+func BenchmarkHIPAttentionHeadsChunkedWorkspace_FinalHiddenOutputReused(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	output, err := workspace.EnsureFinalHiddenOutput(driver, 2304, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if output.Count() != 2304 || output.SizeBytes() != 9216 {
+		b.Fatalf("final hidden output shape = %d/%d, want 2304/9216", output.Count(), output.SizeBytes())
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		output, err = workspace.EnsureFinalHiddenOutput(driver, 2304, i&1)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if output.Count() != 2304 || output.SizeBytes() != 9216 {
+			b.Fatalf("final hidden output shape = %d/%d, want 2304/9216", output.Count(), output.SizeBytes())
+		}
+	}
+}
+
+func BenchmarkHIPAttentionHeadsChunkedWorkspace_NextInputOutputReused(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	output, err := workspace.EnsureNextInputOutput(driver, 2304, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if output.Count() != 2304 || output.SizeBytes() != 9216 {
+		b.Fatalf("next input output shape = %d/%d, want 2304/9216", output.Count(), output.SizeBytes())
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		output, err = workspace.EnsureNextInputOutput(driver, 2304, i&1)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if output.Count() != 2304 || output.SizeBytes() != 9216 {
+			b.Fatalf("next input output shape = %d/%d, want 2304/9216", output.Count(), output.SizeBytes())
+		}
+	}
+}
+
 func BenchmarkHIPGemma4Q4PerLayerInputDeviceSetLayer_View(b *testing.B) {
 	driver := &fakeHIPDriver{available: true}
 	const (

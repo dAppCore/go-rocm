@@ -2064,6 +2064,8 @@ type hipAttentionHeadsChunkedWorkspace struct {
 	RMSNoScaleOutputs   map[int]*hipDeviceByteBuffer
 	IntermediateOutputs map[int]*hipDeviceByteBuffer
 	QKVOutputs          map[int]*hipDeviceByteBuffer
+	FinalHiddenOutputs  [2]map[int]*hipDeviceByteBuffer
+	NextInputOutputs    [2]map[int]*hipDeviceByteBuffer
 	partialCap          int
 	statsCap            int
 }
@@ -2320,6 +2322,42 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureQKVOutput(driver nativ
 	return output, nil
 }
 
+func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureFinalHiddenOutput(driver nativeHIPDriver, count, slot int) (*hipDeviceByteBuffer, error) {
+	return workspace.ensureSlottedOutput(driver, &workspace.FinalHiddenOutputs, count, slot, "final hidden output")
+}
+
+func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureNextInputOutput(driver nativeHIPDriver, count, slot int) (*hipDeviceByteBuffer, error) {
+	return workspace.ensureSlottedOutput(driver, &workspace.NextInputOutputs, count, slot, "next layer input output")
+}
+
+func (workspace *hipAttentionHeadsChunkedWorkspace) ensureSlottedOutput(driver nativeHIPDriver, outputs *[2]map[int]*hipDeviceByteBuffer, count, slot int, label string) (*hipDeviceByteBuffer, error) {
+	if workspace == nil {
+		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "attention workspace is required", nil)
+	}
+	if count <= 0 {
+		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", label+" count must be positive", nil)
+	}
+	if outputs == nil {
+		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", label+" storage is required", nil)
+	}
+	slot &= 1
+	if (*outputs)[slot] == nil {
+		(*outputs)[slot] = make(map[int]*hipDeviceByteBuffer, 2)
+	}
+	if output := (*outputs)[slot][count]; output != nil && output.Pointer() != 0 && output.Count() == count && output.SizeBytes() == uint64(count*4) {
+		return output, nil
+	}
+	if err := (*outputs)[slot][count].Close(); err != nil {
+		return nil, err
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.AttentionHeadsChunkedLaunch", label, uint64(count*4), count)
+	if err != nil {
+		return nil, err
+	}
+	(*outputs)[slot][count] = output
+	return output, nil
+}
+
 func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 	if workspace == nil {
 		return nil
@@ -2376,6 +2414,20 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 			lastErr = err
 		}
 	}
+	for slot := range workspace.FinalHiddenOutputs {
+		for _, output := range workspace.FinalHiddenOutputs[slot] {
+			if err := output.Close(); err != nil {
+				lastErr = err
+			}
+		}
+	}
+	for slot := range workspace.NextInputOutputs {
+		for _, output := range workspace.NextInputOutputs[slot] {
+			if err := output.Close(); err != nil {
+				lastErr = err
+			}
+		}
+	}
 	workspace.AttentionOutputs = nil
 	workspace.ProjectionOutputs = nil
 	workspace.ActivationOutputs = nil
@@ -2385,6 +2437,8 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 	workspace.RMSNoScaleOutputs = nil
 	workspace.IntermediateOutputs = nil
 	workspace.QKVOutputs = nil
+	workspace.FinalHiddenOutputs = [2]map[int]*hipDeviceByteBuffer{}
+	workspace.NextInputOutputs = [2]map[int]*hipDeviceByteBuffer{}
 	return lastErr
 }
 

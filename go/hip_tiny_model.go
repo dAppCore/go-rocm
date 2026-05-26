@@ -603,7 +603,7 @@ func (kernels hipNativeProjectionKernelSet) Generate(ctx context.Context, model 
 				return core.E(hipGemma4Q4Layer0Operation, "loaded Gemma4 q4 layer count is required", nil)
 			}
 		}
-		q4Cfg, err := model.loadedGemma4Q4ForwardConfig(model.modelInfo.NumLayers)
+		q4Cfg, err := model.cachedGemma4Q4ForwardConfig(model.modelInfo.NumLayers)
 		if err != nil {
 			return emptyTokenSeq, func() error { return err }
 		}

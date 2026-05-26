@@ -8,6 +8,7 @@ import (
 	"context"
 	"io"
 	"iter"
+	"sync"
 	"time"
 
 	core "dappco.re/go"
@@ -151,6 +152,10 @@ type hipLoadedModel struct {
 	smallLoRA   *hipLoadedSmallLoRAAdapter
 	classLoRA   *hipLoadedClassifierLoRAAdapter
 	tokenText   *hipTokenTextDecoder
+	q4ConfigMu  sync.Mutex
+	q4Config    hipGemma4Q4ForwardConfig
+	q4Layers    int
+	q4ConfigOK  bool
 	createdAt   time.Time
 	closed      bool
 }

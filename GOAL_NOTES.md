@@ -13079,3 +13079,60 @@ Short generation guard after typed page-slice pooling:
 This is a smaller step than the launch/device pool pass, but it keeps the same
 direction: `3.40M -> 2.04M -> 1.98M allocs/op` on the short q4 generation guard
 with tok/s flat-to-slightly-up and no stderr.
+
+## 2026-05-26: Slotted Final-Hidden / Next-Input Workspace Reuse
+
+The next 2048-token pass targeted the remaining residual-add/norm device-buffer
+churn. Decoder layers now receive two slotted workspace outputs for the
+cross-layer final hidden state and the precomputed next-layer input norm. The
+forward loop tracks borrowed ownership for those outputs, using slot parity so a
+layer never overwrites the hidden/input buffer still being consumed from the
+previous layer.
+
+AX-11 benchmarks for the new hot workspace paths:
+
+```text
+BenchmarkHIPAttentionHeadsChunkedWorkspace_FinalHiddenOutputReused-32  3.235 ns/op  0 B/op  0 allocs/op
+BenchmarkHIPAttentionHeadsChunkedWorkspace_NextInputOutputReused-32    3.241 ns/op  0 B/op  0 allocs/op
+```
+
+The immutable Gemma4 q4 forward config is also cached on the loaded model and
+primed through the existing linked-capability check, so repeated turns reuse the
+loaded tensor pointer/shape config instead of rebuilding it.
+
+Short generation guard after the batch:
+
+```text
+2048 text:Hi, slotted hidden/input workspace:
+  19785444116 ns/op, 103.5 tok/s, 52871360 B/op, 311757 allocs/op
+  stderr_bytes=0
+```
+
+Retained-book acceptance after the batch:
+
+```text
+book_wall_s/op             40.63
+book_decode_s/op           36.39
+book_generated_tokens/op    3021
+book_tok/s                 74.36
+book_turn01_tok/s         103.8
+book_turn10_tok/s          64.91
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+stderr_bytes                   0
+B/op                    275889064
+allocs/op                  577472
+```
+
+This keeps the allocation step-down intact:
+
+```text
+3.40M -> 2.04M -> 1.98M -> 1.85M -> 1.78M -> 1.69M -> 1.31M
+  -> 1.23M -> 1.16M -> 0.73M -> 0.53M -> 0.46M -> 0.31M allocs/op
+```
+
+The next short-loop allocation target is the per-owner-layer KV descriptor table
+refresh (`KernelDescriptorTableFromAppendedToken`). It is now one of the
+clearest timed per-token clusters, but the real endpoint remains decode
+scaling: turn 10 is still only about `65 tok/s`, below the `90-100+ tok/s`
+target.

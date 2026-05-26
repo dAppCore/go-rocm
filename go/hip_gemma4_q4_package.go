@@ -21,7 +21,7 @@ func (model *hipLoadedModel) loadedGemma4Q4PackageForwardConfig() (hipGemma4Q4Fo
 	if model.modelInfo.NumLayers <= 0 {
 		return hipGemma4Q4ForwardConfig{}, true, core.E(hipGemma4Q4Layer0Operation, "loaded Gemma4 q4 layer count is required", nil)
 	}
-	cfg, err := model.loadedGemma4Q4ForwardConfig(model.modelInfo.NumLayers)
+	cfg, err := model.cachedGemma4Q4ForwardConfig(model.modelInfo.NumLayers)
 	return cfg, true, err
 }
 

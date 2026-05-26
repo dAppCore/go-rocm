@@ -94,6 +94,8 @@ type hipGemma4Q4DecoderLayerRequest struct {
 	SharedDescriptorTable *rocmDeviceKVDescriptorTable
 	LayerInputDevice      *hipDeviceByteBuffer
 	NextInputNorm         *hipRMSNormDeviceWeightConfig
+	FinalHiddenOutput     *hipDeviceByteBuffer
+	NextLayerInputOutput  *hipDeviceByteBuffer
 	AttentionWorkspace    *hipAttentionHeadsChunkedWorkspace
 	OmitDebugTensors      bool
 	ReturnDeviceHidden    bool
@@ -206,20 +208,22 @@ type hipGemma4Q4Layer0Result struct {
 }
 
 type hipGemma4Q4DecoderLayerResult struct {
-	LayerInput           []float32
-	Key                  []float32
-	Value                []float32
-	UpdatedKeys          []float32
-	UpdatedValues        []float32
-	DeviceKVAttention    string
-	DeviceLayer          *hipGemma4Q4DeviceLayerKVState
-	AttentionOutput      []float32
-	AttentionProjection  []float32
-	AttentionResidual    []float32
-	MLPOutput            []float32
-	FinalHidden          []float32
-	DeviceFinalHidden    *hipDeviceByteBuffer
-	DeviceNextLayerInput *hipDeviceByteBuffer
+	LayerInput                   []float32
+	Key                          []float32
+	Value                        []float32
+	UpdatedKeys                  []float32
+	UpdatedValues                []float32
+	DeviceKVAttention            string
+	DeviceLayer                  *hipGemma4Q4DeviceLayerKVState
+	AttentionOutput              []float32
+	AttentionProjection          []float32
+	AttentionResidual            []float32
+	MLPOutput                    []float32
+	FinalHidden                  []float32
+	DeviceFinalHidden            *hipDeviceByteBuffer
+	DeviceFinalHiddenBorrowed    bool
+	DeviceNextLayerInput         *hipDeviceByteBuffer
+	DeviceNextLayerInputBorrowed bool
 }
 
 type hipGemma4Q4ForwardResult struct {
@@ -426,6 +430,28 @@ func (model *hipLoadedModel) loadedGemma4Q4ForwardConfig(layerCount int) (hipGem
 	return forward, nil
 }
 
+func (model *hipLoadedModel) cachedGemma4Q4ForwardConfig(layerCount int) (hipGemma4Q4ForwardConfig, error) {
+	if layerCount <= 0 {
+		return hipGemma4Q4ForwardConfig{}, core.E(hipGemma4Q4Layer0Operation, "layer count must be positive", nil)
+	}
+	if model == nil {
+		return hipGemma4Q4ForwardConfig{}, core.E(hipGemma4Q4Layer0Operation, "loaded model is required", nil)
+	}
+	model.q4ConfigMu.Lock()
+	defer model.q4ConfigMu.Unlock()
+	if model.q4ConfigOK && model.q4Layers == layerCount {
+		return model.q4Config, nil
+	}
+	cfg, err := model.loadedGemma4Q4ForwardConfig(layerCount)
+	if err != nil {
+		return hipGemma4Q4ForwardConfig{}, err
+	}
+	model.q4Config = cfg
+	model.q4Layers = layerCount
+	model.q4ConfigOK = true
+	return cfg, nil
+}
+
 func hipRunGemma4Q4Layer0(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4Layer0Config, req hipGemma4Q4Layer0Request) (hipGemma4Q4Layer0Result, error) {
 	if err := hipContextErr(ctx); err != nil {
 		return hipGemma4Q4Layer0Result{}, err
@@ -589,8 +615,9 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 		hidden = scaledEmbedding
 	}
 	sharedSources := hipGemma4Q4SharedKVSourceByLayer(cfg)
+	hiddenBufferBorrowed := false
 	defer func() {
-		if hiddenBuffer != nil {
+		if hiddenBuffer != nil && !hiddenBufferBorrowed {
 			_ = hiddenBuffer.Close()
 		}
 	}()
@@ -622,8 +649,9 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 	sharedKVLayers := 0
 	useDeviceSharedKV := req.DeviceKVAttention && req.ReturnDeviceState && req.OmitDebugTensors
 	precomputedLayerInputBuffer := (*hipDeviceByteBuffer)(nil)
+	precomputedLayerInputBorrowed := false
 	defer func() {
-		if precomputedLayerInputBuffer != nil {
+		if precomputedLayerInputBuffer != nil && !precomputedLayerInputBorrowed {
 			_ = precomputedLayerInputBuffer.Close()
 		}
 	}()
@@ -679,6 +707,19 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 				nextInputNormCfg.Epsilon = req.Epsilon
 				layerReq.NextInputNorm = &nextInputNormCfg
 			}
+			if req.AttentionWorkspace != nil {
+				slot := index & 1
+				layerReq.FinalHiddenOutput, err = req.AttentionWorkspace.EnsureFinalHiddenOutput(driver, layerCfg.HiddenSize, slot)
+				if err != nil {
+					return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+				}
+				if layerReq.NextInputNorm != nil {
+					layerReq.NextLayerInputOutput, err = req.AttentionWorkspace.EnsureNextInputOutput(driver, layerReq.NextInputNorm.Count, slot)
+					if err != nil {
+						return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+					}
+				}
+			}
 		}
 		if perLayerInputDevices != nil && perLayerInputDevices.Layer(index) != nil {
 			layerReq.PerLayerInputDevice = perLayerInputDevices.Layer(index)
@@ -703,17 +744,21 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 			sharedKVLayers++
 		}
 		consumedLayerInputBuffer := precomputedLayerInputBuffer
+		consumedLayerInputBorrowed := precomputedLayerInputBorrowed
 		precomputedLayerInputBuffer = nil
+		precomputedLayerInputBorrowed = false
 		layer, err := hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx, driver, layerCfg, hidden, hiddenBuffer, layerReq, false)
-		if consumedLayerInputBuffer != nil {
+		if consumedLayerInputBuffer != nil && !consumedLayerInputBorrowed {
 			_ = consumedLayerInputBuffer.Close()
 		}
 		if err != nil {
 			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
 		}
 		nextHiddenBuffer := layer.DeviceFinalHidden
+		nextHiddenBorrowed := layer.DeviceFinalHiddenBorrowed
 		layer.DeviceFinalHidden = nil
 		precomputedLayerInputBuffer = layer.DeviceNextLayerInput
+		precomputedLayerInputBorrowed = layer.DeviceNextLayerInputBorrowed
 		layer.DeviceNextLayerInput = nil
 		switch layer.DeviceKVAttention {
 		case "append_existing_device":
@@ -725,7 +770,7 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 		}
 		if req.ReturnDeviceState {
 			if layer.DeviceLayer == nil {
-				if nextHiddenBuffer != nil {
+				if nextHiddenBuffer != nil && !nextHiddenBorrowed {
 					_ = nextHiddenBuffer.Close()
 				}
 				return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, core.E(hipGemma4Q4Layer0Operation, "decoder layer did not return device KV state", nil)
@@ -739,12 +784,14 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 		if !req.OmitHostState {
 			nextState.Layers[index] = hipGemma4Q4LayerKVState{Keys: layer.UpdatedKeys, Values: layer.UpdatedValues}
 		}
-		if hiddenBuffer != nil {
+		if hiddenBuffer != nil && !hiddenBufferBorrowed {
 			_ = hiddenBuffer.Close()
-			hiddenBuffer = nil
 		}
+		hiddenBuffer = nil
+		hiddenBufferBorrowed = false
 		if nextHiddenBuffer != nil {
 			hiddenBuffer = nextHiddenBuffer
+			hiddenBufferBorrowed = nextHiddenBorrowed
 			hidden = nil
 		} else {
 			hidden = layer.FinalHidden
@@ -1524,9 +1571,10 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 	postFeedForwardNormCfg.Epsilon = req.Epsilon
 	var returnedFinalHiddenBuffer *hipDeviceByteBuffer
 	var nextLayerInputBuffer *hipDeviceByteBuffer
+	nextLayerInputBorrowed := false
 	nextLayerInputReturned := false
 	defer func() {
-		if nextLayerInputBuffer != nil && !nextLayerInputReturned {
+		if nextLayerInputBuffer != nil && !nextLayerInputReturned && !nextLayerInputBorrowed {
 			_ = nextLayerInputBuffer.Close()
 		}
 	}()
@@ -1537,11 +1585,21 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 		postFeedForwardOutputScale = layerScalar
 	}
 	var finalHiddenBuffer *hipDeviceByteBuffer
-	finalHiddenWorkspaceBorrowed := false
+	finalHiddenBorrowed := false
 	if req.NextInputNorm != nil && !hasPerLayerInput {
-		finalHiddenBuffer, nextLayerInputBuffer, err = hipRunRMSNormResidualAddNormScaledKernelWithDeviceInputWeightConfig(ctx, driver, mlpOutputBuffer, attentionResidualBuffer, postFeedForwardNormCfg, *req.NextInputNorm, postFeedForwardOutputScale)
-		if err != nil {
-			return hipGemma4Q4DecoderLayerResult{}, err
+		if req.OmitDebugTensors && req.FinalHiddenOutput != nil && req.NextLayerInputOutput != nil {
+			if err := hipRunRMSNormResidualAddNormScaledKernelWithDeviceInputWeightConfigOutput(ctx, driver, mlpOutputBuffer, attentionResidualBuffer, postFeedForwardNormCfg, *req.NextInputNorm, req.FinalHiddenOutput, req.NextLayerInputOutput, postFeedForwardOutputScale); err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			finalHiddenBuffer = req.FinalHiddenOutput
+			finalHiddenBorrowed = true
+			nextLayerInputBuffer = req.NextLayerInputOutput
+			nextLayerInputBorrowed = true
+		} else {
+			finalHiddenBuffer, nextLayerInputBuffer, err = hipRunRMSNormResidualAddNormScaledKernelWithDeviceInputWeightConfig(ctx, driver, mlpOutputBuffer, attentionResidualBuffer, postFeedForwardNormCfg, *req.NextInputNorm, postFeedForwardOutputScale)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
 		}
 	} else if hasPerLayerInput && req.AttentionWorkspace != nil && req.OmitDebugTensors {
 		finalHiddenBuffer, err = req.AttentionWorkspace.EnsureIntermediateOutput(driver, postFeedForwardNormCfg.Count)
@@ -1551,18 +1609,26 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 		if err := hipRunRMSNormResidualAddScaledKernelWithDeviceInputWeightConfigOutput(ctx, driver, mlpOutputBuffer, attentionResidualBuffer, postFeedForwardNormCfg, finalHiddenBuffer, postFeedForwardOutputScale); err != nil {
 			return hipGemma4Q4DecoderLayerResult{}, err
 		}
-		finalHiddenWorkspaceBorrowed = true
+		finalHiddenBorrowed = true
 	} else {
-		finalHiddenBuffer, err = hipRunRMSNormResidualAddScaledKernelWithDeviceInputWeightConfig(ctx, driver, mlpOutputBuffer, attentionResidualBuffer, postFeedForwardNormCfg, postFeedForwardOutputScale)
-		if err != nil {
-			return hipGemma4Q4DecoderLayerResult{}, err
+		if req.OmitDebugTensors && req.FinalHiddenOutput != nil {
+			if err := hipRunRMSNormResidualAddScaledKernelWithDeviceInputWeightConfigOutput(ctx, driver, mlpOutputBuffer, attentionResidualBuffer, postFeedForwardNormCfg, req.FinalHiddenOutput, postFeedForwardOutputScale); err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			finalHiddenBuffer = req.FinalHiddenOutput
+			finalHiddenBorrowed = true
+		} else {
+			finalHiddenBuffer, err = hipRunRMSNormResidualAddScaledKernelWithDeviceInputWeightConfig(ctx, driver, mlpOutputBuffer, attentionResidualBuffer, postFeedForwardNormCfg, postFeedForwardOutputScale)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
 		}
 	}
-	defer func(buffer *hipDeviceByteBuffer) {
-		if buffer != returnedFinalHiddenBuffer && !finalHiddenWorkspaceBorrowed {
+	defer func(buffer *hipDeviceByteBuffer, borrowed bool) {
+		if buffer != returnedFinalHiddenBuffer && !borrowed {
 			_ = buffer.Close()
 		}
-	}(finalHiddenBuffer)
+	}(finalHiddenBuffer, finalHiddenBorrowed)
 	if hasPerLayerInput {
 		var perLayerProjectionBuffer *hipDeviceByteBuffer
 		if req.PerLayerInputDevice != nil && req.AttentionWorkspace != nil && req.OmitDebugTensors {
@@ -1587,23 +1653,43 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 		perLayerNormCfg := cfg.PerLayerInput.PostInputNorm
 		perLayerNormCfg.Epsilon = req.Epsilon
 		var perLayerFinalHiddenBuffer *hipDeviceByteBuffer
+		perLayerFinalHiddenBorrowed := false
 		if req.NextInputNorm != nil {
-			perLayerFinalHiddenBuffer, nextLayerInputBuffer, err = hipRunRMSNormResidualAddNormScaledKernelWithDeviceInputWeightConfig(ctx, driver, perLayerProjectionBuffer, finalHiddenBuffer, perLayerNormCfg, *req.NextInputNorm, layerScalar)
-			if err != nil {
-				return hipGemma4Q4DecoderLayerResult{}, err
+			if req.OmitDebugTensors && req.FinalHiddenOutput != nil && req.NextLayerInputOutput != nil {
+				if err := hipRunRMSNormResidualAddNormScaledKernelWithDeviceInputWeightConfigOutput(ctx, driver, perLayerProjectionBuffer, finalHiddenBuffer, perLayerNormCfg, *req.NextInputNorm, req.FinalHiddenOutput, req.NextLayerInputOutput, layerScalar); err != nil {
+					return hipGemma4Q4DecoderLayerResult{}, err
+				}
+				perLayerFinalHiddenBuffer = req.FinalHiddenOutput
+				perLayerFinalHiddenBorrowed = true
+				nextLayerInputBuffer = req.NextLayerInputOutput
+				nextLayerInputBorrowed = true
+			} else {
+				perLayerFinalHiddenBuffer, nextLayerInputBuffer, err = hipRunRMSNormResidualAddNormScaledKernelWithDeviceInputWeightConfig(ctx, driver, perLayerProjectionBuffer, finalHiddenBuffer, perLayerNormCfg, *req.NextInputNorm, layerScalar)
+				if err != nil {
+					return hipGemma4Q4DecoderLayerResult{}, err
+				}
 			}
 		} else {
-			perLayerFinalHiddenBuffer, err = hipRunRMSNormResidualAddScaledKernelWithDeviceInputWeightConfig(ctx, driver, perLayerProjectionBuffer, finalHiddenBuffer, perLayerNormCfg, layerScalar)
-			if err != nil {
-				return hipGemma4Q4DecoderLayerResult{}, err
+			if req.OmitDebugTensors && req.FinalHiddenOutput != nil {
+				if err := hipRunRMSNormResidualAddScaledKernelWithDeviceInputWeightConfigOutput(ctx, driver, perLayerProjectionBuffer, finalHiddenBuffer, perLayerNormCfg, req.FinalHiddenOutput, layerScalar); err != nil {
+					return hipGemma4Q4DecoderLayerResult{}, err
+				}
+				perLayerFinalHiddenBuffer = req.FinalHiddenOutput
+				perLayerFinalHiddenBorrowed = true
+			} else {
+				perLayerFinalHiddenBuffer, err = hipRunRMSNormResidualAddScaledKernelWithDeviceInputWeightConfig(ctx, driver, perLayerProjectionBuffer, finalHiddenBuffer, perLayerNormCfg, layerScalar)
+				if err != nil {
+					return hipGemma4Q4DecoderLayerResult{}, err
+				}
 			}
 		}
-		defer func(buffer *hipDeviceByteBuffer) {
-			if buffer != returnedFinalHiddenBuffer {
+		defer func(buffer *hipDeviceByteBuffer, borrowed bool) {
+			if buffer != returnedFinalHiddenBuffer && !borrowed {
 				_ = buffer.Close()
 			}
-		}(perLayerFinalHiddenBuffer)
+		}(perLayerFinalHiddenBuffer, perLayerFinalHiddenBorrowed)
 		finalHiddenBuffer = perLayerFinalHiddenBuffer
+		finalHiddenBorrowed = perLayerFinalHiddenBorrowed
 	}
 	var finalHidden []float32
 	var deviceFinalHidden *hipDeviceByteBuffer
@@ -1624,15 +1710,17 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 	}
 	retainedDeviceLayerSuccess = true
 	result := hipGemma4Q4DecoderLayerResult{
-		Key:                  ropeKey,
-		Value:                value,
-		UpdatedKeys:          updatedKeys,
-		UpdatedValues:        updatedValues,
-		DeviceKVAttention:    deviceKVAttention,
-		DeviceLayer:          retainedDeviceLayer,
-		FinalHidden:          finalHidden,
-		DeviceFinalHidden:    deviceFinalHidden,
-		DeviceNextLayerInput: nextLayerInputBuffer,
+		Key:                          ropeKey,
+		Value:                        value,
+		UpdatedKeys:                  updatedKeys,
+		UpdatedValues:                updatedValues,
+		DeviceKVAttention:            deviceKVAttention,
+		DeviceLayer:                  retainedDeviceLayer,
+		FinalHidden:                  finalHidden,
+		DeviceFinalHidden:            deviceFinalHidden,
+		DeviceFinalHiddenBorrowed:    finalHiddenBorrowed,
+		DeviceNextLayerInput:         nextLayerInputBuffer,
+		DeviceNextLayerInputBorrowed: nextLayerInputBorrowed,
 	}
 	if !req.OmitDebugTensors {
 		layerInput, err = ensureLayerInput()
