@@ -1741,6 +1741,37 @@ func hipRunMLXQ4TripleProjectionKernelWithDeviceInputViews(ctx context.Context, 
 			_ = output.Close()
 		}
 	}()
+	first, second, third, err := hipRunMLXQ4TripleProjectionKernelWithDeviceInputViewsOutput(ctx, driver, input, firstCfg, secondCfg, thirdCfg, output)
+	if err != nil {
+		return nil, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, err
+	}
+	success = true
+	return output, first, second, third, nil
+}
+
+func hipRunMLXQ4TripleProjectionKernelWithDeviceInputViewsOutput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, firstCfg, secondCfg, thirdCfg hipMLXQ4DeviceWeightConfig, output *hipDeviceByteBuffer) (hipDeviceByteBuffer, hipDeviceByteBuffer, hipDeviceByteBuffer, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, err
+	}
+	if input == nil || input.Pointer() == 0 {
+		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "MLX q4 triple projection device input is required", nil)
+	}
+	if firstCfg.Cols != secondCfg.Cols || firstCfg.Cols != thirdCfg.Cols ||
+		firstCfg.GroupSize != secondCfg.GroupSize || firstCfg.GroupSize != thirdCfg.GroupSize {
+		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "triple projection input shapes must match", nil)
+	}
+	for _, cfg := range []hipMLXQ4DeviceWeightConfig{firstCfg, secondCfg, thirdCfg} {
+		if err := cfg.validateInputCount(input.Count()); err != nil {
+			return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, err
+		}
+		if input.SizeBytes() != uint64(cfg.Cols*4) {
+			return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "MLX q4 triple projection device input byte count mismatch", nil)
+		}
+	}
+	totalRows := firstCfg.Rows + secondCfg.Rows + thirdCfg.Rows
+	if output == nil || output.Pointer() == 0 || output.Count() != totalRows || output.SizeBytes() != uint64(totalRows*4) {
+		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "MLX q4 triple projection output shape mismatch", nil)
+	}
 	launchBytes, err := (hipMLXQ4TripleProjLaunchArgs{
 		InputPointer:        input.Pointer(),
 		OutputPointer:       output.Pointer(),
@@ -1772,14 +1803,14 @@ func hipRunMLXQ4TripleProjectionKernelWithDeviceInputViews(ctx context.Context, 
 		ThirdBiasBytes:      thirdCfg.BiasBytes,
 	}).Binary()
 	if err != nil {
-		return nil, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, err
+		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, err
 	}
 	config, err := hipMLXQ4TripleProjectionLaunchConfig(launchBytes, totalRows)
 	if err != nil {
-		return nil, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, err
+		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, err
 	}
 	if err := hipLaunchKernel(driver, config); err != nil {
-		return nil, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, err
+		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, err
 	}
 	first := hipDeviceByteBuffer{
 		driver:    driver,
@@ -1807,8 +1838,7 @@ func hipRunMLXQ4TripleProjectionKernelWithDeviceInputViews(ctx context.Context, 
 		borrowed:  true,
 		label:     "MLX q4 triple projection third output",
 	}
-	success = true
-	return output, first, second, third, nil
+	return first, second, third, nil
 }
 
 func hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, gateCfg, upCfg hipMLXQ4DeviceWeightConfig) (*hipDeviceByteBuffer, error) {

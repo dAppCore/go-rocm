@@ -183,9 +183,14 @@ intermediate post-FFN buffers then moved the short guard to `19816510363 ns/op`,
 stayed green at `41.23s` wall, `36.99s` decode, `3021` generated tokens,
 `73.27 tok/s` average, `64.44 tok/s` on turn 10, empty stderr, no cap hits, and
 chapter-10 anchor hits of `3`, while dropping to `296256152 B/op` and
-`895702 allocs/op`. This is the current best allocation route for the book
-endpoint, but not the final driver endpoint: later-turn decode is still only
-`64.4 tok/s`, below the
+`895702 allocs/op`. Reusing QKV/triple-projection outputs then moved the short
+guard to `19776340979 ns/op`, `103.6 tok/s`, `62041912 B/op`, and
+`455039 allocs/op`. The retained book route stayed green at `40.74s` wall,
+`36.49s` decode, `3021` generated tokens, `74.16 tok/s` average,
+`65.31 tok/s` on turn 10, empty stderr, no cap hits, and chapter-10 anchor hits
+of `3`, while dropping to `289548824 B/op` and `789629 allocs/op`. This is the
+current best allocation route for the book endpoint, but not the final driver
+endpoint: later-turn decode is still only `65.3 tok/s`, below the
 `90-100+ tok/s` target, and the visible output remains repetitive. Keep tuning
 retained long-context attention and state quality until the later turns stay
 near the target.
@@ -203,7 +208,7 @@ max_new_tokens  route                    tok/s   B/op       allocs/op
 2048            chunked-128 device KV     90.53  314.81M     3426653
 4096            non-chunked value-fast    72.45  633.26M     6833550
 4096            chunked-128 query cache   80.33  885.71M     6749654
-2048 text:Hi    workspace batch          103.3    66.63M      526667
+2048 text:Hi    workspace batch          103.6    62.04M      455039
 ```
 
 The earlier 256-token chunked route was rejected because it fell to `58.24

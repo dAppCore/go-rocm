@@ -2280,6 +2280,29 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_IntermediateOutputReused(b *test
 	}
 }
 
+func BenchmarkHIPAttentionHeadsChunkedWorkspace_QKVOutputReused(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	output, err := workspace.EnsureQKVOutput(driver, 2560)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if output.Count() != 2560 || output.SizeBytes() != 10240 {
+		b.Fatalf("QKV output shape = %d/%d, want 2560/10240", output.Count(), output.SizeBytes())
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		output, err = workspace.EnsureQKVOutput(driver, 2560)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if output.Count() != 2560 || output.SizeBytes() != 10240 {
+			b.Fatalf("QKV output shape = %d/%d, want 2560/10240", output.Count(), output.SizeBytes())
+		}
+	}
+}
+
 func BenchmarkHIPGemma4Q4PerLayerInputDeviceSetLayer_View(b *testing.B) {
 	driver := &fakeHIPDriver{available: true}
 	const (

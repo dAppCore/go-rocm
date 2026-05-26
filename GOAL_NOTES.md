@@ -100,6 +100,17 @@
   `296256152 B/op`, and `895702 allocs/op`. The short-guard allocation sequence
   is now
   `3.40M -> 2.04M -> 1.98M -> 1.85M -> 1.78M -> 1.69M -> 1.31M -> 1.23M -> 1.16M -> 0.73M -> 0.53M allocs/op`.
+- Reused caller-owned QKV/triple-projection outputs for the q4 layer-input
+  projection step. Added
+  `BenchmarkHIPAttentionHeadsChunkedWorkspace_QKVOutputReused`, which reports
+  `3.070 ns/op`, `0 B/op`, and `0 allocs/op`. The live `text:Hi` 2048-token
+  guard now reports `103.6 tok/s`, `62041912 B/op`, and `455039 allocs/op`.
+  The retained 10-turn full-cap greedy book route stayed green at `40.74s`
+  wall, `36.49s` decode, `3021` generated tokens, `74.16 tok/s` average,
+  `65.31 tok/s` on turn 10, empty stderr, no cap hits, chapter-10 anchor hits
+  of `3`, `289548824 B/op`, and `789629 allocs/op`. The short-guard allocation
+  sequence is now
+  `3.40M -> 2.04M -> 1.98M -> 1.85M -> 1.78M -> 1.69M -> 1.31M -> 1.23M -> 1.16M -> 0.73M -> 0.53M -> 0.46M allocs/op`.
 
 ## 2026-05-26 Full-Chapter Book and Long-Attention Pass
 

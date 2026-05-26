@@ -2063,6 +2063,7 @@ type hipAttentionHeadsChunkedWorkspace struct {
 	RMSRoPEOutputs      map[int]*hipDeviceByteBuffer
 	RMSNoScaleOutputs   map[int]*hipDeviceByteBuffer
 	IntermediateOutputs map[int]*hipDeviceByteBuffer
+	QKVOutputs          map[int]*hipDeviceByteBuffer
 	partialCap          int
 	statsCap            int
 }
@@ -2295,6 +2296,30 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureIntermediateOutput(dri
 	return output, nil
 }
 
+func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureQKVOutput(driver nativeHIPDriver, count int) (*hipDeviceByteBuffer, error) {
+	if workspace == nil {
+		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "attention workspace is required", nil)
+	}
+	if count <= 0 {
+		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "QKV output count must be positive", nil)
+	}
+	if workspace.QKVOutputs == nil {
+		workspace.QKVOutputs = make(map[int]*hipDeviceByteBuffer, 2)
+	}
+	if output := workspace.QKVOutputs[count]; output != nil && output.Pointer() != 0 && output.Count() == count && output.SizeBytes() == uint64(count*4) {
+		return output, nil
+	}
+	if err := workspace.QKVOutputs[count].Close(); err != nil {
+		return nil, err
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.AttentionHeadsChunkedLaunch", "QKV output", uint64(count*4), count)
+	if err != nil {
+		return nil, err
+	}
+	workspace.QKVOutputs[count] = output
+	return output, nil
+}
+
 func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 	if workspace == nil {
 		return nil
@@ -2346,6 +2371,11 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 			lastErr = err
 		}
 	}
+	for _, output := range workspace.QKVOutputs {
+		if err := output.Close(); err != nil {
+			lastErr = err
+		}
+	}
 	workspace.AttentionOutputs = nil
 	workspace.ProjectionOutputs = nil
 	workspace.ActivationOutputs = nil
@@ -2354,6 +2384,7 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 	workspace.RMSRoPEOutputs = nil
 	workspace.RMSNoScaleOutputs = nil
 	workspace.IntermediateOutputs = nil
+	workspace.QKVOutputs = nil
 	return lastErr
 }
 

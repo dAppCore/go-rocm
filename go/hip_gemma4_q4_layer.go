@@ -1063,20 +1063,42 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 	if projectLocalKV &&
 		cfg.QueryProjection.Cols == cfg.KeyProjection.Cols && cfg.QueryProjection.Cols == cfg.ValueProjection.Cols &&
 		cfg.QueryProjection.GroupSize == cfg.KeyProjection.GroupSize && cfg.QueryProjection.GroupSize == cfg.ValueProjection.GroupSize {
-		qkvOutputBuffer, queryBufferView, keyBufferView, valueBufferView, err = hipRunMLXQ4TripleProjectionKernelWithDeviceInputViews(ctx, driver, layerInputBuffer, cfg.QueryProjection, cfg.KeyProjection, cfg.ValueProjection)
-		if err != nil {
-			return hipGemma4Q4DecoderLayerResult{}, err
+		if req.AttentionWorkspace != nil && req.OmitDebugTensors {
+			qkvCount := cfg.QueryProjection.Rows + cfg.KeyProjection.Rows + cfg.ValueProjection.Rows
+			qkvOutputBuffer, err = req.AttentionWorkspace.EnsureQKVOutput(driver, qkvCount)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			queryBufferView, keyBufferView, valueBufferView, err = hipRunMLXQ4TripleProjectionKernelWithDeviceInputViewsOutput(ctx, driver, layerInputBuffer, cfg.QueryProjection, cfg.KeyProjection, cfg.ValueProjection, qkvOutputBuffer)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+		} else {
+			qkvOutputBuffer, queryBufferView, keyBufferView, valueBufferView, err = hipRunMLXQ4TripleProjectionKernelWithDeviceInputViews(ctx, driver, layerInputBuffer, cfg.QueryProjection, cfg.KeyProjection, cfg.ValueProjection)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			defer qkvOutputBuffer.Close()
 		}
 		queryBuffer = &queryBufferView
 		keyBuffer = &keyBufferView
 		valueBuffer = &valueBufferView
-		defer qkvOutputBuffer.Close()
 	} else {
-		queryBuffer, err = hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx, driver, layerInputBuffer, cfg.QueryProjection)
-		if err != nil {
-			return hipGemma4Q4DecoderLayerResult{}, err
+		if req.AttentionWorkspace != nil && req.OmitDebugTensors {
+			queryBuffer, err = req.AttentionWorkspace.EnsureProjectionOutput(driver, cfg.QueryProjection.Rows)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			if err := hipRunMLXQ4ProjectionKernelWithDeviceInputOutput(ctx, driver, layerInputBuffer, cfg.QueryProjection, queryBuffer); err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+		} else {
+			queryBuffer, err = hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx, driver, layerInputBuffer, cfg.QueryProjection)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			defer queryBuffer.Close()
 		}
-		defer queryBuffer.Close()
 	}
 	queryNormCfg := hipGemma4Q4RoPENormConfig(cfg.QueryNorm, req.Epsilon, cfg.HeadDim)
 	ropeFrequencyDim, ropeRotaryCount := hipGemma4Q4RoPEKernelDims(cfg)

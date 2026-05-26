@@ -758,6 +758,54 @@ func TestHIPKernels_MLXQ4TripleProjectionLaunchArgs_Good(t *testing.T) {
 	assertFloat32SlicesNear(t, []float32{28, 38}, firstValues, 0.0001)
 	assertFloat32SlicesNear(t, []float32{8}, secondValues, 0.0001)
 	assertFloat32SlicesNear(t, []float32{16}, thirdValues, 0.0001)
+
+	reusedOutput, err := hipAllocateByteBuffer(driver, "rocm.hip.MLXQ4TripleProjectionLaunch", "reused triple projection output", uint64((firstReq.Rows+secondReq.Rows+thirdReq.Rows)*4), firstReq.Rows+secondReq.Rows+thirdReq.Rows)
+	core.AssertNoError(t, err)
+	defer reusedOutput.Close()
+	reusedFirst, reusedSecond, reusedThird, err := hipRunMLXQ4TripleProjectionKernelWithDeviceInputViewsOutput(context.Background(), driver, firstBuffers.Input,
+		hipMLXQ4DeviceWeightConfig{
+			WeightPointer: firstBuffers.Weight.Pointer(),
+			ScalePointer:  firstBuffers.Scales.Pointer(),
+			BiasPointer:   firstBuffers.Biases.Pointer(),
+			WeightBytes:   firstBuffers.Weight.SizeBytes(),
+			ScaleBytes:    firstBuffers.Scales.SizeBytes(),
+			BiasBytes:     firstBuffers.Biases.SizeBytes(),
+			Rows:          firstReq.Rows,
+			Cols:          firstReq.Cols,
+			GroupSize:     firstReq.GroupSize,
+		},
+		hipMLXQ4DeviceWeightConfig{
+			WeightPointer: secondBuffers.Weight.Pointer(),
+			ScalePointer:  secondBuffers.Scales.Pointer(),
+			BiasPointer:   secondBuffers.Biases.Pointer(),
+			WeightBytes:   secondBuffers.Weight.SizeBytes(),
+			ScaleBytes:    secondBuffers.Scales.SizeBytes(),
+			BiasBytes:     secondBuffers.Biases.SizeBytes(),
+			Rows:          secondReq.Rows,
+			Cols:          secondReq.Cols,
+			GroupSize:     secondReq.GroupSize,
+		},
+		hipMLXQ4DeviceWeightConfig{
+			WeightPointer: thirdBuffers.Weight.Pointer(),
+			ScalePointer:  thirdBuffers.Scales.Pointer(),
+			BiasPointer:   thirdBuffers.Biases.Pointer(),
+			WeightBytes:   thirdBuffers.Weight.SizeBytes(),
+			ScaleBytes:    thirdBuffers.Scales.SizeBytes(),
+			BiasBytes:     thirdBuffers.Biases.SizeBytes(),
+			Rows:          thirdReq.Rows,
+			Cols:          thirdReq.Cols,
+			GroupSize:     thirdReq.GroupSize,
+		}, reusedOutput)
+	core.AssertNoError(t, err)
+	reusedFirstValues, err := hipReadFloat32DeviceOutput(&reusedFirst, "rocm.hip.MLXQ4TripleProjectionLaunch", "reused first output", firstReq.Rows)
+	core.AssertNoError(t, err)
+	reusedSecondValues, err := hipReadFloat32DeviceOutput(&reusedSecond, "rocm.hip.MLXQ4TripleProjectionLaunch", "reused second output", secondReq.Rows)
+	core.AssertNoError(t, err)
+	reusedThirdValues, err := hipReadFloat32DeviceOutput(&reusedThird, "rocm.hip.MLXQ4TripleProjectionLaunch", "reused third output", thirdReq.Rows)
+	core.AssertNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{28, 38}, reusedFirstValues, 0.0001)
+	assertFloat32SlicesNear(t, []float32{8}, reusedSecondValues, 0.0001)
+	assertFloat32SlicesNear(t, []float32{16}, reusedThirdValues, 0.0001)
 }
 
 func TestHIPKernels_MLXQ4GELUTanhMultiplyLaunchArgs_Good(t *testing.T) {
