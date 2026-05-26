@@ -2750,6 +2750,129 @@ func TestHIPKernels_VectorAddLaunchArgs_Bad(t *testing.T) {
 	core.AssertContains(t, err.Error(), "left byte count")
 }
 
+func TestHIPKernels_VectorAddScaledLaunchArgs_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	leftPayload, err := hipFloat32Payload([]float32{1, -2, 0.5})
+	core.AssertNoError(t, err)
+	left, err := hipUploadByteBuffer(driver, "rocm.hip.VectorAddScaledLaunch", "left", leftPayload, 3)
+	core.AssertNoError(t, err)
+	defer left.Close()
+	rightPayload, err := hipFloat32Payload([]float32{4, 3, -0.25})
+	core.AssertNoError(t, err)
+	right, err := hipUploadByteBuffer(driver, "rocm.hip.VectorAddScaledLaunch", "right", rightPayload, 3)
+	core.AssertNoError(t, err)
+	defer right.Close()
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.VectorAddScaledLaunch", "output", 12, 3)
+	core.AssertNoError(t, err)
+	defer output.Close()
+
+	launchBytes, err := (hipVectorAddScaledLaunchArgs{
+		LeftPointer:   left.Pointer(),
+		RightPointer:  right.Pointer(),
+		OutputPointer: output.Pointer(),
+		Count:         3,
+		LeftBytes:     left.SizeBytes(),
+		RightBytes:    right.SizeBytes(),
+		OutputBytes:   output.SizeBytes(),
+		Scale:         2,
+	}).Binary()
+	core.AssertNoError(t, err)
+	core.AssertEqual(t, hipVectorAddScaledLaunchArgsBytes, len(launchBytes))
+	core.AssertEqual(t, hipVectorAddScaledLaunchArgsVersion, binary.LittleEndian.Uint32(launchBytes[0:]))
+	core.AssertEqual(t, uint32(hipVectorAddScaledLaunchArgsBytes), binary.LittleEndian.Uint32(launchBytes[4:]))
+	core.AssertEqual(t, uint64(left.Pointer()), binary.LittleEndian.Uint64(launchBytes[8:]))
+	core.AssertEqual(t, uint64(right.Pointer()), binary.LittleEndian.Uint64(launchBytes[16:]))
+	core.AssertEqual(t, uint64(output.Pointer()), binary.LittleEndian.Uint64(launchBytes[24:]))
+	core.AssertEqual(t, uint32(3), binary.LittleEndian.Uint32(launchBytes[32:]))
+	core.AssertEqual(t, uint32(12), binary.LittleEndian.Uint32(launchBytes[36:]))
+	core.AssertEqual(t, uint32(12), binary.LittleEndian.Uint32(launchBytes[40:]))
+	core.AssertEqual(t, uint32(12), binary.LittleEndian.Uint32(launchBytes[44:]))
+	core.AssertEqual(t, math.Float32bits(2), binary.LittleEndian.Uint32(launchBytes[48:]))
+
+	config, err := hipOneDimensionalLaunchConfig(hipKernelNameVectorAddScaled, launchBytes, 3)
+	core.AssertNoError(t, err)
+	core.AssertNoError(t, hipLaunchKernel(driver, config))
+	values, err := hipReadFloat32DeviceOutput(output, "rocm.hip.VectorAddScaledLaunch", "output", 3)
+	core.AssertNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{10, 2, 0.5}, values, 0.0001)
+
+	reusedOutput, err := hipAllocateByteBuffer(driver, "rocm.hip.VectorAddScaledLaunch", "reused output", 12, 3)
+	core.AssertNoError(t, err)
+	defer reusedOutput.Close()
+	core.AssertNoError(t, hipRunVectorAddScaledDeviceKernelOutput(context.Background(), driver, left, right, 2, reusedOutput))
+	values, err = hipReadFloat32DeviceOutput(reusedOutput, "rocm.hip.VectorAddScaledLaunch", "reused output", 3)
+	core.AssertNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{10, 2, 0.5}, values, 0.0001)
+
+	ownedOutput, err := hipRunVectorAddScaledDeviceKernel(context.Background(), driver, left, right, 2)
+	core.AssertNoError(t, err)
+	defer ownedOutput.Close()
+	values, err = hipReadFloat32DeviceOutput(ownedOutput, "rocm.hip.VectorAddScaledLaunch", "owned output", 3)
+	core.AssertNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{10, 2, 0.5}, values, 0.0001)
+}
+
+func TestHIPKernels_VectorAddScaledLaunchArgs_Bad(t *testing.T) {
+	_, err := (hipVectorAddScaledLaunchArgs{
+		LeftPointer:   1,
+		RightPointer:  2,
+		OutputPointer: 3,
+		Count:         2,
+		LeftBytes:     4,
+		RightBytes:    8,
+		OutputBytes:   8,
+		Scale:         1,
+	}).Binary()
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "left byte count")
+
+	_, err = (hipVectorAddScaledLaunchArgs{
+		LeftPointer:   1,
+		RightPointer:  2,
+		OutputPointer: 3,
+		Count:         1,
+		LeftBytes:     4,
+		RightBytes:    4,
+		OutputBytes:   4,
+		Scale:         float32(math.Inf(1)),
+	}).Binary()
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "scale")
+}
+
+func BenchmarkHIPVectorAddScaledDeviceKernelOutput_Hot(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	leftPayload, err := hipFloat32Payload([]float32{1, -2, 0.5, 4})
+	if err != nil {
+		b.Fatal(err)
+	}
+	left, err := hipUploadByteBuffer(driver, "rocm.hip.VectorAddScaledLaunch", "left", leftPayload, 4)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer left.Close()
+	rightPayload, err := hipFloat32Payload([]float32{4, 3, -0.25, -1})
+	if err != nil {
+		b.Fatal(err)
+	}
+	right, err := hipUploadByteBuffer(driver, "rocm.hip.VectorAddScaledLaunch", "right", rightPayload, 4)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer right.Close()
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.VectorAddScaledLaunch", "output", 16, 4)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer output.Close()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := hipRunVectorAddScaledDeviceKernelOutput(context.Background(), driver, left, right, 2, output); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func TestHIPKernels_VectorScaleLaunchArgs_Good(t *testing.T) {
 	driver := &fakeHIPDriver{available: true}
 	req := hipVectorScaleRequest{Input: []float32{1, -2, 0.5}, Scale: 4}

@@ -1667,41 +1667,51 @@ func hipGemma4Q4DefaultSuppressTokenIDs(model *hipLoadedModel) []int32 {
 	if model == nil || model.tokenText == nil || !isROCmGemma4Architecture(model.modelInfo.Architecture) {
 		return nil
 	}
-	return hipTokenTextIDs(model.tokenText, []string{
-		"<pad>",
-		"<bos>",
-		"<unk>",
-		"<mask>",
-		"<|tool>",
-		"<tool|>",
-		"<|tool_call>",
-		"<tool_call|>",
-		"<|tool_response>",
-		"<tool_response|>",
-		`<|"|>`,
-		"<|think|>",
-		"<|channel>",
-		"<channel|>",
-		"<|turn>",
-		"<|image>",
-		"<|audio>",
-		"<|image|>",
-		"<|audio|>",
-		"<image|>",
-		"<audio|>",
-		"<|video|>",
-	})
+	model.q4ConfigMu.Lock()
+	defer model.q4ConfigMu.Unlock()
+	if len(model.q4Suppress) == 0 {
+		model.q4Suppress = hipTokenTextIDs(model.tokenText, []string{
+			"<pad>",
+			"<bos>",
+			"<unk>",
+			"<mask>",
+			"<|tool>",
+			"<tool|>",
+			"<|tool_call>",
+			"<tool_call|>",
+			"<|tool_response>",
+			"<tool_response|>",
+			`<|"|>`,
+			"<|think|>",
+			"<|channel>",
+			"<channel|>",
+			"<|turn>",
+			"<|image>",
+			"<|audio>",
+			"<|image|>",
+			"<|audio|>",
+			"<image|>",
+			"<audio|>",
+			"<|video|>",
+		})
+	}
+	return model.q4Suppress[:len(model.q4Suppress):len(model.q4Suppress)]
 }
 
 func hipGemma4Q4DefaultStopTokenIDs(model *hipLoadedModel) []int32 {
 	if model == nil || model.tokenText == nil || !isROCmGemma4Architecture(model.modelInfo.Architecture) {
 		return nil
 	}
-	return hipTokenTextIDs(model.tokenText, []string{
-		"<eos>",
-		"<turn|>",
-		"<|tool_response>",
-	})
+	model.q4ConfigMu.Lock()
+	defer model.q4ConfigMu.Unlock()
+	if len(model.q4Stop) == 0 {
+		model.q4Stop = hipTokenTextIDs(model.tokenText, []string{
+			"<eos>",
+			"<turn|>",
+			"<|tool_response>",
+		})
+	}
+	return model.q4Stop[:len(model.q4Stop):len(model.q4Stop)]
 }
 
 func hipGemma4Q4GenerationSuppressTokenIDs(model *hipLoadedModel, stopTokens []int32) []int32 {
@@ -1839,14 +1849,12 @@ func hipTokenTextIDs(decoder *hipTokenTextDecoder, texts []string) []int32 {
 		return nil
 	}
 	ids := make([]int32, 0, len(texts))
-	seen := map[int32]bool{}
 	for _, text := range texts {
 		id, ok := decoder.specialText[text]
-		if !ok || seen[id] {
+		if !ok || hipTokenIsSuppressed(id, ids) {
 			continue
 		}
 		ids = append(ids, id)
-		seen[id] = true
 	}
 	return ids
 }

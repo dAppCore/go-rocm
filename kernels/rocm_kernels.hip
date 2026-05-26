@@ -101,6 +101,8 @@ constexpr uint32_t ROCM_ATTENTION_KV_SOURCE_CONTIGUOUS = 0;
 constexpr uint32_t ROCM_ATTENTION_KV_SOURCE_DEVICE = 1;
 constexpr uint32_t ROCM_VECTOR_ADD_LAUNCH_ARGS_VERSION = 1;
 constexpr uint32_t ROCM_VECTOR_ADD_LAUNCH_ARGS_BYTES = 64;
+constexpr uint32_t ROCM_VECTOR_ADD_SCALED_LAUNCH_ARGS_VERSION = 1;
+constexpr uint32_t ROCM_VECTOR_ADD_SCALED_LAUNCH_ARGS_BYTES = 64;
 constexpr uint32_t ROCM_VECTOR_SCALE_LAUNCH_ARGS_VERSION = 1;
 constexpr uint32_t ROCM_VECTOR_SCALE_LAUNCH_ARGS_BYTES = 64;
 constexpr uint32_t ROCM_PER_LAYER_INPUT_TRANSPOSE_LAUNCH_ARGS_VERSION = 1;
@@ -838,6 +840,21 @@ struct rocm_vector_add_launch_args {
 	uint64_t reserved2;
 };
 
+struct rocm_vector_add_scaled_launch_args {
+	uint32_t version;
+	uint32_t total_bytes;
+	uint64_t left_pointer;
+	uint64_t right_pointer;
+	uint64_t output_pointer;
+	uint32_t count;
+	uint32_t left_bytes;
+	uint32_t right_bytes;
+	uint32_t output_bytes;
+	uint32_t scale_bits;
+	uint32_t reserved;
+	uint64_t reserved2;
+};
+
 struct rocm_vector_scale_launch_args {
 	uint32_t version;
 	uint32_t total_bytes;
@@ -1096,6 +1113,7 @@ static_assert(sizeof(rocm_attention_heads_launch_args) == ROCM_ATTENTION_HEADS_L
 static_assert(sizeof(rocm_attention_heads_batch_causal_launch_args) == ROCM_ATTENTION_HEADS_BATCH_CAUSAL_LAUNCH_ARGS_BYTES, "attention heads batch causal launch ABI drift");
 static_assert(sizeof(rocm_attention_heads_chunked_launch_args) == ROCM_ATTENTION_HEADS_CHUNKED_LAUNCH_ARGS_BYTES, "attention heads chunked launch ABI drift");
 static_assert(sizeof(rocm_vector_add_launch_args) == ROCM_VECTOR_ADD_LAUNCH_ARGS_BYTES, "vector add launch ABI drift");
+static_assert(sizeof(rocm_vector_add_scaled_launch_args) == ROCM_VECTOR_ADD_SCALED_LAUNCH_ARGS_BYTES, "vector add-scaled launch ABI drift");
 static_assert(sizeof(rocm_vector_scale_launch_args) == ROCM_VECTOR_SCALE_LAUNCH_ARGS_BYTES, "vector scale launch ABI drift");
 static_assert(sizeof(rocm_per_layer_input_transpose_launch_args) == ROCM_PER_LAYER_INPUT_TRANSPOSE_LAUNCH_ARGS_BYTES, "per-layer input transpose launch ABI drift");
 static_assert(sizeof(rocm_swiglu_launch_args) == ROCM_SWIGLU_LAUNCH_ARGS_BYTES, "SwiGLU launch ABI drift");
@@ -2456,6 +2474,20 @@ __device__ bool rocm_valid_vector_add_args(const rocm_vector_add_launch_args &ar
 		args.left_bytes == args.count * sizeof(float) &&
 		args.right_bytes == args.count * sizeof(float) &&
 		args.output_bytes == args.count * sizeof(float);
+}
+
+__device__ bool rocm_valid_vector_add_scaled_args(const rocm_vector_add_scaled_launch_args &args)
+{
+	return args.version == ROCM_VECTOR_ADD_SCALED_LAUNCH_ARGS_VERSION &&
+		args.total_bytes == ROCM_VECTOR_ADD_SCALED_LAUNCH_ARGS_BYTES &&
+		args.left_pointer != 0 &&
+		args.right_pointer != 0 &&
+		args.output_pointer != 0 &&
+		args.count > 0 &&
+		args.left_bytes == args.count * sizeof(float) &&
+		args.right_bytes == args.count * sizeof(float) &&
+		args.output_bytes == args.count * sizeof(float) &&
+		isfinite(rocm_float_from_bits(args.scale_bits));
 }
 
 __device__ bool rocm_valid_vector_scale_args(const rocm_vector_scale_launch_args &args)
@@ -5902,6 +5934,25 @@ extern "C" __global__ void rocm_vector_add(const unsigned char *packet)
 	const float *right = reinterpret_cast<const float *>(static_cast<uintptr_t>(args.right_pointer));
 	float *output = reinterpret_cast<float *>(static_cast<uintptr_t>(args.output_pointer));
 	output[index] = left[index] + right[index];
+}
+
+extern "C" __global__ void rocm_vector_add_scaled(const unsigned char *packet)
+{
+	if (packet == nullptr) {
+		return;
+	}
+	const rocm_vector_add_scaled_launch_args &args = *reinterpret_cast<const rocm_vector_add_scaled_launch_args *>(packet);
+	if (!rocm_valid_vector_add_scaled_args(args)) {
+		return;
+	}
+	const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+	if (index >= args.count) {
+		return;
+	}
+	const float *left = reinterpret_cast<const float *>(static_cast<uintptr_t>(args.left_pointer));
+	const float *right = reinterpret_cast<const float *>(static_cast<uintptr_t>(args.right_pointer));
+	float *output = reinterpret_cast<float *>(static_cast<uintptr_t>(args.output_pointer));
+	output[index] = (left[index] + right[index]) * rocm_float_from_bits(args.scale_bits);
 }
 
 extern "C" __global__ void rocm_vector_scale(const unsigned char *packet)

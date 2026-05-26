@@ -48,6 +48,8 @@ const (
 	hipAttentionKVSourceDevice                    uint32 = 1
 	hipVectorAddLaunchArgsVersion                 uint32 = 1
 	hipVectorAddLaunchArgsBytes                          = 64
+	hipVectorAddScaledLaunchArgsVersion           uint32 = 1
+	hipVectorAddScaledLaunchArgsBytes                    = 64
 	hipVectorScaleLaunchArgsVersion               uint32 = 1
 	hipVectorScaleLaunchArgsBytes                        = 64
 	hipSwiGLULaunchArgsVersion                    uint32 = 1
@@ -403,6 +405,17 @@ type hipVectorAddLaunchArgs struct {
 	LeftBytes     uint64
 	RightBytes    uint64
 	OutputBytes   uint64
+}
+
+type hipVectorAddScaledLaunchArgs struct {
+	LeftPointer   nativeDevicePointer
+	RightPointer  nativeDevicePointer
+	OutputPointer nativeDevicePointer
+	Count         int
+	LeftBytes     uint64
+	RightBytes    uint64
+	OutputBytes   uint64
+	Scale         float32
 }
 
 type hipVectorScaleRequest struct {
@@ -2285,6 +2298,43 @@ func (args hipVectorAddLaunchArgs) Binary() ([]byte, error) {
 	binary.LittleEndian.PutUint32(payload[36:], leftBytes)
 	binary.LittleEndian.PutUint32(payload[40:], rightBytes)
 	binary.LittleEndian.PutUint32(payload[44:], outputBytes)
+	return payload, nil
+}
+
+func (args hipVectorAddScaledLaunchArgs) Binary() ([]byte, error) {
+	if args.LeftPointer == 0 || args.RightPointer == 0 || args.OutputPointer == 0 {
+		return nil, core.E("rocm.hip.VectorAddScaledLaunch", "left, right, and output pointers are required", nil)
+	}
+	if math.IsNaN(float64(args.Scale)) || math.IsInf(float64(args.Scale), 0) {
+		return nil, core.E("rocm.hip.VectorAddScaledLaunch", "scale must be finite", nil)
+	}
+	count, err := rocmDeviceKVPositiveUint32("count", args.Count)
+	if err != nil {
+		return nil, err
+	}
+	leftBytes, err := hipAlignedFloat32Bytes("left", args.LeftBytes, count)
+	if err != nil {
+		return nil, core.E("rocm.hip.VectorAddScaledLaunch", "left byte count", err)
+	}
+	rightBytes, err := hipAlignedFloat32Bytes("right", args.RightBytes, count)
+	if err != nil {
+		return nil, core.E("rocm.hip.VectorAddScaledLaunch", "right byte count", err)
+	}
+	outputBytes, err := hipAlignedFloat32Bytes("output", args.OutputBytes, count)
+	if err != nil {
+		return nil, core.E("rocm.hip.VectorAddScaledLaunch", "output byte count", err)
+	}
+	payload := hipBorrowLaunchPacket(hipVectorAddScaledLaunchArgsBytes)
+	binary.LittleEndian.PutUint32(payload[0:], hipVectorAddScaledLaunchArgsVersion)
+	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
+	binary.LittleEndian.PutUint64(payload[8:], uint64(args.LeftPointer))
+	binary.LittleEndian.PutUint64(payload[16:], uint64(args.RightPointer))
+	binary.LittleEndian.PutUint64(payload[24:], uint64(args.OutputPointer))
+	binary.LittleEndian.PutUint32(payload[32:], count)
+	binary.LittleEndian.PutUint32(payload[36:], leftBytes)
+	binary.LittleEndian.PutUint32(payload[40:], rightBytes)
+	binary.LittleEndian.PutUint32(payload[44:], outputBytes)
+	binary.LittleEndian.PutUint32(payload[48:], math.Float32bits(args.Scale))
 	return payload, nil
 }
 

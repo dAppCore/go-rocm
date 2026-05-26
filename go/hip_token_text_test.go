@@ -108,6 +108,32 @@ func TestHIPTokenTextDecoder_Gemma4DefaultSuppressTokenIDs_Good(t *testing.T) {
 	core.AssertFalse(t, hipTokenIsSuppressed(106, explicitStopIDs))
 }
 
+func BenchmarkHIPGemma4Q4GenerationSuppressTokenIDs_CachedExplicitStop(b *testing.B) {
+	decoder := &hipTokenTextDecoder{
+		specialText: map[string]int32{
+			"<pad>":        0,
+			"<bos>":        2,
+			"<|turn>":      105,
+			"<turn|>":      106,
+			"<|tool_call>": 200,
+		},
+	}
+	model := &hipLoadedModel{
+		modelInfo: inference.ModelInfo{Architecture: "gemma4", QuantBits: 4},
+		tokenText: decoder,
+	}
+	if ids := hipGemma4Q4GenerationSuppressTokenIDs(model, []int32{106}); len(ids) == 0 {
+		b.Fatal("initial suppress IDs are empty")
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		ids := hipGemma4Q4GenerationSuppressTokenIDs(model, []int32{106})
+		if !hipTokenIsSuppressed(200, ids) || hipTokenIsSuppressed(106, ids) {
+			b.Fatalf("suppress IDs = %#v", ids)
+		}
+	}
+}
+
 func TestHIPTokenTextDecoder_Bad_MergeAndFallbackEdges(t *testing.T) {
 	stringRanks := hipTokenTextMergeRanks([]byte(`["a b","bad","c d"]`))
 	core.AssertEqual(t, 0, stringRanks["a b"])

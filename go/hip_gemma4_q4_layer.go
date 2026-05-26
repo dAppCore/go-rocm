@@ -2839,29 +2839,15 @@ func hipRunGemma4Q4PerLayerInputConfigDeviceSet(ctx context.Context, driver nati
 	if workspace == nil {
 		defer projectedNorm.Close()
 	}
-	var combined *hipDeviceByteBuffer
-	if workspace != nil {
-		combined, err = workspace.EnsurePerLayerCombined(driver, cfg.ModelProjection.Rows)
-		if err == nil {
-			err = hipRunVectorAddDeviceKernelOutput(ctx, driver, projectedNorm, perLayerEmbeddingScaled, combined)
-		}
-	} else {
-		combined, err = hipRunVectorAddDeviceKernel(ctx, driver, projectedNorm, perLayerEmbeddingScaled)
-	}
-	if err != nil {
-		return nil, err
-	}
-	if workspace == nil {
-		defer combined.Close()
-	}
+	addScale := float32(math.Sqrt(0.5))
 	var scaled *hipDeviceByteBuffer
 	if workspace != nil {
 		scaled, err = workspace.EnsurePerLayerOutput(driver, cfg.ModelProjection.Rows)
 		if err == nil {
-			err = hipRunVectorScaleDeviceKernelOutput(ctx, driver, combined, float32(math.Sqrt(0.5)), scaled)
+			err = hipRunVectorAddScaledDeviceKernelOutput(ctx, driver, projectedNorm, perLayerEmbeddingScaled, addScale, scaled)
 		}
 	} else {
-		scaled, err = hipRunVectorScaleDeviceKernel(ctx, driver, combined, float32(math.Sqrt(0.5)))
+		scaled, err = hipRunVectorAddScaledDeviceKernel(ctx, driver, projectedNorm, perLayerEmbeddingScaled, addScale)
 	}
 	if err != nil {
 		return nil, err

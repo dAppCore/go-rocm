@@ -13967,3 +13967,70 @@ allocs/op, the chapter guard moved from `10425` to `6350` allocs/op, and
 retained-book allocation count moved from `106651` to `100506` allocs/op.
 Retained decode remains noise-flat and below the late-turn target, so the next
 material speed target is still retained long-context attention/projection.
+
+## 2026-05-26: Per-Layer Add-Scale Fusion and Suppress Token Cache
+
+This 2048-token fast-loop pass kept the prior kernel geometry and only removed
+small host/device churn:
+
+```text
+- Add rocm_vector_add_scaled and the Go/fake-driver launch path.
+- Use it in the decode per-layer input precompute so the projected-normalized
+  PLE vector and scaled per-layer embedding write the final scaled buffer
+  directly, removing one intermediate device buffer and one vector launch from
+  that decode path.
+- Cache Gemma4 default suppress/stop token ID lists on the loaded model and
+  remove the per-call map allocation from hipTokenTextIDs.
+```
+
+Rejected during this pass:
+
+```text
+Extending add-scale fusion into batched prefill/residual helpers reduced
+allocations but slowed the chapter-shaped 2048 guard to about 99 tok/s, so that
+part was backed out. Keep the fused path scoped to decode-side per-layer input
+until a prefill-specific benchmark shows a real win.
+```
+
+AX-11 microbenchmarks:
+
+```text
+BenchmarkHIPVectorAddScaledDeviceKernelOutput_Hot-32                  173.7 ns/op  518 B/op  2 allocs/op
+BenchmarkHIPGemma4Q4GenerationSuppressTokenIDs_CachedExplicitStop-32  42.94 ns/op    0 B/op  0 allocs/op
+```
+
+2048-token fast guards:
+
+```text
+2048 text:Hi:
+  18856679894 ns/op, 108.6 tok/s, 7139000 B/op, 4714 allocs/op
+
+2048 generated tokens, context_len=4096, chapter-1 lighthouse prompt:
+  20287692404 ns/op, 100.9 tok/s, 15136304 B/op, 6341 allocs/op
+```
+
+Retained-book acceptance:
+
+```text
+book_wall_s/op             37.79
+book_decode_s/op           33.56
+book_generated_tokens/op    3021
+book_tok/s                 79.94
+book_turn01_tok/s         109.7
+book_turn10_tok/s          69.37
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+stderr_bytes                   0
+B/op                    230528032
+allocs/op                  100445
+output: /tmp/go-rocm-book-10turn-fullcap-addscaled-cache.md
+stderr: /tmp/go-rocm-book-10turn-fullcap-addscaled-cache.err
+```
+
+This is a small allocation/memory cleanup, not a retained decode speed win.
+Compared with the previous state-pool/RMS workspace pass, retained-book
+allocation count moved from `100506` to `100445` allocs/op and byte volume moved
+from `230620784` to `230528032 B/op`; average decode stayed noise-flat around
+`80 tok/s`, and turn 10 stayed around `69 tok/s`. The next material target is
+still the q4 projection/GELU/long-context attention hot path, not vector helper
+fusion.

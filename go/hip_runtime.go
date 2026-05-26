@@ -156,6 +156,8 @@ type hipLoadedModel struct {
 	q4Config    hipGemma4Q4ForwardConfig
 	q4Layers    int
 	q4ConfigOK  bool
+	q4Suppress  []int32
+	q4Stop      []int32
 	createdAt   time.Time
 	closed      bool
 }

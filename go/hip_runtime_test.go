@@ -2319,6 +2319,8 @@ func (driver *fakeHIPDriver) LaunchKernel(config hipKernelLaunchConfig) error {
 		return driver.launchAttentionHeadsBatchCausal(config.Args)
 	case hipKernelNameVectorAdd:
 		return driver.launchVectorAdd(config.Args)
+	case hipKernelNameVectorAddScaled:
+		return driver.launchVectorAddScaled(config.Args)
 	case hipKernelNameVectorScale:
 		return driver.launchVectorScale(config.Args)
 	case hipKernelNamePerLayerInputTranspose:
@@ -5696,6 +5698,58 @@ func (driver *fakeHIPDriver) launchVectorAdd(args []byte) error {
 	out := make([]float32, count)
 	for index := range out {
 		out[index] = left[index] + right[index]
+	}
+	payload, err := hipFloat32Payload(out)
+	if err != nil {
+		return err
+	}
+	copy(outputData[outputOffset:outputOffset+outputBytes], payload)
+	return nil
+}
+
+func (driver *fakeHIPDriver) launchVectorAddScaled(args []byte) error {
+	if len(args) != hipVectorAddScaledLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "vector add-scaled launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipVectorAddScaledLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipVectorAddScaledLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "vector add-scaled launch header mismatch", nil)
+	}
+	leftPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	rightPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[24:]))
+	count := int(binary.LittleEndian.Uint32(args[32:]))
+	leftBytes := int(binary.LittleEndian.Uint32(args[36:]))
+	rightBytes := int(binary.LittleEndian.Uint32(args[40:]))
+	outputBytes := int(binary.LittleEndian.Uint32(args[44:]))
+	scale := math.Float32frombits(binary.LittleEndian.Uint32(args[48:]))
+	if count <= 0 || leftBytes != count*4 || rightBytes != count*4 || outputBytes != count*4 ||
+		math.IsNaN(float64(scale)) || math.IsInf(float64(scale), 0) {
+		return core.E("rocm.hip.FakeLaunch", "vector add-scaled shape metadata mismatch", nil)
+	}
+	leftData, leftOffset, ok := driver.memoryForPointer(leftPointer, leftBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "vector add-scaled left buffer is missing", nil)
+	}
+	rightData, rightOffset, ok := driver.memoryForPointer(rightPointer, rightBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "vector add-scaled right buffer is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "vector add-scaled output buffer is missing", nil)
+	}
+	left, err := hipFloat32PayloadValues(leftData[leftOffset : leftOffset+leftBytes])
+	if err != nil {
+		return err
+	}
+	right, err := hipFloat32PayloadValues(rightData[rightOffset : rightOffset+rightBytes])
+	if err != nil {
+		return err
+	}
+	out := make([]float32, count)
+	for index := range out {
+		out[index] = (left[index] + right[index]) * scale
 	}
 	payload, err := hipFloat32Payload(out)
 	if err != nil {

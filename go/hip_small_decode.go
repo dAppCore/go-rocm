@@ -3004,6 +3004,79 @@ func hipRunVectorAddDeviceKernelOutput(ctx context.Context, driver nativeHIPDriv
 	return nil
 }
 
+func hipRunVectorAddScaledDeviceKernel(ctx context.Context, driver nativeHIPDriver, left, right *hipDeviceByteBuffer, scale float32) (*hipDeviceByteBuffer, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return nil, err
+	}
+	if left == nil || right == nil || left.Pointer() == 0 || right.Pointer() == 0 {
+		return nil, core.E("rocm.hip.VectorAddScaledLaunch", "vector add-scaled device inputs are required", nil)
+	}
+	if left.Count() <= 0 || right.Count() != left.Count() ||
+		left.SizeBytes() != uint64(left.Count()*4) ||
+		right.SizeBytes() != uint64(right.Count()*4) {
+		return nil, core.E("rocm.hip.VectorAddScaledLaunch", "vector add-scaled device input shape mismatch", nil)
+	}
+	if math.IsNaN(float64(scale)) || math.IsInf(float64(scale), 0) {
+		return nil, core.E("rocm.hip.VectorAddScaledLaunch", "scale must be finite", nil)
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.VectorAddScaledLaunch", "vector add-scaled output", left.SizeBytes(), left.Count())
+	if err != nil {
+		return nil, err
+	}
+	success := false
+	defer func() {
+		if !success {
+			_ = output.Close()
+		}
+	}()
+	if err := hipRunVectorAddScaledDeviceKernelOutput(ctx, driver, left, right, scale, output); err != nil {
+		return nil, err
+	}
+	success = true
+	return output, nil
+}
+
+func hipRunVectorAddScaledDeviceKernelOutput(ctx context.Context, driver nativeHIPDriver, left, right *hipDeviceByteBuffer, scale float32, output *hipDeviceByteBuffer) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	if left == nil || right == nil || left.Pointer() == 0 || right.Pointer() == 0 {
+		return core.E("rocm.hip.VectorAddScaledLaunch", "vector add-scaled device inputs are required", nil)
+	}
+	if left.Count() <= 0 || right.Count() != left.Count() ||
+		left.SizeBytes() != uint64(left.Count()*4) ||
+		right.SizeBytes() != uint64(right.Count()*4) {
+		return core.E("rocm.hip.VectorAddScaledLaunch", "vector add-scaled device input shape mismatch", nil)
+	}
+	if output == nil || output.Pointer() == 0 || output.Count() != left.Count() || output.SizeBytes() != left.SizeBytes() {
+		return core.E("rocm.hip.VectorAddScaledLaunch", "vector add-scaled output shape mismatch", nil)
+	}
+	if math.IsNaN(float64(scale)) || math.IsInf(float64(scale), 0) {
+		return core.E("rocm.hip.VectorAddScaledLaunch", "scale must be finite", nil)
+	}
+	launchBytes, err := (hipVectorAddScaledLaunchArgs{
+		LeftPointer:   left.Pointer(),
+		RightPointer:  right.Pointer(),
+		OutputPointer: output.Pointer(),
+		Count:         left.Count(),
+		LeftBytes:     left.SizeBytes(),
+		RightBytes:    right.SizeBytes(),
+		OutputBytes:   output.SizeBytes(),
+		Scale:         scale,
+	}).Binary()
+	if err != nil {
+		return err
+	}
+	config, err := hipOneDimensionalLaunchConfig(hipKernelNameVectorAddScaled, launchBytes, left.Count())
+	if err != nil {
+		return err
+	}
+	if err := hipLaunchKernel(driver, config); err != nil {
+		return err
+	}
+	return nil
+}
+
 func hipRunVectorScaleKernel(ctx context.Context, driver nativeHIPDriver, req hipVectorScaleRequest) ([]float32, error) {
 	if err := hipContextErr(ctx); err != nil {
 		return nil, err

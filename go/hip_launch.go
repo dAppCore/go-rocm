@@ -41,6 +41,7 @@ const (
 	hipKernelNameAttentionHeadsChunkedStage1 = "rocm_attention_heads_chunked_stage1"
 	hipKernelNameAttentionHeadsChunkedStage2 = "rocm_attention_heads_chunked_stage2"
 	hipKernelNameVectorAdd                   = "rocm_vector_add"
+	hipKernelNameVectorAddScaled             = "rocm_vector_add_scaled"
 	hipKernelNameVectorScale                 = "rocm_vector_scale"
 	hipKernelNamePerLayerInputTranspose      = "rocm_per_layer_input_transpose"
 	hipKernelNameSwiGLU                      = "rocm_swiglu"
