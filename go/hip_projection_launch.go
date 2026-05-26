@@ -2299,17 +2299,14 @@ func hipDeviceByteBufferPoolTake(driver nativeHIPDriver, sizeBytes uint64) (nati
 		}
 		pointer := entry.pointer
 		entries[index] = entries[len(entries)-1]
+		entries[len(entries)-1] = hipDeviceByteBufferPoolEntry{}
 		entries = entries[:len(entries)-1]
 		if hipDeviceByteBufferPool.bytes >= sizeBytes {
 			hipDeviceByteBufferPool.bytes -= sizeBytes
 		} else {
 			hipDeviceByteBufferPool.bytes = 0
 		}
-		if len(entries) == 0 {
-			delete(hipDeviceByteBufferPool.entries, sizeBytes)
-		} else {
-			hipDeviceByteBufferPool.entries[sizeBytes] = entries
-		}
+		hipDeviceByteBufferPool.entries[sizeBytes] = entries
 		return pointer, true
 	}
 	return 0, false

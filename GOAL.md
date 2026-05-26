@@ -131,11 +131,24 @@ chapter-10 anchor hits of `3`. After reducing chunked attention to 128-token
 chunks, adding a direct chunked KQ8/VQ4 page path, and making chunked attention
 the default route, the full-cap retained book route completed in `41.96s` wall
 with empty stderr, `3021` generated tokens, no chapter cap hits, and
-chapter-10 anchor hits of `3`. This is the current best production-candidate
-route for the book endpoint, but not the final driver endpoint: later-turn
-decode is still only `61.8 tok/s`, the average is `72.0 tok/s`, and the visible
-output remains repetitive. Keep tuning retained long-context attention and state
-quality until the later turns stay near the `90-100+ tok/s` target.
+chapter-10 anchor hits of `3`. A separate dynamic shared-memory query cache for
+chunked stage 1 then kept the same acceptance shape green at `41.31s` wall,
+`37.08s` decode, `3021` generated tokens, `73.13 tok/s` average, `63.28 tok/s`
+on turn 10, empty stderr, and chapter-10 anchor hits of `3`, while reducing the
+book benchmark allocation volume from `887.5MB/op` to `762.4MB/op`. After
+typed launch-packet pooling and device-buffer pool bucket retention, the same
+route stayed green at `41.29s` wall, `37.04s` decode, `73.17 tok/s` average,
+`63.85 tok/s` on turn 10, empty stderr, and chapter-10 anchor hits of `3`,
+while reducing object churn from `5.18M` to `3.18M allocs/op`; the one-shot book
+`B/op` rose to `1.09GB/op`, so the next allocation pass should target byte
+volume and unique temporary buffer sizes rather than only object count. A typed
+KV page-slice pool then improved the short 2048-token guard from `3.40M` to
+`1.98M allocs/op` overall while keeping decode at `103.5 tok/s`. This is the
+current best production-candidate route for the book endpoint, but not the final
+driver endpoint: later-turn decode is still only `63.9 tok/s`, below the
+`90-100+ tok/s` target, and the visible output remains repetitive. Keep tuning
+retained long-context attention and state quality until the later turns stay
+near the target.
 
 Current decode-scaling status as of 2026-05-26: Gemma4 E2B/E4B context is
 `128k` tokens, not `128` tokens; the context-128 short decode numbers remain a
@@ -149,16 +162,18 @@ max_new_tokens  route                    tok/s   B/op       allocs/op
 1024            chunked-128 device KV     95.23  181.78M     1734305
 2048            chunked-128 device KV     90.53  314.81M     3426653
 4096            non-chunked value-fast    72.45  633.26M     6833550
-4096            chunked-128 device KV     79.92  1.105B      6747133
-2048 text:Hi    default chunked-128      102.8   248.18M     3403515
+4096            chunked-128 query cache   80.33  885.71M     6749654
+2048 text:Hi    query cache + pools      103.5   187.35M     1982073
 ```
 
 The earlier 256-token chunked route was rejected because it fell to `58.24
 tok/s` at 4096 tokens and made the retained book slower. The current 128-token
-chunked route is accepted as the default because it keeps deterministic output,
-keeps the short `text:Hi` 2048-token hot-loop gate above `100 tok/s`, improves
-the chapter-prompt 4096-token diagnostic from `72.45` to `79.92 tok/s`, and
-improves the full-cap retained book route from `60.2s` to `41.8s` wall.
+chunked route is accepted as the default because it keeps the short `text:Hi`
+2048-token hot-loop gate above `100 tok/s`, improves the chapter-prompt
+4096-token diagnostic from `72.45` to `80.33 tok/s`, and improves the full-cap
+retained book route from `60.2s` to `41.3s` wall. Book acceptance is based on
+the retained-state arc gate and measured wall/decode metrics, not byte-identical
+story text across separate generations.
 `GO_ROCM_GEMMA4_Q4_CHUNKED_ATTENTION=0` remains the explicit escape hatch.
 
 Fresh long-decode evidence after removing the invalid 512-token chapter cap:
@@ -168,9 +183,9 @@ completed with empty stderr at `59315672504 ns/op`, `69.05 tok/s`,
 KQ8/VQ4 one-token value fast path for the no-shared-metadata region, the same
 4096-token diagnostic byte-matches the previous greedy output and reports
 `56533521855 ns/op`, `72.45 tok/s`, `633262152 B/op`, and `6833550 allocs/op`.
-With the default chunked-128 route, the same 4096-token diagnostic reports
-`51250824793 ns/op`, `79.92 tok/s`, `1105365704 B/op`, and `6747133 allocs/op`,
-with byte-identical greedy output and empty stderr.
+With the default chunked-128 route plus the separate stage-1 query cache, the
+same 4096-token diagnostic reports `50991794554 ns/op`, `80.33 tok/s`,
+`885711080 B/op`, and `6749654 allocs/op`, with empty stderr.
 `rocprof --stats` on the pre-fast-path shape showed the kernel ceiling clearly:
 `rocm_attention_heads` was `46.48%` of GPU kernel time (`22.203s` over `143325`
 launches), followed by `rocm_mlx_q4_projection` at `17.67%`. After the value

@@ -76,7 +76,14 @@ type nativeHIPKernelLauncher interface {
 	LaunchKernel(config hipKernelLaunchConfig) error
 }
 
+type hipLaunchPacketPool struct {
+	sync.Mutex
+	packets [][]byte
+}
+
 var hipLaunchPacketPools sync.Map
+
+const hipLaunchPacketPoolMaxPerSize = 512
 
 func hipBorrowLaunchPacket(size int) []byte {
 	if size <= 0 {
@@ -84,12 +91,19 @@ func hipBorrowLaunchPacket(size int) []byte {
 	}
 	poolValue, ok := hipLaunchPacketPools.Load(size)
 	if !ok {
-		pool := &sync.Pool{}
+		pool := &hipLaunchPacketPool{}
 		poolValue, _ = hipLaunchPacketPools.LoadOrStore(size, pool)
 	}
-	if packet := poolValue.(*sync.Pool).Get(); packet != nil {
-		return packet.([]byte)[:size]
+	pool := poolValue.(*hipLaunchPacketPool)
+	pool.Lock()
+	if index := len(pool.packets) - 1; index >= 0 {
+		packet := pool.packets[index]
+		pool.packets[index] = nil
+		pool.packets = pool.packets[:index]
+		pool.Unlock()
+		return packet[:size]
 	}
+	pool.Unlock()
 	return make([]byte, size, size+1)
 }
 
@@ -99,7 +113,12 @@ func hipReleaseLaunchPacket(packet []byte) {
 	}
 	clear(packet)
 	if poolValue, ok := hipLaunchPacketPools.Load(len(packet)); ok {
-		poolValue.(*sync.Pool).Put(packet[:0])
+		pool := poolValue.(*hipLaunchPacketPool)
+		pool.Lock()
+		if len(pool.packets) < hipLaunchPacketPoolMaxPerSize {
+			pool.packets = append(pool.packets, packet[:0])
+		}
+		pool.Unlock()
 	}
 }
 

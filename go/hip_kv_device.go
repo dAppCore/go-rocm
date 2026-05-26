@@ -153,7 +153,14 @@ type rocmDeviceKVPageDescriptor struct {
 	ValueEncoding string
 }
 
-var rocmDeviceKVPageSlicePool = sync.Pool{}
+type rocmDeviceKVPageSlicePool struct {
+	sync.Mutex
+	pages [][]rocmDeviceKVPage
+}
+
+var rocmDeviceKVPageSlicePools sync.Map
+
+const rocmDeviceKVPageSlicePoolMaxPerCapacity = 512
 
 type rocmDeviceKVTensorPoolEntry struct {
 	driver  nativeHIPDriver
@@ -184,12 +191,22 @@ func rocmDeviceKVBorrowPageSlice(length, minCapacity int) []rocmDeviceKVPage {
 		minCapacity = length
 	}
 	minCapacity = rocmDeviceKVPageSliceCapacity(minCapacity)
-	if pooled := rocmDeviceKVPageSlicePool.Get(); pooled != nil {
-		pages := pooled.([]rocmDeviceKVPage)
-		if cap(pages) >= minCapacity {
+	if minCapacity >= rocmDeviceKVHotPageCapacity && minCapacity <= rocmDeviceKVPagePoolMaxCapacity {
+		poolValue, ok := rocmDeviceKVPageSlicePools.Load(minCapacity)
+		if !ok {
+			pool := &rocmDeviceKVPageSlicePool{}
+			poolValue, _ = rocmDeviceKVPageSlicePools.LoadOrStore(minCapacity, pool)
+		}
+		pool := poolValue.(*rocmDeviceKVPageSlicePool)
+		pool.Lock()
+		if index := len(pool.pages) - 1; index >= 0 {
+			pages := pool.pages[index]
+			pool.pages[index] = nil
+			pool.pages = pool.pages[:index]
+			pool.Unlock()
 			return pages[:length]
 		}
-		rocmDeviceKVReleasePageSlice(pages)
+		pool.Unlock()
 	}
 	return make([]rocmDeviceKVPage, length, minCapacity)
 }
@@ -222,7 +239,17 @@ func rocmDeviceKVReleasePageSlice(pages []rocmDeviceKVPage) {
 	for index := range full {
 		full[index] = rocmDeviceKVPage{}
 	}
-	rocmDeviceKVPageSlicePool.Put(full[:0])
+	poolValue, ok := rocmDeviceKVPageSlicePools.Load(cap(full))
+	if !ok {
+		pool := &rocmDeviceKVPageSlicePool{}
+		poolValue, _ = rocmDeviceKVPageSlicePools.LoadOrStore(cap(full), pool)
+	}
+	pool := poolValue.(*rocmDeviceKVPageSlicePool)
+	pool.Lock()
+	if len(pool.pages) < rocmDeviceKVPageSlicePoolMaxPerCapacity {
+		pool.pages = append(pool.pages, full[:0])
+	}
+	pool.Unlock()
 }
 
 func rocmDeviceKVTensorPoolEnabled() bool {

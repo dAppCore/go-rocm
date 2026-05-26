@@ -12791,3 +12791,179 @@ attention share from `44.20%` in `rocm_attention_heads` to `34.23%` in
 `rocm_attention_heads_chunked_stage1`. Stage2 is not the bottleneck. The next
 work should focus on stage1 score/value memory access or q4 projection
 throughput.
+
+## 2026-05-26 - Separate query cache for chunked attention stage 1
+
+Kept a safer version of the earlier shared-query experiment. The rejected
+version reused the fixed `scratch` buffer for both cached query values and
+later per-token partial reductions, which made the retained-book arc gate fail.
+The accepted version allocates a separate dynamic shared-memory region after
+the chunk scores, value pointers, and value scales:
+
+```text
+chunk128 dim256 shared_mem: 3072 bytes
+chunk128 dim512 shared_mem: 4096 bytes
+```
+
+That lets the multi-lane KQ8 score path read `query_values[dim]` from shared
+memory without aliasing the reduction scratch buffer. The source/unit gates and
+live direct-token KV hardware equivalence check pass:
+
+```text
+go test ./go -run '^(TestHIPAttentionHeadsChunkedSharedMemBytes_Good|TestHIPAttentionHeadsSharedMemBytes_Good|TestHIPKernelSource_ExportsLaunchABI_Good|TestHIPKernelSource_MLXQ4ProjectionGeometry_Good|TestHIPGemma4Q4ChunkedAttentionEnabled_Good)$' -count=1
+  ok dappco.re/go/rocm 0.004s
+
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100.hsaco
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_HIP_TESTS=1 GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco go test ./go -run '^TestHIPHardwareTransformerKernelSource_Good$/attention-heads-chunked-direct-token-kv' -count=1 -timeout=120s
+  ok dappco.re/go/rocm 0.094s
+```
+
+4096-token chapter-prompt diagnostic, default chunked route:
+
+```text
+50991794554 ns/op
+80.33 tok/s
+885711080 B/op
+6749654 allocs/op
+stderr_bytes: 0
+output: /tmp/go-rocm-greedy-4096-querycache.txt
+```
+
+The prior `chunk128-fastvalid` 4096-token run reported `79.95 tok/s`,
+`792578616 B/op`, and `6745568 allocs/op`. The new path is only a small
+throughput win and not an allocation win on that single-stream diagnostic, so
+the retained workload is the deciding signal.
+
+Full-cap retained book route, greedy/device sampling, acceptance mode:
+
+```text
+book_wall_s/op             41.31
+book_decode_s/op           37.08
+book_generated_tokens/op    3021
+book_tok/s                 73.13
+book_turn01_tok/s         103.8
+book_turn10_tok/s          63.28
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+stderr_bytes                   0
+B/op                    762442592
+allocs/op                 5184953
+output: /tmp/go-rocm-book-10turn-fullcap-greedy-default-chunk128-querycache.md
+```
+
+Compared with the prior accepted `chunk128-fastvalid` retained-book run, this
+keeps the story-arc gate green, slightly improves wall/decode speed, and drops
+book allocation volume from `887524336 B/op` to `762442592 B/op`. Treat that
+allocation/transfer reduction as the primary progress signal; tokens-per-second
+is a guardrail while the retained-state shape is being cleaned up.
+
+Short hot-loop guard remained green:
+
+```text
+2048 text:Hi, default chunked query cache:
+  19810620657 ns/op, 103.4 tok/s, 247755600 B/op, 3403492 allocs/op
+  stderr_bytes=0
+```
+
+Book generation is stochastic/workload-shaped even under separate runs; do not
+require two full-book outputs to be byte-identical. Exact output comparisons are
+only useful for narrow deterministic math smokes with identical prompt/config
+and a known baseline. The book gate is retained-state wall/decode metrics plus
+chapter-10 arc retention.
+
+## 2026-05-26 - Step down launch/device pool object churn
+
+The accepted next target was allocation shape, not immediate tok/s. A
+generation-delta memprofile for `text:Hi`, `GO_ROCM_BENCH_TOKENS=2048`,
+`context_len=128`, using the query-cache route showed the remaining hot object
+churn concentrated in launch packet lifecycle, temporary device buffer
+borrow/return, KV page bookkeeping, and per-launch payload constructors:
+
+```text
+before pool cleanup, 2048 text:Hi:
+  19810620657 ns/op, 103.4 tok/s, 247755600 B/op, 3403492 allocs/op
+
+generation-delta profile highlights:
+  hipReleaseLaunchPacket         ~1.00M objects
+  hipAllocateByteBuffer          ~0.92M objects
+  hipDeviceByteBufferPoolPut     ~0.57M objects
+  hipMLXQ4TripleProjLaunchArgs   ~0.20M objects
+  hipBorrowDeviceByteBuffer      ~0.20M objects
+```
+
+Kept two pool-shape fixes:
+
+- Device buffer pool buckets now retain the empty per-size slice instead of
+  deleting the map entry when a size bucket drains. Repeated same-size
+  take/return no longer reallocates the bucket backing array.
+- Launch packet pooling now uses a small typed per-size stack instead of
+  `sync.Pool` storing `[]byte` through `interface{}` on every release. This
+  removes slice-header/interface churn from the per-launch packet path.
+
+AX-11 benchmarks were added for both hot paths:
+
+```text
+BenchmarkHIPDeviceByteBufferPool_ReusedSize-32  52.03 ns/op  0 B/op  0 allocs/op
+BenchmarkHIPLaunchPacketPool_ReusedSize-32      22.90 ns/op  0 B/op  0 allocs/op
+```
+
+Short generation guard after both pool fixes:
+
+```text
+2048 text:Hi, query cache + pools:
+  19809533432 ns/op, 103.4 tok/s, 188879968 B/op, 2035887 allocs/op
+  stderr_bytes=0
+```
+
+This is the clean step-down pattern to keep chasing: `3.40M -> 2.04M allocs/op`
+with tok/s unchanged and stderr clean. The next similar targets in the
+generation-delta profile are `hipAllocateByteBuffer`, borrowed buffer wrappers,
+KV descriptor/table alias wrappers, and the per-token/per-layer launch arg
+constructors.
+
+Retained-book acceptance after both pool fixes also stayed green:
+
+```text
+book_wall_s/op             41.29
+book_decode_s/op           37.04
+book_generated_tokens/op    3021
+book_tok/s                 73.17
+book_turn01_tok/s         103.8
+book_turn10_tok/s          63.85
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+stderr_bytes                   0
+B/op                   1088869472
+allocs/op                 3180338
+output: /tmp/go-rocm-book-10turn-fullcap-greedy-default-chunk128-querycache-pools.md
+```
+
+Compared with the prior `querycache` book run, object count dropped sharply
+(`5.18M -> 3.18M allocs/op`) while the one-shot book `B/op` rose
+(`762MB -> 1.09GB`). Do not over-interpret one single book allocation sample;
+keep both numbers visible and continue reducing actual temporary byte volume,
+unique buffer sizes, and host-to-device movement.
+
+Typed KV page-slice pooling was then applied to the retained-page bookkeeping
+pool. This mirrors the launch-packet fix: replace `sync.Pool` carrying
+`[]rocmDeviceKVPage` through `interface{}` with a typed per-capacity stack so
+same-capacity borrow/release does not allocate slice headers.
+
+AX-11 benchmark:
+
+```text
+BenchmarkROCmDeviceKVPageSlicePool_ReusedCapacity-32  684.1 ns/op  0 B/op  0 allocs/op
+```
+
+Short generation guard after typed page-slice pooling:
+
+```text
+2048 text:Hi, query cache + typed pools:
+  19794570030 ns/op, 103.5 tok/s, 187353064 B/op, 1982073 allocs/op
+  stderr_bytes=0
+```
+
+This is a smaller step than the launch/device pool pass, but it keeps the same
+direction: `3.40M -> 2.04M -> 1.98M allocs/op` on the short q4 generation guard
+with tok/s flat-to-slightly-up and no stderr.

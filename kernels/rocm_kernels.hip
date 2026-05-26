@@ -5396,8 +5396,10 @@ extern "C" __global__ void rocm_attention_heads_chunked_stage1(const unsigned ch
 	float *scores = reinterpret_cast<float *>(shared_bytes);
 	uint64_t value_pointer_offset = rocm_attention_align_shared_offset(static_cast<uint64_t>(args.chunk_size) * sizeof(float), sizeof(uint64_t));
 	uint64_t value_scale_offset = rocm_attention_align_shared_offset(value_pointer_offset + static_cast<uint64_t>(args.chunk_size) * sizeof(uint64_t), sizeof(float));
+	uint64_t query_cache_offset = rocm_attention_align_shared_offset(value_scale_offset + static_cast<uint64_t>(args.chunk_size) * sizeof(float), sizeof(float));
 	uint64_t *value_pointers = reinterpret_cast<uint64_t *>(shared_bytes + value_pointer_offset);
 	float *value_scales = reinterpret_cast<float *>(shared_bytes + value_scale_offset);
+	float *query_values = reinterpret_cast<float *>(shared_bytes + query_cache_offset);
 	__shared__ float scratch[ROCM_ATTENTION_HEADS_CHUNKED_BLOCK_SIZE];
 	__shared__ float shared_max_score;
 	__shared__ float shared_sum;
@@ -5418,10 +5420,9 @@ extern "C" __global__ void rocm_attention_heads_chunked_stage1(const unsigned ch
 		device_kv_header->mode_code == ROCM_DEVICE_KV_DESCRIPTOR_MODE_KQ8VQ4;
 
 	if (tid < args.dim) {
-		scratch[tid] = query[tid];
+		query_values[tid] = query[tid];
 	}
 	__syncthreads();
-	const float *query_values = scratch;
 
 	float local_max = -FLT_MAX;
 	const uint32_t score_lanes = args.chunk_size <= threads && (threads % args.chunk_size) == 0u
@@ -5452,7 +5453,7 @@ extern "C" __global__ void rocm_attention_heads_chunked_stage1(const unsigned ch
 				const int8_t *key_values = reinterpret_cast<const int8_t *>(key_bytes + sizeof(uint32_t));
 				float quantized_dot = 0.0f;
 				for (uint32_t dim = lane; dim < args.dim; dim += score_lanes) {
-					quantized_dot += query[dim] * static_cast<float>(key_values[key_base + dim]);
+					quantized_dot += query_values[dim] * static_cast<float>(key_values[key_base + dim]);
 				}
 				partial_dot = quantized_dot * key_scale;
 				if (lane == 0u) {

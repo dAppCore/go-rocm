@@ -2035,6 +2035,76 @@ func TestHIPAttentionHeadsSharedMemBytes_Good(t *testing.T) {
 	core.AssertEqual(t, uint32(32000), longDevice)
 }
 
+func TestHIPAttentionHeadsChunkedSharedMemBytes_Good(t *testing.T) {
+	dim256, err := hipAttentionHeadsChunkedSharedMemBytes(128, 256)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, uint32(3072), dim256)
+
+	dim512, err := hipAttentionHeadsChunkedSharedMemBytes(128, 512)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, uint32(4096), dim512)
+
+	_, err = hipAttentionHeadsChunkedSharedMemBytes(0, 512)
+	core.AssertNotEqual(t, nil, err)
+}
+
+func BenchmarkHIPDeviceByteBufferPool_ReusedSize(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	const sizeBytes uint64 = 4096
+	const pointer nativeDevicePointer = 42
+	hipDeviceByteBufferPool.Lock()
+	hipDeviceByteBufferPool.entries = make(map[uint64][]hipDeviceByteBufferPoolEntry)
+	hipDeviceByteBufferPool.bytes = 0
+	hipDeviceByteBufferPool.Unlock()
+	if !hipDeviceByteBufferPoolPut(driver, pointer, sizeBytes) {
+		b.Fatal("seed device buffer pool")
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		got, ok := hipDeviceByteBufferPoolTake(driver, sizeBytes)
+		if !ok || got != pointer {
+			b.Fatalf("take = %d, %v; want %d, true", got, ok, pointer)
+		}
+		if !hipDeviceByteBufferPoolPut(driver, got, sizeBytes) {
+			b.Fatal("return device buffer to pool")
+		}
+	}
+}
+
+func BenchmarkHIPLaunchPacketPool_ReusedSize(b *testing.B) {
+	hipLaunchPacketPools.Range(func(key, _ any) bool {
+		hipLaunchPacketPools.Delete(key)
+		return true
+	})
+	packet := hipBorrowLaunchPacket(hipMLXQ4TripleProjLaunchArgsBytes)
+	hipReleaseLaunchPacket(packet)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		packet = hipBorrowLaunchPacket(hipMLXQ4TripleProjLaunchArgsBytes)
+		if len(packet) != hipMLXQ4TripleProjLaunchArgsBytes {
+			b.Fatalf("packet len = %d, want %d", len(packet), hipMLXQ4TripleProjLaunchArgsBytes)
+		}
+		hipReleaseLaunchPacket(packet)
+	}
+}
+
+func BenchmarkROCmDeviceKVPageSlicePool_ReusedCapacity(b *testing.B) {
+	rocmDeviceKVPageSlicePools.Range(func(key, _ any) bool {
+		rocmDeviceKVPageSlicePools.Delete(key)
+		return true
+	})
+	pages := rocmDeviceKVBorrowPageSlice(32, rocmDeviceKVHotPageCapacity)
+	rocmDeviceKVReleasePageSlice(pages)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		pages = rocmDeviceKVBorrowPageSlice(32, rocmDeviceKVHotPageCapacity)
+		if len(pages) != 32 || cap(pages) != rocmDeviceKVHotPageCapacity {
+			b.Fatalf("page slice len/cap = %d/%d, want 32/%d", len(pages), cap(pages), rocmDeviceKVHotPageCapacity)
+		}
+		rocmDeviceKVReleasePageSlice(pages)
+	}
+}
+
 func assertGemma4Q4DeviceStateMatchesQuantizedHost(t *testing.T, cfg hipGemma4Q4ForwardConfig, hostState, restoredState hipGemma4Q4DecodeState, deviceState *hipGemma4Q4DeviceDecodeState, mode string) {
 	t.Helper()
 	core.AssertEqual(t, len(hostState.Layers), len(restoredState.Layers))

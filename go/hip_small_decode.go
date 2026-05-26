@@ -2068,6 +2068,10 @@ func hipRunAttentionHeadsChunked(ctx context.Context, driver nativeHIPDriver, re
 		return err
 	}
 	stage2LaunchBytes := append([]byte(nil), launchBytes...)
+	sharedMemBytes, err := hipAttentionHeadsChunkedSharedMemBytes(chunkSize, dim)
+	if err != nil {
+		return err
+	}
 	gridX, err := rocmDeviceKVPositiveUint32("attention chunked stage1 blocks", headCount*chunkCount)
 	if err != nil {
 		return err
@@ -2081,7 +2085,7 @@ func hipRunAttentionHeadsChunked(ctx context.Context, driver nativeHIPDriver, re
 		BlockX:         hipAttentionHeadsChunkedBlockSize,
 		BlockY:         1,
 		BlockZ:         1,
-		SharedMemBytes: uint32(chunkSize * (4 + 8 + 4)),
+		SharedMemBytes: sharedMemBytes,
 	}
 	if err := stage1.Validate(); err != nil {
 		return err
@@ -2104,6 +2108,28 @@ func hipRunAttentionHeadsChunked(ctx context.Context, driver nativeHIPDriver, re
 		return err
 	}
 	return hipLaunchKernel(driver, stage2)
+}
+
+func hipAttentionHeadsChunkedSharedMemBytes(chunkSize, dim int) (uint32, error) {
+	chunk, err := rocmDeviceKVPositiveUint32("attention chunked chunk size", chunkSize)
+	if err != nil {
+		return 0, err
+	}
+	width, err := rocmDeviceKVPositiveUint32("attention chunked query dim", dim)
+	if err != nil {
+		return 0, err
+	}
+	bytes := uint64(chunk) * 4
+	bytes = hipAttentionHeadsAlignSharedBytes(bytes, 8)
+	bytes += uint64(chunk) * 8
+	bytes = hipAttentionHeadsAlignSharedBytes(bytes, 4)
+	bytes += uint64(chunk) * 4
+	bytes = hipAttentionHeadsAlignSharedBytes(bytes, 4)
+	bytes += uint64(width) * 4
+	if bytes > math.MaxUint32 {
+		return 0, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "attention chunked shared memory byte count is out of uint32 range", nil)
+	}
+	return uint32(bytes), nil
 }
 
 func hipAttentionHeadsSharedMemBytes(tokenCount int, deviceKV bool) (uint32, error) {
