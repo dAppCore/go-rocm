@@ -2206,6 +2206,80 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_RMSOutputsReused(b *testing.B) {
 	}
 }
 
+func BenchmarkHIPAttentionHeadsChunkedWorkspace_RMSRoPEOutputsReused(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	queryOutput, err := workspace.EnsureRMSRoPEOutput(driver, 2048)
+	if err != nil {
+		b.Fatal(err)
+	}
+	keyOutput, err := workspace.EnsureRMSRoPEOutput(driver, 256)
+	if err != nil {
+		b.Fatal(err)
+	}
+	noScaleOutput, err := workspace.EnsureRMSNoScaleOutput(driver, 256)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if queryOutput.Count() != 2048 || queryOutput.SizeBytes() != 8192 {
+		b.Fatalf("RMS RoPE query output shape = %d/%d, want 2048/8192", queryOutput.Count(), queryOutput.SizeBytes())
+	}
+	if keyOutput.Count() != 256 || keyOutput.SizeBytes() != 1024 {
+		b.Fatalf("RMS RoPE key output shape = %d/%d, want 256/1024", keyOutput.Count(), keyOutput.SizeBytes())
+	}
+	if noScaleOutput.Count() != 256 || noScaleOutput.SizeBytes() != 1024 {
+		b.Fatalf("RMS no-scale output shape = %d/%d, want 256/1024", noScaleOutput.Count(), noScaleOutput.SizeBytes())
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		queryOutput, err = workspace.EnsureRMSRoPEOutput(driver, 2048)
+		if err != nil {
+			b.Fatal(err)
+		}
+		keyOutput, err = workspace.EnsureRMSRoPEOutput(driver, 256)
+		if err != nil {
+			b.Fatal(err)
+		}
+		noScaleOutput, err = workspace.EnsureRMSNoScaleOutput(driver, 256)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if queryOutput.Count() != 2048 || queryOutput.SizeBytes() != 8192 {
+			b.Fatalf("RMS RoPE query output shape = %d/%d, want 2048/8192", queryOutput.Count(), queryOutput.SizeBytes())
+		}
+		if keyOutput.Count() != 256 || keyOutput.SizeBytes() != 1024 {
+			b.Fatalf("RMS RoPE key output shape = %d/%d, want 256/1024", keyOutput.Count(), keyOutput.SizeBytes())
+		}
+		if noScaleOutput.Count() != 256 || noScaleOutput.SizeBytes() != 1024 {
+			b.Fatalf("RMS no-scale output shape = %d/%d, want 256/1024", noScaleOutput.Count(), noScaleOutput.SizeBytes())
+		}
+	}
+}
+
+func BenchmarkHIPAttentionHeadsChunkedWorkspace_IntermediateOutputReused(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	output, err := workspace.EnsureIntermediateOutput(driver, 2304)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if output.Count() != 2304 || output.SizeBytes() != 9216 {
+		b.Fatalf("intermediate output shape = %d/%d, want 2304/9216", output.Count(), output.SizeBytes())
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		output, err = workspace.EnsureIntermediateOutput(driver, 2304)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if output.Count() != 2304 || output.SizeBytes() != 9216 {
+			b.Fatalf("intermediate output shape = %d/%d, want 2304/9216", output.Count(), output.SizeBytes())
+		}
+	}
+}
+
 func BenchmarkHIPGemma4Q4PerLayerInputDeviceSetLayer_View(b *testing.B) {
 	driver := &fakeHIPDriver{available: true}
 	const (

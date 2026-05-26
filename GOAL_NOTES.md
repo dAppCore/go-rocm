@@ -87,6 +87,19 @@
   of `3`, `315658912 B/op`, and `1198795 allocs/op`. The short-guard
   allocation sequence is now
   `3.40M -> 2.04M -> 1.98M -> 1.85M -> 1.78M -> 1.69M -> 1.31M -> 1.23M -> 1.16M -> 0.73M allocs/op`.
+- Reused caller-owned query/key RoPE, value RMS no-scale, and intermediate
+  post-FFN hidden outputs. Added
+  `BenchmarkHIPAttentionHeadsChunkedWorkspace_RMSRoPEOutputsReused` and
+  `BenchmarkHIPAttentionHeadsChunkedWorkspace_IntermediateOutputReused`, which
+  report `8.712 ns/op` and `3.035 ns/op` respectively, both with `0 B/op` and
+  `0 allocs/op`. The live `text:Hi` 2048-token guard now reports
+  `103.3 tok/s`, `66625400 B/op`, and `526667 allocs/op`. The retained
+  10-turn full-cap greedy book route stayed green at `41.23s` wall, `36.99s`
+  decode, `3021` generated tokens, `73.27 tok/s` average, `64.44 tok/s` on
+  turn 10, empty stderr, no cap hits, chapter-10 anchor hits of `3`,
+  `296256152 B/op`, and `895702 allocs/op`. The short-guard allocation sequence
+  is now
+  `3.40M -> 2.04M -> 1.98M -> 1.85M -> 1.78M -> 1.69M -> 1.31M -> 1.23M -> 1.16M -> 0.73M -> 0.53M allocs/op`.
 
 ## 2026-05-26 Full-Chapter Book and Long-Attention Pass
 

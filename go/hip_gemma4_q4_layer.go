@@ -1080,11 +1080,21 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 	}
 	queryNormCfg := hipGemma4Q4RoPENormConfig(cfg.QueryNorm, req.Epsilon, cfg.HeadDim)
 	ropeFrequencyDim, ropeRotaryCount := hipGemma4Q4RoPEKernelDims(cfg)
-	ropeQueryBuffer, err = hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfig(ctx, driver, queryBuffer, queryNormCfg, cfg.QueryHeads, req.Position, ropeBase, ropeFrequencyDim, ropeRotaryCount)
-	if err != nil {
-		return hipGemma4Q4DecoderLayerResult{}, err
+	if req.AttentionWorkspace != nil && req.OmitDebugTensors {
+		ropeQueryBuffer, err = req.AttentionWorkspace.EnsureRMSRoPEOutput(driver, queryBuffer.Count())
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+		if err := hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigOutput(ctx, driver, queryBuffer, queryNormCfg, cfg.QueryHeads, req.Position, ropeBase, ropeFrequencyDim, ropeRotaryCount, ropeQueryBuffer); err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+	} else {
+		ropeQueryBuffer, err = hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfig(ctx, driver, queryBuffer, queryNormCfg, cfg.QueryHeads, req.Position, ropeBase, ropeFrequencyDim, ropeRotaryCount)
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+		defer ropeQueryBuffer.Close()
 	}
-	defer ropeQueryBuffer.Close()
 	var ropeKey []float32
 	var value []float32
 	var ropeKeyDevice *hipDeviceByteBuffer
@@ -1117,11 +1127,21 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 			defer valueBuffer.Close()
 		}
 		useDeviceKVToken := req.OmitHostKV && req.DeviceKVAttention
-		valueDevice, err = hipRunGemma4Q4RMSNormNoScaleDeviceKernel(ctx, driver, valueBuffer, req.Epsilon)
-		if err != nil {
-			return hipGemma4Q4DecoderLayerResult{}, err
+		if req.AttentionWorkspace != nil && req.OmitDebugTensors {
+			valueDevice, err = req.AttentionWorkspace.EnsureRMSNoScaleOutput(driver, valueBuffer.Count())
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			if err := hipRunGemma4Q4RMSNormNoScaleDeviceKernelOutput(ctx, driver, valueBuffer, valueDevice, req.Epsilon); err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+		} else {
+			valueDevice, err = hipRunGemma4Q4RMSNormNoScaleDeviceKernel(ctx, driver, valueBuffer, req.Epsilon)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			defer valueDevice.Close()
 		}
-		defer valueDevice.Close()
 		if !useDeviceKVToken {
 			value, err = hipReadFloat32DeviceOutput(valueDevice, hipGemma4Q4Layer0Operation, "RMSNormNoScale output", valueDevice.Count())
 			if err != nil {
@@ -1129,11 +1149,22 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 			}
 		}
 		keyNormCfg := hipGemma4Q4RoPENormConfig(cfg.KeyNorm, req.Epsilon, cfg.HeadDim)
-		ropeKeyBuffer, err := hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfig(ctx, driver, keyBuffer, keyNormCfg, 1, req.Position, ropeBase, 0, 0)
-		if err != nil {
-			return hipGemma4Q4DecoderLayerResult{}, err
+		ropeKeyBuffer := (*hipDeviceByteBuffer)(nil)
+		if req.AttentionWorkspace != nil && req.OmitDebugTensors {
+			ropeKeyBuffer, err = req.AttentionWorkspace.EnsureRMSRoPEOutput(driver, keyBuffer.Count())
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			if err := hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigOutput(ctx, driver, keyBuffer, keyNormCfg, 1, req.Position, ropeBase, 0, 0, ropeKeyBuffer); err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+		} else {
+			ropeKeyBuffer, err = hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfig(ctx, driver, keyBuffer, keyNormCfg, 1, req.Position, ropeBase, 0, 0)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			defer ropeKeyBuffer.Close()
 		}
-		defer ropeKeyBuffer.Close()
 		ropeKeyDevice = ropeKeyBuffer
 		if !useDeviceKVToken {
 			ropeKey, err = hipReadFloat32DeviceOutput(ropeKeyBuffer, hipGemma4Q4Layer0Operation, "RoPE key output", cfg.HeadDim)
@@ -1162,11 +1193,21 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 			defer valueBuffer.Close()
 		}
 		useDeviceKVToken := req.OmitHostKV && req.DeviceKVAttention
-		valueDevice, err = hipRunGemma4Q4RMSNormNoScaleDeviceKernel(ctx, driver, valueBuffer, req.Epsilon)
-		if err != nil {
-			return hipGemma4Q4DecoderLayerResult{}, err
+		if req.AttentionWorkspace != nil && req.OmitDebugTensors {
+			valueDevice, err = req.AttentionWorkspace.EnsureRMSNoScaleOutput(driver, valueBuffer.Count())
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			if err := hipRunGemma4Q4RMSNormNoScaleDeviceKernelOutput(ctx, driver, valueBuffer, valueDevice, req.Epsilon); err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+		} else {
+			valueDevice, err = hipRunGemma4Q4RMSNormNoScaleDeviceKernel(ctx, driver, valueBuffer, req.Epsilon)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			defer valueDevice.Close()
 		}
-		defer valueDevice.Close()
 		if !useDeviceKVToken {
 			value, err = hipReadFloat32DeviceOutput(valueDevice, hipGemma4Q4Layer0Operation, "RMSNormNoScale output", valueDevice.Count())
 			if err != nil {
@@ -1174,11 +1215,22 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 			}
 		}
 		keyNormCfg := hipGemma4Q4RoPENormConfig(cfg.KeyNorm, req.Epsilon, cfg.HeadDim)
-		ropeKeyBuffer, err := hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfig(ctx, driver, keyBuffer, keyNormCfg, 1, req.Position, ropeBase, cfg.HeadDim, cfg.RoPERotaryDim)
-		if err != nil {
-			return hipGemma4Q4DecoderLayerResult{}, err
+		ropeKeyBuffer := (*hipDeviceByteBuffer)(nil)
+		if req.AttentionWorkspace != nil && req.OmitDebugTensors {
+			ropeKeyBuffer, err = req.AttentionWorkspace.EnsureRMSRoPEOutput(driver, keyBuffer.Count())
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			if err := hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigOutput(ctx, driver, keyBuffer, keyNormCfg, 1, req.Position, ropeBase, cfg.HeadDim, cfg.RoPERotaryDim, ropeKeyBuffer); err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+		} else {
+			ropeKeyBuffer, err = hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfig(ctx, driver, keyBuffer, keyNormCfg, 1, req.Position, ropeBase, cfg.HeadDim, cfg.RoPERotaryDim)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			defer ropeKeyBuffer.Close()
 		}
-		defer ropeKeyBuffer.Close()
 		ropeKeyDevice = ropeKeyBuffer
 		if !useDeviceKVToken {
 			ropeKey, err = hipReadFloat32DeviceOutput(ropeKeyBuffer, hipGemma4Q4Layer0Operation, "RoPE key output", cfg.HeadDim)
@@ -1463,11 +1515,21 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 		postFeedForwardOutputScale = layerScalar
 	}
 	var finalHiddenBuffer *hipDeviceByteBuffer
+	finalHiddenWorkspaceBorrowed := false
 	if req.NextInputNorm != nil && !hasPerLayerInput {
 		finalHiddenBuffer, nextLayerInputBuffer, err = hipRunRMSNormResidualAddNormScaledKernelWithDeviceInputWeightConfig(ctx, driver, mlpOutputBuffer, attentionResidualBuffer, postFeedForwardNormCfg, *req.NextInputNorm, postFeedForwardOutputScale)
 		if err != nil {
 			return hipGemma4Q4DecoderLayerResult{}, err
 		}
+	} else if hasPerLayerInput && req.AttentionWorkspace != nil && req.OmitDebugTensors {
+		finalHiddenBuffer, err = req.AttentionWorkspace.EnsureIntermediateOutput(driver, postFeedForwardNormCfg.Count)
+		if err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+		if err := hipRunRMSNormResidualAddScaledKernelWithDeviceInputWeightConfigOutput(ctx, driver, mlpOutputBuffer, attentionResidualBuffer, postFeedForwardNormCfg, finalHiddenBuffer, postFeedForwardOutputScale); err != nil {
+			return hipGemma4Q4DecoderLayerResult{}, err
+		}
+		finalHiddenWorkspaceBorrowed = true
 	} else {
 		finalHiddenBuffer, err = hipRunRMSNormResidualAddScaledKernelWithDeviceInputWeightConfig(ctx, driver, mlpOutputBuffer, attentionResidualBuffer, postFeedForwardNormCfg, postFeedForwardOutputScale)
 		if err != nil {
@@ -1475,7 +1537,7 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 		}
 	}
 	defer func(buffer *hipDeviceByteBuffer) {
-		if buffer != returnedFinalHiddenBuffer {
+		if buffer != returnedFinalHiddenBuffer && !finalHiddenWorkspaceBorrowed {
 			_ = buffer.Close()
 		}
 	}(finalHiddenBuffer)
@@ -2305,6 +2367,24 @@ func hipRunGemma4Q4RMSNormNoScaleDeviceKernel(ctx context.Context, driver native
 		return nil, err
 	}
 	return output, nil
+}
+
+func hipRunGemma4Q4RMSNormNoScaleDeviceKernelOutput(ctx context.Context, driver nativeHIPDriver, input, output *hipDeviceByteBuffer, epsilon float32) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	if input == nil || input.Pointer() == 0 || input.Count() <= 0 || input.SizeBytes() != uint64(input.Count()*4) {
+		return core.E(hipGemma4Q4Layer0Operation, "RMSNormNoScale device input is required", nil)
+	}
+	if output == nil || output.Pointer() == 0 || output.Count() != input.Count() || output.SizeBytes() != input.SizeBytes() {
+		return core.E(hipGemma4Q4Layer0Operation, "RMSNormNoScale device output shape mismatch", nil)
+	}
+	cfg := hipRMSNormDeviceWeightConfig{
+		Count:          input.Count(),
+		Epsilon:        epsilon,
+		WeightEncoding: hipRMSNormWeightEncodingNone,
+	}
+	return hipRunRMSNormDeviceToDeviceKernel(ctx, driver, input.Pointer(), input.SizeBytes(), output.Pointer(), output.SizeBytes(), cfg)
 }
 
 func hipRunGemma4Q4PerLayerInputForLayer(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4Layer0Config, tokenID int32, hidden []float32, epsilon float32) ([]float32, error) {

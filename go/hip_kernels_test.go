@@ -1670,6 +1670,17 @@ func TestHIPKernels_RMSNormResidualAddLaunchArgs_Good(t *testing.T) {
 	scaledUnitValues, err := hipReadFloat32DeviceOutput(scaledUnitOutput, "rocm.hip.RMSNormResidualAddLaunch", "scaled unit output", 2)
 	core.AssertNoError(t, err)
 	assertFloat32SlicesNear(t, []float32{5.4243, 0.0657}, scaledUnitValues, 0.0001)
+
+	reusedOutput, err := hipAllocateByteBuffer(driver, "rocm.hip.RMSNormResidualAddLaunch", "reused output", 8, 2)
+	core.AssertNoError(t, err)
+	defer reusedOutput.Close()
+	core.AssertNoError(t, hipRunRMSNormResidualAddScaledKernelWithDeviceInputWeightConfigOutput(context.Background(), driver, input, residual, hipRMSNormDeviceWeightConfig{
+		Count:          2,
+		WeightEncoding: hipRMSNormWeightEncodingNone,
+	}, reusedOutput, 0.5))
+	reusedValues, err := hipReadFloat32DeviceOutput(reusedOutput, "rocm.hip.RMSNormResidualAddLaunch", "reused output", 2)
+	core.AssertNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{5.4243, 0.0657}, reusedValues, 0.0001)
 }
 
 func TestHIPKernels_RMSNormResidualAddLaunchArgs_Bad(t *testing.T) {
@@ -1784,6 +1795,14 @@ func TestHIPKernels_RMSNormRoPEHeadsLaunchArgs_Good(t *testing.T) {
 		want = append(want, normalized...)
 	}
 	assertFloat32SlicesNear(t, want, values, 0.0001)
+
+	reusedOutput, err := hipAllocateByteBuffer(driver, "rocm.hip.RMSNormRoPEHeadsLaunch", "reused rms norm rope heads output", input.SizeBytes(), input.Count())
+	core.AssertNoError(t, err)
+	defer reusedOutput.Close()
+	core.AssertNoError(t, hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigOutput(context.Background(), driver, input, cfg, 2, 1, 1, 4, 2, reusedOutput))
+	reusedValues, err := hipReadFloat32DeviceOutput(reusedOutput, "rocm.hip.RMSNormRoPEHeadsLaunch", "reused rms norm rope heads output", len(inputValues))
+	core.AssertNoError(t, err)
+	assertFloat32SlicesNear(t, want, reusedValues, 0.0001)
 
 	neoxCfg := cfg
 	neoxCfg.Flags = hipRMSNormLaunchFlagRoPENeoX

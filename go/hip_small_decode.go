@@ -1075,6 +1075,48 @@ func hipRunRMSNormResidualAddScaledKernelWithDeviceInputWeightConfig(ctx context
 			_ = output.Close()
 		}
 	}()
+	if err := hipRunRMSNormResidualAddScaledKernelWithDeviceInputWeightConfigOutput(ctx, driver, input, residual, cfg, output, outputScale); err != nil {
+		return nil, err
+	}
+	success = true
+	return output, nil
+}
+
+func hipRunRMSNormResidualAddScaledKernelWithDeviceInputWeightConfigOutput(ctx context.Context, driver nativeHIPDriver, input, residual *hipDeviceByteBuffer, cfg hipRMSNormDeviceWeightConfig, output *hipDeviceByteBuffer, outputScale float32) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	if driver == nil || !driver.Available() {
+		return core.E("rocm.hip.RMSNormResidualAddLaunch", "HIP driver is not available", nil)
+	}
+	if input == nil || input.Pointer() == 0 {
+		return core.E("rocm.hip.RMSNormResidualAddLaunch", "RMSNorm input device buffer is required", nil)
+	}
+	if residual == nil || residual.Pointer() == 0 {
+		return core.E("rocm.hip.RMSNormResidualAddLaunch", "residual device buffer is required", nil)
+	}
+	if cfg.WeightEncoding == hipRMSNormWeightEncodingNone {
+		if cfg.Flags != 0 {
+			return core.E("rocm.hip.RMSNormResidualAddLaunch", "unit RMSNorm weight does not support flags", nil)
+		}
+		if cfg.WeightPointer != 0 || cfg.WeightBytes != 0 {
+			return core.E("rocm.hip.RMSNormResidualAddLaunch", "unit RMSNorm weight must not provide a weight pointer", nil)
+		}
+	} else if cfg.WeightPointer == 0 {
+		return core.E("rocm.hip.RMSNormResidualAddLaunch", "RMSNorm weight pointer is required", nil)
+	}
+	if cfg.Count <= 0 {
+		return core.E("rocm.hip.RMSNormResidualAddLaunch", "count must be positive", nil)
+	}
+	if math.IsNaN(float64(outputScale)) || math.IsInf(float64(outputScale), 0) {
+		return core.E("rocm.hip.RMSNormResidualAddLaunch", "output scale must be finite", nil)
+	}
+	if input.Count() != cfg.Count || residual.Count() != cfg.Count || input.SizeBytes() != uint64(cfg.Count*4) || residual.SizeBytes() != uint64(cfg.Count*4) {
+		return core.E("rocm.hip.RMSNormResidualAddLaunch", "RMSNorm residual-add device buffer shape mismatch", nil)
+	}
+	if output == nil || output.Pointer() == 0 || output.Count() != cfg.Count || output.SizeBytes() != uint64(cfg.Count*4) {
+		return core.E("rocm.hip.RMSNormResidualAddLaunch", "RMSNorm residual-add output device buffer shape mismatch", nil)
+	}
 	launchBytes, err := (hipRMSNormResidualAddLaunchArgs{
 		InputPointer:    input.Pointer(),
 		WeightPointer:   cfg.WeightPointer,
@@ -1091,17 +1133,16 @@ func hipRunRMSNormResidualAddScaledKernelWithDeviceInputWeightConfig(ctx context
 		OutputScale:     outputScale,
 	}).Binary()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	config, err := hipSingleBlockLaunchConfig(hipKernelNameRMSNormResidualAdd, launchBytes, 256)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if err := hipLaunchKernel(driver, config); err != nil {
-		return nil, err
+		return err
 	}
-	success = true
-	return output, nil
+	return nil
 }
 
 func hipRunRMSNormResidualAddNormKernelWithDeviceInputWeightConfig(ctx context.Context, driver nativeHIPDriver, input, residual *hipDeviceByteBuffer, residualCfg, normCfg hipRMSNormDeviceWeightConfig) (*hipDeviceByteBuffer, *hipDeviceByteBuffer, error) {
@@ -1372,6 +1413,32 @@ func hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfig(ctx context.Context
 			_ = output.Close()
 		}
 	}()
+	if err := hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigOutput(ctx, driver, input, cfg, headCount, position, base, frequencyDim, rotaryCount, output); err != nil {
+		return nil, err
+	}
+	success = true
+	return output, nil
+}
+
+func hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigOutput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipRMSNormDeviceWeightConfig, headCount int, position int, base float32, frequencyDim int, rotaryCount int, output *hipDeviceByteBuffer) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	if driver == nil || !driver.Available() {
+		return core.E("rocm.hip.RMSNormRoPEHeadsLaunch", "HIP driver is not available", nil)
+	}
+	if input == nil || input.Pointer() == 0 {
+		return core.E("rocm.hip.RMSNormRoPEHeadsLaunch", "RMSNorm RoPE heads input device buffer is required", nil)
+	}
+	if cfg.Count <= 0 || cfg.Count%2 != 0 || headCount <= 0 {
+		return core.E("rocm.hip.RMSNormRoPEHeadsLaunch", "head dim must be positive/even and head count must be positive", nil)
+	}
+	if input.Count() != cfg.Count*headCount || input.SizeBytes() != uint64(input.Count()*4) {
+		return core.E("rocm.hip.RMSNormRoPEHeadsLaunch", "RMSNorm RoPE heads input device buffer shape mismatch", nil)
+	}
+	if output == nil || output.Pointer() == 0 || output.Count() != input.Count() || output.SizeBytes() != input.SizeBytes() {
+		return core.E("rocm.hip.RMSNormRoPEHeadsLaunch", "RMSNorm RoPE heads output device buffer shape mismatch", nil)
+	}
 	launchBytes, err := (hipRMSNormRoPEHeadsLaunchArgs{
 		InputPointer:   input.Pointer(),
 		WeightPointer:  cfg.WeightPointer,
@@ -1390,7 +1457,7 @@ func hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfig(ctx context.Context
 		RotaryCount:    rotaryCount,
 	}).Binary()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	config := hipKernelLaunchConfig{
 		Name:   hipKernelNameRMSNormRoPEHeads,
@@ -1403,13 +1470,12 @@ func hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfig(ctx context.Context
 		BlockZ: 1,
 	}
 	if err := config.Validate(); err != nil {
-		return nil, err
+		return err
 	}
 	if err := hipLaunchKernel(driver, config); err != nil {
-		return nil, err
+		return err
 	}
-	success = true
-	return output, nil
+	return nil
 }
 
 func hipRunRMSNormRoPEHeadsBatchKernelWithDeviceInputWeightConfig(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipRMSNormDeviceWeightConfig, headCount int, batch int, startPosition int, base float32, frequencyDim int, rotaryCount int) (*hipDeviceByteBuffer, error) {
@@ -1987,15 +2053,18 @@ func hipRunAttentionHeadsBatchCausalOutputFromDeviceQueryToDeviceKernel(ctx cont
 }
 
 type hipAttentionHeadsChunkedWorkspace struct {
-	Partial            *hipDeviceByteBuffer
-	Stats              *hipDeviceByteBuffer
-	AttentionOutputs   map[int]*hipDeviceByteBuffer
-	ProjectionOutputs  map[int]*hipDeviceByteBuffer
-	ActivationOutputs  map[int]*hipDeviceByteBuffer
-	RMSResidualOutputs map[int]*hipDeviceByteBuffer
-	RMSNormOutputs     map[int]*hipDeviceByteBuffer
-	partialCap         int
-	statsCap           int
+	Partial             *hipDeviceByteBuffer
+	Stats               *hipDeviceByteBuffer
+	AttentionOutputs    map[int]*hipDeviceByteBuffer
+	ProjectionOutputs   map[int]*hipDeviceByteBuffer
+	ActivationOutputs   map[int]*hipDeviceByteBuffer
+	RMSResidualOutputs  map[int]*hipDeviceByteBuffer
+	RMSNormOutputs      map[int]*hipDeviceByteBuffer
+	RMSRoPEOutputs      map[int]*hipDeviceByteBuffer
+	RMSNoScaleOutputs   map[int]*hipDeviceByteBuffer
+	IntermediateOutputs map[int]*hipDeviceByteBuffer
+	partialCap          int
+	statsCap            int
 }
 
 func (workspace *hipAttentionHeadsChunkedWorkspace) Ensure(driver nativeHIPDriver, headCount, dim, tokenCount, chunkSize int) error {
@@ -2154,6 +2223,78 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureRMSNormOutput(driver n
 	return output, nil
 }
 
+func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureRMSRoPEOutput(driver nativeHIPDriver, count int) (*hipDeviceByteBuffer, error) {
+	if workspace == nil {
+		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "attention workspace is required", nil)
+	}
+	if count <= 0 {
+		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "RMS RoPE output count must be positive", nil)
+	}
+	if workspace.RMSRoPEOutputs == nil {
+		workspace.RMSRoPEOutputs = make(map[int]*hipDeviceByteBuffer, 2)
+	}
+	if output := workspace.RMSRoPEOutputs[count]; output != nil && output.Pointer() != 0 && output.Count() == count && output.SizeBytes() == uint64(count*4) {
+		return output, nil
+	}
+	if err := workspace.RMSRoPEOutputs[count].Close(); err != nil {
+		return nil, err
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.AttentionHeadsChunkedLaunch", "RMS RoPE output", uint64(count*4), count)
+	if err != nil {
+		return nil, err
+	}
+	workspace.RMSRoPEOutputs[count] = output
+	return output, nil
+}
+
+func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureRMSNoScaleOutput(driver nativeHIPDriver, count int) (*hipDeviceByteBuffer, error) {
+	if workspace == nil {
+		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "attention workspace is required", nil)
+	}
+	if count <= 0 {
+		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "RMS no-scale output count must be positive", nil)
+	}
+	if workspace.RMSNoScaleOutputs == nil {
+		workspace.RMSNoScaleOutputs = make(map[int]*hipDeviceByteBuffer, 2)
+	}
+	if output := workspace.RMSNoScaleOutputs[count]; output != nil && output.Pointer() != 0 && output.Count() == count && output.SizeBytes() == uint64(count*4) {
+		return output, nil
+	}
+	if err := workspace.RMSNoScaleOutputs[count].Close(); err != nil {
+		return nil, err
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.AttentionHeadsChunkedLaunch", "RMS no-scale output", uint64(count*4), count)
+	if err != nil {
+		return nil, err
+	}
+	workspace.RMSNoScaleOutputs[count] = output
+	return output, nil
+}
+
+func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureIntermediateOutput(driver nativeHIPDriver, count int) (*hipDeviceByteBuffer, error) {
+	if workspace == nil {
+		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "attention workspace is required", nil)
+	}
+	if count <= 0 {
+		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "intermediate output count must be positive", nil)
+	}
+	if workspace.IntermediateOutputs == nil {
+		workspace.IntermediateOutputs = make(map[int]*hipDeviceByteBuffer, 2)
+	}
+	if output := workspace.IntermediateOutputs[count]; output != nil && output.Pointer() != 0 && output.Count() == count && output.SizeBytes() == uint64(count*4) {
+		return output, nil
+	}
+	if err := workspace.IntermediateOutputs[count].Close(); err != nil {
+		return nil, err
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.AttentionHeadsChunkedLaunch", "intermediate output", uint64(count*4), count)
+	if err != nil {
+		return nil, err
+	}
+	workspace.IntermediateOutputs[count] = output
+	return output, nil
+}
+
 func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 	if workspace == nil {
 		return nil
@@ -2190,11 +2331,29 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 			lastErr = err
 		}
 	}
+	for _, output := range workspace.RMSRoPEOutputs {
+		if err := output.Close(); err != nil {
+			lastErr = err
+		}
+	}
+	for _, output := range workspace.RMSNoScaleOutputs {
+		if err := output.Close(); err != nil {
+			lastErr = err
+		}
+	}
+	for _, output := range workspace.IntermediateOutputs {
+		if err := output.Close(); err != nil {
+			lastErr = err
+		}
+	}
 	workspace.AttentionOutputs = nil
 	workspace.ProjectionOutputs = nil
 	workspace.ActivationOutputs = nil
 	workspace.RMSResidualOutputs = nil
 	workspace.RMSNormOutputs = nil
+	workspace.RMSRoPEOutputs = nil
+	workspace.RMSNoScaleOutputs = nil
+	workspace.IntermediateOutputs = nil
 	return lastErr
 }
 

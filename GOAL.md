@@ -177,9 +177,15 @@ residual-add/norm outputs. The short guard now reports `19849179335 ns/op`,
 stayed green at `40.69s` wall, `36.45s` decode, `3021` generated tokens,
 `74.25 tok/s` average, `65.44 tok/s` on turn 10, empty stderr, no cap hits, and
 chapter-10 anchor hits of `3`, while dropping to `315658912 B/op` and
-`1198795 allocs/op`. This is the current best production-candidate route for
-the book endpoint, but not the final driver endpoint: later-turn decode is
-still only `65.4 tok/s`, below the
+`1198795 allocs/op`. Reusing query/key RoPE, value RMS no-scale, and
+intermediate post-FFN buffers then moved the short guard to `19816510363 ns/op`,
+`103.3 tok/s`, `66625400 B/op`, and `526667 allocs/op`. The retained book route
+stayed green at `41.23s` wall, `36.99s` decode, `3021` generated tokens,
+`73.27 tok/s` average, `64.44 tok/s` on turn 10, empty stderr, no cap hits, and
+chapter-10 anchor hits of `3`, while dropping to `296256152 B/op` and
+`895702 allocs/op`. This is the current best allocation route for the book
+endpoint, but not the final driver endpoint: later-turn decode is still only
+`64.4 tok/s`, below the
 `90-100+ tok/s` target, and the visible output remains repetitive. Keep tuning
 retained long-context attention and state quality until the later turns stay
 near the target.
@@ -197,7 +203,7 @@ max_new_tokens  route                    tok/s   B/op       allocs/op
 2048            chunked-128 device KV     90.53  314.81M     3426653
 4096            non-chunked value-fast    72.45  633.26M     6833550
 4096            chunked-128 query cache   80.33  885.71M     6749654
-2048 text:Hi    workspace batch          103.2    79.73M      731369
+2048 text:Hi    workspace batch          103.3    66.63M      526667
 ```
 
 The earlier 256-token chunked route was rejected because it fell to `58.24
