@@ -5,9 +5,16 @@ package rocm
 import (
 	// Note: strconv: numeric parsing of sysfs values; no core.ParseInt
 	"strconv"
+	"sync"
 
 	core "dappco.re/go"
 )
+
+var rocmVRAMInfoSysfsCache = struct {
+	sync.Mutex
+	usedPath string
+	total    uint64
+}{}
 
 //	info, err := GetVRAMInfo()
 //	fmt.Printf("%d MiB free\n", info.Free>>20)
@@ -22,6 +29,15 @@ func GetVRAMInfo() (
 	VRAMInfo,
 	error,
 ) {
+	rocmVRAMInfoSysfsCache.Lock()
+	if rocmVRAMInfoSysfsCache.usedPath != "" && rocmVRAMInfoSysfsCache.total > 0 {
+		usedPath := rocmVRAMInfoSysfsCache.usedPath
+		total := rocmVRAMInfoSysfsCache.total
+		rocmVRAMInfoSysfsCache.Unlock()
+		return readCachedVRAMInfo(usedPath, total)
+	}
+	rocmVRAMInfoSysfsCache.Unlock()
+
 	cards := core.PathGlob("/sys/class/drm/card[0-9]*/device/mem_info_vram_total")
 	if len(cards) == 0 {
 		return VRAMInfo{}, core.E("rocm.GetVRAMInfo", "no GPU VRAM info found in sysfs", nil)
@@ -45,21 +61,47 @@ func GetVRAMInfo() (
 		return VRAMInfo{}, core.E("rocm.GetVRAMInfo", "no readable VRAM sysfs entries", nil)
 	}
 
-	used, err := readSysfsUint64(core.PathJoin(bestDir, "mem_info_vram_used"))
+	usedPath := core.PathJoin(bestDir, "mem_info_vram_used")
+	used, err := readSysfsUint64(usedPath)
 	if err != nil {
 		return VRAMInfo{}, core.E("rocm.GetVRAMInfo", "read vram used", err)
 	}
 
+	rocmVRAMInfoSysfsCache.Lock()
+	if rocmVRAMInfoSysfsCache.usedPath == "" {
+		rocmVRAMInfoSysfsCache.usedPath = usedPath
+		rocmVRAMInfoSysfsCache.total = bestTotal
+	}
+	rocmVRAMInfoSysfsCache.Unlock()
+
+	return vramInfoFromTotalUsed(bestTotal, used), nil
+}
+
+func readCachedVRAMInfo(usedPath string, total uint64) (VRAMInfo, error) {
+	used, err := readSysfsUint64(usedPath)
+	if err != nil {
+		rocmVRAMInfoSysfsCache.Lock()
+		if rocmVRAMInfoSysfsCache.usedPath == usedPath {
+			rocmVRAMInfoSysfsCache.usedPath = ""
+			rocmVRAMInfoSysfsCache.total = 0
+		}
+		rocmVRAMInfoSysfsCache.Unlock()
+		return VRAMInfo{}, core.E("rocm.GetVRAMInfo", "read cached vram used", err)
+	}
+	return vramInfoFromTotalUsed(total, used), nil
+}
+
+func vramInfoFromTotalUsed(total, used uint64) VRAMInfo {
 	free := uint64(0)
-	if bestTotal > used {
-		free = bestTotal - used
+	if total > used {
+		free = total - used
 	}
 
 	return VRAMInfo{
-		Total: bestTotal,
+		Total: total,
 		Used:  used,
 		Free:  free,
-	}, nil
+	}
 }
 
 func readSysfsUint64(path string) (

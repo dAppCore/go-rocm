@@ -1809,6 +1809,7 @@ func (m *rocmModel) recordMetricsDurations(promptTokens, generatedTokens int, pr
 	if decode < 0 {
 		decode = 0
 	}
+	memoryBytes := nativePeakMemoryBytes()
 	metrics := inference.GenerateMetrics{
 		PromptTokens:        promptTokens,
 		GeneratedTokens:     generatedTokens,
@@ -1817,8 +1818,8 @@ func (m *rocmModel) recordMetricsDurations(promptTokens, generatedTokens int, pr
 		TotalDuration:       prefill + decode,
 		PrefillTokensPerSec: tokensPerSecond(promptTokens, prefill),
 		DecodeTokensPerSec:  tokensPerSecond(generatedTokens, decode),
-		PeakMemoryBytes:     nativePeakMemoryBytes(),
-		ActiveMemoryBytes:   nativePeakMemoryBytes(),
+		PeakMemoryBytes:     memoryBytes,
+		ActiveMemoryBytes:   memoryBytes,
 	}
 	if m.native != nil {
 		nativeMetrics := m.native.Metrics()

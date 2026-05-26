@@ -322,8 +322,16 @@ chapter-shaped prompt. The retained book route stayed green at `37.65s` wall,
 `33.43s` decode, `3021` generated tokens, `80.24 tok/s` average,
 `69.97 tok/s` on turn 10, empty stderr, no cap hits, and chapter-10 anchor hits
 of `3`, with `230971104 B/op` and `109680 allocs/op`.
+Collapsing duplicate VRAM metric reads and caching the selected sysfs VRAM path
+then trimmed the 2048-token benchmark accounting path to `108.9 tok/s`,
+`7339968 B/op`, and `10853 allocs/op` for `text:Hi`, and `101.4 tok/s`,
+`15369792 B/op`, and `12555 allocs/op` for the chapter-shaped prompt. The
+retained book route stayed green at `37.71s` wall, `33.49s` decode, `3021`
+generated tokens, `80.11 tok/s` average, `69.90 tok/s` on turn 10, empty
+stderr, no cap hits, and chapter-10 anchor hits of `3`, with `230972112 B/op`
+and `109684 allocs/op`.
 This is still not the final driver endpoint: later-turn decode is only
-`69.97 tok/s`, below the `90-100+ tok/s` target, and the visible output remains
+`69.90 tok/s`, below the `90-100+ tok/s` target, and the visible output remains
 repetitive. Keep tuning retained long-context attention and state quality until
 the later turns stay near the target.
 
@@ -356,6 +364,8 @@ max_new_tokens  route                    tok/s   B/op       allocs/op
 2048 chapter    greedy-token embedding 101.5    15.93M       71533
 2048 text:Hi    cgo/free-list cleanup  109.0     7.39M       11646
 2048 chapter    cgo/free-list cleanup  101.4    15.39M       13344
+2048 text:Hi    VRAM metrics cache     108.9     7.34M       10853
+2048 chapter    VRAM metrics cache     101.4    15.37M       12555
 ```
 
 The earlier 256-token chunked route was rejected because it fell to `58.24

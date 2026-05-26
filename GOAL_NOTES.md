@@ -1,5 +1,21 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-26 VRAM Metrics Cache Pass
+
+- Collapsed `recordMetricsDurations` from two `nativePeakMemoryBytes` calls to
+  one and cached the selected sysfs VRAM `used` path/total after the first
+  `GetVRAMInfo` scan. Later metric reads no longer glob every DRM card.
+- Live RX 7800 XT 2048-token guards after this batch:
+  short `text:Hi` reports `108.9 tok/s`, `7339968 B/op`, and
+  `10853 allocs/op`; chapter-shaped prompt reports `101.4 tok/s`,
+  `15369792 B/op`, and `12555 allocs/op`.
+- Retained 10-turn full-cap greedy book acceptance stayed green:
+  `37.71s` wall, `33.49s` decode, `3021` generated tokens, `80.11 tok/s`
+  average, `69.90 tok/s` on turn 10, empty stderr, no cap hits, chapter-10
+  anchor hits of `3`, `230972112 B/op`, and `109684 allocs/op`.
+- This is accepted as a small benchmark/accounting allocation cleanup. It does
+  not move the retained late-turn decode target.
+
 ## 2026-05-26 CGo Result-Return HIP Bridge Pass
 
 - Kept the 2048-token fast loop as the edit gate and promoted only after the
