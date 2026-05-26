@@ -1086,6 +1086,9 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 		var current hipGemma4Q4ForwardResult
 		haveCurrent := false
 		var history []int32
+		if hostSampling {
+			history = make([]int32, 0, generate.MaxTokens)
+		}
 		useBatchedPrefill := hipGemma4Q4CanUseBatchedGeneratePrefill(cfg) && !hostSampling
 		for _, ubatch := range prefillPlan.Batches {
 			if !useBatchedPrefill {
@@ -1205,7 +1208,9 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 			if !yield(token) {
 				return
 			}
-			history = append(history, tokenID)
+			if hostSampling {
+				history = append(history, tokenID)
+			}
 			if generated == generate.MaxTokens-1 {
 				return
 			}

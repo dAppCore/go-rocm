@@ -2377,6 +2377,103 @@ func BenchmarkHIPGemma4Q4PerLayerInputDeviceSetLayer_View(b *testing.B) {
 	}
 }
 
+func BenchmarkHIPGemma4Q4SharedKVSourceByLayer_Cached(b *testing.B) {
+	const layerCount = 32
+	layers := make([]hipGemma4Q4Layer0Config, layerCount)
+	for index := range layers {
+		if index%6 == 5 {
+			layers[index].LayerType = "full_attention"
+			layers[index].HeadDim = 256
+		} else {
+			layers[index].LayerType = "sliding_attention"
+			layers[index].HeadDim = 256
+		}
+	}
+	cfg := hipGemma4Q4ForwardConfig{
+		Layers:         layers,
+		KVSharedLayers: hipGemma4Q4DefaultKVSharedLayers(layerCount),
+	}
+	cfg.SharedKVSources = hipGemma4Q4BuildSharedKVSourceByLayer(cfg)
+	if got := len(hipGemma4Q4SharedKVSourceByLayer(cfg)); got != layerCount {
+		b.Fatalf("shared KV source count = %d, want %d", got, layerCount)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		sources := hipGemma4Q4SharedKVSourceByLayer(cfg)
+		if len(sources) != layerCount || sources[layerCount-1] < 0 {
+			b.Fatalf("shared KV sources = %#v", sources)
+		}
+	}
+}
+
+func BenchmarkHIPGemma4Q4DecoderLayerRequest_NextInputNormValue(b *testing.B) {
+	req := hipGemma4Q4DecoderLayerRequest{
+		NextInputNormValue: hipRMSNormDeviceWeightConfig{
+			WeightPointer:  0x1000,
+			WeightBytes:    4608,
+			Count:          2304,
+			WeightEncoding: hipRMSNormWeightEncodingBF16,
+			Flags:          hipRMSNormLaunchFlagAddUnitWeight,
+			Epsilon:        1e-6,
+		},
+		HasNextInputNorm: true,
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		cfg, ok := req.nextInputNormConfig()
+		if !ok || cfg.Count != 2304 || cfg.WeightPointer == 0 {
+			b.Fatalf("next input norm = %#v, %v", cfg, ok)
+		}
+	}
+}
+
+func BenchmarkHIPGemma4Q4DeviceLayerKVStateValueHandoff(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	cache := &rocmDeviceKVCache{
+		driver:     driver,
+		mode:       rocmKVCacheModeKQ8VQ4,
+		blockSize:  1,
+		tokenCount: 1,
+		pages: []rocmDeviceKVPage{{
+			tokenStart: 0,
+			tokenCount: 1,
+			keyWidth:   4,
+			valueWidth: 4,
+			key:        rocmDeviceKVTensor{pointer: 0x1000, sizeBytes: 4, encoding: rocmKVEncodingQ8},
+			value:      rocmDeviceKVTensor{pointer: 0x2000, sizeBytes: 2, encoding: rocmKVEncodingQ4},
+			owned:      true,
+		}},
+	}
+	table := &rocmDeviceKVDescriptorTable{
+		driver:    driver,
+		pointer:   0x3000,
+		sizeBytes: rocmDeviceKVDescriptorHeaderBytes + rocmDeviceKVDescriptorPageBytes,
+		version:   rocmDeviceKVDescriptorVersion,
+		pageCount: 1,
+	}
+	next := &hipGemma4Q4DeviceDecodeState{layers: make([]hipGemma4Q4DeviceLayerKVState, 0, 1)}
+	result := hipGemma4Q4DecoderLayerResult{
+		DeviceLayer: hipGemma4Q4DeviceLayerKVState{
+			cache:                   cache,
+			descriptorTable:         table,
+			borrowedCache:           true,
+			borrowedDescriptorTable: true,
+		},
+		DeviceLayerValid: true,
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		next.layers = next.layers[:0]
+		if !result.DeviceLayerValid {
+			b.Fatal("device layer was not returned")
+		}
+		next.layers = append(next.layers, result.DeviceLayer)
+		if len(next.layers) != 1 || next.layers[0].cache != cache {
+			b.Fatalf("handoff layers = %#v", next.layers)
+		}
+	}
+}
+
 func BenchmarkHIPGemma4Q4DeviceLayerKVStateClose_Borrowed(b *testing.B) {
 	driver := &fakeHIPDriver{available: true}
 	cache := &rocmDeviceKVCache{

@@ -667,6 +667,9 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 	decodeStart := time.Now()
 	var text strings.Builder
 	generatedCount := 0
+	if hostSampling {
+		history = make([]int32, 0, generate.MaxTokens)
+	}
 	for generated := 0; generated < generate.MaxTokens; generated++ {
 		if err := hipContextErr(ctx); err != nil {
 			return inferenceBenchmarkGemma4Q4RetainedTurn{}, err
@@ -676,7 +679,9 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 			break
 		}
 		text.WriteString(hipGeneratedTokenText(session.model, tokenID))
-		history = append(history, tokenID)
+		if hostSampling {
+			history = append(history, tokenID)
+		}
 		generatedCount++
 		request := hipGemma4Q4ForwardRequest{
 			TokenID:            tokenID,

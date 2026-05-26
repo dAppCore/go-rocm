@@ -208,9 +208,19 @@ to `19785395783 ns/op`, `103.5 tok/s`, `49536176 B/op`, and `255531 allocs/op`.
 The retained book route stayed green at `41.22s` wall, `36.98s` decode,
 `3021` generated tokens, `73.28 tok/s` average, `64.26 tok/s` on turn 10,
 empty stderr, no cap hits, and chapter-10 anchor hits of `3`, while dropping to
-`271027784 B/op` and `492943 allocs/op`. This is the current best allocation
+`271027784 B/op` and `492943 allocs/op`. Passing retained device KV layer state
+by value, caching the shared-KV source table on the loaded forward config, using
+a value-backed next-input norm request, and only keeping generated-token history
+for host sampling then moved the short guard to `19775658852 ns/op`,
+`103.6 tok/s`, `36315928 B/op`, and `110184 allocs/op`. The chapter-shaped
+2048-token fast guard at `context_len=4096` stayed above the working threshold at
+`22207829048 ns/op`, `92.22 tok/s`, `60786376 B/op`, and `125647 allocs/op`.
+The retained book route stayed green at `40.60s` wall, `36.36s` decode, `3021`
+generated tokens, `74.41 tok/s` average, `65.31 tok/s` on turn 10, empty stderr,
+no cap hits, and chapter-10 anchor hits of `3`, while dropping to
+`251419160 B/op` and `277596 allocs/op`. This is the current best allocation
 route for the book endpoint, but not the final driver endpoint: later-turn
-decode is still only `64.3 tok/s`, below the
+decode is still only `65.3 tok/s`, below the
 `90-100+ tok/s` target, and the visible output remains repetitive. Keep tuning
 retained long-context attention and state quality until the later turns stay
 near the target.
@@ -230,6 +240,8 @@ max_new_tokens  route                    tok/s   B/op       allocs/op
 4096            chunked-128 query cache   80.33  885.71M     6749654
 2048 text:Hi    descriptor wrapper pool  103.4    50.91M      281087
 2048 text:Hi    token/PLE workspace      103.5    49.54M      255531
+2048 text:Hi    state handoff cleanup    103.6    36.32M      110184
+2048 chapter    state handoff cleanup     92.22   60.79M      125647
 ```
 
 The earlier 256-token chunked route was rejected because it fell to `58.24

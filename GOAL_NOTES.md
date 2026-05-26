@@ -13243,3 +13243,123 @@ This confirms the 2048-token fast loop is still useful for finding allocation
 and transfer cleanup. It did not change the retained long-context decode
 ceiling: turn 10 stayed near `64 tok/s`, so the next speed work still needs to
 target `rocm_attention_heads_chunked_stage1` and `rocm_mlx_q4_projection`.
+
+## 2026-05-26: Rejected Paired Chunked Value Reduction
+
+Tested a `rocm_attention_heads_chunked_stage1` value-phase variant that added a
+second static shared scratch buffer and reduced the even/odd q4 value dimensions
+after one barrier instead of two separate scratch passes. The idea was to cut
+barrier traffic in the chunked attention hot path without changing descriptor
+layout or q4 math.
+
+The source compiled cleanly with:
+
+```text
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100.hsaco
+```
+
+Focused source tests passed:
+
+```text
+go test ./go -run '^(TestHIPKernelSource|TestHIPAttentionHeadsChunked|TestHIPGemma4Q4)' -count=1
+```
+
+Short guard was neutral/slightly lower:
+
+```text
+2048 text:Hi, paired chunked value reduction:
+  19797338892 ns/op, 103.4 tok/s, 49527632 B/op, 255528 allocs/op
+  stderr_bytes=0
+```
+
+Retained-book acceptance stayed correct but regressed the long-context curve:
+
+```text
+book_wall_s/op             41.31
+book_decode_s/op           37.09
+book_generated_tokens/op    3021
+book_tok/s                 73.13
+book_turn01_tok/s         103.9
+book_turn10_tok/s          63.32
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+stderr_bytes                   0
+B/op                    271019720
+allocs/op                  492945
+output: /tmp/go-rocm-book-10turn-fullcap-greedy-stage1-paired.md
+```
+
+Rejected and reverted. The extra shared memory likely reduced occupancy or
+otherwise outweighed the saved barriers. Keep the original two-pass value
+reduction until a larger stage1 layout or retained KV arena change can move the
+real `64 tok/s` turn-10 ceiling.
+
+## 2026-05-26: Retained State Handoff Allocation Cut
+
+The next 2048-token fast-loop batch removed two hot-path heap escapes without
+changing kernel math: retained `hipGemma4Q4DeviceLayerKVState` now crosses the
+decoder-layer boundary by value instead of via a per-layer heap pointer, and the
+next-input norm request uses a value-backed field on the generated path while
+keeping the old pointer field for compatibility. The loaded Gemma4 q4 forward
+config also caches the shared-KV source table, and generated-token history is
+only grown when host sampling/repeat penalty actually needs it.
+
+AX-11 microbenchmarks added for the hot handoff surfaces:
+
+```text
+BenchmarkHIPGemma4Q4SharedKVSourceByLayer_Cached-32            1.101 ns/op  0 B/op  0 allocs/op
+BenchmarkHIPGemma4Q4DecoderLayerRequest_NextInputNormValue-32  9.059 ns/op  0 B/op  0 allocs/op
+BenchmarkHIPGemma4Q4DeviceLayerKVStateValueHandoff-32          2.653 ns/op  0 B/op  0 allocs/op
+```
+
+Short generation guard after the retained-state handoff cleanup:
+
+```text
+2048 text:Hi:
+  19775658852 ns/op, 103.6 tok/s, 36315928 B/op, 110184 allocs/op
+  stderr_bytes=0
+```
+
+Chapter-shaped fast guard:
+
+```text
+2048 generated tokens, context_len=4096, chapter-1 lighthouse prompt:
+  22207829048 ns/op, 92.22 tok/s, 60786376 B/op, 125647 allocs/op
+  stderr_bytes=0
+```
+
+Retained-book acceptance after the cleanup:
+
+```text
+book_wall_s/op             40.60
+book_decode_s/op           36.36
+book_generated_tokens/op    3021
+book_tok/s                 74.41
+book_turn01_tok/s         103.8
+book_turn10_tok/s          65.31
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+stderr_bytes                   0
+B/op                    251419160
+allocs/op                  277596
+output: /tmp/go-rocm-book-10turn-fullcap-greedy-state-handoff.md
+```
+
+The allocation step-down is now:
+
+```text
+3.40M -> 2.04M -> 1.98M -> 1.85M -> 1.78M -> 1.69M -> 1.31M
+  -> 1.23M -> 1.16M -> 0.73M -> 0.53M -> 0.46M -> 0.31M
+  -> 0.28M -> 0.26M -> 0.11M allocs/op
+```
+
+An env-only probe of `GO_ROCM_ENABLE_KV_TENSOR_POOL=1` did not justify changing
+defaults: it reported `19731904451 ns/op`, `103.8 tok/s`, `39973408 B/op`, and
+`129414 allocs/op`, so throughput was indistinguishable while allocation
+regressed. Keep the KV tensor pool opt-in until a scoped retained-KV arena can
+own and release those pages explicitly.
+
+This is a clean production-path allocation win, not the long-context decode
+breakthrough. Turn 10 improved only to `65.31 tok/s`; the next real speed target
+remains `rocm_attention_heads_chunked_stage1` and q4 projection at retained
+context.
