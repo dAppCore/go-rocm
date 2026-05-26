@@ -229,8 +229,18 @@ the greedy readback payload then moved the short guard to `19811032696 ns/op`,
 `41.23s` wall, `36.97s` decode, `3021` generated tokens, `73.27 tok/s` average,
 `64.47 tok/s` on turn 10, empty stderr, no cap hits, and chapter-10 anchor hits
 of `3`, while dropping to `232519696 B/op` and `227862 allocs/op`. This is the
-current best allocation route for the book endpoint, but not the final driver
-endpoint: later-turn decode is still only `64.5 tok/s`, below the
+current best allocation route for the book endpoint. A follow-up 2048-token
+fast-loop batch then cached hot HIP C bridge symbols, snapshotted the probe sink
+once per public token stream, matched the KV page-slice pool floor to Gemma4's
+512-token local window, and added source guards for q4 projection/GELU row
+geometry. The short guard now reports `19763118653 ns/op`, `103.6 tok/s`,
+`17650384 B/op`, and `72292 allocs/op`; the chapter-shaped 2048-token guard
+reports `22546790165 ns/op`, `90.83 tok/s`, `44646464 B/op`, and
+`87792 allocs/op`. The retained book route stayed green at `41.29s` wall,
+`37.00s` decode, `3021` generated tokens, `73.17 tok/s` average,
+`64.50 tok/s` on turn 10, empty stderr, no cap hits, and chapter-10 anchor hits
+of `3`, with `232426568 B/op` and `227955 allocs/op`. This is still not the
+final driver endpoint: later-turn decode is only `64.5 tok/s`, below the
 `90-100+ tok/s` target, and the visible output remains repetitive. Keep tuning
 retained long-context attention and state quality until the later turns stay
 near the target.

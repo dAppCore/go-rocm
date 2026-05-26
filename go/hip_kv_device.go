@@ -36,7 +36,7 @@ const (
 )
 
 const (
-	rocmDeviceKVHotPageCapacity        = 2048
+	rocmDeviceKVHotPageCapacity        = 512
 	rocmDeviceKVPagePoolMaxCapacity    = 128 * 1024
 	rocmDeviceKVDescriptorTablePoolMax = 4096
 	rocmGemma4Q4DeviceKVBlockSize      = 1

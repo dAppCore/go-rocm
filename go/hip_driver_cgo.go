@@ -64,7 +64,14 @@ static void* core_rocm_hip_symbol(const char* name) {
 }
 
 static int core_rocm_hip_device_count(int* count) {
-	hipGetDeviceCount_t fn = (hipGetDeviceCount_t)core_rocm_hip_symbol("hipGetDeviceCount");
+	static hipGetDeviceCount_t cached = NULL;
+	hipGetDeviceCount_t fn = cached;
+	if (fn == NULL) {
+		fn = (hipGetDeviceCount_t)core_rocm_hip_symbol("hipGetDeviceCount");
+		if (fn != NULL) {
+			cached = fn;
+		}
+	}
 	if (fn == NULL) {
 		return -100001;
 	}
@@ -72,7 +79,14 @@ static int core_rocm_hip_device_count(int* count) {
 }
 
 static int core_rocm_hip_set_device(int device) {
-	hipSetDevice_t fn = (hipSetDevice_t)core_rocm_hip_symbol("hipSetDevice");
+	static hipSetDevice_t cached = NULL;
+	hipSetDevice_t fn = cached;
+	if (fn == NULL) {
+		fn = (hipSetDevice_t)core_rocm_hip_symbol("hipSetDevice");
+		if (fn != NULL) {
+			cached = fn;
+		}
+	}
 	if (fn == NULL) {
 		return -100002;
 	}
@@ -80,7 +94,14 @@ static int core_rocm_hip_set_device(int device) {
 }
 
 static int core_rocm_hip_mem_info(size_t* free_bytes, size_t* total_bytes) {
-	hipMemGetInfo_t fn = (hipMemGetInfo_t)core_rocm_hip_symbol("hipMemGetInfo");
+	static hipMemGetInfo_t cached = NULL;
+	hipMemGetInfo_t fn = cached;
+	if (fn == NULL) {
+		fn = (hipMemGetInfo_t)core_rocm_hip_symbol("hipMemGetInfo");
+		if (fn != NULL) {
+			cached = fn;
+		}
+	}
 	if (fn == NULL) {
 		return -100003;
 	}
@@ -88,7 +109,14 @@ static int core_rocm_hip_mem_info(size_t* free_bytes, size_t* total_bytes) {
 }
 
 static int core_rocm_hip_runtime_version(int* version) {
-	hipRuntimeGetVersion_t fn = (hipRuntimeGetVersion_t)core_rocm_hip_symbol("hipRuntimeGetVersion");
+	static hipRuntimeGetVersion_t cached = NULL;
+	hipRuntimeGetVersion_t fn = cached;
+	if (fn == NULL) {
+		fn = (hipRuntimeGetVersion_t)core_rocm_hip_symbol("hipRuntimeGetVersion");
+		if (fn != NULL) {
+			cached = fn;
+		}
+	}
 	if (fn == NULL) {
 		return -100004;
 	}
@@ -96,7 +124,14 @@ static int core_rocm_hip_runtime_version(int* version) {
 }
 
 static int core_rocm_hip_malloc(uintptr_t* out, size_t size) {
-	hipMalloc_t fn = (hipMalloc_t)core_rocm_hip_symbol("hipMalloc");
+	static hipMalloc_t cached = NULL;
+	hipMalloc_t fn = cached;
+	if (fn == NULL) {
+		fn = (hipMalloc_t)core_rocm_hip_symbol("hipMalloc");
+		if (fn != NULL) {
+			cached = fn;
+		}
+	}
 	if (fn == NULL) {
 		return -100005;
 	}
@@ -107,7 +142,14 @@ static int core_rocm_hip_malloc(uintptr_t* out, size_t size) {
 }
 
 static int core_rocm_hip_free(uintptr_t ptr) {
-	hipFree_t fn = (hipFree_t)core_rocm_hip_symbol("hipFree");
+	static hipFree_t cached = NULL;
+	hipFree_t fn = cached;
+	if (fn == NULL) {
+		fn = (hipFree_t)core_rocm_hip_symbol("hipFree");
+		if (fn != NULL) {
+			cached = fn;
+		}
+	}
 	if (fn == NULL) {
 		return -100006;
 	}
@@ -115,7 +157,14 @@ static int core_rocm_hip_free(uintptr_t ptr) {
 }
 
 static int core_rocm_hip_free_async(uintptr_t ptr) {
-	hipFreeAsync_t fn = (hipFreeAsync_t)core_rocm_hip_symbol("hipFreeAsync");
+	static hipFreeAsync_t cached = NULL;
+	hipFreeAsync_t fn = cached;
+	if (fn == NULL) {
+		fn = (hipFreeAsync_t)core_rocm_hip_symbol("hipFreeAsync");
+		if (fn != NULL) {
+			cached = fn;
+		}
+	}
 	if (fn == NULL) {
 		return -100020;
 	}
@@ -123,7 +172,14 @@ static int core_rocm_hip_free_async(uintptr_t ptr) {
 }
 
 static int core_rocm_hip_memcpy_htod(uintptr_t dst, void* src, size_t size) {
-	hipMemcpy_t fn = (hipMemcpy_t)core_rocm_hip_symbol("hipMemcpy");
+	static hipMemcpy_t cached = NULL;
+	hipMemcpy_t fn = cached;
+	if (fn == NULL) {
+		fn = (hipMemcpy_t)core_rocm_hip_symbol("hipMemcpy");
+		if (fn != NULL) {
+			cached = fn;
+		}
+	}
 	if (fn == NULL) {
 		return -100007;
 	}
@@ -131,7 +187,14 @@ static int core_rocm_hip_memcpy_htod(uintptr_t dst, void* src, size_t size) {
 }
 
 static int core_rocm_hip_memcpy_dtoh(void* dst, uintptr_t src, size_t size) {
-	hipMemcpy_t fn = (hipMemcpy_t)core_rocm_hip_symbol("hipMemcpy");
+	static hipMemcpy_t cached = NULL;
+	hipMemcpy_t fn = cached;
+	if (fn == NULL) {
+		fn = (hipMemcpy_t)core_rocm_hip_symbol("hipMemcpy");
+		if (fn != NULL) {
+			cached = fn;
+		}
+	}
 	if (fn == NULL) {
 		return -100012;
 	}
@@ -139,7 +202,14 @@ static int core_rocm_hip_memcpy_dtoh(void* dst, uintptr_t src, size_t size) {
 }
 
 static int core_rocm_hip_memcpy_htod_async(uintptr_t dst, void* src, size_t size) {
-	hipMemcpyAsync_t fn = (hipMemcpyAsync_t)core_rocm_hip_symbol("hipMemcpyAsync");
+	static hipMemcpyAsync_t cached = NULL;
+	hipMemcpyAsync_t fn = cached;
+	if (fn == NULL) {
+		fn = (hipMemcpyAsync_t)core_rocm_hip_symbol("hipMemcpyAsync");
+		if (fn != NULL) {
+			cached = fn;
+		}
+	}
 	if (fn == NULL) {
 		return -100015;
 	}
@@ -147,7 +217,14 @@ static int core_rocm_hip_memcpy_htod_async(uintptr_t dst, void* src, size_t size
 }
 
 static int core_rocm_hip_memset_async(uintptr_t dst, int value, size_t size) {
-	hipMemsetAsync_t fn = (hipMemsetAsync_t)core_rocm_hip_symbol("hipMemsetAsync");
+	static hipMemsetAsync_t cached = NULL;
+	hipMemsetAsync_t fn = cached;
+	if (fn == NULL) {
+		fn = (hipMemsetAsync_t)core_rocm_hip_symbol("hipMemsetAsync");
+		if (fn != NULL) {
+			cached = fn;
+		}
+	}
 	if (fn == NULL) {
 		return -100019;
 	}
@@ -155,7 +232,14 @@ static int core_rocm_hip_memset_async(uintptr_t dst, int value, size_t size) {
 }
 
 static int core_rocm_hip_module_load_data(uintptr_t* out, void* image) {
-	hipModuleLoadData_t fn = (hipModuleLoadData_t)core_rocm_hip_symbol("hipModuleLoadData");
+	static hipModuleLoadData_t cached = NULL;
+	hipModuleLoadData_t fn = cached;
+	if (fn == NULL) {
+		fn = (hipModuleLoadData_t)core_rocm_hip_symbol("hipModuleLoadData");
+		if (fn != NULL) {
+			cached = fn;
+		}
+	}
 	if (fn == NULL) {
 		return -100008;
 	}
@@ -166,7 +250,14 @@ static int core_rocm_hip_module_load_data(uintptr_t* out, void* image) {
 }
 
 static int core_rocm_hip_module_unload(uintptr_t module) {
-	hipModuleUnload_t fn = (hipModuleUnload_t)core_rocm_hip_symbol("hipModuleUnload");
+	static hipModuleUnload_t cached = NULL;
+	hipModuleUnload_t fn = cached;
+	if (fn == NULL) {
+		fn = (hipModuleUnload_t)core_rocm_hip_symbol("hipModuleUnload");
+		if (fn != NULL) {
+			cached = fn;
+		}
+	}
 	if (fn == NULL) {
 		return -100009;
 	}
@@ -174,7 +265,14 @@ static int core_rocm_hip_module_unload(uintptr_t module) {
 }
 
 static int core_rocm_hip_module_get_function(uintptr_t* out, uintptr_t module, const char* name) {
-	hipModuleGetFunction_t fn = (hipModuleGetFunction_t)core_rocm_hip_symbol("hipModuleGetFunction");
+	static hipModuleGetFunction_t cached = NULL;
+	hipModuleGetFunction_t fn = cached;
+	if (fn == NULL) {
+		fn = (hipModuleGetFunction_t)core_rocm_hip_symbol("hipModuleGetFunction");
+		if (fn != NULL) {
+			cached = fn;
+		}
+	}
 	if (fn == NULL) {
 		return -100010;
 	}
@@ -195,7 +293,14 @@ static int core_rocm_hip_module_launch_kernel(
 	unsigned int shared_mem_bytes,
 	uintptr_t args
 ) {
-	hipModuleLaunchKernel_t fn = (hipModuleLaunchKernel_t)core_rocm_hip_symbol("hipModuleLaunchKernel");
+	static hipModuleLaunchKernel_t cached = NULL;
+	hipModuleLaunchKernel_t fn = cached;
+	if (fn == NULL) {
+		fn = (hipModuleLaunchKernel_t)core_rocm_hip_symbol("hipModuleLaunchKernel");
+		if (fn != NULL) {
+			cached = fn;
+		}
+	}
 	if (fn == NULL) {
 		return -100011;
 	}
@@ -205,7 +310,14 @@ static int core_rocm_hip_module_launch_kernel(
 }
 
 static int core_rocm_hip_device_synchronize() {
-	hipDeviceSynchronize_t fn = (hipDeviceSynchronize_t)core_rocm_hip_symbol("hipDeviceSynchronize");
+	static hipDeviceSynchronize_t cached = NULL;
+	hipDeviceSynchronize_t fn = cached;
+	if (fn == NULL) {
+		fn = (hipDeviceSynchronize_t)core_rocm_hip_symbol("hipDeviceSynchronize");
+		if (fn != NULL) {
+			cached = fn;
+		}
+	}
 	if (fn == NULL) {
 		return -100021;
 	}
@@ -213,9 +325,30 @@ static int core_rocm_hip_device_synchronize() {
 }
 
 static int core_rocm_hip_host_malloc_mapped(uintptr_t* host_out, uintptr_t* device_out, size_t size) {
-	hipHostMalloc_t malloc_fn = (hipHostMalloc_t)core_rocm_hip_symbol("hipHostMalloc");
-	hipHostGetDevicePointer_t pointer_fn = (hipHostGetDevicePointer_t)core_rocm_hip_symbol("hipHostGetDevicePointer");
-	hipHostFree_t free_fn = (hipHostFree_t)core_rocm_hip_symbol("hipHostFree");
+	static hipHostMalloc_t cached_malloc = NULL;
+	static hipHostGetDevicePointer_t cached_pointer = NULL;
+	static hipHostFree_t cached_free = NULL;
+	hipHostMalloc_t malloc_fn = cached_malloc;
+	hipHostGetDevicePointer_t pointer_fn = cached_pointer;
+	hipHostFree_t free_fn = cached_free;
+	if (malloc_fn == NULL) {
+		malloc_fn = (hipHostMalloc_t)core_rocm_hip_symbol("hipHostMalloc");
+		if (malloc_fn != NULL) {
+			cached_malloc = malloc_fn;
+		}
+	}
+	if (pointer_fn == NULL) {
+		pointer_fn = (hipHostGetDevicePointer_t)core_rocm_hip_symbol("hipHostGetDevicePointer");
+		if (pointer_fn != NULL) {
+			cached_pointer = pointer_fn;
+		}
+	}
+	if (free_fn == NULL) {
+		free_fn = (hipHostFree_t)core_rocm_hip_symbol("hipHostFree");
+		if (free_fn != NULL) {
+			cached_free = free_fn;
+		}
+	}
 	if (malloc_fn == NULL || pointer_fn == NULL || free_fn == NULL) {
 		return -100013;
 	}
@@ -236,7 +369,14 @@ static int core_rocm_hip_host_malloc_mapped(uintptr_t* host_out, uintptr_t* devi
 }
 
 static int core_rocm_hip_host_free(uintptr_t host) {
-	hipHostFree_t fn = (hipHostFree_t)core_rocm_hip_symbol("hipHostFree");
+	static hipHostFree_t cached = NULL;
+	hipHostFree_t fn = cached;
+	if (fn == NULL) {
+		fn = (hipHostFree_t)core_rocm_hip_symbol("hipHostFree");
+		if (fn != NULL) {
+			cached = fn;
+		}
+	}
 	if (fn == NULL) {
 		return -100014;
 	}
@@ -244,7 +384,14 @@ static int core_rocm_hip_host_free(uintptr_t host) {
 }
 
 static int core_rocm_hip_host_malloc_pinned(uintptr_t* host_out, size_t size) {
-	hipHostMalloc_t malloc_fn = (hipHostMalloc_t)core_rocm_hip_symbol("hipHostMalloc");
+	static hipHostMalloc_t cached = NULL;
+	hipHostMalloc_t malloc_fn = cached;
+	if (malloc_fn == NULL) {
+		malloc_fn = (hipHostMalloc_t)core_rocm_hip_symbol("hipHostMalloc");
+		if (malloc_fn != NULL) {
+			cached = malloc_fn;
+		}
+	}
 	if (malloc_fn == NULL) {
 		return -100016;
 	}
@@ -258,7 +405,14 @@ static int core_rocm_hip_host_malloc_pinned(uintptr_t* host_out, size_t size) {
 }
 
 static int core_rocm_hip_event_create(uintptr_t* out) {
-	hipEventCreateWithFlags_t fn = (hipEventCreateWithFlags_t)core_rocm_hip_symbol("hipEventCreateWithFlags");
+	static hipEventCreateWithFlags_t cached = NULL;
+	hipEventCreateWithFlags_t fn = cached;
+	if (fn == NULL) {
+		fn = (hipEventCreateWithFlags_t)core_rocm_hip_symbol("hipEventCreateWithFlags");
+		if (fn != NULL) {
+			cached = fn;
+		}
+	}
 	if (fn == NULL) {
 		return -100017;
 	}
@@ -269,7 +423,14 @@ static int core_rocm_hip_event_create(uintptr_t* out) {
 }
 
 static int core_rocm_hip_event_record(uintptr_t event) {
-	hipEventRecord_t fn = (hipEventRecord_t)core_rocm_hip_symbol("hipEventRecord");
+	static hipEventRecord_t cached = NULL;
+	hipEventRecord_t fn = cached;
+	if (fn == NULL) {
+		fn = (hipEventRecord_t)core_rocm_hip_symbol("hipEventRecord");
+		if (fn != NULL) {
+			cached = fn;
+		}
+	}
 	if (fn == NULL) {
 		return -100018;
 	}
@@ -277,7 +438,14 @@ static int core_rocm_hip_event_record(uintptr_t event) {
 }
 
 static int core_rocm_hip_event_synchronize(uintptr_t event) {
-	hipEventSynchronize_t fn = (hipEventSynchronize_t)core_rocm_hip_symbol("hipEventSynchronize");
+	static hipEventSynchronize_t cached = NULL;
+	hipEventSynchronize_t fn = cached;
+	if (fn == NULL) {
+		fn = (hipEventSynchronize_t)core_rocm_hip_symbol("hipEventSynchronize");
+		if (fn != NULL) {
+			cached = fn;
+		}
+	}
 	if (fn == NULL) {
 		return -100019;
 	}
@@ -285,7 +453,14 @@ static int core_rocm_hip_event_synchronize(uintptr_t event) {
 }
 
 static int core_rocm_hip_event_destroy(uintptr_t event) {
-	hipEventDestroy_t fn = (hipEventDestroy_t)core_rocm_hip_symbol("hipEventDestroy");
+	static hipEventDestroy_t cached = NULL;
+	hipEventDestroy_t fn = cached;
+	if (fn == NULL) {
+		fn = (hipEventDestroy_t)core_rocm_hip_symbol("hipEventDestroy");
+		if (fn != NULL) {
+			cached = fn;
+		}
+	}
 	if (fn == NULL) {
 		return -100020;
 	}

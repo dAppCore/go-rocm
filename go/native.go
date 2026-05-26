@@ -1568,12 +1568,15 @@ func (m *rocmModel) wrapTokenStream(stream iter.Seq[inference.Token], streamErro
 	return func(yield func(inference.Token) bool) {
 		var count int
 		var firstTokenAt time.Time
+		sink := m.probeSinkSnapshot()
 		emit := func(token inference.Token) bool {
 			if firstTokenAt.IsZero() {
 				firstTokenAt = time.Now()
 			}
 			count++
-			m.emitTokenProbe(token, promptTokens, count)
+			if sink != nil {
+				emitTokenProbeTo(sink, token, promptTokens, count)
+			}
 			return yield(token)
 		}
 		stops := nonEmptyStopSequences(stopSequences)
@@ -1719,9 +1722,10 @@ func (m *rocmModel) emitTokenProbe(token inference.Token, promptTokens, generate
 	if m == nil {
 		return
 	}
-	m.stateMutex.Lock()
-	sink := m.probeSink
-	m.stateMutex.Unlock()
+	emitTokenProbeTo(m.probeSinkSnapshot(), token, promptTokens, generatedTokens)
+}
+
+func emitTokenProbeTo(sink inference.ProbeSink, token inference.Token, promptTokens, generatedTokens int) {
 	if sink == nil {
 		return
 	}

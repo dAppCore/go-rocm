@@ -13431,3 +13431,84 @@ the retained book route stayed within the `<=90s` wall target with arc retention
 It is not a decode breakthrough: turn 10 is still `64.47 tok/s`, so the next
 speed work remains retained long-context attention/projection rather than more
 wrapper cleanup.
+
+## 2026-05-26: 2048 Fast-Loop Bridge and KV Slice Batch
+
+This batch kept the 2048-token loop as the edit/acceptance gate. A 16-row
+GELU/tanh multiply reduction experiment was rejected even though the
+chapter-shaped 2048 guard reduced byte volume: it changed deterministic
+generation enough that the retained 10-turn book acceptance failed with only
+`2` chapter-10 arc-anchor hits. That path must not be revived without an
+exactness check against the accepted output.
+
+Accepted changes:
+
+```text
+- Cache hot HIP C bridge function pointers after first dlsym lookup.
+- Snapshot the public-token probe sink once per stream instead of taking the
+  model mutex for every token when probes are disabled.
+- Lower the KV page-slice pool floor from 2048 pages to 512 pages, matching
+  Gemma4's local sliding window and making local-window slices reusable.
+- Add source guards for normal q4 projection, projection-batch, GELU multiply,
+  and GELU multiply-batch row geometry.
+```
+
+Focused checks:
+
+```text
+TestNativeContract_ProbeSinkReceivesGeneratedTokens_Good PASS
+TestHIPKernelSource PASS
+TestKVCache_DevicePageSliceCapacity_Good PASS
+TestKVCache_Good_DeviceDescriptorAppendBuildsTableOnDevice PASS
+TestKVCache_Good_DeviceMirrorWindowAppendTrimsAndTransfersPages PASS
+
+BenchmarkROCmDeviceKVCacheBorrowRelease_Hot-32       11.16 ns/op  0 B/op  0 allocs/op
+BenchmarkROCmDeviceKVPageSlicePool_ReusedCapacity-32 196.1 ns/op  0 B/op  0 allocs/op
+```
+
+Short generation guard:
+
+```text
+2048 text:Hi:
+  19763118653 ns/op, 103.6 tok/s, 17650384 B/op, 72292 allocs/op
+  stderr_bytes=0
+```
+
+Chapter-shaped fast guard:
+
+```text
+2048 generated tokens, context_len=4096, chapter-1 lighthouse prompt:
+  22546790165 ns/op, 90.83 tok/s, 44646464 B/op, 87792 allocs/op
+  stderr_bytes=0
+```
+
+Retained-book acceptance after the batch:
+
+```text
+book_wall_s/op             41.29
+book_decode_s/op           37.00
+book_generated_tokens/op    3021
+book_tok/s                 73.17
+book_turn01_tok/s         104.0
+book_turn10_tok/s          64.50
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+stderr_bytes                   0
+B/op                    232426568
+allocs/op                  227955
+output: /tmp/go-rocm-book-10turn-fullcap-greedy-cgo-probe-kv512.md
+```
+
+The allocation step-down on the short 2048 guard is now:
+
+```text
+3.40M -> 2.04M -> 1.98M -> 1.85M -> 1.78M -> 1.69M -> 1.31M
+  -> 1.23M -> 1.16M -> 0.73M -> 0.53M -> 0.46M -> 0.31M
+  -> 0.28M -> 0.26M -> 0.11M -> 0.072M allocs/op
+```
+
+This is a valid 2048-token fast-loop cleanup because `B/op` dropped sharply on
+the short guard and the chapter-shaped guard remained above `90 tok/s`. It is
+not a retained long-context decode win: turn 10 remains about `64.5 tok/s`, so
+the next speed target remains chunked attention stage 1 and q4 projection at
+retained context.

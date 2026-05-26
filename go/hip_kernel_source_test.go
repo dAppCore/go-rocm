@@ -220,12 +220,20 @@ func TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good(t *test
 	core.AssertTrue(t, !strings.Contains(projection, `ROCM_MLX_Q4_PROJECTION_GREEDY_THREADS_PER_ROW`), "projection must not use greedy row threads")
 
 	batch := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_projection_batch`)
+	core.AssertTrue(t, strings.Contains(batch, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_THREADS_PER_ROW`), "batch projection rows use normal row geometry")
+	core.AssertTrue(t, strings.Contains(batch, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_ROWS_PER_BLOCK + row_lane`), "batch projection grid uses normal row blocks")
 	core.AssertTrue(t, strings.Contains(batch, `blockIdx.y * ROCM_MLX_Q4_PROJECTION_BATCH_TOKENS_PER_BLOCK`), "batch projection must use grid Y for token blocks")
 	core.AssertTrue(t, strings.Contains(batch, `batch >= args.batch`), "batch projection must guard partial token blocks")
 	core.AssertTrue(t, strings.Contains(batch, `+ batch * args.cols`), "batch projection input must be row-offset by batch")
 	core.AssertTrue(t, strings.Contains(batch, `+ batch * args.rows`), "batch projection output must be row-offset by batch")
 
+	gelu := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply`)
+	core.AssertTrue(t, strings.Contains(gelu, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_THREADS_PER_ROW`), "GELU multiply rows use projection row geometry")
+	core.AssertTrue(t, strings.Contains(gelu, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_ROWS_PER_BLOCK + row_lane`), "GELU multiply grid uses projection row blocks")
+
 	geluBatch := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply_batch`)
+	core.AssertTrue(t, strings.Contains(geluBatch, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_THREADS_PER_ROW`), "batch GELU multiply rows use projection row geometry")
+	core.AssertTrue(t, strings.Contains(geluBatch, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_ROWS_PER_BLOCK + row_lane`), "batch GELU multiply grid uses projection row blocks")
 	core.AssertTrue(t, strings.Contains(geluBatch, `blockIdx.y * ROCM_MLX_Q4_PROJECTION_BATCH_TOKENS_PER_BLOCK`), "batch GELU multiply must use grid Y for token blocks")
 	core.AssertTrue(t, strings.Contains(geluBatch, `batch >= args.batch`), "batch GELU multiply must guard partial token blocks")
 	core.AssertTrue(t, strings.Contains(geluBatch, `+ batch * args.cols`), "batch GELU multiply input must be row-offset by batch")
