@@ -163,13 +163,15 @@ fused triple projection. The short guard now reports `19783450849 ns/op`,
 `103.5 tok/s`, `117716864 B/op`, and `1314741 allocs/op`. Replacing shared-KV
 alias objects with explicit borrowed ownership flags then moved the short guard
 to `19806588088 ns/op`, `103.4 tok/s`, `111822000 B/op`, and
-`1232865 allocs/op`. The retained book route was not rerun for these fast-loop batches;
-the last green retained book metrics above remain the current book acceptance
-evidence. This is the current best production-candidate route for the book
-endpoint, but not the final driver endpoint: later-turn decode is still only
-`63.7 tok/s`, below the `90-100+ tok/s` target, and the visible output remains
-repetitive. Keep tuning retained long-context attention and state quality until
-the later turns stay near the target.
+`1232865 allocs/op`. The retained book route stayed green after both fast-loop
+batches at `41.38s` wall, `37.15s` decode, `3021` generated tokens,
+`73.01 tok/s` average, `64.10 tok/s` on turn 10, empty stderr, no cap hits, and
+chapter-10 anchor hits of `3`, while dropping to `363260200 B/op` and
+`1941374 allocs/op`. This is the current best production-candidate route for
+the book endpoint, but not the final driver endpoint: later-turn decode is
+still only `64.1 tok/s`, below the `90-100+ tok/s` target, and the visible
+output remains repetitive. Keep tuning retained long-context attention and
+state quality until the later turns stay near the target.
 
 Current decode-scaling status as of 2026-05-26: Gemma4 E2B/E4B context is
 `128k` tokens, not `128` tokens; the context-128 short decode numbers remain a

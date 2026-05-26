@@ -58,6 +58,12 @@
   guard now reports `103.4 tok/s`, `111822000 B/op`, and `1232865 allocs/op`.
   The short-guard allocation sequence is now
   `3.40M -> 2.04M -> 1.98M -> 1.85M -> 1.78M -> 1.69M -> 1.31M -> 1.23M allocs/op`.
+- Retained 10-turn full-cap greedy book acceptance stayed green after the
+  fast-loop batches: `41.38s` wall, `37.15s` decode, `3021` generated tokens,
+  `73.01 tok/s` average, `64.10 tok/s` on turn 10, empty stderr, no cap hits,
+  chapter-10 anchor hits of `3`, `363260200 B/op`, and `1941374 allocs/op`.
+  Wall/decode are roughly flat versus the prior route, while allocation volume
+  stepped down from `418587400 B/op` and `2660797 allocs/op`.
 
 ## 2026-05-26 Full-Chapter Book and Long-Attention Pass
 
