@@ -49,6 +49,15 @@
   guard now reports `103.5 tok/s`, `117716864 B/op`, and `1314741 allocs/op`.
   The short-guard allocation sequence is now
   `3.40M -> 2.04M -> 1.98M -> 1.85M -> 1.78M -> 1.69M -> 1.31M allocs/op`.
+- Replaced shared-device-KV alias cache/descriptor objects with explicit
+  borrowed ownership flags on `hipGemma4Q4DeviceLayerKVState`. Close/finalize
+  now skips borrowed references so the source owner layer transfers or frees
+  pages exactly once. Added
+  `BenchmarkHIPGemma4Q4DeviceLayerKVStateClose_Borrowed`, which reports
+  `1.755 ns/op`, `0 B/op`, and `0 allocs/op`. The live `text:Hi` 2048-token
+  guard now reports `103.4 tok/s`, `111822000 B/op`, and `1232865 allocs/op`.
+  The short-guard allocation sequence is now
+  `3.40M -> 2.04M -> 1.98M -> 1.85M -> 1.78M -> 1.69M -> 1.31M -> 1.23M allocs/op`.
 
 ## 2026-05-26 Full-Chapter Book and Long-Attention Pass
 

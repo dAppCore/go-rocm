@@ -1195,6 +1195,8 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 
 	var deviceKV *rocmDeviceKVCache
 	var descriptorTable *rocmDeviceKVDescriptorTable
+	borrowedDeviceKV := false
+	borrowedDescriptorTable := false
 	deviceKVAttention := ""
 	var retainedDeviceLayer *hipGemma4Q4DeviceLayerKVState
 	retainedDeviceLayerSuccess := false
@@ -1206,15 +1208,17 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 	if req.DeviceKVAttention {
 		borrowedPageCount := 0
 		if req.SharedDeviceKV != nil {
-			deviceKV, err = req.SharedDeviceKV.borrowedAlias()
-			if err != nil {
-				return hipGemma4Q4DecoderLayerResult{}, err
+			if req.SharedDeviceKV.closed {
+				return hipGemma4Q4DecoderLayerResult{}, core.E(hipGemma4Q4Layer0Operation, "shared device KV source is closed", nil)
 			}
+			deviceKV = req.SharedDeviceKV
+			borrowedDeviceKV = true
 			if req.SharedDescriptorTable != nil {
-				descriptorTable, err = req.SharedDescriptorTable.borrowedAlias()
-				if err != nil {
-					return hipGemma4Q4DecoderLayerResult{}, err
+				if req.SharedDescriptorTable.closed || req.SharedDescriptorTable.Pointer() == 0 {
+					return hipGemma4Q4DecoderLayerResult{}, core.E(hipGemma4Q4Layer0Operation, "shared device KV descriptor table is closed", nil)
 				}
+				descriptorTable = req.SharedDescriptorTable
+				borrowedDescriptorTable = true
 			}
 			deviceKVAttention = "shared_device_kv"
 		} else if req.OmitHostKV && req.PriorDeviceKV != nil && ropeKeyDevice != nil && valueDevice != nil {
@@ -1273,7 +1277,9 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 			descriptorTable, err = deviceKV.KernelDescriptorTable()
 		}
 		if err != nil {
-			if borrowedPageCount > 0 {
+			if borrowedDeviceKV {
+				// Source owner layer keeps the shared cache alive.
+			} else if borrowedPageCount > 0 {
 				_ = deviceKV.closePagesFrom(borrowedPageCount)
 			} else {
 				_ = deviceKV.Close()
@@ -1282,8 +1288,12 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 		}
 		launch, err := deviceKV.KernelLaunchDescriptor(descriptorTable)
 		if err != nil {
-			_ = descriptorTable.Close()
-			if borrowedPageCount > 0 {
+			if !borrowedDescriptorTable {
+				_ = descriptorTable.Close()
+			}
+			if borrowedDeviceKV {
+				// Source owner layer keeps the shared cache alive.
+			} else if borrowedPageCount > 0 {
 				_ = deviceKV.closePagesFrom(borrowedPageCount)
 			} else {
 				_ = deviceKV.Close()
@@ -1291,11 +1301,21 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 			return hipGemma4Q4DecoderLayerResult{}, err
 		}
 		if req.KeepDeviceKV {
-			layer := &hipGemma4Q4DeviceLayerKVState{cache: deviceKV, descriptorTable: descriptorTable, launch: launch}
+			layer := &hipGemma4Q4DeviceLayerKVState{
+				cache:                   deviceKV,
+				descriptorTable:         descriptorTable,
+				launch:                  launch,
+				borrowedCache:           borrowedDeviceKV,
+				borrowedDescriptorTable: borrowedDescriptorTable,
+			}
 			retainedDeviceLayer = layer
 		} else {
-			defer descriptorTable.Close()
-			if borrowedPageCount > 0 {
+			if !borrowedDescriptorTable {
+				defer descriptorTable.Close()
+			}
+			if borrowedDeviceKV {
+				// Source owner layer keeps the shared cache alive.
+			} else if borrowedPageCount > 0 {
 				defer deviceKV.closePagesFrom(borrowedPageCount)
 			} else {
 				defer deviceKV.Close()

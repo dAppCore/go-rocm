@@ -2151,6 +2151,47 @@ func BenchmarkHIPGemma4Q4PerLayerInputDeviceSetLayer_View(b *testing.B) {
 	}
 }
 
+func BenchmarkHIPGemma4Q4DeviceLayerKVStateClose_Borrowed(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	cache := &rocmDeviceKVCache{
+		driver:     driver,
+		mode:       rocmKVCacheModeKQ8VQ4,
+		blockSize:  1,
+		tokenCount: 1,
+		pages: []rocmDeviceKVPage{{
+			tokenStart: 0,
+			tokenCount: 1,
+			keyWidth:   4,
+			valueWidth: 4,
+			key:        rocmDeviceKVTensor{pointer: 0x1000, sizeBytes: 4, encoding: rocmKVEncodingQ8},
+			value:      rocmDeviceKVTensor{pointer: 0x2000, sizeBytes: 2, encoding: rocmKVEncodingQ4},
+			owned:      true,
+		}},
+	}
+	table := &rocmDeviceKVDescriptorTable{
+		driver:    driver,
+		pointer:   0x3000,
+		sizeBytes: rocmDeviceKVDescriptorHeaderBytes + rocmDeviceKVDescriptorPageBytes,
+		version:   rocmDeviceKVDescriptorVersion,
+		pageCount: 1,
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		layer := hipGemma4Q4DeviceLayerKVState{
+			cache:                   cache,
+			descriptorTable:         table,
+			borrowedCache:           true,
+			borrowedDescriptorTable: true,
+		}
+		if err := layer.Close(); err != nil {
+			b.Fatal(err)
+		}
+		if cache.closed || table.closed {
+			b.Fatal("borrowed layer close closed source owner")
+		}
+	}
+}
+
 func BenchmarkHIPMLXQ4TripleProjLaunchArgsBinary_Hot(b *testing.B) {
 	args := hipMLXQ4TripleProjLaunchArgs{
 		InputPointer:        0x1000,

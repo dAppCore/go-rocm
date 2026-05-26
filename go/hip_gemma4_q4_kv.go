@@ -15,9 +15,11 @@ type hipGemma4Q4DeviceDecodeState struct {
 }
 
 type hipGemma4Q4DeviceLayerKVState struct {
-	cache           *rocmDeviceKVCache
-	descriptorTable *rocmDeviceKVDescriptorTable
-	launch          rocmDeviceKVLaunchDescriptor
+	cache                   *rocmDeviceKVCache
+	descriptorTable         *rocmDeviceKVDescriptorTable
+	launch                  rocmDeviceKVLaunchDescriptor
+	borrowedCache           bool
+	borrowedDescriptorTable bool
 }
 
 func (layer *hipGemma4Q4DeviceLayerKVState) Close() error {
@@ -25,13 +27,30 @@ func (layer *hipGemma4Q4DeviceLayerKVState) Close() error {
 		return nil
 	}
 	var lastErr error
-	if err := layer.descriptorTable.Close(); err != nil {
-		lastErr = core.E("rocm.hip.Gemma4Q4DeviceKV", "free descriptor table", err)
+	if !layer.borrowedDescriptorTable {
+		if err := layer.descriptorTable.Close(); err != nil {
+			lastErr = core.E("rocm.hip.Gemma4Q4DeviceKV", "free descriptor table", err)
+		}
 	}
-	if err := layer.cache.Close(); err != nil {
-		lastErr = core.E("rocm.hip.Gemma4Q4DeviceKV", "free device KV layer", err)
+	if !layer.borrowedCache {
+		if err := layer.cache.Close(); err != nil {
+			lastErr = core.E("rocm.hip.Gemma4Q4DeviceKV", "free device KV layer", err)
+		}
 	}
+	layer.cache = nil
+	layer.descriptorTable = nil
 	return lastErr
+}
+
+func (layer *hipGemma4Q4DeviceLayerKVState) closeDescriptorTable() error {
+	if layer == nil || layer.borrowedDescriptorTable {
+		return nil
+	}
+	if err := layer.descriptorTable.Close(); err != nil {
+		return core.E("rocm.hip.Gemma4Q4DeviceKV", "free descriptor table", err)
+	}
+	layer.descriptorTable = nil
+	return nil
 }
 
 func hipMirrorGemma4Q4DecodeState(driver nativeHIPDriver, cfg hipGemma4Q4ForwardConfig, state hipGemma4Q4DecodeState, mode string) (*hipGemma4Q4DeviceDecodeState, error) {
@@ -118,7 +137,7 @@ func hipUpdateGemma4Q4DeviceDecodeState(driver nativeHIPDriver, cfg hipGemma4Q4F
 	for index := range nextHost.Layers {
 		oldLayer := &previousDevice.layers[index]
 		layerCfg := cfg.Layers[index]
-		if hipGemma4Q4LayerStateCanAppendDeviceKV(layerCfg, previousHost.Layers[index], nextHost.Layers[index]) {
+		if !oldLayer.borrowedCache && hipGemma4Q4LayerStateCanAppendDeviceKV(layerCfg, previousHost.Layers[index], nextHost.Layers[index]) {
 			keyStart := len(nextHost.Layers[index].Keys) - layerCfg.HeadDim
 			valueStart := len(nextHost.Layers[index].Values) - layerCfg.HeadDim
 			nextCache, err := oldLayer.cache.withAppendedToken(nextHost.Layers[index].Keys[keyStart:], nextHost.Layers[index].Values[valueStart:])
@@ -150,14 +169,16 @@ func hipUpdateGemma4Q4DeviceDecodeState(driver nativeHIPDriver, cfg hipGemma4Q4F
 		actions = append(actions, ownershipAction{oldLayer: oldLayer})
 	}
 	for _, action := range actions {
-		if action.append {
+		if action.oldLayer.borrowedCache {
+			// The source owner layer handles the shared cache once.
+		} else if action.append {
 			if err := action.oldLayer.cache.transferPagesTo(action.newCache); err != nil {
 				return nil, err
 			}
 		} else if err := action.oldLayer.cache.Close(); err != nil {
 			return nil, err
 		}
-		if err := action.oldLayer.descriptorTable.Close(); err != nil {
+		if err := action.oldLayer.closeDescriptorTable(); err != nil {
 			return nil, err
 		}
 	}
@@ -180,7 +201,9 @@ func hipFinalizeGemma4Q4ForwardDeviceState(previous, next *hipGemma4Q4DeviceDeco
 	for index := range next.layers {
 		oldLayer := &previous.layers[index]
 		newLayer := &next.layers[index]
-		if oldLayer.cache.ownsAnyPages() && newLayer.cache.borrowsPagesFrom(oldLayer.cache) {
+		if oldLayer.borrowedCache {
+			// The source owner layer handles the shared cache once.
+		} else if oldLayer.cache.ownsAnyPages() && newLayer.cache.borrowsPagesFrom(oldLayer.cache) {
 			if err := oldLayer.cache.transferPagesTo(newLayer.cache); err != nil {
 				return err
 			}
@@ -191,7 +214,7 @@ func hipFinalizeGemma4Q4ForwardDeviceState(previous, next *hipGemma4Q4DeviceDeco
 		} else if err := oldLayer.cache.Close(); err != nil {
 			return err
 		}
-		if err := oldLayer.descriptorTable.Close(); err != nil {
+		if err := oldLayer.closeDescriptorTable(); err != nil {
 			return err
 		}
 	}
@@ -303,8 +326,10 @@ func (state *hipGemma4Q4DeviceDecodeState) MemoryBytes() uint64 {
 	}
 	var total uint64
 	for _, layer := range state.layers {
-		total += layer.cache.MemoryBytes()
-		if layer.descriptorTable != nil {
+		if !layer.borrowedCache {
+			total += layer.cache.MemoryBytes()
+		}
+		if !layer.borrowedDescriptorTable && layer.descriptorTable != nil {
 			total += layer.descriptorTable.SizeBytes()
 		}
 	}
