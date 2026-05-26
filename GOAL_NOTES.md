@@ -86,6 +86,9 @@
   `33.96s` decode, `3021` generated tokens, `79.12 tok/s` average,
   `68.81 tok/s` on turn 10, empty stderr, no cap hits, chapter-10 anchor hits
   of `3`, `232416808 B/op`, and `227925 allocs/op`.
+- Rejected explicit row-base offset locals in the q4 group64 row-sum/GELU
+  branches. The short guard was neutral at `108.9 tok/s`, but the
+  chapter-shaped guard regressed to `98.89 tok/s`.
 
 ## 2026-05-26 Allocation/Transfer Step-Down Pass
 
