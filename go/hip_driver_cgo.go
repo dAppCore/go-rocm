@@ -605,6 +605,17 @@ type cgoHIPLaunchArgLease struct {
 	noEvent    bool
 }
 
+type cgoHIPLaunchArgMode struct {
+	async  bool
+	mapped bool
+	events bool
+}
+
+var cgoHIPLaunchArgModeCache = struct {
+	sync.Once
+	mode cgoHIPLaunchArgMode
+}{}
+
 var cgoHIPLaunchArgRing = struct {
 	sync.Mutex
 	next    int
@@ -896,13 +907,10 @@ func (cgoHIPDriver) CopyDeviceToHostUint64(pointer nativeDevicePointer) (uint64,
 }
 
 func (driver cgoHIPDriver) LaunchKernel(config hipKernelLaunchConfig) error {
-	if err := config.Validate(); err != nil {
-		return err
-	}
 	if !driver.Available() {
 		return core.E("rocm.hip.LaunchKernel", "HIP driver is not available", nil)
 	}
-	modulePath := core.Trim(os.Getenv("GO_ROCM_KERNEL_HSACO"))
+	modulePath := os.Getenv("GO_ROCM_KERNEL_HSACO")
 	if modulePath == "" {
 		return core.E("rocm.hip.LaunchKernel", "GO_ROCM_KERNEL_HSACO is not set; native HIP kernels are not linked yet", nil)
 	}
@@ -937,7 +945,7 @@ func (driver cgoHIPDriver) LaunchKernel(config hipKernelLaunchConfig) error {
 }
 
 func (driver cgoHIPDriver) launchArgPointer(args []byte) (cgoHIPLaunchArgLease, error) {
-	if os.Getenv("GO_ROCM_DISABLE_ASYNC_LAUNCH_ARGS") == "" || os.Getenv("GO_ROCM_ENABLE_MAPPED_LAUNCH_ARGS") != "" {
+	if cgoHIPLaunchArgModeConfig().async {
 		return driver.launchArgPointerAsync(args)
 	}
 	return driver.launchArgPointerSync(args)
@@ -1025,7 +1033,18 @@ func (driver cgoHIPDriver) launchArgPointerAsync(args []byte) (cgoHIPLaunchArgLe
 }
 
 func cgoHIPLaunchArgEventsEnabled() bool {
-	return os.Getenv("GO_ROCM_ENABLE_LAUNCH_ARG_EVENTS") != ""
+	return cgoHIPLaunchArgModeConfig().events
+}
+
+func cgoHIPLaunchArgModeConfig() cgoHIPLaunchArgMode {
+	cgoHIPLaunchArgModeCache.Do(func() {
+		cgoHIPLaunchArgModeCache.mode = cgoHIPLaunchArgMode{
+			async:  os.Getenv("GO_ROCM_DISABLE_ASYNC_LAUNCH_ARGS") == "" || os.Getenv("GO_ROCM_ENABLE_MAPPED_LAUNCH_ARGS") != "",
+			mapped: os.Getenv("GO_ROCM_DISABLE_MAPPED_LAUNCH_ARGS") == "",
+			events: os.Getenv("GO_ROCM_ENABLE_LAUNCH_ARG_EVENTS") != "",
+		}
+	})
+	return cgoHIPLaunchArgModeCache.mode
 }
 
 func (lease cgoHIPLaunchArgLease) finish(success bool) error {
@@ -1052,7 +1071,7 @@ func (lease cgoHIPLaunchArgLease) finish(success bool) error {
 }
 
 func (driver cgoHIPDriver) allocateLaunchArgBuffer(size uint64) (unsafe.Pointer, nativeDevicePointer, bool, error) {
-	if os.Getenv("GO_ROCM_DISABLE_MAPPED_LAUNCH_ARGS") == "" {
+	if cgoHIPLaunchArgModeConfig().mapped {
 		result := C.core_rocm_hip_host_malloc_mapped_result(C.size_t(size))
 		if result.rc == 0 {
 			return unsafe.Pointer(uintptr(result.first)), nativeDevicePointer(result.second), true, nil
@@ -1078,7 +1097,7 @@ func (driver cgoHIPDriver) resizeLaunchArgSlot(slot *cgoHIPLaunchArgSlot, size u
 	if err := driver.freeLaunchArgSlot(slot); err != nil {
 		return err
 	}
-	if os.Getenv("GO_ROCM_DISABLE_MAPPED_LAUNCH_ARGS") == "" {
+	if cgoHIPLaunchArgModeConfig().mapped {
 		result := C.core_rocm_hip_host_malloc_mapped_result(C.size_t(size))
 		if result.rc == 0 {
 			event := C.uintptr_t(0)

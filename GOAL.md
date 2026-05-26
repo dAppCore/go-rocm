@@ -1565,6 +1565,13 @@ Remaining blocker:
   matmul algorithm: current kernels are still row-dot packet primitives with
   limited tiling, not a production tiled GEMM/dequant path with broad reuse of
   input/weights across rows and tokens.
+- The 2048-token fast loop is useful for accepting allocation/plumbing cleanup,
+  but retained-book quality remains the gate for numerical launch changes. A
+  512-thread RMS launch-shape experiment improved 2048 tok/s, then failed the
+  retained chapter-10 arc check, so it was rejected. The latest accepted
+  launch-plumbing pass is quality-preserving and flat on retained speed:
+  `37.67s` wall, `80.20 tok/s` average, turn 10 `69.63 tok/s`,
+  `230999296 B/op`, `106651 allocs/op`, `chapter10_arc_anchor_hits=3`.
 
 - [ ] Phase 0: Snapshot the tree and establish the baseline.
   - Run `git status --short`.

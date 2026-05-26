@@ -141,7 +141,7 @@ func hipLaunchKernel(driver nativeHIPDriver, config hipKernelLaunchConfig) error
 }
 
 func (config hipKernelLaunchConfig) Validate() error {
-	if core.Trim(config.Name) == "" {
+	if config.Name == "" {
 		return core.E("rocm.hip.LaunchKernel", "kernel name is required", nil)
 	}
 	if len(config.Args) == 0 {

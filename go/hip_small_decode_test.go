@@ -2100,6 +2100,25 @@ func BenchmarkHIPLaunchPacketPool_ReusedSize(b *testing.B) {
 	}
 }
 
+func BenchmarkHIPKernelLaunchConfigValidate_Hot(b *testing.B) {
+	config := hipKernelLaunchConfig{
+		Name:   hipKernelNameMLXQ4Proj,
+		Args:   []byte{1},
+		GridX:  1,
+		GridY:  1,
+		GridZ:  1,
+		BlockX: hipMLXQ4ProjectionBlockSize,
+		BlockY: 1,
+		BlockZ: 1,
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := config.Validate(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 type fakeHIPUint64Reader struct {
 	fakeHIPDriver
 	value uint64

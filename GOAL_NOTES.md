@@ -13836,3 +13836,76 @@ and the retained book to `38.24s` wall / `79.01 tok/s`, so it was removed.
 The accepted batch is a host-allocation cleanup, not the decode breakthrough.
 Turn 10 remains about `70 tok/s`; the next speed target remains retained
 long-context attention/projection.
+
+## 2026-05-26: 2048 Launch-Plumbing Pass
+
+This fast-loop pass used the 2048-token guards to test launch overhead and a
+small RMS launch-shape idea before batching anything under retained-book
+acceptance.
+
+Rejected numerical launch-shape changes:
+
+```text
+All RMS/RMS-residual launches at 512 threads:
+  2048 text:Hi: 110.1 tok/s, 7385648 B/op, 8798 allocs/op
+  2048 chapter: 102.7 tok/s, 15371792 B/op, 10353 allocs/op
+  retained book: FAILED chapter10 arc, anchor_hits=1
+
+Only rocm_rms_norm_residual_add_norm at 512 threads:
+  retained book: FAILED chapter10 arc, anchor_hits=2
+```
+
+The 2048 numbers looked attractive, but the retained story arc drift makes the
+RMS block-size change invalid for production. Leave those kernels at the prior
+256-thread launch shape unless a future change can prove deterministic retained
+quality.
+
+Accepted non-numerical launch-plumbing cleanup:
+
+```text
+- Cache cgo launch-argument mode flags instead of reading env vars on every
+  kernel launch.
+- Stop trimming the HSACO path and constant kernel names in the launch hot path.
+- Remove duplicate cgo launch-config validation after the central
+  hipLaunchKernel validation has already run.
+```
+
+AX-11 microbenchmarks:
+
+```text
+BenchmarkCGOHIPLaunchArgModeConfig_Hot-32      0.9558 ns/op  0 B/op  0 allocs/op
+BenchmarkHIPLaunchPacketPool_ReusedSize-32      23.10 ns/op  0 B/op  0 allocs/op
+BenchmarkHIPKernelLaunchConfigValidate_Hot-32   2.900 ns/op  0 B/op  0 allocs/op
+```
+
+2048-token fast guards:
+
+```text
+2048 text:Hi:
+  18792314852 ns/op, 109.0 tok/s, 7385296 B/op, 8798 allocs/op
+
+2048 generated tokens, context_len=4096, chapter-1 lighthouse prompt:
+  20196559191 ns/op, 101.4 tok/s, 15379000 B/op, 10425 allocs/op
+```
+
+Retained-book acceptance:
+
+```text
+book_wall_s/op             37.67
+book_decode_s/op           33.44
+book_generated_tokens/op    3021
+book_tok/s                 80.20
+book_turn01_tok/s         110.2
+book_turn10_tok/s          69.63
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+stderr_bytes                   0
+B/op                    230999296
+allocs/op                  106651
+output: /tmp/go-rocm-book-10turn-fullcap-launchplumb2.md
+```
+
+This is a small 2048-loop allocation/plumbing cleanup and quality-preserving
+acceptance pass. It is not a retained decode win: retained wall/decode metrics
+remain noise-flat, and turn 10 is still about `70 tok/s`. The next material
+target remains long-context attention/projection, not launch wrapper overhead.
