@@ -2324,6 +2324,10 @@ func (driver *fakeHIPDriver) LaunchKernel(config hipKernelLaunchConfig) error {
 		return driver.launchAttentionHeads(config.Args)
 	case hipKernelNameAttentionHeadsBatchCausal:
 		return driver.launchAttentionHeadsBatchCausal(config.Args)
+	case hipKernelNameAttentionHeadsBatchChunkedStage1:
+		return driver.launchAttentionHeadsBatchChunked(config.Args, false)
+	case hipKernelNameAttentionHeadsBatchChunkedStage2:
+		return driver.launchAttentionHeadsBatchChunked(config.Args, true)
 	case hipKernelNameVectorAdd:
 		return driver.launchVectorAdd(config.Args)
 	case hipKernelNameVectorAddScaled:
@@ -5396,6 +5400,96 @@ func (driver *fakeHIPDriver) launchAttentionHeadsBatchCausal(args []byte) error 
 				weightStart := weightOffset + baseIndex*tokenCount*4
 				copy(weightData[weightStart:weightStart+visibleTokens*4], weightPayload)
 			}
+		}
+	}
+	return nil
+}
+
+func (driver *fakeHIPDriver) launchAttentionHeadsBatchChunked(args []byte, writeOutput bool) error {
+	if len(args) != hipAttentionHeadsBatchChunkedLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "attention heads batch chunked launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipAttentionHeadsBatchChunkedLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipAttentionHeadsBatchChunkedLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "attention heads batch chunked launch header mismatch", nil)
+	}
+	queryPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	descriptorPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	partialPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[24:]))
+	statsPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[32:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[40:]))
+	dim := int(binary.LittleEndian.Uint32(args[48:]))
+	tokenCount := int(binary.LittleEndian.Uint32(args[52:]))
+	headCount := int(binary.LittleEndian.Uint32(args[56:]))
+	queryCount := int(binary.LittleEndian.Uint32(args[60:]))
+	queryStartToken := int(binary.LittleEndian.Uint32(args[64:]))
+	chunkSize := int(binary.LittleEndian.Uint32(args[68:]))
+	chunkCount := int(binary.LittleEndian.Uint32(args[72:]))
+	queryBytes := int(binary.LittleEndian.Uint32(args[76:]))
+	descriptorBytes := int(binary.LittleEndian.Uint64(args[80:]))
+	partialBytes := int(binary.LittleEndian.Uint32(args[88:]))
+	statsBytes := int(binary.LittleEndian.Uint32(args[92:]))
+	outputBytes := int(binary.LittleEndian.Uint32(args[96:]))
+	scale := math.Float32frombits(binary.LittleEndian.Uint32(args[100:]))
+	if dim <= 0 || dim > hipAttentionHeadsChunkedBlockSize || tokenCount <= 0 || headCount <= 0 || queryCount <= 0 ||
+		queryStartToken < 0 || uint64(queryStartToken)+uint64(queryCount) > uint64(tokenCount) ||
+		chunkSize <= 0 || chunkCount != (tokenCount+chunkSize-1)/chunkSize ||
+		queryBytes != queryCount*headCount*dim*4 ||
+		partialBytes != queryCount*headCount*chunkCount*dim*4 ||
+		statsBytes != queryCount*headCount*chunkCount*2*4 ||
+		outputBytes != queryCount*headCount*dim*4 {
+		return core.E("rocm.hip.FakeLaunch", "attention heads batch chunked shape metadata mismatch", nil)
+	}
+	if scale < 0 || math.IsNaN(float64(scale)) || math.IsInf(float64(scale), 0) {
+		return core.E("rocm.hip.FakeLaunch", "attention heads batch chunked scale is invalid", nil)
+	}
+	queryData, queryOffset, ok := driver.memoryForPointer(queryPointer, queryBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "attention heads batch chunked query buffer is missing", nil)
+	}
+	if _, _, ok := driver.memoryForPointer(partialPointer, partialBytes); !ok {
+		return core.E("rocm.hip.FakeLaunch", "attention heads batch chunked partial buffer is missing", nil)
+	}
+	if _, _, ok := driver.memoryForPointer(statsPointer, statsBytes); !ok {
+		return core.E("rocm.hip.FakeLaunch", "attention heads batch chunked stats buffer is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "attention heads batch chunked output buffer is missing", nil)
+	}
+	if !writeOutput {
+		return nil
+	}
+	keyFlat, valueFlat, err := driver.readDeviceKVDescriptorForAttention(descriptorPointer, descriptorBytes, tokenCount, dim)
+	if err != nil {
+		return err
+	}
+	keys, err := splitHIPReferenceVectors(keyFlat, dim)
+	if err != nil {
+		return err
+	}
+	values, err := splitHIPReferenceVectors(valueFlat, dim)
+	if err != nil {
+		return err
+	}
+	for queryIndex := 0; queryIndex < queryCount; queryIndex++ {
+		visibleTokens := queryStartToken + queryIndex + 1
+		for head := 0; head < headCount; head++ {
+			baseIndex := queryIndex*headCount + head
+			queryStart := queryOffset + baseIndex*dim*4
+			query, err := hipFloat32PayloadValues(queryData[queryStart : queryStart+dim*4])
+			if err != nil {
+				return err
+			}
+			output, _, err := hipReferenceSingleHeadAttentionWithScale(query, keys[:visibleTokens], values[:visibleTokens], scale)
+			if err != nil {
+				return err
+			}
+			outputPayload, err := hipFloat32Payload(output)
+			if err != nil {
+				return err
+			}
+			copy(outputData[outputOffset+baseIndex*dim*4:outputOffset+(baseIndex+1)*dim*4], outputPayload)
 		}
 	}
 	return nil

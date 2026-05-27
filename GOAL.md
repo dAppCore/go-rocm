@@ -456,6 +456,19 @@ prompt  best current result      prompt tok/s  notes
 48k     not rerun post-batch     unknown       only run after 29k improves
 ```
 
+Latest long-prefill attention plumbing: a batch-chunked KQ8/VQ4 attention route
+now handles block-paged device KV above the 2048-token shared-weight limit
+without allocating a materialized `[query, head, token]` score buffer. Fake and
+live `gfx1100` hardware tests pass, including the block-paged descriptor path.
+The first loaded-model checks are correctness/plumbing evidence, not an
+accepted speed win: 4096 tokens at `prefill_ubatch=16` measured
+`12041509654 ns/op`, `340.2 prompt_tok/s`, `567183496 B/op`, and
+`241318 allocs/op`; 8192 tokens measured `35267564072 ns/op`,
+`232.3 prompt_tok/s`, `1654383904 B/op`, and `481431 allocs/op`, essentially
+flat with the previous 8k default-16 baseline aside from a small allocation
+drop. Next pass should use clean kernel tracing or explicit route counters to
+prove how often this path runs before changing the 29k/48k acceptance runs.
+
 For comparison, upstream llama.cpp built locally with HIP for `gfx1100` and run
 against the Hugging Face Gemma4 GGUF
 `/home/claude/models/hf/unsloth-gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf`

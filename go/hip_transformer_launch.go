@@ -12,54 +12,56 @@ import (
 )
 
 const (
-	hipRMSNormLaunchArgsVersion                   uint32 = 1
-	hipRMSNormLaunchArgsBytes                            = 64
-	hipRMSNormResidualAddArgsVersion              uint32 = 1
-	hipRMSNormResidualAddArgsBytes                       = 80
-	hipRMSNormResAddNormArgsVersion               uint32 = 1
-	hipRMSNormResAddNormArgsBytes                        = 128
-	hipRMSNormHeadsLaunchArgsVersion              uint32 = 1
-	hipRMSNormHeadsLaunchArgsBytes                       = 64
-	hipRMSNormRoPEHeadsLaunchArgsVersion          uint32 = 1
-	hipRMSNormRoPEHeadsLaunchArgsBytes                   = 80
-	hipRMSNormRoPEHeadsBatchLaunchArgsVersion     uint32 = 1
-	hipRMSNormRoPEHeadsBatchLaunchArgsBytes              = 96
-	hipRoPELaunchArgsVersion                      uint32 = 1
-	hipRoPELaunchArgsBytes                               = 64
-	hipRoPEHeadsLaunchArgsVersion                 uint32 = 1
-	hipRoPEHeadsLaunchArgsBytes                          = 64
-	hipGreedyLaunchArgsVersion                    uint32 = 1
-	hipGreedyLaunchArgsBytes                             = 64
-	hipSoftcapGreedyLaunchArgsVersion             uint32 = 1
-	hipSoftcapGreedyLaunchArgsBytes                      = 64
-	hipGreedyResultBytes                                 = 8
-	hipAttentionLaunchArgsVersion                 uint32 = 1
-	hipAttentionLaunchArgsBytes                          = 104
-	hipAttentionHeadsLaunchArgsVersion            uint32 = 1
-	hipAttentionHeadsLaunchArgsBytes                     = 128
-	hipAttentionHeadsBatchCausalLaunchArgsVersion uint32 = 1
-	hipAttentionHeadsBatchCausalLaunchArgsBytes          = 144
-	hipAttentionHeadsSharedMaxTokens                     = 2048
-	hipAttentionHeadsChunkedLaunchArgsVersion     uint32 = 1
-	hipAttentionHeadsChunkedLaunchArgsBytes              = 128
-	hipAttentionHeadsChunkedBlockSize                    = 512
-	hipAttentionHeadsChunkSize                           = 128
-	hipAttentionKVSourceContiguous                uint32 = 0
-	hipAttentionKVSourceDevice                    uint32 = 1
-	hipVectorAddLaunchArgsVersion                 uint32 = 1
-	hipVectorAddLaunchArgsBytes                          = 64
-	hipVectorAddScaledLaunchArgsVersion           uint32 = 1
-	hipVectorAddScaledLaunchArgsBytes                    = 64
-	hipVectorScaleLaunchArgsVersion               uint32 = 1
-	hipVectorScaleLaunchArgsBytes                        = 64
-	hipSwiGLULaunchArgsVersion                    uint32 = 1
-	hipSwiGLULaunchArgsBytes                             = 64
-	hipGELUTanhMulLaunchArgsVersion               uint32 = 1
-	hipGELUTanhMulLaunchArgsBytes                        = 64
-	hipTinyPrefillLaunchArgsVersion               uint32 = 1
-	hipTinyPrefillLaunchArgsBytes                        = 160
-	hipTinyDecodeLaunchArgsVersion                uint32 = 1
-	hipTinyDecodeLaunchArgsBytes                         = 160
+	hipRMSNormLaunchArgsVersion                    uint32 = 1
+	hipRMSNormLaunchArgsBytes                             = 64
+	hipRMSNormResidualAddArgsVersion               uint32 = 1
+	hipRMSNormResidualAddArgsBytes                        = 80
+	hipRMSNormResAddNormArgsVersion                uint32 = 1
+	hipRMSNormResAddNormArgsBytes                         = 128
+	hipRMSNormHeadsLaunchArgsVersion               uint32 = 1
+	hipRMSNormHeadsLaunchArgsBytes                        = 64
+	hipRMSNormRoPEHeadsLaunchArgsVersion           uint32 = 1
+	hipRMSNormRoPEHeadsLaunchArgsBytes                    = 80
+	hipRMSNormRoPEHeadsBatchLaunchArgsVersion      uint32 = 1
+	hipRMSNormRoPEHeadsBatchLaunchArgsBytes               = 96
+	hipRoPELaunchArgsVersion                       uint32 = 1
+	hipRoPELaunchArgsBytes                                = 64
+	hipRoPEHeadsLaunchArgsVersion                  uint32 = 1
+	hipRoPEHeadsLaunchArgsBytes                           = 64
+	hipGreedyLaunchArgsVersion                     uint32 = 1
+	hipGreedyLaunchArgsBytes                              = 64
+	hipSoftcapGreedyLaunchArgsVersion              uint32 = 1
+	hipSoftcapGreedyLaunchArgsBytes                       = 64
+	hipGreedyResultBytes                                  = 8
+	hipAttentionLaunchArgsVersion                  uint32 = 1
+	hipAttentionLaunchArgsBytes                           = 104
+	hipAttentionHeadsLaunchArgsVersion             uint32 = 1
+	hipAttentionHeadsLaunchArgsBytes                      = 128
+	hipAttentionHeadsBatchCausalLaunchArgsVersion  uint32 = 1
+	hipAttentionHeadsBatchCausalLaunchArgsBytes           = 144
+	hipAttentionHeadsSharedMaxTokens                      = 2048
+	hipAttentionHeadsChunkedLaunchArgsVersion      uint32 = 1
+	hipAttentionHeadsChunkedLaunchArgsBytes               = 128
+	hipAttentionHeadsBatchChunkedLaunchArgsVersion uint32 = 1
+	hipAttentionHeadsBatchChunkedLaunchArgsBytes          = 136
+	hipAttentionHeadsChunkedBlockSize                     = 512
+	hipAttentionHeadsChunkSize                            = 128
+	hipAttentionKVSourceContiguous                 uint32 = 0
+	hipAttentionKVSourceDevice                     uint32 = 1
+	hipVectorAddLaunchArgsVersion                  uint32 = 1
+	hipVectorAddLaunchArgsBytes                           = 64
+	hipVectorAddScaledLaunchArgsVersion            uint32 = 1
+	hipVectorAddScaledLaunchArgsBytes                     = 64
+	hipVectorScaleLaunchArgsVersion                uint32 = 1
+	hipVectorScaleLaunchArgsBytes                         = 64
+	hipSwiGLULaunchArgsVersion                     uint32 = 1
+	hipSwiGLULaunchArgsBytes                              = 64
+	hipGELUTanhMulLaunchArgsVersion                uint32 = 1
+	hipGELUTanhMulLaunchArgsBytes                         = 64
+	hipTinyPrefillLaunchArgsVersion                uint32 = 1
+	hipTinyPrefillLaunchArgsBytes                         = 160
+	hipTinyDecodeLaunchArgsVersion                 uint32 = 1
+	hipTinyDecodeLaunchArgsBytes                          = 160
 )
 
 const (
@@ -370,6 +372,27 @@ type hipAttentionHeadsChunkedLaunchArgs struct {
 	Dim               int
 	TokenCount        int
 	HeadCount         int
+	ChunkSize         int
+	ChunkCount        int
+	QueryBytes        uint64
+	DescriptorBytes   uint64
+	PartialBytes      uint64
+	StatsBytes        uint64
+	OutputBytes       uint64
+	Scale             float32
+}
+
+type hipAttentionHeadsBatchChunkedLaunchArgs struct {
+	QueryPointer      nativeDevicePointer
+	DescriptorPointer nativeDevicePointer
+	PartialPointer    nativeDevicePointer
+	StatsPointer      nativeDevicePointer
+	OutputPointer     nativeDevicePointer
+	Dim               int
+	TokenCount        int
+	HeadCount         int
+	QueryCount        int
+	QueryStartToken   int
 	ChunkSize         int
 	ChunkCount        int
 	QueryBytes        uint64
@@ -2155,6 +2178,93 @@ func (args hipAttentionHeadsChunkedLaunchArgs) Binary() ([]byte, error) {
 	binary.LittleEndian.PutUint32(payload[84:], statsBytes)
 	binary.LittleEndian.PutUint32(payload[88:], outputBytes)
 	binary.LittleEndian.PutUint32(payload[92:], math.Float32bits(args.Scale))
+	return payload, nil
+}
+
+func (args hipAttentionHeadsBatchChunkedLaunchArgs) Binary() ([]byte, error) {
+	if args.QueryPointer == 0 || args.DescriptorPointer == 0 || args.PartialPointer == 0 || args.StatsPointer == 0 || args.OutputPointer == 0 {
+		return nil, core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "query, descriptor, workspace, and output pointers are required", nil)
+	}
+	if args.Scale < 0 || math.IsNaN(float64(args.Scale)) || math.IsInf(float64(args.Scale), 0) {
+		return nil, core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "scale must be non-negative and finite", nil)
+	}
+	dim, err := rocmDeviceKVPositiveUint32("dimension", args.Dim)
+	if err != nil {
+		return nil, err
+	}
+	tokenCount, err := rocmDeviceKVPositiveUint32("token count", args.TokenCount)
+	if err != nil {
+		return nil, err
+	}
+	headCount, err := rocmDeviceKVPositiveUint32("head count", args.HeadCount)
+	if err != nil {
+		return nil, err
+	}
+	queryCount, err := rocmDeviceKVPositiveUint32("query count", args.QueryCount)
+	if err != nil {
+		return nil, err
+	}
+	queryStartToken, err := rocmDeviceKVUint32("query start token", args.QueryStartToken)
+	if err != nil {
+		return nil, err
+	}
+	if uint64(queryStartToken)+uint64(queryCount) > uint64(tokenCount) {
+		return nil, core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "causal query window exceeds token count", nil)
+	}
+	chunkSize, err := rocmDeviceKVPositiveUint32("attention chunk size", args.ChunkSize)
+	if err != nil {
+		return nil, err
+	}
+	chunkCount, err := rocmDeviceKVPositiveUint32("attention chunk count", args.ChunkCount)
+	if err != nil {
+		return nil, err
+	}
+	if uint64(chunkCount) != (uint64(tokenCount)+uint64(chunkSize)-1)/uint64(chunkSize) {
+		return nil, core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "chunk count must cover token count", nil)
+	}
+	queryElements := uint64(dim) * uint64(headCount) * uint64(queryCount)
+	queryBytes, err := hipExactUint32Bytes("query", args.QueryBytes, queryElements*4)
+	if err != nil {
+		return nil, core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "query byte count", err)
+	}
+	partialCount := queryElements * uint64(chunkCount)
+	partialBytes, err := hipExactUint32Bytes("partial", args.PartialBytes, partialCount*4)
+	if err != nil {
+		return nil, core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "partial byte count", err)
+	}
+	statsCount := uint64(queryCount) * uint64(headCount) * uint64(chunkCount) * 2
+	statsBytes, err := hipExactUint32Bytes("stats", args.StatsBytes, statsCount*4)
+	if err != nil {
+		return nil, core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "stats byte count", err)
+	}
+	outputBytes, err := hipExactUint32Bytes("output", args.OutputBytes, queryElements*4)
+	if err != nil {
+		return nil, core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "output byte count", err)
+	}
+	if args.DescriptorBytes < rocmDeviceKVDescriptorHeaderBytes {
+		return nil, core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "device KV descriptor is required", nil)
+	}
+	payload := hipBorrowLaunchPacket(hipAttentionHeadsBatchChunkedLaunchArgsBytes)
+	binary.LittleEndian.PutUint32(payload[0:], hipAttentionHeadsBatchChunkedLaunchArgsVersion)
+	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
+	binary.LittleEndian.PutUint64(payload[8:], uint64(args.QueryPointer))
+	binary.LittleEndian.PutUint64(payload[16:], uint64(args.DescriptorPointer))
+	binary.LittleEndian.PutUint64(payload[24:], uint64(args.PartialPointer))
+	binary.LittleEndian.PutUint64(payload[32:], uint64(args.StatsPointer))
+	binary.LittleEndian.PutUint64(payload[40:], uint64(args.OutputPointer))
+	binary.LittleEndian.PutUint32(payload[48:], dim)
+	binary.LittleEndian.PutUint32(payload[52:], tokenCount)
+	binary.LittleEndian.PutUint32(payload[56:], headCount)
+	binary.LittleEndian.PutUint32(payload[60:], queryCount)
+	binary.LittleEndian.PutUint32(payload[64:], queryStartToken)
+	binary.LittleEndian.PutUint32(payload[68:], chunkSize)
+	binary.LittleEndian.PutUint32(payload[72:], chunkCount)
+	binary.LittleEndian.PutUint32(payload[76:], queryBytes)
+	binary.LittleEndian.PutUint64(payload[80:], args.DescriptorBytes)
+	binary.LittleEndian.PutUint32(payload[88:], partialBytes)
+	binary.LittleEndian.PutUint32(payload[92:], statsBytes)
+	binary.LittleEndian.PutUint32(payload[96:], outputBytes)
+	binary.LittleEndian.PutUint32(payload[100:], math.Float32bits(args.Scale))
 	return payload, nil
 }
 

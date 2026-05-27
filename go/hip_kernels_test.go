@@ -2582,6 +2582,107 @@ func TestHIPKernels_AttentionHeadsBatchCausalLaunchArgs_Good(t *testing.T) {
 	assertFloat32SlicesNear(t, wantOutput(t), deviceGot, 0.0001)
 }
 
+func TestHIPKernels_AttentionHeadsBatchChunkedLaunchArgs_Good(t *testing.T) {
+	const (
+		dim             = 4
+		tokenCount      = hipAttentionHeadsSharedMaxTokens + 1
+		headCount       = 1
+		queryCount      = 2
+		queryStartToken = tokenCount - queryCount
+	)
+	queryValues := []float32{
+		0.75, -0.25, 0.5, -0.125,
+		-0.5, 0.5, -0.375, 0.25,
+	}
+	keyValues := make([]float32, tokenCount*dim)
+	valueValues := make([]float32, tokenCount*dim)
+	for index := 0; index < tokenCount; index++ {
+		for dimIndex := 0; dimIndex < dim; dimIndex++ {
+			keyValues[index*dim+dimIndex] = float32((index+dimIndex*3)%23-11) * 0.0125
+			valueValues[index*dim+dimIndex] = float32((index+dimIndex*5)%29-14) * 0.01
+		}
+	}
+
+	driver := &fakeHIPDriver{available: true}
+	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, hipGemma4Q4DeviceKVBlockSize())
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(0, dim, dim, keyValues, valueValues))
+	deviceKV, err := cache.MirrorToDevice(driver)
+	core.RequireNoError(t, err)
+	defer deviceKV.Close()
+	table, err := deviceKV.KernelDescriptorTable()
+	core.RequireNoError(t, err)
+	defer table.Close()
+	queryPayload, err := hipFloat32Payload(queryValues)
+	core.RequireNoError(t, err)
+	query, err := hipUploadByteBuffer(driver, "rocm.hip.AttentionHeadsBatchChunkedLaunch", "attention batch chunked query", queryPayload, len(queryValues))
+	core.RequireNoError(t, err)
+	defer query.Close()
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.AttentionHeadsBatchChunkedLaunch", "attention batch chunked output", uint64(len(queryValues)*4), len(queryValues))
+	core.RequireNoError(t, err)
+	defer output.Close()
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	start := len(driver.launches)
+	err = hipRunAttentionHeadsBatchCausalOutputFromDeviceQueryToDeviceKernelWorkspace(context.Background(), driver, hipAttentionHeadsBatchCausalDeviceRequest{
+		DeviceKV:        deviceKV,
+		DescriptorTable: table,
+		Dim:             dim,
+		TokenCount:      tokenCount,
+		HeadCount:       headCount,
+		QueryCount:      queryCount,
+		QueryStartToken: queryStartToken,
+		Scale:           1,
+	}, query, output, workspace)
+	core.RequireNoError(t, err)
+	got, err := hipReadFloat32DeviceOutput(output, "rocm.hip.AttentionHeadsBatchChunkedLaunch", "attention batch chunked output", len(queryValues))
+	core.RequireNoError(t, err)
+	quantKeys, quantValues, err := driver.readDeviceKVDescriptorForAttention(table.Pointer(), int(table.SizeBytes()), tokenCount, dim)
+	core.RequireNoError(t, err)
+	keys, err := splitHIPReferenceVectors(quantKeys, dim)
+	core.RequireNoError(t, err)
+	values, err := splitHIPReferenceVectors(quantValues, dim)
+	core.RequireNoError(t, err)
+	want := make([]float32, 0, len(queryValues))
+	for queryIndex := 0; queryIndex < queryCount; queryIndex++ {
+		visibleTokens := queryStartToken + queryIndex + 1
+		headOutput, _, err := hipReferenceSingleHeadAttentionWithScale(queryValues[queryIndex*dim:(queryIndex+1)*dim], keys[:visibleTokens], values[:visibleTokens], 1)
+		core.RequireNoError(t, err)
+		want = append(want, headOutput...)
+	}
+	assertFloat32SlicesNear(t, want, got, 0.0001)
+	launches := driver.launches[start:]
+	core.AssertEqual(t, 2, len(launches))
+	core.AssertEqual(t, hipKernelNameAttentionHeadsBatchChunkedStage1, launches[0].Name)
+	core.AssertEqual(t, hipKernelNameAttentionHeadsBatchChunkedStage2, launches[1].Name)
+	chunkCount := (tokenCount + hipAttentionHeadsChunkSize - 1) / hipAttentionHeadsChunkSize
+	core.AssertEqual(t, uint32(headCount*queryCount*chunkCount), launches[0].GridX)
+	core.AssertEqual(t, uint32(headCount*queryCount), launches[1].GridX)
+	core.AssertEqual(t, hipAttentionHeadsBatchChunkedLaunchArgsBytes, len(launches[0].Args))
+	core.AssertEqual(t, hipAttentionHeadsBatchChunkedLaunchArgsVersion, binary.LittleEndian.Uint32(launches[0].Args[0:]))
+	core.AssertEqual(t, uint32(hipAttentionHeadsBatchChunkedLaunchArgsBytes), binary.LittleEndian.Uint32(launches[0].Args[4:]))
+	core.AssertEqual(t, uint64(query.Pointer()), binary.LittleEndian.Uint64(launches[0].Args[8:]))
+	core.AssertEqual(t, uint64(table.Pointer()), binary.LittleEndian.Uint64(launches[0].Args[16:]))
+	core.AssertEqual(t, uint64(output.Pointer()), binary.LittleEndian.Uint64(launches[0].Args[40:]))
+	core.AssertEqual(t, uint32(dim), binary.LittleEndian.Uint32(launches[0].Args[48:]))
+	core.AssertEqual(t, uint32(tokenCount), binary.LittleEndian.Uint32(launches[0].Args[52:]))
+	core.AssertEqual(t, uint32(headCount), binary.LittleEndian.Uint32(launches[0].Args[56:]))
+	core.AssertEqual(t, uint32(queryCount), binary.LittleEndian.Uint32(launches[0].Args[60:]))
+	core.AssertEqual(t, uint32(queryStartToken), binary.LittleEndian.Uint32(launches[0].Args[64:]))
+	core.AssertEqual(t, uint32(hipAttentionHeadsChunkSize), binary.LittleEndian.Uint32(launches[0].Args[68:]))
+	core.AssertEqual(t, uint32(chunkCount), binary.LittleEndian.Uint32(launches[0].Args[72:]))
+	core.AssertEqual(t, uint32(len(queryValues)*4), binary.LittleEndian.Uint32(launches[0].Args[76:]))
+	core.AssertEqual(t, uint64(table.SizeBytes()), binary.LittleEndian.Uint64(launches[0].Args[80:]))
+	core.AssertEqual(t, uint32(headCount*queryCount*chunkCount*dim*4), binary.LittleEndian.Uint32(launches[0].Args[88:]))
+	core.AssertEqual(t, uint32(headCount*queryCount*chunkCount*2*4), binary.LittleEndian.Uint32(launches[0].Args[92:]))
+	core.AssertEqual(t, uint32(len(queryValues)*4), binary.LittleEndian.Uint32(launches[0].Args[96:]))
+	core.AssertEqual(t, math.Float32bits(1), binary.LittleEndian.Uint32(launches[0].Args[100:]))
+	if workspace.BatchAttentionWeight != nil {
+		t.Fatalf("batch chunked attention allocated materialized weights")
+	}
+}
+
 func TestHIPKernels_AttentionHeadsBatchCausalLaunchArgs_Bad(t *testing.T) {
 	_, err := (hipAttentionHeadsBatchCausalLaunchArgs{
 		QueryPointer:    1,

@@ -2068,6 +2068,9 @@ func hipRunAttentionHeadsBatchCausalOutputFromDeviceQueryToDeviceKernelWorkspace
 		launch.DescriptorPointer = req.DescriptorTable.Pointer()
 		launch.DescriptorBytes = req.DescriptorTable.SizeBytes()
 	}
+	if hipAttentionHeadsBatchChunkedEligible(req, workspace) {
+		return hipRunAttentionHeadsBatchChunkedOutputFromDeviceQueryToDeviceKernelWorkspace(ctx, driver, req, query, output, workspace)
+	}
 	useSharedWeights := req.TokenCount <= hipAttentionHeadsSharedMaxTokens
 	var sharedMemBytes uint32
 	var weights *hipDeviceByteBuffer
@@ -2114,6 +2117,140 @@ func hipRunAttentionHeadsBatchCausalOutputFromDeviceQueryToDeviceKernelWorkspace
 		return err
 	}
 	return hipLaunchKernel(driver, config)
+}
+
+func hipAttentionHeadsBatchChunkedEligible(req hipAttentionHeadsBatchCausalDeviceRequest, workspace *hipAttentionHeadsChunkedWorkspace) bool {
+	if workspace == nil || req.DeviceKV == nil || req.DescriptorTable == nil {
+		return false
+	}
+	if req.Dim <= 0 || req.Dim > hipAttentionHeadsChunkedBlockSize || req.TokenCount <= hipAttentionHeadsSharedMaxTokens {
+		return false
+	}
+	if req.DeviceKV.mode != rocmKVCacheModeKQ8VQ4 {
+		return false
+	}
+	return req.DeviceKV.TokenCount() == req.TokenCount
+}
+
+func hipRunAttentionHeadsBatchChunkedOutputFromDeviceQueryToDeviceKernelWorkspace(ctx context.Context, driver nativeHIPDriver, req hipAttentionHeadsBatchCausalDeviceRequest, query *hipDeviceByteBuffer, output *hipDeviceByteBuffer, workspace *hipAttentionHeadsChunkedWorkspace) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	if workspace == nil {
+		return core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "attention workspace is required", nil)
+	}
+	if req.DeviceKV == nil || req.DescriptorTable == nil {
+		return core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "device KV cache and descriptor table are required", nil)
+	}
+	if req.Dim <= 0 || req.Dim > hipAttentionHeadsChunkedBlockSize || req.TokenCount <= 0 || req.HeadCount <= 0 || req.QueryCount <= 0 {
+		return core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "attention batch dimensions are unsupported", nil)
+	}
+	if req.QueryStartToken < 0 || uint64(req.QueryStartToken)+uint64(req.QueryCount) > uint64(req.TokenCount) {
+		return core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "causal query window exceeds token count", nil)
+	}
+	if req.Scale < 0 || math.IsNaN(float64(req.Scale)) || math.IsInf(float64(req.Scale), 0) {
+		return core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "scale must be non-negative and finite", nil)
+	}
+	queryCount := req.QueryCount * req.HeadCount * req.Dim
+	if query == nil || query.Pointer() == 0 || query.Count() != queryCount || query.SizeBytes() != uint64(queryCount*4) {
+		return core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "attention query device buffer shape mismatch", nil)
+	}
+	if output == nil || output.Pointer() == 0 || output.Count() != queryCount || output.SizeBytes() != uint64(queryCount*4) {
+		return core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "attention output device buffer shape mismatch", nil)
+	}
+	if err := req.DescriptorTable.CompatibleWith(req.DeviceKV); err != nil {
+		return core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "descriptor table does not match device KV cache", err)
+	}
+	keyWidth, valueWidth, ok := req.DeviceKV.LastVectorWidths()
+	if !ok {
+		return core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "device KV cache has no pages", nil)
+	}
+	if req.DeviceKV.mode != rocmKVCacheModeKQ8VQ4 || keyWidth != req.Dim || valueWidth != req.Dim || req.DeviceKV.TokenCount() != req.TokenCount {
+		return core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "device KV cache shape is unsupported", nil)
+	}
+
+	chunkSize := hipAttentionHeadsChunkSize
+	chunkCount := (req.TokenCount + chunkSize - 1) / chunkSize
+	workspaceHeadRows := req.HeadCount * req.QueryCount
+	if err := workspace.Ensure(driver, workspaceHeadRows, req.Dim, req.TokenCount, chunkSize); err != nil {
+		return err
+	}
+	launch := hipAttentionHeadsBatchChunkedLaunchArgs{
+		QueryPointer:      query.Pointer(),
+		DescriptorPointer: req.DescriptorTable.Pointer(),
+		PartialPointer:    workspace.Partial.Pointer(),
+		StatsPointer:      workspace.Stats.Pointer(),
+		OutputPointer:     output.Pointer(),
+		Dim:               req.Dim,
+		TokenCount:        req.TokenCount,
+		HeadCount:         req.HeadCount,
+		QueryCount:        req.QueryCount,
+		QueryStartToken:   req.QueryStartToken,
+		ChunkSize:         chunkSize,
+		ChunkCount:        chunkCount,
+		QueryBytes:        query.SizeBytes(),
+		DescriptorBytes:   req.DescriptorTable.SizeBytes(),
+		PartialBytes:      uint64(workspaceHeadRows * chunkCount * req.Dim * 4),
+		StatsBytes:        uint64(workspaceHeadRows * chunkCount * 2 * 4),
+		OutputBytes:       output.SizeBytes(),
+		Scale:             req.Scale,
+	}
+	launchBytes, err := launch.Binary()
+	if err != nil {
+		return err
+	}
+	stage2LaunchBytes := hipBorrowLaunchPacket(len(launchBytes))
+	copy(stage2LaunchBytes, launchBytes)
+	sharedMemBytes, err := hipAttentionHeadsChunkedSharedMemBytes(chunkSize, req.Dim)
+	if err != nil {
+		hipReleaseLaunchPacket(stage2LaunchBytes)
+		return err
+	}
+	stage1Blocks, err := rocmDeviceKVPositiveUint32("attention batch chunked stage1 blocks", workspaceHeadRows*chunkCount)
+	if err != nil {
+		hipReleaseLaunchPacket(stage2LaunchBytes)
+		return err
+	}
+	stage1 := hipKernelLaunchConfig{
+		Name:           hipKernelNameAttentionHeadsBatchChunkedStage1,
+		Args:           launchBytes,
+		GridX:          stage1Blocks,
+		GridY:          1,
+		GridZ:          1,
+		BlockX:         hipAttentionHeadsChunkedBlockSize,
+		BlockY:         1,
+		BlockZ:         1,
+		SharedMemBytes: sharedMemBytes,
+	}
+	if err := stage1.Validate(); err != nil {
+		hipReleaseLaunchPacket(stage2LaunchBytes)
+		return err
+	}
+	if err := hipLaunchKernel(driver, stage1); err != nil {
+		hipReleaseLaunchPacket(stage2LaunchBytes)
+		return err
+	}
+	stage2Blocks, err := rocmDeviceKVPositiveUint32("attention batch chunked stage2 blocks", workspaceHeadRows)
+	if err != nil {
+		hipReleaseLaunchPacket(stage2LaunchBytes)
+		return err
+	}
+	stage2 := hipKernelLaunchConfig{
+		Name:           hipKernelNameAttentionHeadsBatchChunkedStage2,
+		Args:           stage2LaunchBytes,
+		GridX:          stage2Blocks,
+		GridY:          1,
+		GridZ:          1,
+		BlockX:         hipAttentionHeadsChunkedBlockSize,
+		BlockY:         1,
+		BlockZ:         1,
+		SharedMemBytes: 0,
+	}
+	if err := stage2.Validate(); err != nil {
+		hipReleaseLaunchPacket(stage2LaunchBytes)
+		return err
+	}
+	return hipLaunchKernel(driver, stage2)
 }
 
 type hipAttentionHeadsChunkedWorkspace struct {

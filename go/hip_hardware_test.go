@@ -2360,6 +2360,73 @@ func TestHIPHardwareTransformerKernelSource_Good(t *testing.T) {
 		}
 	})
 
+	t.Run("attention-heads-batch-chunked-block-kv", func(t *testing.T) {
+		const (
+			dim             = 4
+			tokenCount      = hipAttentionHeadsSharedMaxTokens + 3
+			headCount       = 1
+			queryCount      = 2
+			queryStartToken = tokenCount - queryCount
+		)
+		queryValues := []float32{
+			0.75, -0.25, 0.5, -0.125,
+			-0.5, 0.5, -0.375, 0.25,
+		}
+		keyValues := make([]float32, tokenCount*dim)
+		valueValues := make([]float32, tokenCount*dim)
+		for index := 0; index < tokenCount; index++ {
+			for dimIndex := 0; dimIndex < dim; dimIndex++ {
+				keyValues[index*dim+dimIndex] = float32(math.Sin(float64(index+dimIndex)*0.017) * 0.5)
+				valueValues[index*dim+dimIndex] = float32(math.Cos(float64(index+dimIndex*2)*0.019) * 0.5)
+			}
+		}
+		cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, hipGemma4Q4DeviceKVBlockSize())
+		core.RequireNoError(t, err)
+		core.RequireNoError(t, cache.AppendVectors(0, dim, dim, keyValues, valueValues))
+		deviceKV, err := cache.MirrorToDevice(hipRuntime.driver)
+		core.RequireNoError(t, err)
+		defer deviceKV.Close()
+		table, err := deviceKV.KernelDescriptorTable()
+		core.RequireNoError(t, err)
+		defer table.Close()
+		queryPayload, err := hipFloat32Payload(queryValues)
+		core.RequireNoError(t, err)
+		queryBuffer, err := hipUploadByteBuffer(hipRuntime.driver, "rocm.hip.AttentionHeadsBatchChunkedLaunch", "hardware batch chunked attention query", queryPayload, len(queryValues))
+		core.RequireNoError(t, err)
+		defer queryBuffer.Close()
+		output, err := hipAllocateByteBuffer(hipRuntime.driver, "rocm.hip.AttentionHeadsBatchChunkedLaunch", "hardware batch chunked attention output", uint64(len(queryValues)*4), len(queryValues))
+		core.RequireNoError(t, err)
+		defer output.Close()
+		workspace := &hipAttentionHeadsChunkedWorkspace{}
+		defer workspace.Close()
+		core.RequireNoError(t, hipRunAttentionHeadsBatchCausalOutputFromDeviceQueryToDeviceKernelWorkspace(context.Background(), hipRuntime.driver, hipAttentionHeadsBatchCausalDeviceRequest{
+			DeviceKV:        deviceKV,
+			DescriptorTable: table,
+			Dim:             dim,
+			TokenCount:      tokenCount,
+			HeadCount:       headCount,
+			QueryCount:      queryCount,
+			QueryStartToken: queryStartToken,
+			Scale:           1,
+		}, queryBuffer, output, workspace))
+		got, err := hipReadFloat32DeviceOutput(output, "rocm.hip.AttentionHeadsBatchChunkedLaunch", "hardware batch chunked attention output", len(queryValues))
+		core.RequireNoError(t, err)
+		restoredKeys, restoredValues, err := cache.Restore(0, cache.TokenCount())
+		core.RequireNoError(t, err)
+		keys, err := splitHIPReferenceVectors(restoredKeys, dim)
+		core.RequireNoError(t, err)
+		values, err := splitHIPReferenceVectors(restoredValues, dim)
+		core.RequireNoError(t, err)
+		want := make([]float32, 0, len(queryValues))
+		for queryIndex := 0; queryIndex < queryCount; queryIndex++ {
+			visibleTokens := queryStartToken + queryIndex + 1
+			headOutput, _, err := hipReferenceSingleHeadAttentionWithScale(queryValues[queryIndex*dim:(queryIndex+1)*dim], keys[:visibleTokens], values[:visibleTokens], 1)
+			core.RequireNoError(t, err)
+			want = append(want, headOutput...)
+		}
+		assertFloat32SlicesNear(t, want, got, 0.005)
+	})
+
 	attentionBatchQueryValues := []float32{
 		1, 0,
 		0, 1,

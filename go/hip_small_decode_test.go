@@ -2365,6 +2365,51 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_BatchAttentionWeightsReused(b *t
 	}
 }
 
+func BenchmarkHIPAttentionHeadsBatchChunkedLaunchArgs_FullWindow(b *testing.B) {
+	const (
+		dim        = 256
+		tokenCount = 4096
+		headCount  = 8
+		queryCount = 16
+		chunkSize  = hipAttentionHeadsChunkSize
+	)
+	chunkCount := (tokenCount + chunkSize - 1) / chunkSize
+	queryElements := dim * headCount * queryCount
+	args := hipAttentionHeadsBatchChunkedLaunchArgs{
+		QueryPointer:      1,
+		DescriptorPointer: 2,
+		PartialPointer:    3,
+		StatsPointer:      4,
+		OutputPointer:     5,
+		Dim:               dim,
+		TokenCount:        tokenCount,
+		HeadCount:         headCount,
+		QueryCount:        queryCount,
+		QueryStartToken:   tokenCount - queryCount,
+		ChunkSize:         chunkSize,
+		ChunkCount:        chunkCount,
+		QueryBytes:        uint64(queryElements * 4),
+		DescriptorBytes:   uint64(rocmDeviceKVDescriptorHeaderBytes + tokenCount*rocmDeviceKVDescriptorPageBytes),
+		PartialBytes:      uint64(queryElements * chunkCount * 4),
+		StatsBytes:        uint64(queryCount * headCount * chunkCount * 2 * 4),
+		OutputBytes:       uint64(queryElements * 4),
+		Scale:             1,
+	}
+	packet, err := args.Binary()
+	if err != nil {
+		b.Fatal(err)
+	}
+	hipReleaseLaunchPacket(packet)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		packet, err = args.Binary()
+		if err != nil {
+			b.Fatal(err)
+		}
+		hipReleaseLaunchPacket(packet)
+	}
+}
+
 func BenchmarkHIPAttentionHeadsChunkedWorkspace_ProjectionOutputReused(b *testing.B) {
 	driver := &fakeHIPDriver{available: true}
 	workspace := &hipAttentionHeadsChunkedWorkspace{}
