@@ -339,6 +339,18 @@ var rocmDeviceKVPageSlicePools sync.Map
 
 const rocmDeviceKVPageSlicePoolMaxPerCapacity = 512
 
+type rocmDeviceKVDescriptorBytePool struct {
+	sync.Mutex
+	buffers [][]byte
+}
+
+var rocmDeviceKVDescriptorBytePools sync.Map
+
+const (
+	rocmDeviceKVDescriptorBytePoolMaxPerCapacity = 512
+	rocmDeviceKVDescriptorBytePoolMaxBytes       = rocmDeviceKVDescriptorHeaderBytes + rocmDeviceKVPagePoolMaxCapacity*rocmDeviceKVDescriptorPageBytes
+)
+
 type rocmDeviceKVTensorPoolEntry struct {
 	driver  nativeHIPDriver
 	pointer nativeDevicePointer
@@ -425,6 +437,69 @@ func rocmDeviceKVReleasePageSlice(pages []rocmDeviceKVPage) {
 	pool.Lock()
 	if len(pool.pages) < rocmDeviceKVPageSlicePoolMaxPerCapacity {
 		pool.pages = append(pool.pages, full[:0])
+	}
+	pool.Unlock()
+}
+
+func rocmDeviceKVBorrowDescriptorBytes(length int) []byte {
+	if length <= 0 {
+		return nil
+	}
+	capacity := rocmDeviceKVDescriptorByteCapacity(length)
+	if capacity >= int(rocmDeviceKVDescriptorHotTableBytes()) && capacity <= rocmDeviceKVDescriptorBytePoolMaxBytes {
+		poolValue, ok := rocmDeviceKVDescriptorBytePools.Load(capacity)
+		if !ok {
+			pool := &rocmDeviceKVDescriptorBytePool{}
+			poolValue, _ = rocmDeviceKVDescriptorBytePools.LoadOrStore(capacity, pool)
+		}
+		pool := poolValue.(*rocmDeviceKVDescriptorBytePool)
+		pool.Lock()
+		if index := len(pool.buffers) - 1; index >= 0 {
+			buffer := pool.buffers[index]
+			pool.buffers[index] = nil
+			pool.buffers = pool.buffers[:index]
+			pool.Unlock()
+			return buffer[:length]
+		}
+		pool.Unlock()
+	}
+	return make([]byte, length, capacity)
+}
+
+func rocmDeviceKVDescriptorByteCapacity(length int) int {
+	if length <= 0 {
+		return 0
+	}
+	if length < int(rocmDeviceKVDescriptorHotTableBytes()) {
+		return length
+	}
+	if length <= rocmDeviceKVDescriptorHeaderBytes {
+		return length
+	}
+	pageBytes := rocmDeviceKVDescriptorPageBytes
+	pageCount := (length - rocmDeviceKVDescriptorHeaderBytes + pageBytes - 1) / pageBytes
+	pageCapacity := rocmDeviceKVPageSliceCapacity(pageCount)
+	if pageCapacity > rocmDeviceKVPagePoolMaxCapacity {
+		return length
+	}
+	return rocmDeviceKVDescriptorHeaderBytes + pageCapacity*pageBytes
+}
+
+func rocmDeviceKVReleaseDescriptorBytes(payload []byte) {
+	if cap(payload) < int(rocmDeviceKVDescriptorHotTableBytes()) || cap(payload) > rocmDeviceKVDescriptorBytePoolMaxBytes {
+		return
+	}
+	full := payload[:cap(payload)]
+	clear(full)
+	poolValue, ok := rocmDeviceKVDescriptorBytePools.Load(cap(full))
+	if !ok {
+		pool := &rocmDeviceKVDescriptorBytePool{}
+		poolValue, _ = rocmDeviceKVDescriptorBytePools.LoadOrStore(cap(full), pool)
+	}
+	pool := poolValue.(*rocmDeviceKVDescriptorBytePool)
+	pool.Lock()
+	if len(pool.buffers) < rocmDeviceKVDescriptorBytePoolMaxPerCapacity {
+		pool.buffers = append(pool.buffers, full[:0])
 	}
 	pool.Unlock()
 }
@@ -1592,6 +1667,10 @@ func (cache *rocmDeviceKVCache) KernelDescriptor() (rocmDeviceKVDescriptor, erro
 }
 
 func (cache *rocmDeviceKVCache) KernelDescriptorBytes() ([]byte, error) {
+	return cache.kernelDescriptorBytesInto(nil)
+}
+
+func (cache *rocmDeviceKVCache) kernelDescriptorBytesInto(payload []byte) ([]byte, error) {
 	if cache == nil {
 		return nil, core.E("rocm.KVCache.DeviceMirror", "device KV cache is nil", nil)
 	}
@@ -1620,7 +1699,12 @@ func (cache *rocmDeviceKVCache) KernelDescriptorBytes() ([]byte, error) {
 	if tokenCount == 0 {
 		return nil, core.E("rocm.KVCache.DeviceDescriptor", "token count must be positive", nil)
 	}
-	payload := make([]byte, rocmDeviceKVDescriptorHeaderBytes+len(cache.pages)*rocmDeviceKVDescriptorPageBytes)
+	descriptorBytes := rocmDeviceKVDescriptorHeaderBytes + len(cache.pages)*rocmDeviceKVDescriptorPageBytes
+	if cap(payload) < descriptorBytes {
+		payload = make([]byte, descriptorBytes)
+	} else {
+		payload = payload[:descriptorBytes]
+	}
 	binary.LittleEndian.PutUint32(payload[0:], rocmDeviceKVDescriptorVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(rocmDeviceKVDescriptorHeaderBytes))
 	binary.LittleEndian.PutUint32(payload[8:], uint32(rocmDeviceKVDescriptorPageBytes))
@@ -1697,8 +1781,11 @@ func (cache *rocmDeviceKVCache) KernelDescriptorTable() (*rocmDeviceKVDescriptor
 	if !cache.driver.Available() {
 		return nil, core.E("rocm.KVCache.DeviceDescriptor", "HIP driver is not available", nil)
 	}
-	payload, err := cache.KernelDescriptorBytes()
+	payloadLength := rocmDeviceKVDescriptorHeaderBytes + len(cache.pages)*rocmDeviceKVDescriptorPageBytes
+	payload := rocmDeviceKVBorrowDescriptorBytes(payloadLength)
+	payload, err := cache.kernelDescriptorBytesInto(payload)
 	if err != nil {
+		rocmDeviceKVReleaseDescriptorBytes(payload)
 		return nil, err
 	}
 	sizeBytes := uint64(len(payload))
@@ -1717,6 +1804,7 @@ func (cache *rocmDeviceKVCache) KernelDescriptorTable() (*rocmDeviceKVDescriptor
 		}
 	}
 	if err := hipCopyHostToDevice(cache.driver, pointer, payload); err != nil {
+		rocmDeviceKVReleaseDescriptorBytes(payload)
 		if poolable {
 			_ = rocmDeviceKVDescriptorTableFree(cache.driver, pointer, allocationBytes)
 		} else {
@@ -1724,6 +1812,7 @@ func (cache *rocmDeviceKVCache) KernelDescriptorTable() (*rocmDeviceKVDescriptor
 		}
 		return nil, core.E("rocm.KVCache.DeviceDescriptor", "copy descriptor table", err)
 	}
+	rocmDeviceKVReleaseDescriptorBytes(payload)
 	return rocmBorrowDeviceKVDescriptorTableAllocated(cache.driver, pointer, sizeBytes, allocationBytes, rocmDeviceKVDescriptorVersion, cache.PageCount(), false, poolable), nil
 }
 

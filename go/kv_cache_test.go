@@ -1272,6 +1272,10 @@ func BenchmarkROCmDeviceKVCacheKernelDescriptorTable_HotWindowPooled(b *testing.
 	rocmDeviceKVDescriptorPointerPool.entries = make(map[uint64][]rocmDeviceKVDescriptorPointerPoolEntry)
 	rocmDeviceKVDescriptorPointerPool.bytes = 0
 	rocmDeviceKVDescriptorPointerPool.Unlock()
+	rocmDeviceKVDescriptorBytePools.Range(func(key, _ any) bool {
+		rocmDeviceKVDescriptorBytePools.Delete(key)
+		return true
+	})
 	driver := &fakeHIPDriver{available: true}
 	const (
 		keyWidth   = 128
