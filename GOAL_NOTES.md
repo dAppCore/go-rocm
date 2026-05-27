@@ -17253,3 +17253,78 @@ This does not complete the decode goal. It narrows the next speed target:
 late-turn retained slowdown is now easier to distinguish from fixed per-token
 q4 math, and the next optimization pass should target retained chunked
 attention scaling rather than another already-rejected generic q4 geometry.
+
+## 2026-05-27 Accepted Decode-Only Book Kernel Metrics
+
+Read `../go-mlx/IDEAS.md` and rechecked the Gemma4-specific guidance against
+the ROCm retained benchmark:
+
+- Gemma4's hybrid shape means local SWA should stay bounded at 512/1024 tokens,
+  while only full/global layers should grow with retained context.
+- PLE/q4/projection work should be treated as fixed per-token load unless the
+  route metrics prove otherwise.
+- The retained benchmark must separate current-turn prompt append from generated
+  token decode, otherwise prompt-prefill global attention can be mistaken for a
+  decode regression.
+
+Accepted change:
+
+- Retained `book.md` benchmark artifacts now include decode-only kernel
+  launches/blocks per turn.
+- The artifact also writes a decode-only selected-kernel table and decode-only
+  shape table so q4, attention, and sampling routes can be compared without
+  prompt append noise.
+- A filtered decode-only attention-shape table is included because the generic
+  shape table is often dominated by q4 blocks and can hide the local/global
+  attention split.
+
+Verification:
+
+```text
+go test ./go -run 'TestInferenceBenchmark(HIPKernelCountingDriver|BookTurnKernelDeltas|BookThresholdHelpers|BookRepetitionStats|BookPrompt)' -count=1 -v
+PASS
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.142s
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.108s
+
+go test ./... -count=1
+ok dappco.re/go/rocm/workspace 0.681s
+```
+
+2-turn retained decode-only proof on the RX 7800 XT:
+
+```text
+GO_ROCM_BOOK_TURNS=2
+GO_ROCM_BENCH_KERNEL_ROUTE_METRICS=1
+GO_ROCM_BOOK_OUTPUT_FILE=/tmp/go-rocm-book2-decode-kernel-metrics.md
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 15348287542 ns/op
+book_wall_s=15.32
+book_generated_tokens=1501
+book_tok/s=97.98
+book_turn01_tok/s=106.3
+book_turn02_tok/s=98.35
+book_turn01_decode_kernel_launches=460385
+book_turn02_decode_kernel_launches=275451
+book_turn01_decode_kernel_blocks=76757240
+book_turn02_decode_kernel_blocks=46117428
+stderr: .bench-errors/book2_decode_kernel_metrics_20260527.err (0 bytes)
+```
+
+The decode-only selected-kernel table removes the earlier ambiguity:
+
+```text
+turn 1 q4 GELU blocks/generated_token: 42240
+turn 2 q4 GELU blocks/generated_token: 42240
+turn 1 q4 projection blocks/generated_token: 19584
+turn 2 q4 projection blocks/generated_token: 19584
+turn 1 chunked attention stage1 blocks/generated_token: 1045
+turn 2 chunked attention stage1 blocks/generated_token: 1594
+```
+
+Conclusion: the fixed q4 hot path is now flat per generated token in retained
+decode, while chunked attention stage1 still grows as retained context grows.
+That growth is the next scaling target; the q4 route is still the largest fixed
+cost, but it is not the reason later turns bend downward.

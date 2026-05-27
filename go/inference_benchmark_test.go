@@ -61,6 +61,7 @@ type inferenceBenchmarkHIPKernelShapeEntry struct {
 
 type inferenceBenchmarkHIPKernelStatsSnapshot struct {
 	Kernel map[string]inferenceBenchmarkHIPKernelStats
+	Shape  map[inferenceBenchmarkHIPKernelShapeKey]inferenceBenchmarkHIPKernelStats
 	Total  inferenceBenchmarkHIPKernelStats
 }
 
@@ -168,6 +169,16 @@ func (driver *inferenceBenchmarkHIPKernelCountingDriver) KernelShapeStatsSnapsho
 	return snapshot
 }
 
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) KernelShapeStatsMapSnapshot() map[inferenceBenchmarkHIPKernelShapeKey]inferenceBenchmarkHIPKernelStats {
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	snapshot := make(map[inferenceBenchmarkHIPKernelShapeKey]inferenceBenchmarkHIPKernelStats, len(driver.shape))
+	for key, stats := range driver.shape {
+		snapshot[key] = stats
+	}
+	return snapshot
+}
+
 func (driver *inferenceBenchmarkHIPKernelCountingDriver) TotalKernelStats() inferenceBenchmarkHIPKernelStats {
 	driver.mu.Lock()
 	defer driver.mu.Unlock()
@@ -180,6 +191,7 @@ func inferenceBenchmarkBookKernelSnapshot(driver *inferenceBenchmarkHIPKernelCou
 	}
 	return inferenceBenchmarkHIPKernelStatsSnapshot{
 		Kernel: driver.KernelStatsSnapshot(),
+		Shape:  driver.KernelShapeStatsMapSnapshot(),
 		Total:  driver.TotalKernelStats(),
 	}
 }
@@ -191,10 +203,14 @@ func inferenceBenchmarkBookKernelDelta(driver *inferenceBenchmarkHIPKernelCounti
 	after := inferenceBenchmarkBookKernelSnapshot(driver)
 	delta := inferenceBenchmarkHIPKernelStatsSnapshot{
 		Kernel: make(map[string]inferenceBenchmarkHIPKernelStats, len(after.Kernel)),
+		Shape:  make(map[inferenceBenchmarkHIPKernelShapeKey]inferenceBenchmarkHIPKernelStats, len(after.Shape)),
 		Total:  inferenceBenchmarkHIPKernelStatsDelta(after.Total, before.Total),
 	}
 	for name, stats := range after.Kernel {
 		delta.Kernel[name] = inferenceBenchmarkHIPKernelStatsDelta(stats, before.Kernel[name])
+	}
+	for key, stats := range after.Shape {
+		delta.Shape[key] = inferenceBenchmarkHIPKernelStatsDelta(stats, before.Shape[key])
 	}
 	return delta
 }
@@ -333,7 +349,27 @@ func inferenceBenchmarkTopHIPKernelShapeEntries(driver *inferenceBenchmarkHIPKer
 	if driver == nil || limit <= 0 {
 		return nil
 	}
-	entries := driver.KernelShapeStatsSnapshot()
+	return inferenceBenchmarkTopHIPKernelShapeEntriesFromEntries(driver.KernelShapeStatsSnapshot(), limit, sortMode)
+}
+
+func inferenceBenchmarkTopHIPKernelShapeEntriesFromSnapshot(snapshot inferenceBenchmarkHIPKernelStatsSnapshot, limit int, sortMode inferenceBenchmarkHIPKernelSortMode) []inferenceBenchmarkHIPKernelShapeEntry {
+	if len(snapshot.Shape) == 0 || limit <= 0 {
+		return nil
+	}
+	entries := make([]inferenceBenchmarkHIPKernelShapeEntry, 0, len(snapshot.Shape))
+	for key, stats := range snapshot.Shape {
+		entries = append(entries, inferenceBenchmarkHIPKernelShapeEntry{
+			inferenceBenchmarkHIPKernelShapeKey: key,
+			stats:                               stats,
+		})
+	}
+	return inferenceBenchmarkTopHIPKernelShapeEntriesFromEntries(entries, limit, sortMode)
+}
+
+func inferenceBenchmarkTopHIPKernelShapeEntriesFromEntries(entries []inferenceBenchmarkHIPKernelShapeEntry, limit int, sortMode inferenceBenchmarkHIPKernelSortMode) []inferenceBenchmarkHIPKernelShapeEntry {
+	if len(entries) == 0 || limit <= 0 {
+		return nil
+	}
 	entries = slicesDeleteFunc(entries, func(entry inferenceBenchmarkHIPKernelShapeEntry) bool {
 		return entry.stats.Launches == 0 && entry.stats.Blocks == 0
 	})
@@ -629,6 +665,14 @@ func TestInferenceBenchmarkBookTurnKernelDeltas_Good(t *testing.T) {
 	if delta.Total.Launches != 2 || delta.Total.Blocks != 7 {
 		t.Fatalf("book kernel delta total = %+v, want 2 launches and 7 blocks", delta.Total)
 	}
+	shapes := inferenceBenchmarkTopHIPKernelShapeEntriesFromSnapshot(delta, 2, inferenceBenchmarkHIPKernelSortByBlocks)
+	if len(shapes) != 2 ||
+		shapes[0].name != hipKernelNameMLXQ4GELUTanhMul ||
+		shapes[0].stats.Blocks != 5 ||
+		shapes[1].name != hipKernelNameAttentionHeadsChunkedStage1 ||
+		shapes[1].stats.Blocks != 2 {
+		t.Fatalf("book kernel shape deltas = %+v, want top shapes by blocks", shapes)
+	}
 	stats := inferenceBenchmarkBookSelectedKernelDeltas(delta)
 	if len(stats) != 2 ||
 		stats[0].Kernel != hipKernelNameMLXQ4GELUTanhMul ||
@@ -639,17 +683,34 @@ func TestInferenceBenchmarkBookTurnKernelDeltas_Good(t *testing.T) {
 		stats[1].Blocks != 2 {
 		t.Fatalf("selected book kernel deltas = %+v, want gelu and chunked attention deltas", stats)
 	}
+	attentionShapes := inferenceBenchmarkBookAttentionKernelShapeDeltas(delta, 2, inferenceBenchmarkHIPKernelSortByBlocks)
+	if len(attentionShapes) != 1 ||
+		attentionShapes[0].name != hipKernelNameAttentionHeadsChunkedStage1 ||
+		attentionShapes[0].stats.Blocks != 2 {
+		t.Fatalf("attention shape deltas = %+v, want chunked attention shape", attentionShapes)
+	}
 	run := inferenceBenchmarkBookRun{
 		TurnStats: []inferenceBenchmarkBookTurnStat{{
-			Chapter:         10,
-			GeneratedTokens: 2,
-			KernelStats:     stats,
+			Chapter:               10,
+			GeneratedTokens:       2,
+			KernelStats:           stats,
+			DecodeKernelStats:     stats,
+			DecodeKernelShapes:    shapes,
+			DecodeAttentionShapes: attentionShapes,
+			DecodeKernelBlocks:    delta.Total.Blocks,
+			DecodeKernelLaunches:  delta.Total.Launches,
 		}},
 	}
 	var builder strings.Builder
 	inferenceBenchmarkWriteBookTurnKernelRouteMetrics(&builder, run)
+	inferenceBenchmarkWriteBookTurnDecodeKernelRouteMetrics(&builder, run)
+	inferenceBenchmarkWriteBookTurnDecodeKernelShapeRouteMetrics(&builder, run)
+	inferenceBenchmarkWriteBookTurnDecodeAttentionShapeRouteMetrics(&builder, run)
 	got := builder.String()
 	if !strings.Contains(got, "Per-Turn Selected HIP Kernels") ||
+		!strings.Contains(got, "Per-Turn Decode Selected HIP Kernels") ||
+		!strings.Contains(got, "Per-Turn Decode HIP Kernel Shapes By Blocks") ||
+		!strings.Contains(got, "Per-Turn Decode Attention HIP Kernel Shapes") ||
 		!strings.Contains(got, hipKernelNameMLXQ4GELUTanhMul) ||
 		!strings.Contains(got, "2.50") {
 		t.Fatalf("per-turn kernel output = %q, want selected kernel table with per-token ratios", got)
@@ -1120,22 +1181,27 @@ type inferenceBenchmarkBookRun struct {
 }
 
 type inferenceBenchmarkBookTurnStat struct {
-	Chapter           int
-	PromptTokens      int
-	GeneratedTokens   int
-	RetainedTokens    int
-	Wake              time.Duration
-	Wall              time.Duration
-	Prefill           time.Duration
-	Decode            time.Duration
-	PeakMemoryBytes   uint64
-	ActiveMemoryBytes uint64
-	AllocBytes        uint64
-	Allocs            uint64
-	KernelLaunches    uint64
-	KernelBlocks      uint64
-	KernelStats       []inferenceBenchmarkBookTurnKernelStat
-	HitMaxTokens      bool
+	Chapter               int
+	PromptTokens          int
+	GeneratedTokens       int
+	RetainedTokens        int
+	Wake                  time.Duration
+	Wall                  time.Duration
+	Prefill               time.Duration
+	Decode                time.Duration
+	PeakMemoryBytes       uint64
+	ActiveMemoryBytes     uint64
+	AllocBytes            uint64
+	Allocs                uint64
+	KernelLaunches        uint64
+	KernelBlocks          uint64
+	KernelStats           []inferenceBenchmarkBookTurnKernelStat
+	DecodeKernelLaunches  uint64
+	DecodeKernelBlocks    uint64
+	DecodeKernelStats     []inferenceBenchmarkBookTurnKernelStat
+	DecodeKernelShapes    []inferenceBenchmarkHIPKernelShapeEntry
+	DecodeAttentionShapes []inferenceBenchmarkHIPKernelShapeEntry
+	HitMaxTokens          bool
 }
 
 type inferenceBenchmarkBookTurnKernelStat struct {
@@ -1163,6 +1229,7 @@ type inferenceBenchmarkGemma4Q4RetainedTurn struct {
 	Wake            time.Duration
 	Prefill         time.Duration
 	Decode          time.Duration
+	DecodeKernels   inferenceBenchmarkHIPKernelStatsSnapshot
 }
 
 func inferenceBenchmarkBookWorkload() inferenceBenchmarkBookWorkloadSpec {
@@ -1211,7 +1278,7 @@ func inferenceBenchmarkRunBookRetained(ctx context.Context, model *hipLoadedMode
 		allocBefore := inferenceBenchmarkAllocSnapshot()
 		kernelBefore := inferenceBenchmarkBookKernelSnapshot(kernelCounter)
 		turnStart := time.Now()
-		turn, err := session.Generate(turnCtx, prompt, generate)
+		turn, err := session.Generate(turnCtx, prompt, generate, kernelCounter)
 		turnWall := time.Since(turnStart)
 		allocBytes, allocs := inferenceBenchmarkAllocDelta(allocBefore, inferenceBenchmarkAllocSnapshot())
 		kernelDelta := inferenceBenchmarkBookKernelDelta(kernelCounter, kernelBefore)
@@ -1237,22 +1304,27 @@ func inferenceBenchmarkRunBookRetained(ctx context.Context, model *hipLoadedMode
 			run.ActiveMemoryBytes = activeMemory
 		}
 		run.TurnStats = append(run.TurnStats, inferenceBenchmarkBookTurnStat{
-			Chapter:           chapter,
-			PromptTokens:      turn.PromptTokens,
-			GeneratedTokens:   turn.GeneratedTokens,
-			RetainedTokens:    session.position,
-			Wake:              turn.Wake,
-			Wall:              turnWall,
-			Prefill:           turn.Prefill,
-			Decode:            turn.Decode,
-			PeakMemoryBytes:   peakMemory,
-			ActiveMemoryBytes: activeMemory,
-			AllocBytes:        allocBytes,
-			Allocs:            allocs,
-			KernelLaunches:    kernelDelta.Total.Launches,
-			KernelBlocks:      kernelDelta.Total.Blocks,
-			KernelStats:       inferenceBenchmarkBookSelectedKernelDeltas(kernelDelta),
-			HitMaxTokens:      turn.GeneratedTokens >= generate.MaxTokens,
+			Chapter:               chapter,
+			PromptTokens:          turn.PromptTokens,
+			GeneratedTokens:       turn.GeneratedTokens,
+			RetainedTokens:        session.position,
+			Wake:                  turn.Wake,
+			Wall:                  turnWall,
+			Prefill:               turn.Prefill,
+			Decode:                turn.Decode,
+			PeakMemoryBytes:       peakMemory,
+			ActiveMemoryBytes:     activeMemory,
+			AllocBytes:            allocBytes,
+			Allocs:                allocs,
+			KernelLaunches:        kernelDelta.Total.Launches,
+			KernelBlocks:          kernelDelta.Total.Blocks,
+			KernelStats:           inferenceBenchmarkBookSelectedKernelDeltas(kernelDelta),
+			DecodeKernelLaunches:  turn.DecodeKernels.Total.Launches,
+			DecodeKernelBlocks:    turn.DecodeKernels.Total.Blocks,
+			DecodeKernelStats:     inferenceBenchmarkBookSelectedKernelDeltas(turn.DecodeKernels),
+			DecodeKernelShapes:    inferenceBenchmarkTopHIPKernelShapeEntriesFromSnapshot(turn.DecodeKernels, 8, inferenceBenchmarkHIPKernelSortByBlocks),
+			DecodeAttentionShapes: inferenceBenchmarkBookAttentionKernelShapeDeltas(turn.DecodeKernels, 12, inferenceBenchmarkHIPKernelSortByBlocks),
+			HitMaxTokens:          turn.GeneratedTokens >= generate.MaxTokens,
 		})
 		if chapter == 10 {
 			run.Chapter10 = turn.Text
@@ -1435,7 +1507,7 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Close() error {
 	return lastErr
 }
 
-func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx context.Context, prompt string, generate inference.GenerateConfig) (inferenceBenchmarkGemma4Q4RetainedTurn, error) {
+func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx context.Context, prompt string, generate inference.GenerateConfig, kernelCounter *inferenceBenchmarkHIPKernelCountingDriver) (inferenceBenchmarkGemma4Q4RetainedTurn, error) {
 	if err := hipContextErr(ctx); err != nil {
 		return inferenceBenchmarkGemma4Q4RetainedTurn{}, err
 	}
@@ -1547,6 +1619,7 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 	session.position++
 	prefillDuration := time.Since(prefillStart)
 
+	decodeKernelBefore := inferenceBenchmarkBookKernelSnapshot(kernelCounter)
 	decodeStart := time.Now()
 	var text strings.Builder
 	generatedCount := 0
@@ -1619,6 +1692,7 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 		Wake:            0,
 		Prefill:         prefillDuration,
 		Decode:          time.Since(decodeStart),
+		DecodeKernels:   inferenceBenchmarkBookKernelDelta(kernelCounter, decodeKernelBefore),
 	}, nil
 }
 
@@ -1761,8 +1835,8 @@ func inferenceBenchmarkMaybeWriteBookOutput(b *testing.B, run inferenceBenchmark
 	}
 	builder.WriteString("\n\n")
 	if len(run.TurnStats) > 0 {
-		builder.WriteString("| turn | prompt_tokens | generated_tokens | retained_tokens | wake_s | prefill_s | decode_s | wall_s | decode_tok_s | active_mib | peak_mib | alloc_bytes | allocs | kernel_launches | kernel_blocks | hit_max_tokens |\n")
-		builder.WriteString("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|\n")
+		builder.WriteString("| turn | prompt_tokens | generated_tokens | retained_tokens | wake_s | prefill_s | decode_s | wall_s | decode_tok_s | active_mib | peak_mib | alloc_bytes | allocs | kernel_launches | kernel_blocks | decode_kernel_launches | decode_kernel_blocks | hit_max_tokens |\n")
+		builder.WriteString("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|\n")
 		for _, stat := range run.TurnStats {
 			decodeTokS := 0.0
 			if stat.Decode > 0 {
@@ -1799,6 +1873,10 @@ func inferenceBenchmarkMaybeWriteBookOutput(b *testing.B, run inferenceBenchmark
 			builder.WriteString(" | ")
 			builder.WriteString(strconv.FormatUint(stat.KernelBlocks, 10))
 			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatUint(stat.DecodeKernelLaunches, 10))
+			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatUint(stat.DecodeKernelBlocks, 10))
+			builder.WriteString(" | ")
 			if stat.HitMaxTokens {
 				builder.WriteString("yes")
 			} else {
@@ -1809,6 +1887,9 @@ func inferenceBenchmarkMaybeWriteBookOutput(b *testing.B, run inferenceBenchmark
 		builder.WriteString("\n")
 	}
 	inferenceBenchmarkWriteBookTurnKernelRouteMetrics(&builder, run)
+	inferenceBenchmarkWriteBookTurnDecodeKernelRouteMetrics(&builder, run)
+	inferenceBenchmarkWriteBookTurnDecodeKernelShapeRouteMetrics(&builder, run)
+	inferenceBenchmarkWriteBookTurnDecodeAttentionShapeRouteMetrics(&builder, run)
 	inferenceBenchmarkWriteHIPKernelRouteMetrics(&builder, kernelCounter, 12, run.GeneratedTokens)
 	for index, chapter := range run.Chapters {
 		builder.WriteString("## Chapter ")
@@ -1854,6 +1935,143 @@ func inferenceBenchmarkWriteBookTurnKernelRouteMetrics(builder *strings.Builder,
 				builder.WriteString(strconv.FormatFloat(float64(stat.Launches)/float64(turn.GeneratedTokens), 'f', 2, 64))
 				builder.WriteString(" | ")
 				builder.WriteString(strconv.FormatFloat(float64(stat.Blocks)/float64(turn.GeneratedTokens), 'f', 2, 64))
+			} else {
+				builder.WriteString(" | 0.00 | 0.00")
+			}
+			builder.WriteString(" |\n")
+		}
+	}
+	builder.WriteString("\n")
+}
+
+func inferenceBenchmarkWriteBookTurnDecodeKernelRouteMetrics(builder *strings.Builder, run inferenceBenchmarkBookRun) {
+	if builder == nil {
+		return
+	}
+	hasStats := false
+	for _, turn := range run.TurnStats {
+		if len(turn.DecodeKernelStats) > 0 {
+			hasStats = true
+			break
+		}
+	}
+	if !hasStats {
+		return
+	}
+	builder.WriteString("## Per-Turn Decode Selected HIP Kernels\n\n")
+	builder.WriteString("| turn | kernel | launches | blocks | launches/generated_token | blocks/generated_token |\n")
+	builder.WriteString("|---:|---|---:|---:|---:|---:|\n")
+	for _, turn := range run.TurnStats {
+		for _, stat := range turn.DecodeKernelStats {
+			builder.WriteString("| ")
+			builder.WriteString(strconv.Itoa(turn.Chapter))
+			builder.WriteString(" | `")
+			builder.WriteString(stat.Kernel)
+			builder.WriteString("` | ")
+			builder.WriteString(strconv.FormatUint(stat.Launches, 10))
+			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatUint(stat.Blocks, 10))
+			if turn.GeneratedTokens > 0 {
+				builder.WriteString(" | ")
+				builder.WriteString(strconv.FormatFloat(float64(stat.Launches)/float64(turn.GeneratedTokens), 'f', 2, 64))
+				builder.WriteString(" | ")
+				builder.WriteString(strconv.FormatFloat(float64(stat.Blocks)/float64(turn.GeneratedTokens), 'f', 2, 64))
+			} else {
+				builder.WriteString(" | 0.00 | 0.00")
+			}
+			builder.WriteString(" |\n")
+		}
+	}
+	builder.WriteString("\n")
+}
+
+func inferenceBenchmarkWriteBookTurnDecodeKernelShapeRouteMetrics(builder *strings.Builder, run inferenceBenchmarkBookRun) {
+	if builder == nil {
+		return
+	}
+	hasStats := false
+	for _, turn := range run.TurnStats {
+		if len(turn.DecodeKernelShapes) > 0 {
+			hasStats = true
+			break
+		}
+	}
+	if !hasStats {
+		return
+	}
+	builder.WriteString("## Per-Turn Decode HIP Kernel Shapes By Blocks\n\n")
+	builder.WriteString("| turn | kernel | grid | block | shared_mem_bytes | tensor | launches | blocks | launches/generated_token | blocks/generated_token |\n")
+	builder.WriteString("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+	for _, turn := range run.TurnStats {
+		for _, entry := range turn.DecodeKernelShapes {
+			builder.WriteString("| ")
+			builder.WriteString(strconv.Itoa(turn.Chapter))
+			builder.WriteString(" | `")
+			builder.WriteString(entry.name)
+			builder.WriteString("` | ")
+			builder.WriteString(inferenceBenchmarkFormatHIPKernelDims(entry.gridX, entry.gridY, entry.gridZ))
+			builder.WriteString(" | ")
+			builder.WriteString(inferenceBenchmarkFormatHIPKernelDims(entry.blockX, entry.blockY, entry.blockZ))
+			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatUint(uint64(entry.sharedMemBytes), 10))
+			builder.WriteString(" | ")
+			builder.WriteString(inferenceBenchmarkFormatHIPKernelTensorShape(entry))
+			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatUint(entry.stats.Launches, 10))
+			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatUint(entry.stats.Blocks, 10))
+			if turn.GeneratedTokens > 0 {
+				builder.WriteString(" | ")
+				builder.WriteString(strconv.FormatFloat(float64(entry.stats.Launches)/float64(turn.GeneratedTokens), 'f', 2, 64))
+				builder.WriteString(" | ")
+				builder.WriteString(strconv.FormatFloat(float64(entry.stats.Blocks)/float64(turn.GeneratedTokens), 'f', 2, 64))
+			} else {
+				builder.WriteString(" | 0.00 | 0.00")
+			}
+			builder.WriteString(" |\n")
+		}
+	}
+	builder.WriteString("\n")
+}
+
+func inferenceBenchmarkWriteBookTurnDecodeAttentionShapeRouteMetrics(builder *strings.Builder, run inferenceBenchmarkBookRun) {
+	if builder == nil {
+		return
+	}
+	hasStats := false
+	for _, turn := range run.TurnStats {
+		if len(turn.DecodeAttentionShapes) > 0 {
+			hasStats = true
+			break
+		}
+	}
+	if !hasStats {
+		return
+	}
+	builder.WriteString("## Per-Turn Decode Attention HIP Kernel Shapes\n\n")
+	builder.WriteString("| turn | kernel | grid | block | shared_mem_bytes | launches | blocks | launches/generated_token | blocks/generated_token |\n")
+	builder.WriteString("|---:|---|---:|---:|---:|---:|---:|---:|---:|\n")
+	for _, turn := range run.TurnStats {
+		for _, entry := range turn.DecodeAttentionShapes {
+			builder.WriteString("| ")
+			builder.WriteString(strconv.Itoa(turn.Chapter))
+			builder.WriteString(" | `")
+			builder.WriteString(entry.name)
+			builder.WriteString("` | ")
+			builder.WriteString(inferenceBenchmarkFormatHIPKernelDims(entry.gridX, entry.gridY, entry.gridZ))
+			builder.WriteString(" | ")
+			builder.WriteString(inferenceBenchmarkFormatHIPKernelDims(entry.blockX, entry.blockY, entry.blockZ))
+			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatUint(uint64(entry.sharedMemBytes), 10))
+			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatUint(entry.stats.Launches, 10))
+			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatUint(entry.stats.Blocks, 10))
+			if turn.GeneratedTokens > 0 {
+				builder.WriteString(" | ")
+				builder.WriteString(strconv.FormatFloat(float64(entry.stats.Launches)/float64(turn.GeneratedTokens), 'f', 2, 64))
+				builder.WriteString(" | ")
+				builder.WriteString(strconv.FormatFloat(float64(entry.stats.Blocks)/float64(turn.GeneratedTokens), 'f', 2, 64))
 			} else {
 				builder.WriteString(" | 0.00 | 0.00")
 			}
@@ -1920,6 +2138,36 @@ func inferenceBenchmarkBookSelectedKernelDeltas(snapshot inferenceBenchmarkHIPKe
 		})
 	}
 	return out
+}
+
+func inferenceBenchmarkBookAttentionKernelShapeDeltas(snapshot inferenceBenchmarkHIPKernelStatsSnapshot, limit int, sortMode inferenceBenchmarkHIPKernelSortMode) []inferenceBenchmarkHIPKernelShapeEntry {
+	if len(snapshot.Shape) == 0 || limit <= 0 {
+		return nil
+	}
+	entries := make([]inferenceBenchmarkHIPKernelShapeEntry, 0, len(snapshot.Shape))
+	for key, stats := range snapshot.Shape {
+		if !inferenceBenchmarkIsAttentionKernelName(key.name) {
+			continue
+		}
+		entries = append(entries, inferenceBenchmarkHIPKernelShapeEntry{
+			inferenceBenchmarkHIPKernelShapeKey: key,
+			stats:                               stats,
+		})
+	}
+	return inferenceBenchmarkTopHIPKernelShapeEntriesFromEntries(entries, limit, sortMode)
+}
+
+func inferenceBenchmarkIsAttentionKernelName(name string) bool {
+	switch name {
+	case hipKernelNameAttentionHeadsChunkedStage1,
+		hipKernelNameAttentionHeadsChunkedStage2,
+		hipKernelNameAttentionHeadsBatchCausal,
+		hipKernelNameAttentionHeadsBatchChunkedStage1,
+		hipKernelNameAttentionHeadsBatchChunkedStage2:
+		return true
+	default:
+		return false
+	}
 }
 
 func inferenceBenchmarkSelectedHIPKernelNames() []string {
@@ -2111,6 +2359,10 @@ func inferenceBenchmarkReportBookTurnStats(b *testing.B, run inferenceBenchmarkB
 		if stat.KernelLaunches > 0 || stat.KernelBlocks > 0 {
 			b.ReportMetric(float64(stat.KernelLaunches), fmt.Sprintf("book_turn%02d_kernel_launches/op", stat.Chapter))
 			b.ReportMetric(float64(stat.KernelBlocks), fmt.Sprintf("book_turn%02d_kernel_blocks/op", stat.Chapter))
+		}
+		if stat.DecodeKernelLaunches > 0 || stat.DecodeKernelBlocks > 0 {
+			b.ReportMetric(float64(stat.DecodeKernelLaunches), fmt.Sprintf("book_turn%02d_decode_kernel_launches/op", stat.Chapter))
+			b.ReportMetric(float64(stat.DecodeKernelBlocks), fmt.Sprintf("book_turn%02d_decode_kernel_blocks/op", stat.Chapter))
 		}
 	}
 	b.ReportMetric(float64(maxedTurns), "book_maxed_turns/op")
