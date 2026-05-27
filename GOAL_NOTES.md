@@ -1,5 +1,67 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Current Sampled Retained-Book Baseline
+
+- Ran the real full-cap retained `book.md` workload after the latest
+  `go-inference` refresh and route-shape audit. This used the discrete
+  RX 7800 XT, no chapter cap, no prompt replay, default sampled generation, and
+  route metrics enabled.
+
+```text
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85
+GO_ROCM_RUN_BOOK_BENCHMARKS=1
+GO_ROCM_RUN_RETAINED_BOOK_BENCHMARKS=1
+GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit
+GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco
+GO_ROCM_BOOK_CONTEXT_LEN=48000
+GO_ROCM_BOOK_TURNS=10
+GO_ROCM_BOOK_CHAPTER_TOKENS=0
+GO_ROCM_BOOK_PREFILL_UBATCH_TOKENS=512
+GO_ROCM_BOOK_TURN_TIMEOUT_SECONDS=60
+GO_ROCM_BENCH_KERNEL_ROUTE_METRICS=1
+GO_ROCM_BOOK_MIN_ARC_ANCHOR_HITS=3
+GO_ROCM_BOOK_MAX_MAXED_TURNS=0
+GO_ROCM_BOOK_MAX_WALL_SECONDS=90
+```
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState:
+  55635886443 ns/op
+  book_wall_s/op 55.57
+  book_decode_s/op 45.65
+  book_generated_tokens/op 3673
+  book_tok/s 66.10
+  book_turn10_tok/s 57.09
+  book_turn10_retained_tokens/op 5344
+  book_peak_memory_bytes/op 5985624064
+  book_host_sampling 1
+  chapter10_arc_anchor_hits 3
+  book_maxed_turns/op 0
+  B/op 18944752
+  allocs/op 34273
+  stderr: .bench-errors/book_retained_current_20260527.err (empty)
+  output: /tmp/go-rocm-book-retained-current-20260527.md
+```
+
+- Selected route counters from the same run:
+
+```text
+kernel_total_launches/generated_token 500.6
+kernel_total_blocks/generated_token 94630
+rocm_mlx_q4_projection launches/generated_token 125.3
+rocm_mlx_q4_gelu_tanh_multiply launches/generated_token 35.10
+rocm_attention_heads_chunked_stage1 launches/generated_token 34.77
+rocm_attention_heads_chunked_stage1 blocks/generated_token 2052
+rocm_mlx_q4_projection_scores blocks/generated_token 8214
+```
+
+- This confirms the wall-time and story-retention gates are green on the
+  sampled acceptance route, but the late-turn decode goal is still open. The
+  next meaningful speed work is still `rocm_attention_heads_chunked_stage1`
+  memory/math behavior and q4 projection/GELU throughput. The sampled
+  candidate-score/top-k path is visible but already has rejected larger-chunk
+  and multi-round top-k experiments, so do not revisit those exact shapes.
+
 ## 2026-05-27 Current Route Shape After IDEAS Refresh
 
 - Took a fresh selected-kernel route sample after reading the Gemma4 notes in
