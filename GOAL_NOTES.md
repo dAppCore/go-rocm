@@ -14982,3 +14982,47 @@ failure: book last turn 55.628 tok/s below GO_ROCM_BOOK_MIN_LAST_TOK_PER_SEC=65
 The 1024 chunk-size source change was reverted. The transfer-size benchmark and
 source guard remain because they document the sampled candidate path and will
 catch future HIP/Go constant drift.
+
+Also rejected after the transfer benchmark exposed the shape:
+
+```text
+Tried keeping the 512-token packed top-k chunk, but running additional
+device-side packed-top-k rounds before copying candidates back to the host. For
+the 256k/top-k64 benchmark shape this reduced the final readback target from
+256000 bytes to 4096 bytes while preserving exact packed-score top-k coverage.
+
+Focused fake-driver exactness and benchmark checks passed:
+  TestHIPKernels_PackedTopKReduceWorkspace_Good
+  BenchmarkHIPPackedTopKPartialPayload_VocabTopK64:
+    500.0 chunks/op
+    3.000 device_topk_rounds/op
+    256000 partial_payload_bytes/op
+    4096 reduced_payload_bytes/op
+
+Short retained sampled route stayed mechanically healthy:
+  book_wall_s/op 10.43
+  book_generated_tokens/op 1027
+  book_tok/s 98.50
+  book_turn02_tok/s 100.5
+  rocm_packed_topk launches 3087
+  rocm_packed_topk blocks 600936
+  stderr: /tmp/go-rocm-book-retained-topkreduce-2turn.err (0 bytes)
+  output: /tmp/go-rocm-book-retained-topkreduce-2turn.md
+
+Strict 48k retained-book gate rejected it:
+  book_wall_s/op 57.258
+  book_generated_tokens/op 3807
+  book_turn10_retained_tokens 5478
+  book_turn10_generated_tokens 338
+  book_turn10_tok/s 56.53
+  rocm_packed_topk launches 11451
+  rocm_packed_topk blocks 2229128
+  stderr: /tmp/go-rocm-book-retained-topkreduce-48k.err (0 bytes)
+  output: /tmp/go-rocm-book-retained-topkreduce-48k.md
+  failure: book last turn 56.532 tok/s below GO_ROCM_BOOK_MIN_LAST_TOK_PER_SEC=65
+```
+
+The multi-round device top-k implementation was reverted. Extra tiny top-k
+launches outweighed the reduced host copy on the 48k retained route, so the
+next sampled-path attempt should reduce readback without increasing per-token
+kernel launch count.
