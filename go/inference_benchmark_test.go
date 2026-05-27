@@ -391,7 +391,7 @@ func BenchmarkInferenceGemma4Q4Book10Turn_RetainedState(b *testing.B) {
 		b.Fatal(err)
 	}
 	workload := inferenceBenchmarkBookWorkload()
-	model, loaded, cfg := inferenceBenchmarkLoadGemma4Q4Model(b, contextLen, layerCount)
+	model, loaded, cfg, kernelCounter := inferenceBenchmarkLoadGemma4Q4ModelWithKernelCounter(b, contextLen, layerCount)
 	defer inferenceBenchmarkCloseModel(b, model)
 	b.Setenv("GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE", "1")
 	warmupPromptTokens := inferenceBenchmarkRunBookWarmupPrefill(b, loaded, cfg)
@@ -400,6 +400,9 @@ func BenchmarkInferenceGemma4Q4Book10Turn_RetainedState(b *testing.B) {
 	b.ResetTimer()
 	var last inferenceBenchmarkBookRun
 	for i := 0; i < b.N; i++ {
+		if kernelCounter != nil {
+			kernelCounter.ResetKernelStats()
+		}
 		run, err := inferenceBenchmarkRunBookRetained(context.Background(), loaded, cfg, workload, generate, turns, turnTimeout)
 		if err != nil {
 			b.Fatalf("book retained workload: %v", err)
@@ -409,6 +412,7 @@ func BenchmarkInferenceGemma4Q4Book10Turn_RetainedState(b *testing.B) {
 	b.StopTimer()
 	inferenceBenchmarkMaybeWriteBookOutput(b, last, "retained")
 	inferenceBenchmarkReportBookRun(b, last, contextLen, generate.MaxTokens, turnTimeout, "retained")
+	inferenceBenchmarkReportHIPKernelRouteMetrics(b, kernelCounter)
 	b.ReportMetric(float64(generate.Temperature), "book_temperature")
 	b.ReportMetric(float64(generate.TopP), "book_top_p")
 	b.ReportMetric(float64(generate.TopK), "book_top_k")
@@ -1547,12 +1551,18 @@ func inferenceBenchmarkRunGemma4Q4GenerateLoaded(b *testing.B, model inference.T
 }
 
 func inferenceBenchmarkLoadGemma4Q4Model(b *testing.B, contextLen, layerCount int) (inference.TextModel, *hipLoadedModel, hipGemma4Q4ForwardConfig) {
+	model, loaded, cfg, _ := inferenceBenchmarkLoadGemma4Q4ModelWithKernelCounter(b, contextLen, layerCount)
+	return model, loaded, cfg
+}
+
+func inferenceBenchmarkLoadGemma4Q4ModelWithKernelCounter(b *testing.B, contextLen, layerCount int) (inference.TextModel, *hipLoadedModel, hipGemma4Q4ForwardConfig, *inferenceBenchmarkHIPKernelCountingDriver) {
 	b.Helper()
 	modelPath := os.Getenv("GO_ROCM_MODEL_PATH")
 	if modelPath == "" {
 		b.Skip("set GO_ROCM_MODEL_PATH to a local Gemma4 q4 model pack")
 	}
-	model, err := newROCmBackendWithRuntime(newSystemNativeRuntime()).LoadModel(modelPath, inference.WithContextLen(contextLen))
+	nativeRuntime, kernelCounter := inferenceBenchmarkNativeRuntimeAndKernelCounter()
+	model, err := newROCmBackendWithRuntime(nativeRuntime).LoadModel(modelPath, inference.WithContextLen(contextLen))
 	if err != nil {
 		b.Fatalf("LoadModel(%q): %v", modelPath, err)
 	}
@@ -1574,7 +1584,7 @@ func inferenceBenchmarkLoadGemma4Q4Model(b *testing.B, contextLen, layerCount in
 		_ = model.Close()
 		b.Fatalf("loadedGemma4Q4ForwardConfig(%d): %v", layerCount, err)
 	}
-	return model, loaded, cfg
+	return model, loaded, cfg, kernelCounter
 }
 
 func inferenceBenchmarkCloseModel(b *testing.B, model inference.TextModel) {

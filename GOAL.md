@@ -489,6 +489,23 @@ launching `7840` batch-chunked stages; `1024` was flat at 4k and worse at 2k;
 `1536` reached `403.4 prompt_tok/s` at 2k but reduced 4k to
 `330.9 prompt_tok/s`.
 
+Retained-book acceptance after the full-attention cutoff stayed green on the
+state-extending path, not replay: `37.81s` wall, `33.60s` decode,
+`3021` generated tokens, `79.91 tok/s` average, `69.03 tok/s` on turn 10,
+empty stderr, no max-token hits, and `chapter10_arc_anchor_hits=3`. It still
+reported `book_repeated_turns=2` and `book_max_adjacent_repeat=0.921`, so the
+driver is production-candidate on wall time but not done on later-turn quality
+or the `90-100+ tok/s` long-context decode target.
+
+Route metrics on the same retained 10-turn book run measured `37.67s` wall,
+`33.59s` decode, `3021` generated tokens, `80.19 tok/s` average, and
+`68.93 tok/s` on turn 10 with empty stderr. The measured route mix was
+`2940` batch-causal attention launches, `0` batch-prefill chunked launches, and
+`104895` decode-chunked stage-1 plus `104895` decode-chunked stage-2 launches.
+That confirms the retained benchmark is not spending its measured time in prompt
+replay. The current hot path is decode attention launch volume and per-token
+state traffic, not the prefill route.
+
 For comparison, upstream llama.cpp built locally with HIP for `gfx1100` and run
 against the Hugging Face Gemma4 GGUF
 `/home/claude/models/hf/unsloth-gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf`
