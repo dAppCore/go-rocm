@@ -464,6 +464,65 @@ func TestHIPGemma4Q4Layer0_Good(t *testing.T) {
 	}
 }
 
+func TestHIPGemma4Q4GenerateTokenSeq_UsesBatchedPrefill_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup0()
+	layer1, cleanup1 := hipGemma4Q4FixtureConfig(t, driver, 1, 4, 2, 8)
+	defer cleanup1()
+	embeddingWeightsPayload, err := hipUint32Payload(make([]uint32, layer0.VocabSize*(layer0.HiddenSize/layer0.GroupSize)))
+	core.RequireNoError(t, err)
+	embeddingWeights, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "generate batched prefill embedding weights", embeddingWeightsPayload, layer0.VocabSize*(layer0.HiddenSize/layer0.GroupSize))
+	core.RequireNoError(t, err)
+	defer embeddingWeights.Close()
+	embeddingScalesPayload, err := hipUint16Payload([]uint16{0x3f80, 0x3f80})
+	core.RequireNoError(t, err)
+	embeddingScales, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "generate batched prefill embedding scales", embeddingScalesPayload, layer0.VocabSize*(layer0.HiddenSize/layer0.GroupSize))
+	core.RequireNoError(t, err)
+	defer embeddingScales.Close()
+	embeddingBiasesPayload, err := hipUint16Payload([]uint16{0x3f80, 0x3f80})
+	core.RequireNoError(t, err)
+	embeddingBiases, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "generate batched prefill embedding biases", embeddingBiasesPayload, layer0.VocabSize*(layer0.HiddenSize/layer0.GroupSize))
+	core.RequireNoError(t, err)
+	defer embeddingBiases.Close()
+	layer0.Embedding = hipDeviceEmbeddingLookupConfig{
+		EmbeddingPointer: embeddingWeights.Pointer(),
+		EmbeddingBytes:   embeddingWeights.SizeBytes(),
+		TableEncoding:    hipEmbeddingTableEncodingMLXQ4,
+		VocabSize:        layer0.VocabSize,
+		HiddenSize:       layer0.HiddenSize,
+		GroupSize:        layer0.GroupSize,
+		ScalePointer:     embeddingScales.Pointer(),
+		BiasPointer:      embeddingBiases.Pointer(),
+		ScaleBytes:       embeddingScales.SizeBytes(),
+		BiasBytes:        embeddingBiases.SizeBytes(),
+	}
+	layers, cleanupPerLayer := hipGemma4Q4GlobalPerLayerInputFixture(t, driver, []hipGemma4Q4Layer0Config{layer0, layer1})
+	defer cleanupPerLayer()
+	cfg := hipGemma4Q4ForwardConfig{Layers: layers}
+	core.AssertEqual(t, true, hipGemma4Q4CanUseBatchedGeneratePrefill(cfg))
+	t.Setenv(hipGemma4Q4PrefillUBatchEnv, "2")
+
+	start := len(driver.launches)
+	stream, streamErr := hipGemma4Q4GenerateTokenSeq(context.Background(), &hipLoadedModel{driver: driver}, cfg, []int32{0, 1, 0}, inference.GenerateConfig{MaxTokens: 1})
+	var generated []inference.Token
+	for token := range stream {
+		generated = append(generated, token)
+	}
+
+	core.RequireNoError(t, streamErr())
+	core.AssertEqual(t, 1, len(generated))
+	launches := driver.launches[start:]
+	core.AssertEqual(t, 0, countLaunchName(launches, hipKernelNameEmbedLookupGreedyToken))
+	core.AssertEqual(t, 0, countLaunchName(launches, hipKernelNameMLXQ4Proj))
+	batchProjectionLaunches := countLaunchName(launches, hipKernelNameMLXQ4ProjBatch)
+	batchAttentionLaunches := countLaunchName(launches, hipKernelNameAttentionHeadsBatchCausal)
+	finalGreedyLaunches := countLaunchName(launches, hipKernelNameMLXQ4ProjGreedy)
+	if batchProjectionLaunches == 0 || batchAttentionLaunches == 0 || finalGreedyLaunches == 0 {
+		t.Fatalf("Gemma4 q4 generate batched prefill launches projection_batch=%d attention_batch=%d final_greedy=%d, want all nonzero", batchProjectionLaunches, batchAttentionLaunches, finalGreedyLaunches)
+	}
+}
+
 func TestHIPGemma4Q4EffectiveSlidingWindow_Good(t *testing.T) {
 	core.AssertEqual(t, 512, hipGemma4Q4EffectiveSlidingWindow(256, 0))
 	core.AssertEqual(t, 128, hipGemma4Q4EffectiveSlidingWindow(256, 128))

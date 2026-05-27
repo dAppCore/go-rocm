@@ -1547,10 +1547,19 @@ endpoint.
   current cache ownership is still borrow-based and this path deliberately
   handles only untrimmed prior windows, so production full/SWA slot layout and
   ownership transfer remain open.
-- [ ] Implement Gemma4 q4 batched prefill. This must accept a token span,
+- [x] Implement Gemma4 q4 batched prefill. This must accept a token span,
   process prompt tokens in ubatches, update KV slots for every token, request
   logits only for selected output tokens, and avoid feeding large prompts
   through the single-token decode loop.
+  - 2026-05-27 audit: `hipGemma4Q4GenerateTokenSeq` plans prompt tokens into
+    ubatches, routes batched-capable Gemma4 configs through
+    `hipRunGemma4Q4PrefillForwardBatchWithPriorWorkspace`, carries prior
+    device KV between ubatches, requests selected-row final greedy only for the
+    output mask, and keeps host-sampling on the conservative single-token path.
+    `TestHIPGemma4Q4GenerateTokenSeq_UsesBatchedPrefill_Good` now asserts the
+    Generate prompt path launches batched q4 projection, batched causal
+    attention, and selected-row final greedy while launching no single-token q4
+    projection or greedy-token embedding during prompt prefill.
 - [ ] Replace the one-token page KV layout used during prompt load with
   contiguous/slot-based full and SWA KV caches. The target is llama.cpp's shape:
   prepare base/full and sliding-window caches per ubatch, then execute the graph
