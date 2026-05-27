@@ -81,6 +81,37 @@ cross-product hot path touched for this driver needs a `Benchmark*` with
 decode and direct pinned HIP page restore, making allocation and copy cost
 visible before the 48k/64k context work resumes.
 
+## Kernel Benchmark Flow
+
+HIP kernel updates are part of the benchmark flow, not side experiments. A
+kernel pass may change `kernels/rocm_kernels.hip`, launch geometry, C++ bridge
+code, or Go wrapper allocation only when the result is measured through the
+same retained-state route that validates normal Go changes.
+
+The kernel loop is:
+
+- Build a temporary AMD artifact with
+  `hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2`, and run it through
+  `GO_ROCM_KERNEL_HSACO=/tmp/...` before promoting it over the current HSACO.
+- Run the HIP source/ABI guards and a q4 transformer smoke with stderr captured
+  to a `.err` file.
+- Run `text:Hi` 512/2048 guards plus a short retained-book guard with
+  `GO_ROCM_BENCH_KERNEL_ROUTE_METRICS=1`. The benchmark stdout and optional
+  `GO_ROCM_BOOK_OUTPUT_FILE` artifact must include launch-count and block-volume
+  kernel tables so q4 projection, GELU, and attention work can be tracked from
+  one run to the next.
+- For any math-order, launch-geometry, attention, sampler, or retained-KV
+  change, run the strict 48k retained-book gate. Empty stderr and good short
+  tok/s are not sufficient; chapter-10 arc retention must also pass.
+- Keep NVIDIA portability in the loop when the local toolchain is available:
+  `GO_ROCM_RUN_NVIDIA_HIP_COMPILE_TESTS=1` proves the HIP source compiles
+  through CUDA/NVCC, and `GO_ROCM_RUN_ZLUDA_CUDA_TESTS=1` proves the CUDA
+  runtime smoke can execute through ZLUDA on the AMD card.
+- Document rejected kernel shapes in `GOAL_NOTES.md` with their stdout metrics,
+  `.err` path, and reason for rejection. Do not reintroduce a rejected shape
+  unless the new pass changes the numerical or memory behavior that made it
+  fail.
+
 ## Book 10-Turn Retained-State Acceptance
 
 The short decode endpoint and synthetic prompt ladders are diagnostics, not the

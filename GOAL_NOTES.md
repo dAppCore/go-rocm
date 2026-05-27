@@ -14871,3 +14871,46 @@ Confluence-style phrasing. The geometry was reverted.
 failed output: /tmp/go-rocm-book-retained-block16-48k-gelu16.md
 failed stderr: /tmp/go-rocm-book-retained-block16-48k-gelu16.err
 ```
+
+## 2026-05-27: Kernel Benchmark Artifact Flow
+
+Accepted a benchmark-flow update so HIP/kernel passes are first-class tuning
+work rather than informal experiments:
+
+```text
+- GOAL.md now requires temp gfx1100 HSACO builds, HIP source/ABI guards,
+  stderr `.err` capture, short retained-book route metrics, and strict 48k
+  retained-book validation for math/geometry/state changes.
+- NVIDIA portability remains in the same flow through
+  GO_ROCM_RUN_NVIDIA_HIP_COMPILE_TESTS=1 and GO_ROCM_RUN_ZLUDA_CUDA_TESTS=1
+  when the local CUDA/ZLUDA toolchain is available.
+- The retained-book `GO_ROCM_BOOK_OUTPUT_FILE` artifact now includes HIP kernel
+  launch-count and block-volume tables whenever
+  GO_ROCM_BENCH_KERNEL_ROUTE_METRICS=1 is set, so the `.md` result sits beside
+  the `.err` capture as a durable kernel-analysis artifact.
+```
+
+Focused verification:
+
+```text
+go test ./go -run '^TestInferenceBenchmarkHIPKernelCountingDriver_Good$' -count=1
+```
+
+Serialized RX 7800 XT artifact smoke:
+
+```text
+GO_ROCM_BOOK_TURNS=2 GO_ROCM_BOOK_CHAPTER_TOKENS=8
+GO_ROCM_BENCH_KERNEL_ROUTE_METRICS=1
+GO_ROCM_BOOK_OUTPUT_FILE=/tmp/go-rocm-book-kernel-artifact.md
+stderr: /tmp/go-rocm-book-kernel-artifact.err (0 bytes)
+
+book_wall_s/op              0.5955
+book_generated_tokens/op    16
+book_turn02_tok/s           121.3
+kernel_total_launches/op    13674
+kernel_total_blocks/op      5352730
+output includes:
+  ## HIP Kernel Route Metrics
+  ### Top By Launches
+  ### Top By Blocks
+```
