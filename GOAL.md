@@ -2375,6 +2375,10 @@ state must restore from borrowed block refs rather than prompt text replay.
 The ROCm HIP pinned-copy path now uses `core.PinnedView` for the Go-owned byte
 slice passed to HIP, matching the `mdspan + PinnedView` zero-copy direction
 until the host toolchain can compile the `go-cgo` C++23 mdspan companion header.
+The full-attention `attention_k_eq_v` loader path is also covered by
+`TestHIPGemma4Q4LoadedConfigAttentionKEqVSkipsVProjection_Good`: ROCm now has
+the same guard as `go-mlx` that K=V layers do not require a `v_proj` tensor and
+use the K projection buffers as the value projection source.
 
 Run these before handoff:
 

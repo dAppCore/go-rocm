@@ -2132,6 +2132,79 @@ func TestHIPGemma4Q4LoadedTextConfigKEqVOnlyFullAttention_Good(t *testing.T) {
 	core.AssertContains(t, err.Error(), "K=V attention is only valid for full-attention layers")
 }
 
+func TestHIPGemma4Q4LoadedConfigAttentionKEqVSkipsVProjection_Good(t *testing.T) {
+	const (
+		hidden    = 8
+		vocab     = 2
+		groupSize = 8
+	)
+	model := &hipLoadedModel{
+		driver: &fakeHIPDriver{available: true},
+		modelInfo: inference.ModelInfo{
+			Architecture: "gemma4_text",
+			VocabSize:    vocab,
+			HiddenSize:   hidden,
+			NumLayers:    1,
+			QuantBits:    4,
+			QuantGroup:   groupSize,
+		},
+		gemma4TextConfig: nativeGemma4TextConfig{
+			AttentionKEqV: true,
+			LayerTypes:    []string{"full_attention"},
+		},
+		tensors: map[string]hipTensor{},
+	}
+	nextPointer := nativeDevicePointer(0x1000)
+	addTensor := func(name, typeName string, dims []uint64, bytes uint64) {
+		t.Helper()
+		model.tensors[name] = hipTensor{
+			info: nativeTensorInfo{
+				Name:       name,
+				TypeName:   typeName,
+				Dimensions: dims,
+				ByteSize:   bytes,
+			},
+			pointer: nextPointer,
+		}
+		nextPointer += nativeDevicePointer(bytes) + 0x100
+	}
+	addQ4Projection := func(baseName string, rows, cols int) {
+		t.Helper()
+		groups := cols / groupSize
+		addTensor(baseName+".weight", "U32", []uint64{uint64(rows), uint64(cols / 8)}, uint64(rows*(cols/8)*4))
+		addTensor(baseName+".scales", "BF16", []uint64{uint64(rows), uint64(groups)}, uint64(rows*groups*2))
+		addTensor(baseName+".biases", "BF16", []uint64{uint64(rows), uint64(groups)}, uint64(rows*groups*2))
+	}
+	addNorm := func(name string, count int) {
+		t.Helper()
+		addTensor(name, "BF16", []uint64{uint64(count)}, uint64(count*2))
+	}
+
+	addQ4Projection("language_model.model.embed_tokens", vocab, hidden)
+	prefix := "language_model.model.layers.0"
+	addNorm(prefix+".input_layernorm.weight", hidden)
+	addNorm(prefix+".self_attn.q_norm.weight", hidden)
+	addNorm(prefix+".self_attn.k_norm.weight", hidden)
+	addNorm(prefix+".post_attention_layernorm.weight", hidden)
+	addNorm(prefix+".pre_feedforward_layernorm.weight", hidden)
+	addNorm(prefix+".post_feedforward_layernorm.weight", hidden)
+	addNorm("language_model.model.norm.weight", hidden)
+	addQ4Projection(prefix+".self_attn.q_proj", hidden, hidden)
+	addQ4Projection(prefix+".self_attn.k_proj", hidden, hidden)
+	addQ4Projection(prefix+".self_attn.o_proj", hidden, hidden)
+	addQ4Projection(prefix+".mlp.gate_proj", hidden*2, hidden)
+	addQ4Projection(prefix+".mlp.up_proj", hidden*2, hidden)
+	addQ4Projection(prefix+".mlp.down_proj", hidden, hidden*2)
+
+	cfg, err := model.loadedGemma4Q4LayerConfig(0)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, true, cfg.AttentionKEqV)
+	core.AssertEqual(t, cfg.KeyProjection.WeightPointer, cfg.ValueProjection.WeightPointer)
+	core.AssertEqual(t, cfg.KeyProjection.ScalePointer, cfg.ValueProjection.ScalePointer)
+	core.AssertEqual(t, cfg.KeyProjection.BiasPointer, cfg.ValueProjection.BiasPointer)
+	core.AssertEqual(t, false, model.hasHIPTensor(prefix+".self_attn.v_proj.weight"))
+}
+
 func TestHIPGemma4Q4LoadedTextConfigFinalLogitSoftcap_Good(t *testing.T) {
 	core.AssertEqual(t, float32(30), (*hipLoadedModel)(nil).loadedGemma4Q4FinalLogitSoftcap())
 	model := &hipLoadedModel{gemma4TextConfig: nativeGemma4TextConfig{FinalLogitSoftcap: 42}}
