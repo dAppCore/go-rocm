@@ -618,6 +618,19 @@ tests passed, and a serialized 2-turn `2k` retained sampled book guard with
 Both debug turns hit the 768-token cap, so this is accepted as neutral hot-loop
 codegen cleanup rather than book-quality evidence.
 
+Diagnostic full `48k` row-base rerun: the same serialized retained book route
+with `block_size=16`, `prefill_ubatch=512`, and the strict wall/repeat/max-token
+gates had empty runtime stderr and completed the timed work in `41.099s` wall
+with `2975` generated tokens, `0` repeated turns, `0` max-token hits,
+`72.39 tok/s` average, and `76.87 tok/s` on turn 10. The process still exited
+non-zero because `GO_ROCM_BOOK_MIN_ARC_ANCHOR_HITS=3` reported
+`chapter10_arc_anchor_hits=0`: chapter 10 retained the broader silence/truth
+continuity but did not literally include enough of the required
+`lighthouse`/`keeper`/`light`/`ocean`/`deep` anchor words. Treat this as a clean
+runtime and promising wall-time datapoint, not full book acceptance. The
+retained benchmark path still appends only the new turn prompt to the `.kv`/MP4
+state; do not "fix" this by rebuilding prior chapters as prompt text.
+
 Rejected prompt-shortening follow-up: replacing the anchored wording with a
 shorter "advance the arc / keep continuity words alive" instruction reduced
 prompt tokens to `1581` and still passed the arc gate with `3` anchors, but it
