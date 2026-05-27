@@ -2385,6 +2385,13 @@ directly from `rocmDeviceKVCache.pages` instead of first allocating a
 `BenchmarkROCmDeviceKVCacheKernelDescriptorBytes_HotWindow` reports
 `7892 ns/op`, `40960 B/op`, and `1 alloc/op`, leaving only the descriptor
 payload allocation visible.
+The descriptor table upload path now pools only hot-window-sized descriptor
+backing pointers while preserving exact-sized small descriptor allocations.
+`BenchmarkROCmDeviceKVCacheKernelDescriptorTable_HotWindowPooled` reports
+`8159 ns/op`, `41006 B/op`, and `1 alloc/op`; its guard asserts no fresh fake
+device allocation after the warm pooled table. This keeps the go-mlx/IDEAS rule
+honest: reduce retained-state descriptor churn without hiding logical descriptor
+shape from the kernels.
 
 Run these before handoff:
 

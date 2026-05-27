@@ -1701,15 +1701,30 @@ func (cache *rocmDeviceKVCache) KernelDescriptorTable() (*rocmDeviceKVDescriptor
 	if err != nil {
 		return nil, err
 	}
-	pointer, err := cache.driver.Malloc(uint64(len(payload)))
-	if err != nil {
-		return nil, core.E("rocm.KVCache.DeviceDescriptor", "allocate descriptor table", err)
+	sizeBytes := uint64(len(payload))
+	allocationBytes := sizeBytes
+	poolable := sizeBytes >= rocmDeviceKVDescriptorHotTableBytes()
+	var pointer nativeDevicePointer
+	if poolable {
+		pointer, allocationBytes, err = rocmDeviceKVDescriptorTableMalloc(cache.driver, sizeBytes)
+		if err != nil {
+			return nil, core.E("rocm.KVCache.DeviceDescriptor", "allocate descriptor table", err)
+		}
+	} else {
+		pointer, err = cache.driver.Malloc(sizeBytes)
+		if err != nil {
+			return nil, core.E("rocm.KVCache.DeviceDescriptor", "allocate descriptor table", err)
+		}
 	}
 	if err := hipCopyHostToDevice(cache.driver, pointer, payload); err != nil {
-		_ = cache.driver.Free(pointer)
+		if poolable {
+			_ = rocmDeviceKVDescriptorTableFree(cache.driver, pointer, allocationBytes)
+		} else {
+			_ = cache.driver.Free(pointer)
+		}
 		return nil, core.E("rocm.KVCache.DeviceDescriptor", "copy descriptor table", err)
 	}
-	return rocmBorrowDeviceKVDescriptorTable(cache.driver, pointer, uint64(len(payload)), rocmDeviceKVDescriptorVersion, cache.PageCount(), false, false), nil
+	return rocmBorrowDeviceKVDescriptorTableAllocated(cache.driver, pointer, sizeBytes, allocationBytes, rocmDeviceKVDescriptorVersion, cache.PageCount(), false, poolable), nil
 }
 
 func (cache *rocmDeviceKVCache) KernelDescriptorTableFromAppendedToken(ctx context.Context, previous *rocmDeviceKVCache, previousTable *rocmDeviceKVDescriptorTable) (*rocmDeviceKVDescriptorTable, error) {

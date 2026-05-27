@@ -1267,6 +1267,68 @@ func BenchmarkROCmDeviceKVCacheKernelDescriptorBytes_HotWindow(b *testing.B) {
 	}
 }
 
+func BenchmarkROCmDeviceKVCacheKernelDescriptorTable_HotWindowPooled(b *testing.B) {
+	rocmDeviceKVDescriptorPointerPool.Lock()
+	rocmDeviceKVDescriptorPointerPool.entries = make(map[uint64][]rocmDeviceKVDescriptorPointerPoolEntry)
+	rocmDeviceKVDescriptorPointerPool.bytes = 0
+	rocmDeviceKVDescriptorPointerPool.Unlock()
+	driver := &fakeHIPDriver{available: true}
+	const (
+		keyWidth   = 128
+		valueWidth = 128
+	)
+	keyBytes, err := rocmKVTensorDeviceByteCount(rocmKVEncodingQ8, keyWidth)
+	if err != nil {
+		b.Fatalf("key bytes: %v", err)
+	}
+	valueBytes, err := rocmKVTensorDeviceByteCount(rocmKVEncodingQ4, valueWidth)
+	if err != nil {
+		b.Fatalf("value bytes: %v", err)
+	}
+	pages := rocmDeviceKVBorrowPageSlice(0, rocmDeviceKVHotPageCapacity)
+	for token := 0; token < rocmDeviceKVHotPageCapacity; token++ {
+		pages = append(pages, rocmDeviceKVPage{
+			tokenStart: token,
+			tokenCount: 1,
+			keyWidth:   keyWidth,
+			valueWidth: valueWidth,
+			key:        rocmDeviceKVTensor{pointer: nativeDevicePointer(0x100000 + token*0x1000), sizeBytes: keyBytes, encoding: rocmKVEncodingQ8},
+			value:      rocmDeviceKVTensor{pointer: nativeDevicePointer(0x200000 + token*0x1000), sizeBytes: valueBytes, encoding: rocmKVEncodingQ4},
+		})
+	}
+	cache := rocmBorrowDeviceKVCache(driver, rocmKVCacheModeKQ8VQ4, rocmGemma4Q4DeviceKVBlockSize, rocmDeviceKVHotPageCapacity, pages, false)
+	warm, err := cache.KernelDescriptorTable()
+	if err != nil {
+		b.Fatalf("warm descriptor table: %v", err)
+	}
+	if err := warm.Close(); err != nil {
+		b.Fatalf("close warm descriptor table: %v", err)
+	}
+	allocationsAfterWarm := len(driver.allocations)
+	b.Cleanup(func() {
+		rocmDeviceKVReleasePageSlice(cache.pages)
+		cache.pages = nil
+		rocmReleaseDeviceKVCache(cache)
+	})
+	wantBytes := uint64(rocmDeviceKVDescriptorHeaderBytes + rocmDeviceKVHotPageCapacity*rocmDeviceKVDescriptorPageBytes)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		table, err := cache.KernelDescriptorTable()
+		if err != nil {
+			b.Fatalf("descriptor table: %v", err)
+		}
+		if table.SizeBytes() != wantBytes || table.pageCount != rocmDeviceKVHotPageCapacity {
+			b.Fatalf("descriptor table shape = %d/%d, want %d/%d", table.SizeBytes(), table.pageCount, wantBytes, rocmDeviceKVHotPageCapacity)
+		}
+		if err := table.Close(); err != nil {
+			b.Fatalf("close descriptor table: %v", err)
+		}
+		if len(driver.allocations) != allocationsAfterWarm {
+			b.Fatalf("descriptor table used fresh device allocation: got %d allocations, want %d", len(driver.allocations), allocationsAfterWarm)
+		}
+	}
+}
+
 func BenchmarkROCmDeviceKVDescriptorAppendInPlace_HotWindow(b *testing.B) {
 	driver := &fakeHIPDriver{available: true, skipLaunchRecording: true, releaseLaunchPackets: true}
 	const (
