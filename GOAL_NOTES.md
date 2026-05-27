@@ -56,6 +56,29 @@ Route metrics off:
   route-metric shape is still dominated by q4 projection, GELU
   multiply/projection, residual/norm, and chunked decode attention launch
   volume.
+- Full-cap retained-state book guard, no prompt replay, also stayed green:
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState:
+  wall: 37.72s
+  generated_tokens: 2603
+  prompt_tokens: 1671
+  retained turn-10 tokens: 4274
+  average decode: 69.02 tok/s
+  turn-10 decode: 67.23 tok/s
+  peak memory: 5.59 GiB
+  B/op: 41839360
+  allocs/op: 31295
+  chapter10_arc_anchor_hits: 4
+  stderr: /tmp/go-rocm-book-retained-direct-pinned-copy.err (empty)
+  output: /tmp/go-rocm-book-retained-direct-pinned-copy.md
+```
+
+- CoreGO check: `external/go` is already at `f7a84db` / `v0.10.3` on its
+  configured `https://forge.lthn.sh/core/go.git` `dev` branch. The sibling
+  `/home/claude/Code/core/go` checkout is stale/divergent on the older
+  `ssh://git@forge.lthn.ai:2223/core/go.git` remote (`ahead 1, behind 162`) and
+  was not changed from the ROCm worktree.
 
 ## 2026-05-27 Dependency Refresh and Rejected Batch Row-Base Probe
 
