@@ -17698,3 +17698,30 @@ Conclusion: pinned tensor uploads preserve the accepted short decode baseline
 onto the same pinned-copy primitive needed for the later `.kv`/`.mp4`
 zero-copy work. The open production blocker remains retained full/global
 attention scaling in late book turns.
+
+## 2026-05-27 Accepted Gemma4 E2B Topology Guard
+
+The local Gemma4 E2B q4 config is the source of truth for ROCm tuning. It uses
+`35` text layers, with `28` `sliding_attention` layers and `7`
+`full_attention` layers at indices `4,9,14,19,24,29,34`. The local/SWA head dim
+is `256`; the full/global head dim is `512`. This driver is not using a
+FlashAttention2 path with a `256`-dim cap: ROCm's chunked attention route
+supports `dim=512` and exposes that full/global route as the `4096` byte
+stage1 shared-memory shape.
+
+The config also declares `num_kv_shared_layers=20`. A non-hardware guard now
+checks that the last 20-layer shared-KV suffix preserves layer type ownership:
+the first `15` layers own KV, later sliding layers borrow from sliding source
+layer `13`, and later full/global layers borrow from full source layer `14`.
+
+Verification:
+
+```text
+go test ./go -run 'TestHIPGemma4Q4E2BSharedKVLayoutUsesLayerTypes_Good' -count=1 -v
+PASS
+```
+
+Conclusion: future global-attention work should treat the E2B topology as
+`28/7` local/full with `512`-dim global attention and a 20-layer shared-KV
+suffix. The remaining late-turn slowdown is not a missing FA2 fallback; it is
+the custom global attention memory path doing too much repeated K/V traffic.

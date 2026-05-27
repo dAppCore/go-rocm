@@ -2341,6 +2341,43 @@ func TestHIPGemma4Q4E4BSharedKVLayoutUsesLayerTypes_Good(t *testing.T) {
 	core.AssertEqual(t, 23, sources[41])
 }
 
+func TestHIPGemma4Q4E2BSharedKVLayoutUsesLayerTypes_Good(t *testing.T) {
+	const layerCount = 35
+	layers := make([]hipGemma4Q4Layer0Config, layerCount)
+	slidingLayers := 0
+	fullLayers := 0
+	for index := range layers {
+		layerType := "sliding_attention"
+		headDim := 256
+		if (index+1)%5 == 0 {
+			layerType = "full_attention"
+			headDim = 512
+		}
+		layers[index] = hipGemma4Q4Layer0Config{Layer: index, LayerType: layerType, HeadDim: headDim}
+		switch layerType {
+		case "sliding_attention":
+			slidingLayers++
+		case "full_attention":
+			fullLayers++
+		}
+	}
+
+	sources := hipGemma4Q4BuildSharedKVSourceByLayer(hipGemma4Q4ForwardConfig{Layers: layers, KVSharedLayers: 20})
+
+	ownerCount := 0
+	for index, source := range sources {
+		if source == index {
+			ownerCount++
+		}
+	}
+	core.AssertEqual(t, 28, slidingLayers)
+	core.AssertEqual(t, 7, fullLayers)
+	core.AssertEqual(t, 15, ownerCount)
+	core.AssertEqual(t, 13, sources[15])
+	core.AssertEqual(t, 14, sources[19])
+	core.AssertEqual(t, 14, sources[34])
+}
+
 func TestHIPGemma4Q4SharedDeviceKV_Good(t *testing.T) {
 	driver := &fakeHIPDriver{available: true}
 	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 8, 1, 8)
