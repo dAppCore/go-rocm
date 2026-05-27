@@ -1594,10 +1594,11 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 		defer ropeQueryBuffer.Close()
 	}
 	attentionReq := hipAttentionRequest{
-		QueryDim: cfg.HeadDim,
-		Keys:     updatedKeys,
-		Values:   updatedValues,
-		Scale:    hipGemma4Q4AttentionScale(cfg.HeadDim),
+		QueryDim:   cfg.HeadDim,
+		Keys:       updatedKeys,
+		Values:     updatedValues,
+		WindowSize: cfg.SlidingWindow,
+		Scale:      hipGemma4Q4AttentionScale(cfg.HeadDim),
 	}
 	if req.DeviceKVAttention {
 		attentionReq.Keys = nil

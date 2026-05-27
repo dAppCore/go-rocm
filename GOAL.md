@@ -40,31 +40,31 @@ The 100+ tok/s goal is complete only when all of these are true:
 Current status as of 2026-05-27: the q4 2048-token performance endpoint remains
 met on the pinned RX 7800 XT with a fresh live `gfx1100` HSACO. The latest
 route-metric `GO_ROCM_BENCH_TOKENS=2048` `text:Hi` run, after contiguous encoded
-K/V pair allocation and fused embedding-output scaling, reports `18446052200
-ns/op`, `111.0 tok/s`, `6441696 B/op`, and `2620 allocs/op`. It also reports
-`31286` device mallocs/op, `24599920` device malloc bytes/op, `16408` D2H
-bytes/op, `2320` async H2D bytes/op, `995258` kernel launches/op, and
-`165147671` kernel blocks/op. This now beats the previous best short guard after
-pinned model uploads (`109.4 tok/s`) while keeping allocation volume near the
-accepted pair-allocation route.
+K/V pair allocation, fused embedding-output scaling, and Gemma4 SWA-window-aware
+decode attention routing, reports `17791173716 ns/op`, `115.1 tok/s`,
+`6453176 B/op`, and `2640 allocs/op`. It also reports `31285` device mallocs/op,
+`24591728` device malloc bytes/op, `941442` kernel launches/op, and keeps
+chunked stage1/stage2 launches at `13454` each. This beats the previous
+embedding-scale short guard (`111.0 tok/s`) while keeping allocation volume near
+the accepted pair-allocation route.
 The chapter-shaped 2048-token fast guard at `context_len=4096` reports
 `19536530899 ns/op`, `104.8 tok/s`, `8017064 B/op`, and `3438 allocs/op`.
 Full-attention/global Gemma4 device KV pages now use 128-token blocks while
 sliding-window layers keep exact one-token pages for 512/1024 SWA trimming. A
 fresh strict retained 10-turn book gate with device-reduced sampled top-k
-partials, contiguous encoded K/V pair allocation, and fused embedding-output
-scaling remains inside the production-candidate wall window: `56.12s` wall,
-`45.79s` decode, `4132` generated tokens, `3` chapter-10 arc anchors, no
-repeated or maxed turns, `25124448 B/op`, and `41127` allocs/op; turn 10 decode
-measured `74.22 tok/s`. The earlier pair-allocation book sample remains faster
-at `46.60s` wall because it sampled `3479` generated tokens, while the newer
-proof wrote a longer book. The artifact
-`/tmp/go-rocm-book-embedding-scale-rerun-20260527.md` keeps sampled book output
-coherent while the route avoids separate HIP allocations for encoded K/V pages
-and removes avoidable embedding vector-scale launches. Local/SWA attention
-remains bounded, q4/RoPE work stays flat per generated token, and full/global
-chunked stage1 remains the late-turn scaling blocker. Long-context decode is
-still below the final 90-100 tok/s production target. These numbers use the
+partials, contiguous encoded K/V pair allocation, fused embedding-output
+scaling, and SWA-window-aware decode routing remains inside the
+production-candidate wall window: `48.18s` wall, `38.56s` decode, `3470`
+generated tokens, `5` chapter-10 arc anchors, no repeated or maxed turns,
+`22726072 B/op`, and `67468` allocs/op; turn 10 decode measured `76.04 tok/s`.
+The artifact `/tmp/go-rocm-book-swa-single-attention-20260527.md` keeps sampled
+book output coherent while the route avoids separate HIP allocations for
+encoded K/V pages, removes avoidable embedding vector-scale launches, and keeps
+bounded local/SWA layers off the chunked global-attention decode path.
+Local/SWA attention remains bounded, q4/RoPE work stays flat per generated
+token, and full/global chunked stage1 remains the late-turn scaling blocker.
+Long-context decode is still below the final 90-100 tok/s production target.
+These numbers use the
 benchmark's
 `inference.WithContextLen` load setting, now correctly applied to Gemma4 q4
 sliding-window layers, and keep full-attention layers uncapped.

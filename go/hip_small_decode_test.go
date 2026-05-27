@@ -2807,6 +2807,9 @@ func TestHIPAttentionHeadsChunkedEligible_BlockPagesGood(t *testing.T) {
 		DescriptorTable: &rocmDeviceKVDescriptorTable{},
 	}
 	core.AssertEqual(t, true, hipAttentionHeadsChunkedEligible(req, 256, 320))
+	req.WindowSize = 512
+	core.AssertEqual(t, false, hipAttentionHeadsChunkedEligible(req, 256, 320))
+	req.WindowSize = 0
 
 	req.DeviceKV.mode = rocmKVCacheModeQ8
 	core.AssertEqual(t, false, hipAttentionHeadsChunkedEligible(req, 256, 320))

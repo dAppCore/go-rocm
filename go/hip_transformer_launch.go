@@ -289,6 +289,7 @@ type hipAttentionRequest struct {
 	Values          []float32
 	DeviceKV        *rocmDeviceKVCache
 	DescriptorTable *rocmDeviceKVDescriptorTable
+	WindowSize      int
 	Scale           float32
 }
 

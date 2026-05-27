@@ -18290,3 +18290,160 @@ scale launch pair, improves the 2048 endpoint above the previous best short
 guard, and preserves the no-replay retained book acceptance path. The next
 large blocker remains full/global `head_dim=512` chunked attention growth and
 q4 projection launch/block volume, not the embedding lookup path.
+
+## 2026-05-27 Rejected Chunked Attention Direct Block-Page Probe
+
+Purpose: test whether chunked attention could reduce descriptor/page math by
+resolving a single direct KQ8/VQ4 page per chunk when `block_size == 1` and
+`page_count == token_count`.
+
+Validation passed before the live run:
+
+```text
+go test ./go -run 'TestHIPKernelSource_AttentionChunkedStage1ScoreLaneReduction_Good|TestHIPAttentionHeads(ChunkedSharedMemBytes|ChunkedEligible)_Good|TestHIPAttentionHeadsChunkedEligible_Gemma4HeadDim512_Good|TestHIPKernels_AttentionHeadsBatchChunked' -count=1 -v
+go test ./go -count=1
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+hipcc -> /tmp/go-rocm-kernels-gfx1100-block-page-20260527.hsaco
+stderr: .bench-errors/hipcc_gfx1100_block_page_20260527.err (0 bytes)
+```
+
+2048-token route-metric guard:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 18503629923 ns/op
+tok/s=110.7
+tokens=2048
+B/op=6450832
+allocs/op=2628
+stderr: .bench-errors/2048_block_page_route_20260527.err (0 bytes)
+```
+
+Strict retained 48k 10-turn book sample:
+
+```text
+wall_seconds=57.824
+generated_tokens=4245
+turn10_decode_tok_s=75.15
+chapter10_arc_anchor_hits=2
+maxed_turns=0
+repeated_turns=0
+stderr: .bench-errors/book10_block_page_20260527.err (0 bytes)
+output: /tmp/go-rocm-book-block-page-20260527.md
+```
+
+Conclusion: rejected and reverted. The source compiled and passed tests, but
+the 2048 route regressed slightly from the accepted embedding-scale baseline
+(`111.0 tok/s`, `6441696 B/op`, `2620 allocs/op`), and the retained book sample
+missed the strict arc-anchor gate (`2/3`). Do not retry this direct block-page
+shape unless the descriptor/state layout changes materially.
+
+## 2026-05-27 Accepted SWA-Window Decode Attention Routing
+
+`../go-mlx/IDEAS.md` makes the Gemma4 split explicit: local/SWA layers are
+bounded at `512`/`1024` tokens, while full/global layers carry the unbounded
+retained context. The ROCm decode route was only looking at effective
+`tokenCount`, so local/SWA layers could still enter the two-stage chunked
+attention path even though their window fits the single-kernel shared route.
+
+Accepted change:
+
+- Carry `WindowSize` through `hipAttentionRequest`.
+- Populate it from `cfg.SlidingWindow` in the Gemma4 q4 layer path.
+- Suppress `hipAttentionHeadsChunkedEligible` for bounded-window decode when
+  the effective retained window fits `hipAttentionHeadsSharedMaxTokens`.
+- Leave full/global layers (`WindowSize == 0`) on the chunked path once they
+  meet the existing chunked-attention eligibility checks.
+
+This is different from the earlier rejected local-window shared-attention probe:
+it does not force the full/global route through the shared path, and it keeps
+the current row-scaled device-KV and embedding-scale baseline intact.
+
+Validation:
+
+```text
+go test ./go -run 'TestHIPAttentionHeadsChunkedEligible_BlockPagesGood|TestHIPAttentionHeadsChunkedEligible_Gemma4HeadDim512_Good|TestHIPGemma4Q4EffectiveSlidingWindow_Good|TestHIPGemma4Q4DeviceKVBlockSizeForSlidingWindow_Good' -count=1 -v
+PASS
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.140s
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.110s
+```
+
+512-token route-metric guard:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 4314350335 ns/op
+tok/s=118.7
+tokens=512
+B/op=3264160
+allocs/op=2466
+device_mallocs/op=8216
+device_malloc_bytes/op=11029040
+kernel_attention_decode_chunked_stage1_launches=2702
+kernel_attention_decode_chunked_stage2_launches=2702
+kernel_rocm_attention_heads_launches=15183
+kernel_total_launches=234882
+stderr: .bench-errors/512_swa_single_attention_20260527.err (0 bytes)
+```
+
+2048-token route-metric guard:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 17791173716 ns/op
+tok/s=115.1
+tokens=2048
+B/op=6453176
+allocs/op=2640
+device_mallocs/op=31285
+device_malloc_bytes/op=24591728
+kernel_attention_decode_chunked_stage1_launches=13454
+kernel_attention_decode_chunked_stage2_launches=13454
+kernel_rocm_attention_heads_launches=58191
+kernel_total_launches=941442
+stderr: .bench-errors/2048_swa_single_attention_20260527.err (0 bytes)
+```
+
+Strict retained 48k 10-turn book proof:
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 48209987824 ns/op
+book_wall_s=48.18
+book_decode_s=38.56
+book_generated_tokens=3470
+book_tok/s=72.02
+book_turn10_tok/s=76.04
+book_turn10_retained_tokens=5623
+book_maxed_turns=0
+book_repeated_turns=0
+book_max_adjacent_repeat=0.03931
+chapter10_arc_anchor_hits=5
+B/op=22726072
+allocs/op=67468
+peak_memory_bytes=5881077760
+stderr: .bench-errors/book10_swa_single_attention_20260527.err (0 bytes)
+output: /tmp/go-rocm-book-swa-single-attention-20260527.md
+```
+
+Per-turn decode remains the next blocker despite the accepted wall-time result:
+
+```text
+turn01 108.83 tok/s
+turn02  98.15 tok/s
+turn03  94.09 tok/s
+turn04  92.88 tok/s
+turn05  88.12 tok/s
+turn06  85.97 tok/s
+turn07  82.13 tok/s
+turn08  81.97 tok/s
+turn09  76.91 tok/s
+turn10  76.04 tok/s
+```
+
+Conclusion: accepted. This applies the Gemma4 local/global split from
+`go-mlx/IDEAS.md` to the decode router, improves both short guards, improves
+the strict book wall-time over the embedding-scale confirmation run, and keeps
+the no-replay retained-state acceptance path green. The remaining target is
+still full/global `head_dim=512` chunked attention growth and q4 projection
+block volume so later turns stay above `90-100 tok/s`.

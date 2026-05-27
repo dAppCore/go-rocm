@@ -3119,6 +3119,9 @@ func hipAttentionHeadsChunkedEligible(req hipAttentionRequest, dim, tokenCount i
 	if dim <= 0 || dim > hipAttentionHeadsChunkedBlockSize || tokenCount < hipAttentionHeadsChunkSize {
 		return false
 	}
+	if req.WindowSize > 0 && tokenCount <= hipAttentionHeadsSharedMaxTokens {
+		return false
+	}
 	if req.DeviceKV == nil || req.DescriptorTable == nil {
 		return false
 	}
