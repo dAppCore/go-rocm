@@ -1,5 +1,64 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Rejected Batched Q4 Group64 Row-Base Specialization
+
+- Tested carrying the single-token q4 `group_size == 64` row-base/index
+  specialization into the batched prefill q4 projection, batched GELU-tanh
+  multiply, and batched GELU-tanh projection kernels.
+- The edit compiled and passed the focused source geometry guard, but it added
+  about 200 lines of duplicated kernel code, increased the temporary `gfx1100`
+  HSACO to `401600` bytes, and did not produce a measured prompt-preload win
+  against the accepted HSACO on the same machine.
+
+```text
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2:
+  /tmp/go-rocm-kernels-gfx1100-batch-group64.hsaco
+  stderr: .bench-errors/hipcc_gfx1100_batch_group64_20260527.err (empty)
+
+focused source guard:
+  go test ./go -run 'TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good' -count=1
+
+2k prompt, batch-group64 HSACO:
+  5729220203 ns/op
+  357.5 prompt_tok/s
+  8523624 B/op
+  5263 allocs/op
+  stderr: .bench-errors/prompt_2k_batch_group64_20260527.err (empty)
+
+2k prompt, accepted HSACO comparison:
+  5731908711 ns/op
+  357.3 prompt_tok/s
+  8515720 B/op
+  5265 allocs/op
+  stderr: .bench-errors/prompt_2k_baseline_compare_20260527.err (empty)
+
+4k prompt, batch-group64 HSACO:
+  15204820172 ns/op
+  269.4 prompt_tok/s
+  11649160 B/op
+  9017 allocs/op
+  stderr: .bench-errors/prompt_4k_batch_group64_20260527.err (empty)
+
+4k prompt, accepted HSACO comparison:
+  15278328437 ns/op
+  268.1 prompt_tok/s
+  11641832 B/op
+  9024 allocs/op
+  stderr: .bench-errors/prompt_4k_baseline_compare_20260527.err (empty)
+
+2048 text:Hi, batch-group64 HSACO:
+  19048967528 ns/op
+  107.5 tok/s
+  6681600 B/op
+  2633 allocs/op
+  stderr: .bench-errors/2048_batch_group64_20260527.err (empty)
+```
+
+- Rejected and reverted. The measured 2k/4k prompt results are effectively
+  baseline noise, the short decode guard is slightly below the accepted
+  comparison, and the extra code/HSACO size is not justified without a visible
+  prompt or retained-book gain.
+
 ## 2026-05-27 Accepted Pinned Descriptor Table Upload
 
 - Carried the `go-mlx/IDEAS.md` `PinnedView` direction into the retained-state
