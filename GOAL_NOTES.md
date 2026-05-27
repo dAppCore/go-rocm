@@ -34,6 +34,23 @@ tokens_2000 18265196384 ns/op     109.5 tok/s    2284760 B/op  1219 allocs/op
 ```text
 BenchmarkHIPGemma4Q4PlanPromptPrefill_29K-32  643.6 ns/op  5216 B/op  2 allocs/op
 ```
+- Retained-book benchmark accounting now fills the memory fields for the
+  direct retained path and reports per-turn retained-token counts, active
+  memory, and peak memory. A 2-turn/8-token greedy smoke on the RX 7800 XT
+  completed with empty `/tmp/go-rocm-book-2x8-metrics.err`:
+
+```text
+book_wall_s/op 0.6245
+book_decode_s/op 0.1262
+book_generated_tokens/op 16
+book_turn01_retained_tokens/op 102
+book_turn02_retained_tokens/op 230
+book_turn01_active_memory_bytes 2635603446
+book_turn02_active_memory_bytes 2636503542
+peak_memory_bytes 3495653376
+B/op 8017536
+allocs/op 16269
+```
 
 ## 2026-05-26 Public Q4 Direct Token Path
 
