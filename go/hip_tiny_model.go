@@ -1136,7 +1136,7 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 					if outputToken {
 						if hostSampling {
 							if len(current.Candidates) > 0 {
-								current.Greedy, err = hipGemma4Q4HostSampleCandidateResultWorkspace(current.Candidates, generate, history, rand.Float64(), attentionWorkspace)
+								current.Greedy, err = hipGemma4Q4HostSampleSortedCandidateResultWorkspace(current.Candidates, generate, history, rand.Float64(), attentionWorkspace)
 							} else {
 								current.Greedy, err = hipGemma4Q4HostSampleResult(current.Logits, generate, suppressTokens, history, rand.Float64())
 							}
@@ -1263,7 +1263,7 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 			hipReleaseClosedGemma4Q4DeviceDecodeState(previousDeviceState)
 			if hostSampling {
 				if len(current.Candidates) > 0 {
-					current.Greedy, err = hipGemma4Q4HostSampleCandidateResultWorkspace(current.Candidates, generate, history, rand.Float64(), attentionWorkspace)
+					current.Greedy, err = hipGemma4Q4HostSampleSortedCandidateResultWorkspace(current.Candidates, generate, history, rand.Float64(), attentionWorkspace)
 				} else {
 					current.Greedy, err = hipGemma4Q4HostSampleResult(current.Logits, generate, suppressTokens, history, rand.Float64())
 				}
@@ -1881,6 +1881,21 @@ func hipGemma4Q4HostSampleCandidateResultWorkspace(candidates []hipGreedySampleR
 }
 
 func hipGemma4Q4HostSampleCandidateResultScratch(candidates []hipGreedySampleResult, generate inference.GenerateConfig, history []int32, draw float64, working []hipReferenceCandidate, weights []float64) (hipGreedySampleResult, []hipReferenceCandidate, []float64, error) {
+	return hipGemma4Q4HostSampleCandidateResultScratchOrder(candidates, generate, history, draw, working, weights, false)
+}
+
+func hipGemma4Q4HostSampleSortedCandidateResultWorkspace(candidates []hipGreedySampleResult, generate inference.GenerateConfig, history []int32, draw float64, workspace *hipAttentionHeadsChunkedWorkspace) (hipGreedySampleResult, error) {
+	if workspace == nil {
+		result, _, _, err := hipGemma4Q4HostSampleCandidateResultScratchOrder(candidates, generate, history, draw, nil, nil, true)
+		return result, err
+	}
+	result, sampleCandidates, sampleWeights, err := hipGemma4Q4HostSampleCandidateResultScratchOrder(candidates, generate, history, draw, workspace.SampleCandidates, workspace.SampleWeights, true)
+	workspace.SampleCandidates = sampleCandidates
+	workspace.SampleWeights = sampleWeights
+	return result, err
+}
+
+func hipGemma4Q4HostSampleCandidateResultScratchOrder(candidates []hipGreedySampleResult, generate inference.GenerateConfig, history []int32, draw float64, working []hipReferenceCandidate, weights []float64, sorted bool) (hipGreedySampleResult, []hipReferenceCandidate, []float64, error) {
 	if len(candidates) == 0 {
 		return hipGreedySampleResult{}, working, weights, core.E("rocm.hip.Gemma4Q4HostSampler", "candidates are required", nil)
 	}
@@ -1916,7 +1931,9 @@ func hipGemma4Q4HostSampleCandidateResultScratch(candidates []hipGreedySampleRes
 		}
 	}
 	if generate.Temperature <= 0 && generate.TopP <= 0 {
-		sortHIPReferenceCandidates(working)
+		if !sorted || hipGemma4Q4RepeatHistoryRequired(generate) {
+			sortHIPReferenceCandidates(working)
+		}
 		candidate := working[0]
 		return hipGreedySampleResult{TokenID: candidate.index, Score: candidate.value}, working, weights, nil
 	}
@@ -1934,7 +1951,9 @@ func hipGemma4Q4HostSampleCandidateResultScratch(candidates []hipGreedySampleRes
 	if topP <= 0 || topP > 1 || math.IsNaN(float64(topP)) || math.IsInf(float64(topP), 0) {
 		return hipGreedySampleResult{}, working, weights, core.E("rocm.hip.Gemma4Q4HostSampler", "top-p must be in (0, 1]", nil)
 	}
-	sortHIPReferenceCandidates(working)
+	if !sorted || hipGemma4Q4RepeatHistoryRequired(generate) {
+		sortHIPReferenceCandidates(working)
+	}
 	maxValue := float64(working[0].value) / float64(temperature)
 	if cap(weights) < len(working) {
 		weights = make([]float64, len(working))

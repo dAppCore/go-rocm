@@ -380,6 +380,15 @@ func TestHIPTransformerReferenceSamplerBadInputsAndTies_Bad(t *testing.T) {
 	core.AssertEqual(t, candidateSampled, scratchSampled)
 	core.AssertEqual(t, 2, cap(scratchCandidates))
 	core.AssertEqual(t, 2, cap(scratchWeights))
+	sortedSampled, err := hipGemma4Q4HostSampleSortedCandidateResultWorkspace(
+		[]hipGreedySampleResult{{TokenID: 1, Score: 5}, {TokenID: 2, Score: 4}},
+		inference.GenerateConfig{Temperature: 1, TopK: 2, TopP: 1, RepeatPenalty: 1},
+		nil,
+		0,
+		nil,
+	)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, candidateSampled, sortedSampled)
 
 	candidatePenalized, err := hipGemma4Q4HostSampleCandidateResult(
 		[]hipGreedySampleResult{{TokenID: 1, Score: 5}, {TokenID: 2, Score: 4}},
@@ -389,6 +398,15 @@ func TestHIPTransformerReferenceSamplerBadInputsAndTies_Bad(t *testing.T) {
 	)
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, 2, candidatePenalized.TokenID)
+	sortedPenalized, err := hipGemma4Q4HostSampleSortedCandidateResultWorkspace(
+		[]hipGreedySampleResult{{TokenID: 1, Score: 5}, {TokenID: 2, Score: 4}},
+		inference.GenerateConfig{RepeatPenalty: 2},
+		[]int32{1},
+		0,
+		nil,
+	)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, candidatePenalized, sortedPenalized)
 	core.AssertTrue(t, hipGemma4Q4DeviceCandidateSamplingRequested(inference.GenerateConfig{Temperature: 1, TopK: 2, TopP: 1, RepeatPenalty: 1}), "top-k sampling can use device candidates without repeat penalty")
 	core.AssertTrue(t, !hipGemma4Q4DeviceCandidateSamplingRequested(inference.GenerateConfig{Temperature: 1, TopK: 2, TopP: 1, RepeatPenalty: 2}), "repeat penalty changes the top-k set and must use full logits")
 	core.AssertTrue(t, !hipGemma4Q4RepeatHistoryRequired(inference.GenerateConfig{Temperature: 1, TopK: 2, TopP: 1, RepeatPenalty: 1}), "repeat history is unused when repeat penalty is neutral")
@@ -581,6 +599,27 @@ func BenchmarkHIPGemma4Q4HostSampleCandidateResultScratch_TopK64(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		result, nextCandidates, nextWeights, err := hipGemma4Q4HostSampleCandidateResultScratch(candidates, generate, nil, 0.42, scratchCandidates, scratchWeights)
+		if err != nil {
+			b.Fatal(err)
+		}
+		scratchCandidates = nextCandidates
+		scratchWeights = nextWeights
+		benchmarkHIPCandidateSampleResultSink = result
+	}
+}
+
+func BenchmarkHIPGemma4Q4HostSampleSortedCandidateResultScratch_TopK64(b *testing.B) {
+	candidates := make([]hipGreedySampleResult, 64)
+	for index := range candidates {
+		candidates[index] = hipGreedySampleResult{TokenID: index, Score: float32(64 - index)}
+	}
+	generate := inference.GenerateConfig{Temperature: 1, TopK: 64, TopP: 0.95, RepeatPenalty: 1}
+	scratchCandidates := make([]hipReferenceCandidate, 0, 64)
+	scratchWeights := make([]float64, 0, 64)
+
+	b.ReportAllocs()
+	for b.Loop() {
+		result, nextCandidates, nextWeights, err := hipGemma4Q4HostSampleCandidateResultScratchOrder(candidates, generate, nil, 0.42, scratchCandidates, scratchWeights, true)
 		if err != nil {
 			b.Fatal(err)
 		}

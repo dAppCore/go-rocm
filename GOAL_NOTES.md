@@ -14770,3 +14770,43 @@ stderr: /tmp/go-rocm-book-retained-block16-2turn-nohistory.err
 This is cleanup only; retained long-context decode still needs q4
 projection/GELU and attention work to move turn 10 from the mid-60s toward the
 `90-100+ tok/s` target.
+
+## 2026-05-27: Sorted Device Candidate Sampling Cleanup
+
+Accepted another exact host-side cleanup on the sampled q4 route:
+
+```text
+- Device top-k candidates are already returned in sampler order, so the public
+  Generate path and retained book harness now use a sorted-candidate sampler
+  that skips the second host-side sort when `RepeatPenalty == 1`.
+- The generic candidate sampler still sorts arbitrary inputs.
+- When repeat penalty is active, the sorted path still sorts after penalties are
+  applied because penalties can reorder the candidate set.
+```
+
+AX-11 microbenchmarks:
+
+```text
+BenchmarkHIPGemma4Q4HostSampleCandidateResultScratch_TopK64-32        556.8 ns/op  0 B/op  0 allocs/op
+BenchmarkHIPGemma4Q4HostSampleSortedCandidateResultScratch_TopK64-32  503.5 ns/op  0 B/op  0 allocs/op
+BenchmarkHIPGemma4Q4RepeatHistoryRequired_Hot-32                     0.8247 ns/op  0 B/op  0 allocs/op
+```
+
+Serialized retained hardware guard:
+
+```text
+book_wall_s/op              8.182
+book_decode_s/op            7.697
+book_generated_tokens/op      762
+book_tok/s                  93.13
+book_turn02_tok/s           89.16
+B/op                      5872160
+allocs/op                   6978
+stderr_bytes                   0
+output: /tmp/go-rocm-book-retained-block16-2turn-sorted-candidates.md
+stderr: /tmp/go-rocm-book-retained-block16-2turn-sorted-candidates.err
+```
+
+This keeps the short retained route in the same decode band while trimming
+host-side allocation/accounting cost. The long-context goal remains open until
+the 48k retained turn-10 decode path is back above `90 tok/s`.
