@@ -37,17 +37,20 @@ The 100+ tok/s goal is complete only when all of these are true:
 - Normal, Linux no-cgo, legacy-server, HIP, model, and cache smoke gates keep
   passing or skip cleanly when hardware is absent.
 
-Current status as of 2026-05-27: the q4 performance endpoint is met on the
-pinned RX 7800 XT with a fresh live `gfx1100` HSACO. The latest stricter
-`GO_ROCM_BENCH_TOKENS=2048` `text:Hi` run reports `17964551296 ns/op`,
-`114.0 tok/s`, `6624528 B/op`, and `2635 allocs/op`. The chapter-shaped
-2048-token fast guard at `context_len=4096` reports `19536530899 ns/op`,
-`104.8 tok/s`, `8017064 B/op`, and `3438 allocs/op`. After the retained-book
-prompt was hardened with explicit forbidden distractor blocks and an exact
-chapter-10 ending anchor, the strict retained 10-turn book gate is still a
-wall-time production candidate at `71.03s` wall with `5` chapter-10 arc anchors,
-but late-turn decode is still below the final target at `50.12 tok/s` on turn
-10. These numbers use the benchmark's
+Current status as of 2026-05-27: the q4 2048-token performance endpoint remains
+met on the pinned RX 7800 XT with a fresh live `gfx1100` HSACO. The latest
+stricter `GO_ROCM_BENCH_TOKENS=2048` route-metric `text:Hi` run reports
+`19162439900 ns/op`, `106.9 tok/s`, `5412624 B/op`, and `4673 allocs/op`.
+The chapter-shaped 2048-token fast guard at `context_len=4096` reports
+`19536530899 ns/op`, `104.8 tok/s`, `8017064 B/op`, and `3438 allocs/op`.
+Full-attention/global Gemma4 device KV pages now use 128-token blocks while
+sliding-window layers keep exact one-token pages for 512/1024 SWA trimming. The
+strict retained 10-turn book gate improved to `55.81s` wall, `3974` generated
+tokens, `5` chapter-10 arc anchors, no repeated turns, no max-token turns,
+`13352624 B/op`, and `39059 allocs/op`; turn 10 decode rose to `69.78 tok/s`.
+This is a large long-context allocation and wall-time win, but late-turn decode
+is still below the final 90-100 tok/s production target. These numbers use the
+benchmark's
 `inference.WithContextLen` load setting, now correctly applied to Gemma4 q4
 sliding-window layers, and keep full-attention layers uncapped.
 
@@ -2247,6 +2250,17 @@ Remaining blocker:
   max-token turns, `chapter10_arc_anchor_hits=5`, `20085592 B/op`, and
   `39863 allocs/op`; turn 10 decode was only `50.12 tok/s`, so this is a
   story/wall gate restoration, not the final long-context speed endpoint.
+- Accepted global/full-attention KV block paging: sliding-window layers still
+  use exact one-token device KV pages so 512/1024 SWA trimming cannot straddle
+  encoded rows, while full-attention layers use 128-token pages for initial
+  retained prefill. This drops long-context descriptor pressure without changing
+  local SWA semantics. Validation stayed green with empty stderr: package tests,
+  q4 `text:Hi` smoke, a `2048` route-metric guard at `106.9 tok/s` with
+  `5412624 B/op`, and the strict serialized `48k` 10-turn retained book gate at
+  `55.81s` wall, `3974` generated tokens, `5` chapter-10 anchors,
+  `0` repeated turns, `0` max-token turns, `13352624 B/op`, `39059 allocs/op`,
+  and `69.78 tok/s` on turn 10. This is accepted, but the final late-turn
+  decode target remains open.
 
 - [x] Phase 0: Snapshot the tree and establish the baseline.
   - Run `git status --short`.
@@ -2396,12 +2410,14 @@ Remaining blocker:
 Latest retained-state driver checkpoint, 2026-05-27: the `.kv` file is treated
 as the state source over MP4-style vector pages, not as replayable prompt text.
 Direct token-page indexing remains gated on `block_size == 1`; mixed block-page
-state uses descriptor lookup and validation. The current 48k retained book route
-passes strict story/wall acceptance after the prompt hardening at `71.03s` wall,
-`4210` generated tokens, empty stderr, and chapter-10 anchor hits of `5`, but
-turn-10 decode is still only `50.12 tok/s`. The open endpoint remains
-`90-100+ tok/s` late-turn decode by reducing q4 projection/GELU launches and
-long-context attention cost, not by replaying prompt text.
+state uses descriptor lookup and validation. Sliding-window layers keep exact
+one-token pages for SWA trimming, while full-attention/global layers now use
+128-token pages for retained prefill. The current 48k retained book route
+passes strict story/wall acceptance at `55.81s` wall, `3974` generated tokens,
+empty stderr, and chapter-10 anchor hits of `5`; turn-10 decode improved to
+`69.78 tok/s`. The open endpoint remains `90-100+ tok/s` late-turn decode by
+reducing q4 projection/GELU launches and long-context attention cost, not by
+replaying prompt text.
 
 Gemma4 q4 layer geometry is now metadata-driven when safetensors config data is
 available. ROCm carries `layer_types`, `num_kv_shared_layers`, `sliding_window`,

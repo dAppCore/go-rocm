@@ -548,6 +548,7 @@ func TestHIPGemma4Q4ChunkedAttentionEnabled_Good(t *testing.T) {
 
 func TestHIPGemma4Q4DeviceKVBlockSize_Good(t *testing.T) {
 	t.Setenv("GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE", "")
+	t.Setenv("GO_ROCM_GEMMA4_Q4_GLOBAL_DEVICE_KV_BLOCK_SIZE", "")
 	core.AssertEqual(t, rocmGemma4Q4DeviceKVBlockSize, hipGemma4Q4DeviceKVBlockSize())
 
 	t.Setenv("GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE", "16")
@@ -555,6 +556,22 @@ func TestHIPGemma4Q4DeviceKVBlockSize_Good(t *testing.T) {
 
 	t.Setenv("GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE", "bad")
 	core.AssertEqual(t, rocmGemma4Q4DeviceKVBlockSize, hipGemma4Q4DeviceKVBlockSize())
+}
+
+func TestHIPGemma4Q4DeviceKVBlockSizeForSlidingWindow_Good(t *testing.T) {
+	t.Setenv("GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE", "")
+	t.Setenv("GO_ROCM_GEMMA4_Q4_GLOBAL_DEVICE_KV_BLOCK_SIZE", "")
+	core.AssertEqual(t, rocmGemma4Q4DeviceKVBlockSize, hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(512))
+	core.AssertEqual(t, rocmGemma4Q4GlobalDeviceKVBlockSize, hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(0))
+
+	t.Setenv("GO_ROCM_GEMMA4_Q4_GLOBAL_DEVICE_KV_BLOCK_SIZE", "256")
+	core.AssertEqual(t, 256, hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(0))
+	core.AssertEqual(t, rocmGemma4Q4DeviceKVBlockSize, hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(1024))
+
+	t.Setenv("GO_ROCM_GEMMA4_Q4_GLOBAL_DEVICE_KV_BLOCK_SIZE", "")
+	t.Setenv("GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE", "16")
+	core.AssertEqual(t, 16, hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(0))
+	core.AssertEqual(t, 16, hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(512))
 }
 
 func TestHIPGemma4Q4PrefillPlan_Good(t *testing.T) {
@@ -1061,6 +1078,53 @@ func TestHIPGemma4Q4PrefillDeviceKVBatch_Good(t *testing.T) {
 	core.AssertEqual(t, uint64(min(tokenCount, hipGemma4Q4DeviceKVBlockSize())), binary.LittleEndian.Uint64(descriptorPayload[pageOffset+8:]))
 	core.AssertEqual(t, uint32(cfg.HeadDim), binary.LittleEndian.Uint32(descriptorPayload[pageOffset+16:]))
 	core.AssertEqual(t, uint32(cfg.HeadDim), binary.LittleEndian.Uint32(descriptorPayload[pageOffset+20:]))
+}
+
+func TestHIPGemma4Q4PrefillDeviceKVBatchFullAttentionUsesGlobalBlockSize_Good(t *testing.T) {
+	t.Setenv("GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE", "")
+	t.Setenv("GO_ROCM_GEMMA4_Q4_GLOBAL_DEVICE_KV_BLOCK_SIZE", "")
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup()
+	cfg.LayerType = "full_attention"
+	cfg.SlidingWindow = 0
+	tokenCount := rocmGemma4Q4GlobalDeviceKVBlockSize + 2
+	keyRows := make([]float32, tokenCount*cfg.HeadDim)
+	valueRows := make([]float32, tokenCount*cfg.HeadDim)
+	for index := range keyRows {
+		keyRows[index] = float32(index%11) - 5
+		valueRows[index] = float32(index%7) - 3
+	}
+	keyPayload, err := hipFloat32Payload(keyRows)
+	core.RequireNoError(t, err)
+	key, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill full attention device KV key fixture", keyPayload, len(keyRows))
+	core.RequireNoError(t, err)
+	defer key.Close()
+	valuePayload, err := hipFloat32Payload(valueRows)
+	core.RequireNoError(t, err)
+	value, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill full attention device KV value fixture", valuePayload, len(valueRows))
+	core.RequireNoError(t, err)
+	defer value.Close()
+	qk := &hipGemma4Q4PrefillRoPEQKBatch{Key: key}
+
+	start := len(driver.launches)
+	deviceKV, err := hipRunGemma4Q4PrefillDeviceKVBatch(context.Background(), driver, cfg, qk, value, tokenCount, rocmKVCacheModeKQ8VQ4)
+	core.RequireNoError(t, err)
+	defer deviceKV.Close()
+
+	wantBlockSize := hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(cfg.SlidingWindow)
+	wantPages := (tokenCount + wantBlockSize - 1) / wantBlockSize
+	core.AssertEqual(t, wantPages, countLaunchName(driver.launches[start:], hipKernelNameKVEncodeToken))
+	core.AssertEqual(t, wantBlockSize, deviceKV.Cache.blockSize)
+	core.AssertEqual(t, tokenCount, deviceKV.Cache.TokenCount())
+	core.AssertEqual(t, wantPages, deviceKV.Cache.PageCount())
+	core.AssertEqual(t, wantBlockSize, deviceKV.Cache.pages[0].tokenCount)
+	core.AssertEqual(t, 2, deviceKV.Cache.pages[1].tokenCount)
+
+	descriptorPayload := make([]byte, deviceKV.DescriptorTable.SizeBytes())
+	core.RequireNoError(t, driver.CopyDeviceToHost(deviceKV.DescriptorTable.Pointer(), descriptorPayload))
+	core.AssertEqual(t, uint32(wantBlockSize), binary.LittleEndian.Uint32(descriptorPayload[20:]))
+	core.AssertEqual(t, uint64(tokenCount), binary.LittleEndian.Uint64(descriptorPayload[24:]))
 }
 
 func TestHIPGemma4Q4PrefillDeviceKVBatch_Bad(t *testing.T) {

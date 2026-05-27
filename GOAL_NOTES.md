@@ -16924,3 +16924,85 @@ This accepted-source baseline reinforces the same diagnosis as `GOAL.md`: the
 remaining long-context work is dominated by q4 projection/GELU, RMS/residual,
 and decode attention launch volume. Descriptor/KV append work is visible but no
 longer the main speed target.
+
+## 2026-05-27 Accepted Global Device KV Block Pages
+
+Implemented a safer split for Gemma4 q4 device KV page geometry:
+
+- Sliding-window layers keep the existing exact one-token page size so 512/1024
+  SWA windows can always trim without slicing inside row-scaled encoded pages.
+- Full-attention/global layers use 128-token pages for initial retained prefill,
+  with one-token suffix pages for subsequent decode appends. The existing
+  mixed-page descriptor lookup handles this shape; direct token-page indexing
+  still only applies when `block_size == 1`.
+
+Source changes:
+
+```text
+go/hip_kv_device.go:
+  hipGemma4Q4GlobalDeviceKVBlockSize() default 128
+  hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(window)
+
+go/hip_gemma4_q4_prefill.go:
+  new retained prefill device KV cache uses the per-layer block-size helper
+
+go/hip_gemma4_q4_layer.go:
+  first-token decode/remirror cache construction uses the per-layer helper
+
+go/hip_small_decode_test.go:
+  unit coverage for sliding vs global block sizing and full-attention prefill
+  descriptor page count/header block size
+```
+
+Verification:
+
+```text
+Focused tests:
+go test ./go -run 'TestHIPGemma4Q4(DeviceKVBlockSize|PrefillDeviceKVBatch|PrefillDecodeStateTrimsSlidingWindow|PrefillDecodeStateSharedAliasesFollowTrimmedSource|SharedDeviceKV|DecoderLayerAttentionKEqVUsesPairProjection)|TestHIPKernels_AttentionHeadsBatchCausalWindow|TestHIPSmallDecode' -count=1
+ok dappco.re/go/rocm 0.016s
+
+Package test:
+go test ./go -count=1
+ok dappco.re/go/rocm 0.137s
+
+Compile:
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-global-kv-blocks.hsaco
+stderr: .bench-errors/hipcc_gfx1100_global_kv_blocks_20260527.err (0 bytes)
+
+Q4 smoke:
+prompt_tokens=[2 10979], generated tokens=[107 4968], text=["\n" "Model"]
+stderr: .bench-errors/q4_smoke_global_kv_blocks_20260527.err (0 bytes)
+
+2048 route-metric guard:
+BenchmarkInferenceGemma4Q4Generate-32  1  19162439900 ns/op
+106.9 tok/s, 2048 tokens, 5412624 B/op, 4673 allocs/op
+kernel_total_launches/op=999352
+kernel_total_blocks/op=175800259
+stderr: .bench-errors/2048_global_kv_blocks_route_20260527.err (0 bytes)
+
+Strict retained 48k 10-turn book gate:
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32  1  55874799659 ns/op
+book_wall_s=55.81
+book_decode_s=45.37
+book_generated_tokens=3974
+book_tok/s=71.20
+book_turn10_tok/s=69.78
+book_turn10_retained_tokens=6127
+chapter10_arc_anchor_hits=5
+book_repeated_turns=0
+book_maxed_turns=0
+book_max_adjacent_repeat=0.01378
+peak_memory_bytes=5970948096
+13352624 B/op, 39059 allocs/op
+kernel_total_launches/generated_token=500.09
+kernel_total_blocks/generated_token=96003.97
+stderr: .bench-errors/book10_global_kv_blocks_20260527.err (0 bytes)
+output: /tmp/go-rocm-book-global-kv-blocks.md
+```
+
+Accepted reason: this is the first pass that materially improves the strict
+retained-book long-context route after prompt hardening without weakening the
+no-replay gate. It cuts wall time from `71.03s` to `55.81s`, drops B/op from
+`20085592` to `13352624`, and raises turn-10 decode from `50.12 tok/s` to
+`69.78 tok/s`. The endpoint is still open because late-turn decode remains
+below the `90-100+ tok/s` target.

@@ -680,7 +680,7 @@ func hipRunGemma4Q4PrefillDeviceKVBatchWithPrior(ctx context.Context, driver nat
 		}
 		cache, err = prior.withAppendedDeviceRowsWindow(ctx, qk.Key, value, cfg.HeadDim, cfg.HeadDim, tokenCount, window)
 	} else {
-		cache, err = newROCmDeviceKVCacheFromDeviceRows(ctx, driver, firstNonEmptyString(mode, rocmKVCacheModeFP16), hipGemma4Q4DeviceKVBlockSize(), qk.Key, value, cfg.HeadDim, cfg.HeadDim, tokenCount, 0)
+		cache, err = newROCmDeviceKVCacheFromDeviceRows(ctx, driver, firstNonEmptyString(mode, rocmKVCacheModeFP16), hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(cfg.SlidingWindow), qk.Key, value, cfg.HeadDim, cfg.HeadDim, tokenCount, 0)
 	}
 	if err != nil {
 		return nil, err

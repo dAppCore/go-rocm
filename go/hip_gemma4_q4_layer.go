@@ -1484,7 +1484,7 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 			deviceKVAttention = "append_existing_device"
 			borrowedPageCount = req.PriorDeviceKV.PageCount()
 		} else if req.OmitHostKV && ropeKeyDevice != nil && valueDevice != nil {
-			deviceKV, err = newROCmDeviceKVCacheFromDeviceToken(ctx, driver, firstNonEmptyString(req.DeviceKVMode, rocmKVCacheModeFP16), hipGemma4Q4DeviceKVBlockSize(), ropeKeyDevice, valueDevice, cfg.SlidingWindow)
+			deviceKV, err = newROCmDeviceKVCacheFromDeviceToken(ctx, driver, firstNonEmptyString(req.DeviceKVMode, rocmKVCacheModeFP16), hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(cfg.SlidingWindow), ropeKeyDevice, valueDevice, cfg.SlidingWindow)
 			if err != nil {
 				return hipGemma4Q4DecoderLayerResult{}, err
 			}
@@ -1506,7 +1506,7 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 			deviceKVAttention = "append_existing_device"
 			borrowedPageCount = req.PriorDeviceKV.PageCount()
 		} else {
-			host, err := newROCmKVCache(firstNonEmptyString(req.DeviceKVMode, rocmKVCacheModeFP16), hipGemma4Q4DeviceKVBlockSize())
+			host, err := newROCmKVCache(firstNonEmptyString(req.DeviceKVMode, rocmKVCacheModeFP16), hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(cfg.SlidingWindow))
 			if err != nil {
 				return hipGemma4Q4DecoderLayerResult{}, err
 			}

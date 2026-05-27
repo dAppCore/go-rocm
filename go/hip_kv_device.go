@@ -36,10 +36,11 @@ const (
 )
 
 const (
-	rocmDeviceKVHotPageCapacity        = 512
-	rocmDeviceKVPagePoolMaxCapacity    = 128 * 1024
-	rocmDeviceKVDescriptorTablePoolMax = 4096
-	rocmGemma4Q4DeviceKVBlockSize      = 1
+	rocmDeviceKVHotPageCapacity         = 512
+	rocmDeviceKVPagePoolMaxCapacity     = 128 * 1024
+	rocmDeviceKVDescriptorTablePoolMax  = 4096
+	rocmGemma4Q4DeviceKVBlockSize       = 1
+	rocmGemma4Q4GlobalDeviceKVBlockSize = 128
 )
 
 const (
@@ -373,6 +374,28 @@ func hipGemma4Q4DeviceKVBlockSize() int {
 		return rocmGemma4Q4DeviceKVBlockSize
 	}
 	return value
+}
+
+func hipGemma4Q4GlobalDeviceKVBlockSize() int {
+	raw := os.Getenv("GO_ROCM_GEMMA4_Q4_GLOBAL_DEVICE_KV_BLOCK_SIZE")
+	if raw == "" {
+		raw = os.Getenv("GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE")
+	}
+	if raw == "" {
+		return rocmGemma4Q4GlobalDeviceKVBlockSize
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return rocmGemma4Q4GlobalDeviceKVBlockSize
+	}
+	return value
+}
+
+func hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(slidingWindow int) int {
+	if slidingWindow > 0 {
+		return hipGemma4Q4DeviceKVBlockSize()
+	}
+	return hipGemma4Q4GlobalDeviceKVBlockSize()
 }
 
 func rocmDeviceKVBorrowPageSlice(length, minCapacity int) []rocmDeviceKVPage {
