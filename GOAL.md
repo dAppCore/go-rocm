@@ -1912,7 +1912,7 @@ Remaining blocker:
     and the retained book benchmark test asserts turn 2 appends only the new
     Gemma4 user turn, not `Book so far`.
 
-- [ ] Phase 7: HIP runtime stepping stones.
+- [x] Phase 7: HIP runtime stepping stones.
   - Keep allocation/copy tests green.
   - Add tensor shape/dtype validation before kernels.
   - Implement prefill/decode kernels one narrow path at a time:
@@ -1922,12 +1922,29 @@ Remaining blocker:
     4. q8 and k-q8-v-q4 KV cache modes.
     5. MoE router and lazy expert residency.
     6. JANGTQ/MXTQ packed dequant/projection.
+  - 2026-05-27 audit: focused HIP stepping-stone tests pass:
+    `TestHIPRuntime_LoadModelRunsTinyPrefillDecodeWhenHSACOConfigured_Good`,
+    tiny q8/JANGTQ/codebook validation tests, Gemma4 q4 package
+    prefill/decode tests, KV cache/device-state tests, MoE router/lazy-expert
+    launch tests, JANGTQ projection tests, and `TestNativeDecodeSmokeKernelStatus_Good`.
+    Shape/dtype validation is covered by the HIP launch/model-pack bad-path
+    tests for unsupported tensor dtype and device-buffer shape mismatch. This
+    phase is stepping-stone complete; the remaining open work is production
+    long-context decode/prefill kernel quality and speed, not fixture coverage.
 
-- [ ] Phase 8: Bench, eval, and probes.
+- [x] Phase 8: Bench, eval, and probes.
   - Make ROCm bench reports use the same fields as MLX: prefill tok/s, decode
     tok/s, memory peak, cache hit rate, restore time, LoRA overhead, perplexity
     hooks, queue latency, first-token latency, and probe counts.
   - Add fake-device deterministic tests and opt-in hardware smoke tests.
+  - 2026-05-27 audit: `rocmModel.Benchmark` reports prompt/decode tok/s,
+    peak memory, prompt-cache hit rate, KV restore milliseconds, queue and
+    first-token latency labels, LoRA overhead labels, and measured probe
+    counts. `rocmModel.Evaluate` reports loss/perplexity hooks and quality
+    probe labels. Deterministic fake-device coverage passed for benchmark,
+    eval, cache/memory probes, LoRA overhead, scheduler queue/first-token
+    probes, and benchmark kernel counters; opt-in hardware smoke tests remain
+    wired behind `GO_ROCM_RUN_*` gates for Phase 9 final ROCm validation.
 
 - [ ] Phase 9: Documentation and final gates.
   - Update `README.md`, `docs/architecture.md`, `docs/development.md`, and
