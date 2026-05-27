@@ -46,15 +46,17 @@ stricter `GO_ROCM_BENCH_TOKENS=2048` route-metric `text:Hi` run reports
 The chapter-shaped 2048-token fast guard at `context_len=4096` reports
 `19536530899 ns/op`, `104.8 tok/s`, `8017064 B/op`, and `3438 allocs/op`.
 Full-attention/global Gemma4 device KV pages now use 128-token blocks while
-sliding-window layers keep exact one-token pages for 512/1024 SWA trimming. The
-strict retained 10-turn book gate remains inside the production-candidate wall
-window after the cols256 specialization: `62.89s` wall, `4507` generated tokens,
-`5` chapter-10 arc anchors, no repeated n-grams, `19316504 B/op`, and `40600`
-allocs/op; turn 10 decode measured `71.61 tok/s`. This is not a clean retained
-wall-time win against the prior `55.81s`/`3974`-token run because the model
-generated more text, but it keeps the no-replay book proof green and improves
-late-turn decode. Long-context decode is still below the final 90-100 tok/s
-production target. These numbers use the benchmark's
+sliding-window layers keep exact one-token pages for 512/1024 SWA trimming. A
+fresh strict retained 10-turn book gate with decode-only attention/RoPE shape
+tables remains inside the production-candidate wall window: `57.03s` wall,
+`46.59s` decode, `4143` generated tokens, `5` chapter-10 arc anchors, no
+repeated turns, `21577176 B/op`, and `41801` allocs/op; turn 10 decode measured
+`72.60 tok/s`. The artifact
+`/tmp/go-rocm-book10-current-rope-attention-shapes-20260527.md` shows q4 and
+RoPE work flat per generated token, local/SWA attention bounded at `896`
+blocks/generated token, and full/global chunked stage1 growing to about `3594`
+blocks/generated token by turn 10. Long-context decode is still below the final
+90-100 tok/s production target. These numbers use the benchmark's
 `inference.WithContextLen` load setting, now correctly applied to Gemma4 q4
 sliding-window layers, and keep full-attention layers uncapped.
 
