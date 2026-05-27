@@ -483,11 +483,14 @@ Follow-up sampled host-scratch cleanup: the workspace-backed packed top-k
 selector now reuses caller-provided host scratch and never grows beyond `topK`
 while inserting, so `BenchmarkHIPTopPackedScoresBytesInto_VocabTopK64` reports
 `0 B/op` and `0 allocs/op`. The normal byte helper also drops from two
-allocations to one (`512 B/op`). A single 2-turn, 8-token retained sampled
-smoke on the RX 7800 XT completed with empty stderr at `0.728s` wall,
-`0.1278s` decode, `120.2 tok/s` on the last turn, `9811768 B/op`, and
-`18546 allocs/op`. This is allocation-shape prep for the sampled path, not a
-new best retained-book route.
+allocations to one (`512 B/op`). The host top-p sampler now has a
+workspace-backed scratch variant as well:
+`BenchmarkHIPGemma4Q4HostSampleCandidateResultScratch_TopK64` reports
+`0 B/op` and `0 allocs/op`, compared with the direct API's `1536 B/op` and
+`2 allocs/op`. A single 2-turn, 8-token retained sampled smoke on the RX 7800
+XT completed with empty stderr at `0.706s` wall, `0.1279s` decode,
+`120.3 tok/s` on the last turn, `9777088 B/op`, and `18496 allocs/op`. This is
+allocation-shape prep for the sampled path, not a new best retained-book route.
 
 Rejected prompt-shortening follow-up: replacing the anchored wording with a
 shorter "advance the arc / keep continuity words alive" instruction reduced

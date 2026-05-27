@@ -1076,7 +1076,7 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 	var history []int32
 	if hostSampling {
 		if len(finalForward.Candidates) > 0 {
-			current, err = hipGemma4Q4HostSampleCandidateResult(finalForward.Candidates, generate, history, rand.Float64())
+			current, err = hipGemma4Q4HostSampleCandidateResultWorkspace(finalForward.Candidates, generate, history, rand.Float64(), session.attentionWorkspace)
 		} else {
 			current, err = hipGemma4Q4HostSampleResult(finalForward.Logits, generate, suppressTokens, history, rand.Float64())
 		}
@@ -1146,7 +1146,7 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 			current = forward.Greedy
 			if hostSampling {
 				if len(forward.Candidates) > 0 {
-					current, err = hipGemma4Q4HostSampleCandidateResult(forward.Candidates, generate, history, rand.Float64())
+					current, err = hipGemma4Q4HostSampleCandidateResultWorkspace(forward.Candidates, generate, history, rand.Float64(), session.attentionWorkspace)
 				} else {
 					current, err = hipGemma4Q4HostSampleResult(forward.Logits, generate, suppressTokens, history, rand.Float64())
 				}

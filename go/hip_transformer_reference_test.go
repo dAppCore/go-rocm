@@ -368,6 +368,18 @@ func TestHIPTransformerReferenceSamplerBadInputsAndTies_Bad(t *testing.T) {
 	)
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, 1, candidateSampled.TokenID)
+	scratchSampled, scratchCandidates, scratchWeights, err := hipGemma4Q4HostSampleCandidateResultScratch(
+		[]hipGreedySampleResult{{TokenID: 1, Score: 5}, {TokenID: 2, Score: 4}},
+		inference.GenerateConfig{Temperature: 1, TopK: 2, TopP: 1, RepeatPenalty: 1},
+		nil,
+		0,
+		make([]hipReferenceCandidate, 0, 2),
+		make([]float64, 0, 2),
+	)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, candidateSampled, scratchSampled)
+	core.AssertEqual(t, 2, cap(scratchCandidates))
+	core.AssertEqual(t, 2, cap(scratchWeights))
 
 	candidatePenalized, err := hipGemma4Q4HostSampleCandidateResult(
 		[]hipGreedySampleResult{{TokenID: 1, Score: 5}, {TokenID: 2, Score: 4}},
@@ -551,6 +563,27 @@ func BenchmarkHIPGemma4Q4HostSampleCandidateResult_TopK64(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
+		benchmarkHIPCandidateSampleResultSink = result
+	}
+}
+
+func BenchmarkHIPGemma4Q4HostSampleCandidateResultScratch_TopK64(b *testing.B) {
+	candidates := make([]hipGreedySampleResult, 64)
+	for index := range candidates {
+		candidates[index] = hipGreedySampleResult{TokenID: index, Score: float32(64 - index)}
+	}
+	generate := inference.GenerateConfig{Temperature: 1, TopK: 64, TopP: 0.95, RepeatPenalty: 1}
+	scratchCandidates := make([]hipReferenceCandidate, 0, 64)
+	scratchWeights := make([]float64, 0, 64)
+
+	b.ReportAllocs()
+	for b.Loop() {
+		result, nextCandidates, nextWeights, err := hipGemma4Q4HostSampleCandidateResultScratch(candidates, generate, nil, 0.42, scratchCandidates, scratchWeights)
+		if err != nil {
+			b.Fatal(err)
+		}
+		scratchCandidates = nextCandidates
+		scratchWeights = nextWeights
 		benchmarkHIPCandidateSampleResultSink = result
 	}
 }

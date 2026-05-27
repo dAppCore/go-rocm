@@ -2290,6 +2290,8 @@ type hipAttentionHeadsChunkedWorkspace struct {
 	ProjectionTopKBytes  []byte
 	ProjectionTopPacked  []uint64
 	ProjectionCandidates []hipGreedySampleResult
+	SampleCandidates     []hipReferenceCandidate
+	SampleWeights        []float64
 	BatchAttentionWeight *hipDeviceByteBuffer
 	FinalHiddenOutputs   [2]map[int]*hipDeviceByteBuffer
 	NextInputOutputs     [2]map[int]*hipDeviceByteBuffer
@@ -3006,6 +3008,8 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 	workspace.ProjectionTopKBytes = nil
 	workspace.ProjectionTopPacked = nil
 	workspace.ProjectionCandidates = nil
+	workspace.SampleCandidates = nil
+	workspace.SampleWeights = nil
 	workspace.batchWeightCap = 0
 	return lastErr
 }
