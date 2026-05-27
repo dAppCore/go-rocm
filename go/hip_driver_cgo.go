@@ -1271,7 +1271,7 @@ func cgoHIPCachedFunction(modulePath, kernelName string) (C.uintptr_t, error) {
 	}
 	function, err := cgoHIPModuleFunction(module.module, kernelName)
 	if err != nil {
-		return 0, err
+		return 0, core.E("rocm.hip.LaunchKernel", "resolve kernel "+kernelName, err)
 	}
 	module.functions[kernelName] = function
 	cgoHIPFunctionCache.Store(key, function)

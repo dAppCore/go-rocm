@@ -2129,6 +2129,17 @@ Remaining blocker:
   empty stderr at `19536530899 ns/op`, `104.8 tok/s`, `8017064 B/op`, and
   `3438 allocs/op`. Treat this as accepted allocation/plumbing progress under the
   go-mlx/IDEAS retained-state rule; it does not change `.kv`/MP4 semantics.
+- The retained-book gate initially exposed a stale `/tmp/go-rocm-kernels-gfx1100.hsaco`:
+  the code path needed `rocm_mlx_q4_projection_scores` and `rocm_packed_topk`
+  for sampled book generation, but the old HSACO did not contain those symbols.
+  Rebuilding with `hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2`
+  produced a `381K` artifact with empty compiler stderr. The strict 10-turn
+  retained-state book run then passed with empty stderr at `54.75s` wall,
+  `45.14s` decode, `66.43 tok/s` average, `57.72 tok/s` turn 10, `3637`
+  generated tokens, `5308` retained tokens, `5` chapter-10 arc anchors,
+  `0` repeated turns, `0` max-token turns, `18900656 B/op`, and `33942 allocs/op`.
+  This meets the wall-time production-candidate gate, but the late-turn decode
+  target remains open.
 - 2026-05-27 rechecked the current source with a fresh `gfx1100 -O2` HSACO:
   `512` tokens measured `4531496458 ns/op`, `113.0 tok/s`,
   `3157648 B/op`, and `2367 allocs/op` with empty stderr. Rebuilding with
