@@ -439,6 +439,13 @@ for only `16` generated tokens. The same run with greedy/device sampling
 `16` tokens, about `97.7 tok/s` decode. The next production decision is
 therefore either a device-side sampler for top-k/top-p or making the retained
 book production route greedy/device-resident until that sampler lands.
+Rejected sampled-path shortcut: keeping final RMSNorm and the LM-head projection
+device-side before reading full logits to the host did not fix the sampled book
+blocker. The same 2-turn, 8-token retained smoke with sampling defaults measured
+`102.6s` wall, `88.09s` decode, `16` generated tokens, `0.1809 tok/s` on the
+last turn, `142272528 B/op`, `16462 allocs/op`, and an empty `.err` file. The
+slow path is not just the final hidden readback; a real device-side top-k/top-p
+sampler or greedy/device-resident production default is still required.
 
 The replay-style book benchmark is deliberately double-gated with
 `GO_ROCM_RUN_UNSAFE_REPLAY_BOOK_BENCHMARKS=1` and has a per-turn timeout because
