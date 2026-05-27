@@ -1826,13 +1826,23 @@ func hipRunMLXQ4TripleProjectionKernelWithDeviceInputViews(ctx context.Context, 
 		firstCfg.GroupSize != secondCfg.GroupSize || firstCfg.GroupSize != thirdCfg.GroupSize {
 		return nil, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "triple projection input shapes must match", nil)
 	}
-	for _, cfg := range []hipMLXQ4DeviceWeightConfig{firstCfg, secondCfg, thirdCfg} {
-		if err := cfg.validateInputCount(input.Count()); err != nil {
-			return nil, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, err
-		}
-		if input.SizeBytes() != uint64(cfg.Cols*4) {
-			return nil, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "MLX q4 triple projection device input byte count mismatch", nil)
-		}
+	if err := firstCfg.validateInputCount(input.Count()); err != nil {
+		return nil, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, err
+	}
+	if input.SizeBytes() != uint64(firstCfg.Cols*4) {
+		return nil, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "MLX q4 triple projection device input byte count mismatch", nil)
+	}
+	if err := secondCfg.validateInputCount(input.Count()); err != nil {
+		return nil, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, err
+	}
+	if input.SizeBytes() != uint64(secondCfg.Cols*4) {
+		return nil, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "MLX q4 triple projection device input byte count mismatch", nil)
+	}
+	if err := thirdCfg.validateInputCount(input.Count()); err != nil {
+		return nil, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, err
+	}
+	if input.SizeBytes() != uint64(thirdCfg.Cols*4) {
+		return nil, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "MLX q4 triple projection device input byte count mismatch", nil)
 	}
 	totalRows := firstCfg.Rows + secondCfg.Rows + thirdCfg.Rows
 	output, err := hipAllocateByteBuffer(driver, "rocm.hip.MLXQ4TripleProjectionLaunch", "MLX q4 triple projection output", uint64(totalRows*4), totalRows)
@@ -1864,13 +1874,23 @@ func hipRunMLXQ4TripleProjectionKernelWithDeviceInputViewsOutput(ctx context.Con
 		firstCfg.GroupSize != secondCfg.GroupSize || firstCfg.GroupSize != thirdCfg.GroupSize {
 		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "triple projection input shapes must match", nil)
 	}
-	for _, cfg := range []hipMLXQ4DeviceWeightConfig{firstCfg, secondCfg, thirdCfg} {
-		if err := cfg.validateInputCount(input.Count()); err != nil {
-			return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, err
-		}
-		if input.SizeBytes() != uint64(cfg.Cols*4) {
-			return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "MLX q4 triple projection device input byte count mismatch", nil)
-		}
+	if err := firstCfg.validateInputCount(input.Count()); err != nil {
+		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, err
+	}
+	if input.SizeBytes() != uint64(firstCfg.Cols*4) {
+		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "MLX q4 triple projection device input byte count mismatch", nil)
+	}
+	if err := secondCfg.validateInputCount(input.Count()); err != nil {
+		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, err
+	}
+	if input.SizeBytes() != uint64(secondCfg.Cols*4) {
+		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "MLX q4 triple projection device input byte count mismatch", nil)
+	}
+	if err := thirdCfg.validateInputCount(input.Count()); err != nil {
+		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, err
+	}
+	if input.SizeBytes() != uint64(thirdCfg.Cols*4) {
+		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "MLX q4 triple projection device input byte count mismatch", nil)
 	}
 	totalRows := firstCfg.Rows + secondCfg.Rows + thirdCfg.Rows
 	if output == nil || output.Pointer() == 0 || output.Count() != totalRows || output.SizeBytes() != uint64(totalRows*4) {

@@ -1,5 +1,41 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Triple Projection Wrapper Allocation Cleanup
+
+- Re-read `/home/claude/Code/core/go-mlx/IDEAS.md` for the Gemma4 data points
+  that still matter on the ROCm path: 512/1024 local SWA ring windows, unified
+  or shared KV ownership, PLE scale handling, and the pinned/mdspan zero-copy
+  direction for `.mp4` state layout.
+- Flattened the q4 triple-projection device-view wrapper validation so the
+  first/second/third weight configs are checked directly instead of materialized
+  through a short slice literal on a per-token launch route.
+- Added AX-11 coverage for the wrapper path, using a launch-packet-releasing
+  no-op HIP driver so the measurement matches the live cgo driver's packet
+  lifetime:
+
+```text
+BenchmarkHIPMLXQ4TripleProjLaunchArgsBinary_Hot:
+  43.03 ns/op, 0 B/op, 0 allocs/op
+BenchmarkHIPMLXQ4TripleProjectionKernelWithDeviceInputViewsOutput_Hot:
+  95.53 ns/op, 0 B/op, 0 allocs/op
+```
+
+- Verification:
+
+```text
+go test ./go -run 'TestHIPKernels_MLXQ4TripleProjectionLaunchArgs_Good|TestHIPGemma4Q4DecoderLayerAttentionKEqVUsesPairProjection_Good' -count=1
+go test ./go -run '^$' -bench 'BenchmarkHIPMLXQ4Triple(ProjLaunchArgsBinary|ProjectionKernelWithDeviceInputViewsOutput)_Hot' -benchmem -count=1
+go test ./go -count=1
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+go test ./... -count=1
+go test -tags rocm_legacy_server ./... -count=1
+```
+
+- This is Go wrapper cleanup only, so no HSACO rebuild or live RX 7800 XT run
+  was required. The larger route metrics still point at q4 projection/GELU
+  launch volume and long-context global attention as the meaningful remaining
+  throughput targets.
+
 ## 2026-05-27 Dependency Refresh After Scale Cache
 
 - Fast-forwarded active dev submodules again:

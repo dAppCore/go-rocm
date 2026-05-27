@@ -3654,6 +3654,89 @@ func BenchmarkHIPMLXQ4TripleProjLaunchArgsBinary_Hot(b *testing.B) {
 	}
 }
 
+type hipLaunchPacketReleasingStubDriver struct {
+	inferenceBenchmarkHIPKernelCountingStubDriver
+}
+
+func (hipLaunchPacketReleasingStubDriver) LaunchKernel(config hipKernelLaunchConfig) error {
+	hipReleaseLaunchPacket(config.Args)
+	return nil
+}
+
+func BenchmarkHIPMLXQ4TripleProjectionKernelWithDeviceInputViewsOutput_Hot(b *testing.B) {
+	driver := hipLaunchPacketReleasingStubDriver{}
+	input := &hipDeviceByteBuffer{
+		driver:    driver,
+		pointer:   0x1000,
+		count:     16,
+		sizeBytes: 64,
+		borrowed:  true,
+		label:     "benchmark q4 triple input",
+	}
+	output := &hipDeviceByteBuffer{
+		driver:    driver,
+		pointer:   0x2000,
+		count:     24,
+		sizeBytes: 96,
+		borrowed:  true,
+		label:     "benchmark q4 triple output",
+	}
+	firstCfg := hipMLXQ4DeviceWeightConfig{
+		WeightPointer: 0x3000,
+		ScalePointer:  0x4000,
+		BiasPointer:   0x5000,
+		WeightBytes:   128,
+		ScaleBytes:    64,
+		BiasBytes:     64,
+		Rows:          16,
+		Cols:          16,
+		GroupSize:     8,
+	}
+	secondCfg := hipMLXQ4DeviceWeightConfig{
+		WeightPointer: 0x6000,
+		ScalePointer:  0x7000,
+		BiasPointer:   0x8000,
+		WeightBytes:   32,
+		ScaleBytes:    16,
+		BiasBytes:     16,
+		Rows:          4,
+		Cols:          16,
+		GroupSize:     8,
+	}
+	thirdCfg := hipMLXQ4DeviceWeightConfig{
+		WeightPointer: 0x9000,
+		ScalePointer:  0xa000,
+		BiasPointer:   0xb000,
+		WeightBytes:   32,
+		ScaleBytes:    16,
+		BiasBytes:     16,
+		Rows:          4,
+		Cols:          16,
+		GroupSize:     8,
+	}
+	first, second, third, err := hipRunMLXQ4TripleProjectionKernelWithDeviceInputViewsOutput(context.Background(), driver, input, firstCfg, secondCfg, thirdCfg, output)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if first.Pointer() != output.Pointer() ||
+		second.Pointer() != output.Pointer()+nativeDevicePointer(firstCfg.Rows*4) ||
+		third.Pointer() != output.Pointer()+nativeDevicePointer((firstCfg.Rows+secondCfg.Rows)*4) {
+		b.Fatalf("bad borrowed output views")
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		first, second, third, err = hipRunMLXQ4TripleProjectionKernelWithDeviceInputViewsOutput(context.Background(), driver, input, firstCfg, secondCfg, thirdCfg, output)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if first.Pointer() != output.Pointer() ||
+			second.Pointer() != output.Pointer()+nativeDevicePointer(firstCfg.Rows*4) ||
+			third.Pointer() != output.Pointer()+nativeDevicePointer((firstCfg.Rows+secondCfg.Rows)*4) {
+			b.Fatalf("bad borrowed output views")
+		}
+	}
+}
+
 func BenchmarkHIPPackedTopKLaunchArgsBinary_Hot(b *testing.B) {
 	inputCount := 256000
 	topK := 64
