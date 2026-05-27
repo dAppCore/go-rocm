@@ -1,5 +1,68 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Dependency Refresh and Rejected Batch Row-Base Probe
+
+- Fast-forwarded active dev submodules again:
+  - `external/go-inference` `882da5a` -> `62babf7`
+    (`test(jsonenc): AX-11 baseline benchmarks + zero-alloc budget gates`,
+    `test(model/pack): AX-11 baseline benchmarks + Hash budget gate`,
+    `perf(model/pack): cache Fs handle via sync.Once`).
+  - `external/go-cgo` `0ad5431` -> `9fc855d`
+    (`perf(scope): inline-array SBO`, `perf(scope): skip redundant finalizer on
+    scope-managed Buffers`, `test(bench): extend AX-11 coverage`).
+- Verified the refreshed dependency surface:
+
+```text
+go test ./external/go-inference/go/... -count=1
+go test ./external/go-cgo/go/... -count=1
+go test ./go -count=1
+go test ./... -count=1
+```
+
+- Fresh RX 7800 XT 2048-token q4 guard on the accepted SWA-window HSACO stayed
+  green after the dependency refresh:
+
+```text
+BenchmarkInferenceGemma4Q4Generate:
+  20091442095 ns/op
+  101.9 tok/s
+  6667144 B/op
+  2607 allocs/op
+  stderr: /tmp/go-rocm-2048-after-deps-2.err (empty)
+```
+
+- Rejected a batch q4 row-base arithmetic cleanup that hoisted
+  `row * packed_per_row` and `row * groups_per_row` in
+  `rocm_mlx_q4_projection_batch`,
+  `rocm_mlx_q4_gelu_tanh_multiply_batch`, and
+  `rocm_mlx_q4_gelu_tanh_projection_batch`. It compiled cleanly to
+  `/tmp/go-rocm-kernels-gfx1100-batch-rowbase.hsaco` with empty
+  `/tmp/go-rocm-batch-rowbase-build.err`, but it did not beat the accepted
+  source:
+
+```text
+2k prompt, row-base HSACO:
+  5791443989 ns/op, 353.6 prompt_tok/s, 21816208 B/op, 5269 allocs/op
+  stderr: /tmp/go-rocm-prefill-2k-batch-rowbase.err (empty)
+
+2k prompt, accepted SWA-window HSACO:
+  5760585669 ns/op, 355.5 prompt_tok/s, 21803968 B/op, 5245 allocs/op
+  stderr: /tmp/go-rocm-prefill-2k-swa-window-baseline.err (empty)
+
+4k prompt, row-base HSACO:
+  15447452919 ns/op, 265.2 prompt_tok/s, 41738104 B/op, 9297 allocs/op
+  stderr: /tmp/go-rocm-prefill-4k-batch-rowbase.err (empty)
+
+4k prompt, accepted SWA-window HSACO:
+  15479909622 ns/op, 264.6 prompt_tok/s, 41768616 B/op, 9292 allocs/op
+  stderr: /tmp/go-rocm-prefill-4k-swa-window-baseline.err (empty)
+```
+
+- The 4k prompt result is currently lower than the older `319 prompt_tok/s`
+  note even with the accepted HSACO, so that drop is not caused by this rejected
+  kernel probe. The probe was reverted because the 2k path was slightly worse
+  and the 4k path was only noise-level neutral.
+
 ## 2026-05-27 Tokenizer Merge-Rank Load Parser Cleanup
 
 - Replaced the tokenizer merge-rank loader's nested `json.Unmarshal` path with
