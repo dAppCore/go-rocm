@@ -14706,3 +14706,17 @@ state contract is behaving like state rather than prompt replay. The real driver
 target is still open: the 48k route decays to `66.46 tok/s` on turn 10, so the
 next useful speed work is q4 projection/GELU launch reduction and chunked
 long-context attention, not benchmark accounting.
+
+Rejected immediately after this checkpoint:
+
+```text
+Trying 64-token decode chunks only for 512-dim global attention improved the
+2048 retained route from about 95.6 tok/s to 98.9 tok/s on turn 10, with empty
+stderr, but failed the strict 48k retained book gate. Chapter 10 anchor hits
+fell to 0/3, chapter 9 was nearly empty, and chapter 10 drifted into a duplicate
+symmetry ending. The chunk-size change was reverted; do not accept short-context
+attention speedups unless the 48k retained story gate also passes.
+
+failed output: /tmp/go-rocm-book-retained-block16-48k-global64-route.md
+failed stderr: /tmp/go-rocm-book-retained-block16-48k-global64-route.err
+```
