@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -89,6 +90,16 @@ func (driver *inferenceBenchmarkHIPKernelCountingDriver) KernelStats(name string
 	return driver.kernel[name]
 }
 
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) KernelStatsSnapshot() map[string]inferenceBenchmarkHIPKernelStats {
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	snapshot := make(map[string]inferenceBenchmarkHIPKernelStats, len(driver.kernel))
+	for name, stats := range driver.kernel {
+		snapshot[name] = stats
+	}
+	return snapshot
+}
+
 func (driver *inferenceBenchmarkHIPKernelCountingDriver) TotalKernelStats() inferenceBenchmarkHIPKernelStats {
 	driver.mu.Lock()
 	defer driver.mu.Unlock()
@@ -113,6 +124,64 @@ func inferenceBenchmarkReportHIPKernelRouteMetrics(b *testing.B, driver *inferen
 	report(hipKernelNameAttentionHeadsBatchChunkedStage2, "kernel_attention_batch_chunked_stage2")
 	report(hipKernelNameAttentionHeadsChunkedStage1, "kernel_attention_decode_chunked_stage1")
 	report(hipKernelNameAttentionHeadsChunkedStage2, "kernel_attention_decode_chunked_stage2")
+	inferenceBenchmarkReportTopHIPKernels(b, driver, 12)
+}
+
+func inferenceBenchmarkReportTopHIPKernels(b *testing.B, driver *inferenceBenchmarkHIPKernelCountingDriver, limit int) {
+	b.Helper()
+	if driver == nil || b.N <= 0 || limit <= 0 {
+		return
+	}
+	type kernelEntry struct {
+		name  string
+		stats inferenceBenchmarkHIPKernelStats
+	}
+	snapshot := driver.KernelStatsSnapshot()
+	entries := make([]kernelEntry, 0, len(snapshot))
+	for name, stats := range snapshot {
+		if stats.Launches == 0 && stats.Blocks == 0 {
+			continue
+		}
+		entries = append(entries, kernelEntry{name: name, stats: stats})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].stats.Launches != entries[j].stats.Launches {
+			return entries[i].stats.Launches > entries[j].stats.Launches
+		}
+		if entries[i].stats.Blocks != entries[j].stats.Blocks {
+			return entries[i].stats.Blocks > entries[j].stats.Blocks
+		}
+		return entries[i].name < entries[j].name
+	})
+	if len(entries) > limit {
+		entries = entries[:limit]
+	}
+	for _, entry := range entries {
+		label := "kernel_" + inferenceBenchmarkSanitizeMetricName(entry.name)
+		b.ReportMetric(float64(entry.stats.Launches)/float64(b.N), label+"_launches/op")
+		b.ReportMetric(float64(entry.stats.Blocks)/float64(b.N), label+"_blocks/op")
+	}
+}
+
+func inferenceBenchmarkSanitizeMetricName(name string) string {
+	if name == "" {
+		return "unnamed"
+	}
+	var builder strings.Builder
+	builder.Grow(len(name))
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+			builder.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			builder.WriteRune(r)
+		case r >= '0' && r <= '9':
+			builder.WriteRune(r)
+		default:
+			builder.WriteByte('_')
+		}
+	}
+	return builder.String()
 }
 
 func inferenceBenchmarkNativeRuntimeAndKernelCounter() (nativeRuntime, *inferenceBenchmarkHIPKernelCountingDriver) {
@@ -173,6 +242,17 @@ func TestInferenceBenchmarkHIPKernelCountingDriver_Good(t *testing.T) {
 	total := driver.TotalKernelStats()
 	if total != stats {
 		t.Fatalf("total stats = %+v, want %+v", total, stats)
+	}
+	snapshot := driver.KernelStatsSnapshot()
+	if got := snapshot[hipKernelNameAttentionHeadsBatchChunkedStage1]; got != stats {
+		t.Fatalf("snapshot stats = %+v, want %+v", got, stats)
+	}
+	snapshot[hipKernelNameAttentionHeadsBatchChunkedStage1] = inferenceBenchmarkHIPKernelStats{}
+	if got := driver.KernelStats(hipKernelNameAttentionHeadsBatchChunkedStage1); got != stats {
+		t.Fatalf("mutated snapshot changed driver stats = %+v, want %+v", got, stats)
+	}
+	if got := inferenceBenchmarkSanitizeMetricName("rocm/foo-bar"); got != "rocm_foo_bar" {
+		t.Fatalf("sanitize metric name = %q, want rocm_foo_bar", got)
 	}
 	driver.ResetKernelStats()
 	if got := driver.TotalKernelStats(); got != (inferenceBenchmarkHIPKernelStats{}) {

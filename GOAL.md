@@ -506,6 +506,18 @@ That confirms the retained benchmark is not spending its measured time in prompt
 replay. The current hot path is decode attention launch volume and per-token
 state traffic, not the prefill route.
 
+The expanded top-k retained-book kernel breakdown measured `1,558,970` total
+kernel launches for `3021` generated tokens, about `516` launches/token. The
+largest launch buckets were `rocm_mlx_q4_projection` (`378875`),
+`rocm_rms_norm_residual_add_norm` (`212170`), `rocm_rms_norm_rope_heads`
+(`151550`), `rocm_mlx_q4_gelu_tanh_multiply` (`106085`),
+`rocm_mlx_q4_gelu_tanh_projection` (`106085`),
+`rocm_rms_norm_residual_add` (`106085`), and the two decode attention chunked
+stages (`104895` each). This makes the next production optimization target
+clearer: collapse per-layer decode orchestration and fuse state-adjacent work,
+especially q4 projections, residual/norm pairs, RoPE norm, MLP activation, and
+KV encode/descriptor append.
+
 For comparison, upstream llama.cpp built locally with HIP for `gfx1100` and run
 against the Hugging Face Gemma4 GGUF
 `/home/claude/models/hf/unsloth-gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf`
