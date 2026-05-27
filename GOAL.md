@@ -460,20 +460,24 @@ host readback. The stricter 2048-token greedy guard remained green with the same
 HSACO at `18814378103 ns/op`, `108.9 tok/s`, `6629120 B/op`, and
 `2515 allocs/op`, so the production greedy path was not regressed.
 
-Do not treat that sampled path as production-complete yet. A full 10-turn
-retained book with sampling defaults and the parallel top-k reducer completed at
-`43.54s` wall, `39.01s` decode, `3384` generated tokens, `77.73 tok/s` average,
-and `65.60 tok/s` on turn 10, with `239861224 B/op`, `116712 allocs/op`, no cap
-hits, and empty stderr. That proves the transfer-reduction route is mechanically
-viable, but chapter 10 drifted into the distractor stream and scored `0`
-lighthouse/light/ocean arc anchors. The sampled-quality follow-up is now the
-blocker, not sampled runtime or full-logits readback. Until that lands, the
-production acceptance route remains device-greedy: with
-`GO_ROCM_BOOK_TEMPERATURE=0`, `GO_ROCM_BOOK_TOP_P=0`, and
-`GO_ROCM_BOOK_TOP_K=0`, the full 10-turn retained book passes at `37.63s` wall,
-`33.51s` decode, `3021` generated tokens, `80.29 tok/s` average, `69.20 tok/s`
-on turn 10, `205163552 B/op`, `99123 allocs/op`, empty stderr, no chapter cap
-hits, and `3` chapter-10 arc anchors.
+The sampled path now passes the 10-turn retained book acceptance after tightening
+the per-turn distractor wording and making the continuity anchors explicit in
+the new turn prompt. This still appends only the new user turn and does not
+replay prior chapter text. A full 10-turn retained book with sampling defaults,
+the parallel top-k reducer, and the anchored prompt completed at `41.42s` wall,
+`35.94s` decode, `3090` generated tokens, `74.61 tok/s` average, and
+`65.94 tok/s` on turn 10, with `284971648 B/op`, `139449 allocs/op`, no cap
+hits, empty stderr, `0` repeated turns, and `4` chapter-10 arc anchors. That
+makes the default sampled route production-acceptable on wall time and measured
+arc retention, although the later chapters remain stylistically repetitive and
+the long-context turn-10 decode rate is still below the 90-100 tok/s tuning
+target. The previous greedy/device-resident route remains a speed/quality
+comparison point: with `GO_ROCM_BOOK_TEMPERATURE=0`,
+`GO_ROCM_BOOK_TOP_P=0`, and `GO_ROCM_BOOK_TOP_K=0`, the full 10-turn retained
+book passed at `37.63s` wall, `33.51s` decode, `3021` generated tokens,
+`80.29 tok/s` average, `69.20 tok/s` on turn 10, `205163552 B/op`,
+`99123 allocs/op`, empty stderr, no chapter cap hits, and `3` chapter-10 arc
+anchors.
 
 Rejected device-side packed top-k reduction attempt: an earlier second-stage
 `rocm_packed_topk` kernel that scanned 512-score chunks on device compiled with
