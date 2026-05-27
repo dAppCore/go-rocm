@@ -3200,7 +3200,11 @@ __device__ float rocm_gelu_tanh_value(float value)
 
 __device__ float rocm_fast_expf(float value)
 {
+#if defined(__HIP_CPU_RT__)
+	return expf(value);
+#else
 	return __expf(value);
+#endif
 }
 
 __device__ float rocm_rsqrtf(float value)

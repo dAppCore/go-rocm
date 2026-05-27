@@ -19,12 +19,15 @@ GO_ROCM_RUN_AMD_HIP_COMPILE_TESTS=1 go test ./go -run '^TestHIPKernelSource_AMDH
 CUDA_PATH=/usr/local/cuda-12.8 GO_ROCM_RUN_NVIDIA_HIP_COMPILE_TESTS=1 go test ./go -run '^TestHIPKernelSource_NVIDIAHIPCompile_Good$' -count=1 -v
 GO_ROCM_RUN_HIP_CPU_COMPILE_TESTS=1 go test ./go -run '^TestHIPKernelSource_HIPCPUCompile_Good$' -count=1 -v
 GO_ROCM_RUN_HIP_CPU_RUNTIME_TESTS=1 go test ./go -run '^TestHIPKernelSource_HIPCPURuntimeSmoke_Good$' -count=1 -v
+GO_ROCM_RUN_HIP_CPU_KERNEL_RUNTIME_TESTS=1 go test ./go -run '^TestHIPKernelSource_HIPCPUProductionKernelRuntimeSmoke_Good$' -count=1 -v
 CUDA_PATH=/usr/local/cuda-12.8 GO_ROCM_RUN_ZLUDA_CUDA_TESTS=1 ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 go test ./go -run '^TestHIPKernelSource_ZLUDACUDARuntimeSmoke_Good$' -count=1 -v
 ```
 
 HIP-CPU is discovered through `GO_ROCM_HIP_CPU_INCLUDE`,
 `GO_ROCM_HIP_CPU_ROOT`, or `/opt/hip-cpu/include`. The CPU compile test defaults
 to `x86_64,aarch64`; set `GO_ROCM_HIP_CPU_TARGETS=x86_64` for host-only checks.
+The production-kernel runtime smoke compiles `rocm_kernels.hip` into a HIP-CPU
+host binary and launches `rocm_embedding_mean_pool` on the CPU.
 
 The HIP source is built as C++23. The Go cgo bridge uses `dappco.re/go/cgo`
 and `core.PinnedView` for retained Go-owned buffers; direct HIP use of the

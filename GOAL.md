@@ -74,14 +74,18 @@ ROCm 6.4.4 rpath runtime libraries from `/opt/rocm-6.4.4/lib` so ZLUDA's
 `libamdhip64.so.6` dependency is satisfied without downgrading the real ROCm
 7.2 development stack. HIP-CPU uses the header-only runtime from
 `/opt/hip-cpu/include`; `GO_ROCM_RUN_HIP_CPU_RUNTIME_TESTS=1` runs the x86 host
-runtime smoke on the Ryzen CPU, and the compile gate includes an ARM64
-cross-compile object when `aarch64-linux-gnu-g++` is present.
+runtime smoke on the Ryzen CPU, `GO_ROCM_RUN_HIP_CPU_KERNEL_RUNTIME_TESTS=1`
+compiles `rocm_kernels.hip` into a HIP-CPU host binary and launches the exported
+embedding mean-pool kernel, and the compile gate includes an ARM64 cross-compile
+object when `aarch64-linux-gnu-g++` is present.
 2026-05-27 recheck: AMD HIP compile passed with `std=c++23`, `arch=gfx1100`,
 and a `379912` byte HSACO; NVIDIA HIP compile passed with CUDA 12.8,
 `std=c++20`, `arch=sm_75`, and a `1494496` byte object; HIP-CPU compile passed
-for x86_64 (`9084984` byte object) and aarch64 (`3344752` byte object); HIP-CPU
-runtime smoke passed on `AMD Ryzen 9 9950X 16-Core Processor`; and the ZLUDA v5
-CUDA runtime smoke passed on the discrete RX 7800 XT with
+for x86_64 (`9080872` byte object) and aarch64 (`3345328` byte object); HIP-CPU
+runtime smoke passed on `AMD Ryzen 9 9950X 16-Core Processor`; the HIP-CPU
+production-kernel runtime smoke launched `rocm_embedding_mean_pool` and returned
+`values=5.0,6.0,7.0,8.0`; and the ZLUDA v5 CUDA runtime smoke passed on the
+discrete RX 7800 XT with
 `zluda_cuda_smoke_ok count=1 values=7,8,9,10`. All stderr captures were empty.
 
 AX-11 benchmark rule applies here: any per-token, per-page, per-request, or
@@ -117,8 +121,10 @@ The kernel loop is:
   `GO_ROCM_RUN_NVIDIA_HIP_COMPILE_TESTS=1` proves CUDA/NVCC compilation,
   `GO_ROCM_RUN_HIP_CPU_COMPILE_TESTS=1` proves HIP-CPU x86/ARM64 object
   compilation, `GO_ROCM_RUN_HIP_CPU_RUNTIME_TESTS=1` proves the x86 CPU runtime
-  path on the Ryzen, and `GO_ROCM_RUN_ZLUDA_CUDA_TESTS=1` proves the CUDA
-  runtime smoke can execute through ZLUDA on the AMD card.
+  path on the Ryzen, `GO_ROCM_RUN_HIP_CPU_KERNEL_RUNTIME_TESTS=1` proves an
+  exported ROCm kernel can execute through HIP-CPU, and
+  `GO_ROCM_RUN_ZLUDA_CUDA_TESTS=1` proves the CUDA runtime smoke can execute
+  through ZLUDA on the AMD card.
 - Document rejected kernel shapes in `GOAL_NOTES.md` with their stdout metrics,
   `.err` path, and reason for rejection. Do not reintroduce a rejected shape
   unless the new pass changes the numerical or memory behavior that made it

@@ -15048,14 +15048,19 @@ NVIDIA/CUDA compile proof:
 
 HIP-CPU compile proof:
   GO_ROCM_RUN_HIP_CPU_COMPILE_TESTS=1 go test ./go -run '^TestHIPKernelSource_HIPCPUCompile_Good$' -count=1 -v
-  result x86_64: compiler=/usr/bin/g++, object_bytes=9084984
-  result aarch64: compiler=/usr/bin/aarch64-linux-gnu-g++, object_bytes=3344752
+  result x86_64: compiler=/usr/bin/g++, object_bytes=9080872
+  result aarch64: compiler=/usr/bin/aarch64-linux-gnu-g++, object_bytes=3345328
   stderr: /tmp/go-rocm-hipcpu-compile.err (0 bytes)
 
 HIP-CPU runtime smoke:
   GO_ROCM_RUN_HIP_CPU_RUNTIME_TESTS=1 go test ./go -run '^TestHIPKernelSource_HIPCPURuntimeSmoke_Good$' -count=1 -v
   result: hip_cpu_smoke_ok device=AMD Ryzen 9 9950X 16-Core Processor values=1.0,3.0,5.0,7.0
   stderr: /tmp/go-rocm-hipcpu-runtime.err (0 bytes)
+
+HIP-CPU production-kernel runtime smoke:
+  GO_ROCM_RUN_HIP_CPU_KERNEL_RUNTIME_TESTS=1 go test ./go -run '^TestHIPKernelSource_HIPCPUProductionKernelRuntimeSmoke_Good$' -count=1 -v
+  result: hip_cpu_rocm_kernel_smoke_ok device=AMD Ryzen 9 9950X 16-Core Processor values=5.0,6.0,7.0,8.0
+  stderr: /tmp/go-rocm-hipcpu-production-kernel-runtime.err (0 bytes)
 
 ZLUDA CUDA runtime proof:
   CUDA_PATH=/usr/local/cuda-12.8 GO_ROCM_RUN_ZLUDA_CUDA_TESTS=1 ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 go test ./go -run '^TestHIPKernelSource_ZLUDACUDARuntimeSmoke_Good$' -count=1 -v
@@ -15070,6 +15075,12 @@ with `g++-aarch64-linux-gnu`. The aarch64 HIP-CPU/libco headers currently need
 aarch64 fiber backend calls that macro unguarded when the cross environment
 does not provide Valgrind headers. This is compile-proof only; x86_64 is the
 runtime CPU profile on this Ryzen 9 machine.
+
+The production-kernel HIP-CPU smoke also required a host-compatible fallback for
+`rocm_fast_expf` (`expf` on HIP-CPU, `__expf` on GPU backends). The smoke harness
+defines placeholder dynamic shared-memory symbols for HIP-CPU linking because
+the production attention kernels declare `extern __shared__` scratch buffers
+even though the smoke only launches the embedding mean-pool kernel.
 
 Kernel route metrics now normalize by generated tokens so short smoke runs and
 long retained-book runs can be compared without hiding launch inflation behind

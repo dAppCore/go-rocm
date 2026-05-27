@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -519,6 +520,47 @@ func TestHIPKernelSource_HIPCPURuntimeSmoke_Good(t *testing.T) {
 	t.Log(strings.TrimSpace(string(output)))
 }
 
+func TestHIPKernelSource_HIPCPUProductionKernelRuntimeSmoke_Good(t *testing.T) {
+	if os.Getenv("GO_ROCM_RUN_HIP_CPU_KERNEL_RUNTIME_TESTS") != "1" {
+		t.Skip("set GO_ROCM_RUN_HIP_CPU_KERNEL_RUNTIME_TESTS=1 to compile and run rocm_kernels.hip through HIP-CPU")
+	}
+
+	includeDir := rocmHIPCPUTestIncludeDir(t)
+	compiler := rocmHIPCPUTestCompiler(t, rocmHIPCPUTestTarget{name: "x86_64", compilerEnv: "GO_ROCM_HIP_CPU_CXX", compilerFallback: "g++"})
+	kernelPath, err := filepath.Abs("../kernels/rocm_kernels.hip")
+	core.RequireNoError(t, err)
+	tempDir := t.TempDir()
+	sourcePath := filepath.Join(tempDir, "hip_cpu_rocm_kernel_smoke.cpp")
+	binaryPath := filepath.Join(tempDir, "hip_cpu_rocm_kernel_smoke")
+	source := rocmHIPCPUProductionKernelSmokeSource(kernelPath)
+	core.RequireNoError(t, os.WriteFile(sourcePath, []byte(source), 0o644))
+
+	compile := exec.Command(
+		compiler,
+		"-std=c++20",
+		"-O2",
+		"-I"+includeDir,
+		sourcePath,
+		"-ltbb",
+		"-o",
+		binaryPath,
+	)
+	output, err := compile.CombinedOutput()
+	if err != nil {
+		t.Fatalf("compile HIP-CPU production kernel smoke compiler=%s: %v\n%s", compiler, err, rocmNVIDIATestOutputTail(output))
+	}
+
+	run := exec.Command(binaryPath)
+	output, err = run.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run HIP-CPU production kernel smoke: %v\n%s", err, rocmNVIDIATestOutputTail(output))
+	}
+	if !strings.Contains(string(output), "hip_cpu_rocm_kernel_smoke_ok") {
+		t.Fatalf("HIP-CPU production kernel smoke did not report success:\n%s", rocmNVIDIATestOutputTail(output))
+	}
+	t.Log(strings.TrimSpace(string(output)))
+}
+
 func TestHIPKernelSource_ZLUDACUDARuntimeSmoke_Good(t *testing.T) {
 	if os.Getenv("GO_ROCM_RUN_ZLUDA_CUDA_TESTS") != "1" {
 		t.Skip("set GO_ROCM_RUN_ZLUDA_CUDA_TESTS=1 to compile CUDA with nvcc and run it through ZLUDA")
@@ -715,6 +757,103 @@ int main() {
 	return 0;
 }
 `
+
+const rocmHIPCPUProductionKernelSmokeSourceTemplate = `
+#include <cmath>
+#include <cstdio>
+
+#include ${kernel_path}
+
+#if defined(__HIP_CPU_RT__)
+thread_local float shared_attention_weights[1];
+thread_local unsigned char shared_bytes[1];
+#endif
+
+int main() {
+	hipDeviceProp_t props{};
+	hipError_t err = hipGetDeviceProperties(&props, 0);
+	if (err != hipSuccess) {
+		std::printf("props_error=%s\n", hipGetErrorString(err));
+		return 10;
+	}
+
+	const uint32_t token_count = 3;
+	const uint32_t dim = 4;
+	float host_tokens[token_count * dim] = {
+		1.0f, 2.0f, 3.0f, 4.0f,
+		5.0f, 6.0f, 7.0f, 8.0f,
+		9.0f, 10.0f, 11.0f, 12.0f,
+	};
+	float host_output[dim] = {};
+	float *tokens = nullptr;
+	float *output = nullptr;
+	err = hipMalloc(reinterpret_cast<void **>(&tokens), sizeof(host_tokens));
+	if (err != hipSuccess) {
+		std::printf("malloc_tokens_error=%s\n", hipGetErrorString(err));
+		return 11;
+	}
+	err = hipMalloc(reinterpret_cast<void **>(&output), sizeof(host_output));
+	if (err != hipSuccess) {
+		std::printf("malloc_output_error=%s\n", hipGetErrorString(err));
+		hipFree(tokens);
+		return 12;
+	}
+	err = hipMemcpy(tokens, host_tokens, sizeof(host_tokens), hipMemcpyHostToDevice);
+	if (err != hipSuccess) {
+		std::printf("copy_tokens_error=%s\n", hipGetErrorString(err));
+		hipFree(tokens);
+		hipFree(output);
+		return 13;
+	}
+
+	rocm_embedding_mean_pool_launch_args args{};
+	args.version = ROCM_EMBEDDING_MEAN_POOL_LAUNCH_ARGS_VERSION;
+	args.total_bytes = ROCM_EMBEDDING_MEAN_POOL_LAUNCH_ARGS_BYTES;
+	args.token_pointer = reinterpret_cast<uint64_t>(tokens);
+	args.output_pointer = reinterpret_cast<uint64_t>(output);
+	args.token_count = token_count;
+	args.dim = dim;
+	args.token_bytes = sizeof(host_tokens);
+	args.output_bytes = sizeof(host_output);
+	args.flags = 0;
+	hipLaunchKernelGGL(rocm_embedding_mean_pool, dim3(1), dim3(1), 0, nullptr, reinterpret_cast<const unsigned char *>(&args));
+	err = hipGetLastError();
+	if (err != hipSuccess) {
+		std::printf("launch_error=%s\n", hipGetErrorString(err));
+		hipFree(tokens);
+		hipFree(output);
+		return 14;
+	}
+	err = hipDeviceSynchronize();
+	if (err != hipSuccess) {
+		std::printf("sync_error=%s\n", hipGetErrorString(err));
+		hipFree(tokens);
+		hipFree(output);
+		return 15;
+	}
+	err = hipMemcpy(host_output, output, sizeof(host_output), hipMemcpyDeviceToHost);
+	hipFree(tokens);
+	hipFree(output);
+	if (err != hipSuccess) {
+		std::printf("copy_output_error=%s\n", hipGetErrorString(err));
+		return 16;
+	}
+
+	const float want[dim] = {5.0f, 6.0f, 7.0f, 8.0f};
+	for (uint32_t i = 0; i < dim; ++i) {
+		if (std::fabs(host_output[i] - want[i]) > 0.00001f) {
+			std::printf("value_error index=%u got=%.6f want=%.6f\n", i, host_output[i], want[i]);
+			return 17;
+		}
+	}
+	std::printf("hip_cpu_rocm_kernel_smoke_ok device=%s values=%.1f,%.1f,%.1f,%.1f\n", props.name, host_output[0], host_output[1], host_output[2], host_output[3]);
+	return 0;
+}
+`
+
+func rocmHIPCPUProductionKernelSmokeSource(kernelPath string) string {
+	return strings.ReplaceAll(rocmHIPCPUProductionKernelSmokeSourceTemplate, "${kernel_path}", strconv.Quote(kernelPath))
+}
 
 func rocmNVIDIATestCUDAPath(t *testing.T) string {
 	t.Helper()
