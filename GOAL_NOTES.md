@@ -14854,3 +14854,20 @@ Adding `#pragma unroll 8` to the fixed eight-iteration group64 loop in
 the `text:Hi` 512-token guard to `110.9 tok/s` versus the kept ~`112.7 tok/s`
 band. The unroll was reverted.
 ```
+
+Also rejected during this pass:
+
+```text
+A separate 16-row block geometry for `rocm_mlx_q4_gelu_tanh_multiply` and its
+batch variant cut GELU block volume in the short retained route, but did not
+improve the speed gates and failed retained story quality. It measured
+`112.3 tok/s` on `text:Hi` 512 and `107.3 tok/s` on `text:Hi` 2048, both with
+empty stderr. The 2-turn retained route stayed mechanically healthy at
+`9.081s` wall, `94.04 tok/s`, turn 2 `91.68 tok/s`, and empty stderr, with
+GELU multiply blocks reduced to `18078720`. The strict 48k retained gate then
+failed with chapter-10 anchor hits `1/3`; later chapters drifted into repeated
+Confluence-style phrasing. The geometry was reverted.
+
+failed output: /tmp/go-rocm-book-retained-block16-48k-gelu16.md
+failed stderr: /tmp/go-rocm-book-retained-block16-48k-gelu16.err
+```
