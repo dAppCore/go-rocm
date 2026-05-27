@@ -1592,11 +1592,99 @@ func (cache *rocmDeviceKVCache) KernelDescriptor() (rocmDeviceKVDescriptor, erro
 }
 
 func (cache *rocmDeviceKVCache) KernelDescriptorBytes() ([]byte, error) {
-	descriptor, err := cache.KernelDescriptor()
+	if cache == nil {
+		return nil, core.E("rocm.KVCache.DeviceMirror", "device KV cache is nil", nil)
+	}
+	if cache.closed {
+		return nil, core.E("rocm.KVCache.DeviceMirror", "device KV cache is closed", nil)
+	}
+	if len(cache.pages) == 0 {
+		return nil, core.E("rocm.KVCache.DeviceMirror", "device KV cache has no pages", nil)
+	}
+	modeCode, err := rocmDeviceKVModeCode(cache.mode)
 	if err != nil {
 		return nil, err
 	}
-	return descriptor.Binary()
+	pageCount, err := rocmDeviceKVUint32("page count", len(cache.pages))
+	if err != nil {
+		return nil, err
+	}
+	blockSize, err := rocmDeviceKVPositiveUint32("block size", cache.blockSize)
+	if err != nil {
+		return nil, err
+	}
+	tokenCount, err := rocmDeviceKVUint64("token count", cache.TokenCount())
+	if err != nil {
+		return nil, err
+	}
+	if tokenCount == 0 {
+		return nil, core.E("rocm.KVCache.DeviceDescriptor", "token count must be positive", nil)
+	}
+	payload := make([]byte, rocmDeviceKVDescriptorHeaderBytes+len(cache.pages)*rocmDeviceKVDescriptorPageBytes)
+	binary.LittleEndian.PutUint32(payload[0:], rocmDeviceKVDescriptorVersion)
+	binary.LittleEndian.PutUint32(payload[4:], uint32(rocmDeviceKVDescriptorHeaderBytes))
+	binary.LittleEndian.PutUint32(payload[8:], uint32(rocmDeviceKVDescriptorPageBytes))
+	binary.LittleEndian.PutUint32(payload[12:], modeCode)
+	binary.LittleEndian.PutUint32(payload[16:], pageCount)
+	binary.LittleEndian.PutUint32(payload[20:], blockSize)
+	binary.LittleEndian.PutUint64(payload[24:], tokenCount)
+
+	var lastPageEnd uint64
+	for index, page := range cache.pages {
+		offset := rocmDeviceKVDescriptorHeaderBytes + index*rocmDeviceKVDescriptorPageBytes
+		tokenStart, err := rocmDeviceKVUint64("page token start", page.tokenStart)
+		if err != nil {
+			return nil, err
+		}
+		pageTokenCount, err := rocmDeviceKVUint64("page token count", page.tokenCount)
+		if err != nil {
+			return nil, err
+		}
+		if pageTokenCount == 0 {
+			return nil, core.E("rocm.KVCache.DeviceDescriptor", "page token count must be positive", nil)
+		}
+		pageEnd := tokenStart + pageTokenCount
+		if pageEnd > tokenCount {
+			return nil, core.E("rocm.KVCache.DeviceDescriptor", "page token range exceeds descriptor token count", nil)
+		}
+		if index > 0 && tokenStart < lastPageEnd {
+			return nil, core.E("rocm.KVCache.DeviceDescriptor", "device KV descriptor pages must be sorted and non-overlapping", nil)
+		}
+		lastPageEnd = pageEnd
+		keyWidth, err := rocmDeviceKVPositiveUint32("page key width", page.keyWidth)
+		if err != nil {
+			return nil, err
+		}
+		valueWidth, err := rocmDeviceKVPositiveUint32("page value width", page.valueWidth)
+		if err != nil {
+			return nil, err
+		}
+		keyEncoding, err := rocmDeviceKVEncodingCode(page.key.encoding)
+		if err != nil {
+			return nil, err
+		}
+		valueEncoding, err := rocmDeviceKVEncodingCode(page.value.encoding)
+		if err != nil {
+			return nil, err
+		}
+		if page.key.pointer == 0 || page.value.pointer == 0 {
+			return nil, core.E("rocm.KVCache.DeviceDescriptor", "device KV descriptor page has nil pointer", nil)
+		}
+		if page.key.sizeBytes == 0 || page.value.sizeBytes == 0 {
+			return nil, core.E("rocm.KVCache.DeviceDescriptor", "device KV descriptor page has empty tensor bytes", nil)
+		}
+		binary.LittleEndian.PutUint64(payload[offset:], tokenStart)
+		binary.LittleEndian.PutUint64(payload[offset+8:], pageTokenCount)
+		binary.LittleEndian.PutUint32(payload[offset+16:], keyWidth)
+		binary.LittleEndian.PutUint32(payload[offset+20:], valueWidth)
+		binary.LittleEndian.PutUint32(payload[offset+24:], keyEncoding)
+		binary.LittleEndian.PutUint32(payload[offset+28:], valueEncoding)
+		binary.LittleEndian.PutUint64(payload[offset+32:], uint64(page.key.pointer))
+		binary.LittleEndian.PutUint64(payload[offset+40:], uint64(page.value.pointer))
+		binary.LittleEndian.PutUint64(payload[offset+48:], page.key.sizeBytes)
+		binary.LittleEndian.PutUint64(payload[offset+56:], page.value.sizeBytes)
+	}
+	return payload, nil
 }
 
 func (cache *rocmDeviceKVCache) KernelDescriptorTable() (*rocmDeviceKVDescriptorTable, error) {

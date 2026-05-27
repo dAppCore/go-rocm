@@ -1223,6 +1223,50 @@ func BenchmarkROCmDeviceKVDescriptorPointerPool_HotWindow(b *testing.B) {
 	}
 }
 
+func BenchmarkROCmDeviceKVCacheKernelDescriptorBytes_HotWindow(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	const (
+		keyWidth   = 128
+		valueWidth = 128
+	)
+	keyBytes, err := rocmKVTensorDeviceByteCount(rocmKVEncodingQ8, keyWidth)
+	if err != nil {
+		b.Fatalf("key bytes: %v", err)
+	}
+	valueBytes, err := rocmKVTensorDeviceByteCount(rocmKVEncodingQ4, valueWidth)
+	if err != nil {
+		b.Fatalf("value bytes: %v", err)
+	}
+	pages := rocmDeviceKVBorrowPageSlice(0, rocmDeviceKVHotPageCapacity)
+	for token := 0; token < rocmDeviceKVHotPageCapacity; token++ {
+		pages = append(pages, rocmDeviceKVPage{
+			tokenStart: token,
+			tokenCount: 1,
+			keyWidth:   keyWidth,
+			valueWidth: valueWidth,
+			key:        rocmDeviceKVTensor{pointer: nativeDevicePointer(0x100000 + token*0x1000), sizeBytes: keyBytes, encoding: rocmKVEncodingQ8},
+			value:      rocmDeviceKVTensor{pointer: nativeDevicePointer(0x200000 + token*0x1000), sizeBytes: valueBytes, encoding: rocmKVEncodingQ4},
+		})
+	}
+	cache := rocmBorrowDeviceKVCache(driver, rocmKVCacheModeKQ8VQ4, rocmGemma4Q4DeviceKVBlockSize, rocmDeviceKVHotPageCapacity, pages, false)
+	b.Cleanup(func() {
+		rocmDeviceKVReleasePageSlice(cache.pages)
+		cache.pages = nil
+		rocmReleaseDeviceKVCache(cache)
+	})
+	wantBytes := rocmDeviceKVDescriptorHeaderBytes + rocmDeviceKVHotPageCapacity*rocmDeviceKVDescriptorPageBytes
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err := cache.KernelDescriptorBytes()
+		if err != nil {
+			b.Fatalf("descriptor bytes: %v", err)
+		}
+		if len(payload) != wantBytes {
+			b.Fatalf("descriptor bytes len = %d, want %d", len(payload), wantBytes)
+		}
+	}
+}
+
 func BenchmarkROCmDeviceKVDescriptorAppendInPlace_HotWindow(b *testing.B) {
 	driver := &fakeHIPDriver{available: true, skipLaunchRecording: true, releaseLaunchPackets: true}
 	const (

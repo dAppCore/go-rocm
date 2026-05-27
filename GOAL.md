@@ -2379,6 +2379,12 @@ The full-attention `attention_k_eq_v` loader path is also covered by
 `TestHIPGemma4Q4LoadedConfigAttentionKEqVSkipsVProjection_Good`: ROCm now has
 the same guard as `go-mlx` that K=V layers do not require a `v_proj` tensor and
 use the K projection buffers as the value projection source.
+The descriptor host-plumbing path now serializes `KernelDescriptorBytes`
+directly from `rocmDeviceKVCache.pages` instead of first allocating a
+`[]rocmDeviceKVPageDescriptor`; the hot 512-page benchmark
+`BenchmarkROCmDeviceKVCacheKernelDescriptorBytes_HotWindow` reports
+`7892 ns/op`, `40960 B/op`, and `1 alloc/op`, leaving only the descriptor
+payload allocation visible.
 
 Run these before handoff:
 
