@@ -16476,3 +16476,46 @@ stderr: .bench-errors/2048_q4_rows16_noroute_20260527.err (0 bytes)
 
 The block reduction was real, but throughput and allocation shape did not beat
 the accepted rows8 path. Keep rows8 on gfx1100 for now.
+
+## 2026-05-27 Rejected Q4 Rows4 Projection Blocks
+
+Tested the opposite q4 projection direction from rows16: lowering
+`ROCM_MLX_Q4_PROJECTION_ROWS_PER_BLOCK` and `hipMLXQ4ProjectionRowsPerBlock`
+from 8 to 4 rows per 256-thread block. This doubled block volume but increased
+per-row dot-product parallelism from 32 to 64 threads.
+
+Rejected result:
+
+```text
+Focused tests passed:
+go test ./go -run 'TestHIPKernelSource_ABIConstants_Good|TestHIPKernelSource_MLXQ4Projection|TestHIPKernels_MLXQ4Projection|TestHIPGemma4Q4DeviceGELUTanhMLP' -count=1
+
+Compiled cleanly:
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-q4-rows4.hsaco
+stderr: .bench-errors/hipcc_gfx1100_q4_rows4_20260527.err (0 bytes)
+
+2048 live route guard:
+BenchmarkInferenceGemma4Q4Generate-32  1  18739436028 ns/op
+109.3 tok/s, 2048 tokens, 6692520 B/op, 4703 allocs/op
+kernel_mlx_q4_projection_blocks/op=107688576
+kernel_mlx_q4_gelu_tanh_multiply_blocks/op=172930560
+kernel_mlx_q4_gelu_tanh_projection_blocks/op=4585280
+kernel_mlx_q4_triple_projection_blocks/op=23581440
+kernel_total_blocks/op=330327081
+stderr: .bench-errors/2048_q4_rows4_20260527.err (0 bytes)
+
+2048 live non-route guard:
+BenchmarkInferenceGemma4Q4Generate-32  1  18736495270 ns/op
+109.3 tok/s, 2048 tokens, 6674928 B/op, 2646 allocs/op
+stderr: .bench-errors/2048_q4_rows4_noroute_20260527.err (0 bytes)
+
+Strict 48k retained book:
+FAILED after 84.576s with context deadline exceeded
+stderr: .bench-errors/book_retained_q4_rows4_20260527.err (0 bytes)
+output: not written; benchmark writes only completed book runs
+```
+
+Rows4 is a useful clue: short decode likes more q4 projection parallelism, but
+the retained book endpoint is less stable and timed out under the 60s turn
+guard. Keep rows8 until the row-grain change can be paired with a retained-book
+stable sampling/decode path.
