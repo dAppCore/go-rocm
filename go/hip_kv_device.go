@@ -1861,7 +1861,7 @@ func (cache *rocmDeviceKVCache) KernelDescriptorTableFromAppendedToken(ctx conte
 	outputBytes := uint64(rocmDeviceKVDescriptorHeaderBytes + cache.PageCount()*rocmDeviceKVDescriptorPageBytes)
 	pointer := previousTable.Pointer()
 	allocationBytes := previousTable.AllocationBytes()
-	inPlace := trimStart == 0 && !previousTable.borrowed && pointer != 0 && allocationBytes >= outputBytes
+	inPlace := !previousTable.borrowed && pointer != 0 && allocationBytes >= outputBytes
 	if !inPlace {
 		var err error
 		pointer, allocationBytes, err = rocmDeviceKVDescriptorTableMalloc(cache.driver, outputBytes)

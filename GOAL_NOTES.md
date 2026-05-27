@@ -16696,3 +16696,89 @@ The short speedup is real, but the book output collapsed into repeated chapter
 openings and failed the story-retention correctness gate. Do not keep q4
 projection codegen changes on 2048 speed alone; the retained state/quality gate
 must stay green.
+
+## 2026-05-27 Current-Source Retained Gate Red Before Next Kernel Work
+
+After reverting the rejected q4 unroll source and compiling the current HSACO,
+the strict retained 10-turn 48k book gate was re-run to establish a clean
+baseline before using the Gemma4 notes in `../go-mlx/IDEAS.md`.
+
+```text
+Command shape:
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85
+GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100-current-goalpass.hsaco
+GO_ROCM_BOOK_CONTEXT_LEN=48000
+GO_ROCM_BOOK_TURNS=10
+GO_ROCM_BOOK_CHAPTER_TOKENS=0
+GO_ROCM_BOOK_PREFILL_UBATCH_TOKENS=512
+GO_ROCM_BOOK_MAX_WALL_SECONDS=90
+GO_ROCM_BOOK_MIN_ARC_ANCHOR_HITS=3
+GO_ROCM_BOOK_MAX_MAXED_TURNS=0
+
+Result:
+FAILED chapter10_arc_anchor_hits=2 below minimum 3
+60.043s wall, 3904 generated tokens, 0 repeated turns,
+max_adjacent_repeat=0.006, empty stderr
+artifact: /tmp/go-rocm-book-retained-current-goalpass-10turn-20260527.md
+stderr: .bench-errors/book_retained_current_goalpass_10turn_20260527.err (0 bytes)
+```
+
+The retained-state mechanics were still correct: per-turn prompt tokens stayed
+small, retained tokens reached `5575`, and there was no replay. The failure was
+story-arc drift under distractors, not a prompt resend or runtime crash. Do not
+mark the overall goal complete until this gate is green again.
+
+## 2026-05-27 Accepted Device KV Descriptor Trim Reuse
+
+`go-mlx/IDEAS.md` calls out Gemma4 local-window leakage and dynamic KV movement
+as the hot-path risk. ROCm already trims local/sliding attention state to the
+configured 512-token window, but the descriptor append path only reused a
+descriptor table in place when no trim occurred. Once a local SWA layer filled
+its window, each appended token rebuilt/reallocated the descriptor table even
+though the table shape stayed constant.
+
+Implemented a narrow descriptor-table fix:
+
+- `KernelDescriptorTableFromAppendedToken` now permits in-place reuse whenever
+  the previous descriptor allocation has enough capacity, including trimmed
+  one-token window appends.
+- `rocm_kv_descriptor_append` now has a parallel-safe in-place trim branch: each
+  descriptor tile is loaded before any thread writes back to the same table, so
+  the left-shift cannot race with source reads.
+- Added/updated hot-path tests and a benchmark:
+  `BenchmarkROCmDeviceKVDescriptorAppendInPlaceTrim_HotWindow`.
+
+The first serial in-place trim experiment compiled and passed correctness, but
+the 2048 guard slowed to `100.8 tok/s`; that version was not kept as-is. The
+parallel-safe v2 recovered the baseline while preserving the allocation win:
+
+```text
+Focused tests:
+go test ./go -run 'TestKVCache_Good_DeviceDescriptorAppendReusesCapacity(InPlace|InPlaceAcrossTrim)$|TestHIPKernelSource_KVDescriptorAppendInPlaceSkipsSelfCopy_Good$' -count=1
+ok dappco.re/go/rocm 0.009s
+
+Descriptor benchmarks:
+BenchmarkROCmDeviceKVDescriptorAppendInPlaceTrim_HotWindow-32  ~3.96-4.03 us/op  0 B/op  0 allocs/op
+BenchmarkROCmDeviceKVDescriptorAppendInPlace_HotWindow-32      ~3.47-3.49 us/op  0 B/op  0 allocs/op
+
+Compiled cleanly:
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-descriptor-trim-inplace-v2.hsaco
+stderr: .bench-errors/hipcc_gfx1100_descriptor_trim_inplace_v2_20260527.err (0 bytes)
+
+2048 live route guard:
+BenchmarkInferenceGemma4Q4Generate-32  1  18987410694 ns/op
+107.9 tok/s, 2048 tokens, 6690072 B/op, 4675 allocs/op
+stderr: .bench-errors/2048_descriptor_trim_inplace_v2_route_20260527.err (0 bytes)
+
+2-turn retained guard:
+6.239s wall, 5.698s decode, 599 generated tokens,
+96.01 tok/s average, 100.3 tok/s on turn 2,
+6094064 B/op, 6670 allocs/op, empty stderr
+artifact: /tmp/go-rocm-book-retained-descriptor-trim-inplace-v2-2turn-20260527.md
+stderr: .bench-errors/book_retained_descriptor_trim_inplace_v2_2turn_20260527.err (0 bytes)
+```
+
+This is an accepted hot-path cleanup, not a production completion. It reduces
+descriptor allocation churn in the SWA window path and keeps the 2048 decode
+guard at the current baseline, but the strict 10-turn retained book gate remains
+red because of the current chapter-10 anchor drift documented above.

@@ -338,6 +338,7 @@ func TestHIPKernelSource_KVDescriptorAppendInPlaceSkipsSelfCopy_Good(t *testing.
 
 	appendKernel := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_kv_descriptor_append`)
 	core.AssertTrue(t, strings.Contains(appendKernel, `args.previous_descriptor_pointer == args.output_descriptor_pointer`), "descriptor append must detect in-place table reuse")
+	core.AssertTrue(t, strings.Contains(appendKernel, `args.previous_descriptor_pointer != args.output_descriptor_pointer`), "trimmed descriptor append must avoid parallel self-copy")
 	core.AssertTrue(t, strings.Contains(appendKernel, `args.output_page_count == previous->page_count + 1u`), "descriptor append must keep the no-trim append shape guard")
 	core.AssertTrue(t, strings.Contains(appendKernel, `previous->page_count * ROCM_DEVICE_KV_DESCRIPTOR_PAGE_BYTES`), "descriptor append must write only the appended page in-place")
 }
