@@ -1803,7 +1803,7 @@ func (cache *rocmDeviceKVCache) KernelDescriptorTable() (*rocmDeviceKVDescriptor
 			return nil, core.E("rocm.KVCache.DeviceDescriptor", "allocate descriptor table", err)
 		}
 	}
-	if err := hipCopyHostToDevice(cache.driver, pointer, payload); err != nil {
+	if err := hipCopyPinnedHostToDevice(cache.driver, pointer, payload); err != nil {
 		rocmDeviceKVReleaseDescriptorBytes(payload)
 		if poolable {
 			_ = rocmDeviceKVDescriptorTableFree(cache.driver, pointer, allocationBytes)

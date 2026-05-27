@@ -1,5 +1,69 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Accepted Pinned Descriptor Table Upload
+
+- Carried the `go-mlx/IDEAS.md` `PinnedView` direction into the retained-state
+  descriptor upload path. `rocmDeviceKVCache.KernelDescriptorTable` now copies
+  the serialized descriptor table through `hipCopyPinnedHostToDevice`, matching
+  the existing pinned K/V page payload copies and avoiding the extra async
+  staging copy for this hot Go-owned descriptor byte slice.
+- Added fake-driver coverage that the first device mirror performs two pinned
+  copies for K/V payloads and descriptor-table creation performs the third
+  pinned copy.
+
+Focused verification:
+
+```text
+go test ./go -run 'TestKVCache_Good_MirrorsPagesToHIPDevice|TestKVCache_Bad_DeviceDescriptorTableRollbackOnCopyFailure' -count=1
+go test ./go -run '^$' -bench 'BenchmarkROCmDeviceKVCacheKernelDescriptorTable_HotWindowPooled|BenchmarkROCmDeviceKVCacheKernelDescriptorBytes_HotWindow|BenchmarkROCmDeviceKVDescriptorAppendInPlace_HotWindow' -benchmem -count=3
+
+KernelDescriptorTable_HotWindowPooled:
+  ~6311-6328 ns/op
+  44 B/op
+  0 allocs/op
+
+KVDescriptorAppendInPlace_HotWindow:
+  ~3457-3479 ns/op
+  0 B/op
+  0 allocs/op
+
+go test ./go -count=1
+git diff --check
+```
+
+Serialized RX 7800 XT guards with `/tmp/go-rocm-kernels-gfx1100.hsaco`:
+
+```text
+2048 text:Hi:
+BenchmarkInferenceGemma4Q4Generate-32  1  18922744827 ns/op
+context_len=128 max_tokens=2048 prefill_ubatch_tokens=512
+108.2 tok/s, 2048 tokens, 6673504 B/op, 2635 allocs/op
+stderr: .bench-errors/2048_pinned_descriptor_upload_fresh_hsaco_20260527.err (empty)
+
+Strict sampled retained book:
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32  1  58294759486 ns/op
+book_wall_s/op 58.22
+book_decode_s/op 48.23
+book_generated_tokens/op 3812
+book_tok/s 65.47
+book_turn10_tok/s 55.43
+book_turn10_retained_tokens/op 5483
+chapter10_arc_anchor_hits 3
+B/op 18950832
+allocs/op 34553
+stderr: .bench-errors/book_retained_pinned_descriptor_fresh_20260527.err (empty)
+output: /tmp/go-rocm-book-retained-pinned-descriptor-fresh-20260527.md
+```
+
+- A diagnostic run with stale `/tmp/go-rocm-kernels-gfx1100-current.hsaco`
+  produced a 24-token nonsense book with chapter-10 anchor hits `0`, matching
+  the existing warning that retained-book quality is sensitive to stale HSACO
+  bundles. Do not use that file for acceptance; rebuild or use
+  `/tmp/go-rocm-kernels-gfx1100.hsaco`.
+- This is accepted as copy/allocation hygiene. It does not change the open
+  endpoint: late-turn retained decode remains around `55-66 tok/s`, so the next
+  speed target is still dim512 chunked attention and q4 projection/GELU volume.
+
 ## 2026-05-27 Gemma4 Guardrails From go-mlx IDEAS
 
 - Re-read `/home/claude/Code/core/go-mlx/IDEAS.md` for the Gemma4-specific
