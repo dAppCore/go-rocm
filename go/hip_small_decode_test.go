@@ -1799,6 +1799,63 @@ func TestHIPGemma4Q4SharedKV_Good(t *testing.T) {
 	core.AssertEqual(t, 2, tripleQ4Launches)
 }
 
+func TestHIPGemma4Q4LoadedTextConfigOverridesHeadDimHeuristics_Good(t *testing.T) {
+	model := &hipLoadedModel{
+		contextSize: 2048,
+		gemma4TextConfig: nativeGemma4TextConfig{
+			LayerTypes:        []string{"sliding_attention", "full_attention"},
+			KVSharedLayers:    18,
+			KVSharedLayersSet: true,
+			SlidingWindow:     1024,
+			RoPEParameters: map[string]nativeGemma4RoPEParameters{
+				"sliding_attention": {RopeTheta: 10000, RopeType: "default"},
+				"full_attention":    {PartialRotaryFactor: 0.25, RopeTheta: 1000000, RopeType: "proportional"},
+			},
+		},
+	}
+
+	core.AssertEqual(t, "sliding_attention", model.loadedGemma4Q4LayerType(0, 512))
+	slidingBase, slidingRotaryDim := model.loadedGemma4Q4LayerRoPE("sliding_attention", 512)
+	core.AssertEqual(t, float32(10000), slidingBase)
+	core.AssertEqual(t, 512, slidingRotaryDim)
+	core.AssertEqual(t, 1024, model.loadedGemma4Q4EffectiveSlidingWindow("sliding_attention", 512))
+
+	core.AssertEqual(t, "full_attention", model.loadedGemma4Q4LayerType(1, 1024))
+	fullBase, fullRotaryDim := model.loadedGemma4Q4LayerRoPE("full_attention", 1024)
+	core.AssertEqual(t, float32(1000000), fullBase)
+	core.AssertEqual(t, 256, fullRotaryDim)
+	core.AssertEqual(t, 0, model.loadedGemma4Q4EffectiveSlidingWindow("full_attention", 1024))
+	core.AssertEqual(t, 18, model.loadedGemma4Q4KVSharedLayers(42))
+}
+
+func TestHIPGemma4Q4E4BSharedKVLayoutUsesLayerTypes_Good(t *testing.T) {
+	const layerCount = 42
+	layers := make([]hipGemma4Q4Layer0Config, layerCount)
+	for index := range layers {
+		layerType := "full_attention"
+		if (index+1)%6 != 0 {
+			layerType = "sliding_attention"
+		}
+		if index == layerCount-1 {
+			layerType = "full_attention"
+		}
+		layers[index] = hipGemma4Q4Layer0Config{Layer: index, LayerType: layerType, HeadDim: 512}
+	}
+
+	sources := hipGemma4Q4BuildSharedKVSourceByLayer(hipGemma4Q4ForwardConfig{Layers: layers, KVSharedLayers: 18})
+
+	ownerCount := 0
+	for index, source := range sources {
+		if source == index {
+			ownerCount++
+		}
+	}
+	core.AssertEqual(t, 24, ownerCount)
+	core.AssertEqual(t, 22, sources[24])
+	core.AssertEqual(t, 23, sources[29])
+	core.AssertEqual(t, 23, sources[41])
+}
+
 func TestHIPGemma4Q4SharedDeviceKV_Good(t *testing.T) {
 	driver := &fakeHIPDriver{available: true}
 	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 8, 1, 8)

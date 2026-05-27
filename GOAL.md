@@ -2313,6 +2313,14 @@ decode is still only `66.46 tok/s`. The open endpoint remains `90-100+ tok/s`
 late-turn decode by reducing q4 projection/GELU launches and long-context
 attention cost, not by replaying prompt text.
 
+Gemma4 q4 layer geometry is now metadata-driven when safetensors config data is
+available. ROCm carries `layer_types`, `num_kv_shared_layers`, `sliding_window`,
+and per-attention RoPE settings from the model pack into `hipLoadedModel` before
+building the q4 forward config. This matches the go-mlx pattern and avoids using
+`head_dim >= 512` as the sole full-attention detector on E4B-style `512/1024`
+models. The 2048-token E2B live guard after this parity fix remains stable at
+`108.1 tok/s`, `6667160 B/op`, `2608 allocs/op`, empty stderr.
+
 Run these before handoff:
 
 ```sh

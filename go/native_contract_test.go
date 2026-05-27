@@ -846,6 +846,63 @@ func TestNativeContract_LoadModelSafetensorsGemma4UsesNativeRuntime_Good(t *test
 	}
 }
 
+func TestNativeContract_LoadModelSafetensorsGemma4PropagatesTextRuntimeConfig_Good(t *testing.T) {
+	dir := t.TempDir()
+	writeNativeContractFile(t, core.PathJoin(dir, "config.json"), `{
+		"architectures":["Gemma4ForConditionalGeneration"],
+		"model_type":"gemma4",
+		"tie_word_embeddings":true,
+		"quantization_config":{"bits":4,"group_size":64,"mode":"affine"},
+		"text_config":{
+			"model_type":"gemma4_text",
+			"hidden_size":16,
+			"num_hidden_layers":6,
+			"num_attention_heads":8,
+			"num_key_value_heads":1,
+			"num_global_key_value_heads":1,
+			"head_dim":512,
+			"global_head_dim":1024,
+			"num_kv_shared_layers":2,
+			"max_position_embeddings":131072,
+			"sliding_window":1024,
+			"layer_types":["sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention","sliding_attention"],
+			"rope_parameters":{
+				"sliding_attention":{"rope_theta":10000.0,"rope_type":"default"},
+				"full_attention":{"partial_rotary_factor":0.25,"rope_theta":1000000.0,"rope_type":"proportional"}
+			},
+			"vocab_size":8
+		}
+	}`)
+	writeNativeContractSafetensorsHeaderWithPayload(t, core.PathJoin(dir, "model.safetensors"), `{"language_model.model.embed_tokens.weight":{"dtype":"U32","shape":[8,2],"data_offsets":[0,64]}}`, 64)
+	runtime := &fakeNativeRuntime{
+		available: true,
+		device:    nativeDeviceInfo{Name: "AMD Radeon RX 7800 XT", MemoryBytes: 16 * memoryGiB, FreeBytes: 12 * memoryGiB, Driver: "hip-test"},
+		model:     &fakeNativeModel{},
+	}
+
+	model, err := newROCmBackendWithRuntime(runtime).LoadModel(dir)
+	if err != nil {
+		t.Fatalf("LoadModel: %v", err)
+	}
+	defer model.Close()
+
+	cfg := runtime.loadConfig.Gemma4TextConfig
+	core.AssertEqual(t, []string{"sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention", "sliding_attention"}, cfg.LayerTypes)
+	core.AssertEqual(t, true, cfg.KVSharedLayersSet)
+	core.AssertEqual(t, 2, cfg.KVSharedLayers)
+	core.AssertEqual(t, 1024, cfg.SlidingWindow)
+	core.AssertEqual(t, 512, cfg.HeadDim)
+	core.AssertEqual(t, 1024, cfg.GlobalHeadDim)
+	core.AssertEqual(t, float64(10000), cfg.RoPEParameters["sliding_attention"].RopeTheta)
+	core.AssertEqual(t, float64(1000000), cfg.RoPEParameters["full_attention"].RopeTheta)
+	core.AssertEqual(t, float64(0.25), cfg.RoPEParameters["full_attention"].PartialRotaryFactor)
+	if runtime.loadConfig.ModelLabels["attention_layer_types"] == "" ||
+		runtime.loadConfig.ModelLabels["attention_kv_shared_layers"] != "2" ||
+		runtime.loadConfig.ModelLabels["attention_rope_full_theta"] != "1e+06" {
+		t.Fatalf("model labels = %+v, want Gemma4 attention metadata propagated", runtime.loadConfig.ModelLabels)
+	}
+}
+
 func TestNativeContract_LoadModelSafetensorsShardedPackUsesNativeRuntime_Good(t *testing.T) {
 	dir := t.TempDir()
 	writeNativeContractFile(t, core.PathJoin(dir, "config.json"), `{

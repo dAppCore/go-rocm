@@ -46,10 +46,41 @@ type nativeLoadConfig struct {
 	ParallelSlotCount  int
 	AdapterPath        string
 	ModelInfo          inference.ModelInfo
+	ModelLabels        map[string]string
 	TokenizerPath      string
+	Gemma4TextConfig   nativeGemma4TextConfig
 	DataOffset         int64
 	Tensors            []nativeTensorInfo
 	TiedWordEmbeddings bool
+}
+
+type nativeGemma4TextConfig struct {
+	LayerTypes        []string
+	KVSharedLayers    int
+	KVSharedLayersSet bool
+	SlidingWindow     int
+	HeadDim           int
+	GlobalHeadDim     int
+	RoPEParameters    map[string]nativeGemma4RoPEParameters
+}
+
+type nativeGemma4RoPEParameters struct {
+	PartialRotaryFactor float64
+	RopeTheta           float64
+	RopeType            string
+	Factor              float64
+}
+
+func cloneNativeGemma4TextConfig(cfg nativeGemma4TextConfig) nativeGemma4TextConfig {
+	cfg.LayerTypes = append([]string(nil), cfg.LayerTypes...)
+	if len(cfg.RoPEParameters) > 0 {
+		params := make(map[string]nativeGemma4RoPEParameters, len(cfg.RoPEParameters))
+		for key, value := range cfg.RoPEParameters {
+			params[key] = value
+		}
+		cfg.RoPEParameters = params
+	}
+	return cfg
 }
 
 type nativeTensorInfo struct {

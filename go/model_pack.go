@@ -39,7 +39,10 @@ type rocmModelPackConfigProbe struct {
 	MaxSequenceLength     int                          `json:"max_sequence_length"`
 	SeqLength             int                          `json:"seq_length"`
 	SlidingWindow         int                          `json:"sliding_window"`
+	SlidingWindowPattern  int                          `json:"sliding_window_pattern"`
+	NumKVSharedLayers     *int                         `json:"num_kv_shared_layers"`
 	LayerTypes            []string                     `json:"layer_types"`
+	RoPEParameters        map[string]rocmRoPEProbe     `json:"rope_parameters"`
 	RMSNormEps            float64                      `json:"rms_norm_eps"`
 	FinalLogitSoftcap     float64                      `json:"final_logit_softcapping"`
 	NumLocalExperts       int                          `json:"num_local_experts"`
@@ -53,26 +56,36 @@ type rocmModelPackConfigProbe struct {
 }
 
 type rocmModelPackTextConfigProbe struct {
-	ModelType             string   `json:"model_type"`
-	Architectures         []string `json:"architectures"`
-	DType                 string   `json:"dtype"`
-	HiddenSize            int      `json:"hidden_size"`
-	NumHiddenLayers       int      `json:"num_hidden_layers"`
-	NumLayers             int      `json:"num_layers"`
-	NumAttentionHeads     int      `json:"num_attention_heads"`
-	NumKeyValueHeads      int      `json:"num_key_value_heads"`
-	NumGlobalKVHeads      int      `json:"num_global_key_value_heads"`
-	HeadDim               int      `json:"head_dim"`
-	GlobalHeadDim         int      `json:"global_head_dim"`
-	VocabSize             int      `json:"vocab_size"`
-	MaxPositionEmbeddings int      `json:"max_position_embeddings"`
-	MaxSequenceLength     int      `json:"max_sequence_length"`
-	SeqLength             int      `json:"seq_length"`
-	SlidingWindow         int      `json:"sliding_window"`
-	LayerTypes            []string `json:"layer_types"`
-	RMSNormEps            float64  `json:"rms_norm_eps"`
-	FinalLogitSoftcap     float64  `json:"final_logit_softcapping"`
-	TieWordEmbeddings     bool     `json:"tie_word_embeddings"`
+	ModelType             string                   `json:"model_type"`
+	Architectures         []string                 `json:"architectures"`
+	DType                 string                   `json:"dtype"`
+	HiddenSize            int                      `json:"hidden_size"`
+	NumHiddenLayers       int                      `json:"num_hidden_layers"`
+	NumLayers             int                      `json:"num_layers"`
+	NumAttentionHeads     int                      `json:"num_attention_heads"`
+	NumKeyValueHeads      int                      `json:"num_key_value_heads"`
+	NumGlobalKVHeads      int                      `json:"num_global_key_value_heads"`
+	HeadDim               int                      `json:"head_dim"`
+	GlobalHeadDim         int                      `json:"global_head_dim"`
+	VocabSize             int                      `json:"vocab_size"`
+	MaxPositionEmbeddings int                      `json:"max_position_embeddings"`
+	MaxSequenceLength     int                      `json:"max_sequence_length"`
+	SeqLength             int                      `json:"seq_length"`
+	SlidingWindow         int                      `json:"sliding_window"`
+	SlidingWindowPattern  int                      `json:"sliding_window_pattern"`
+	NumKVSharedLayers     *int                     `json:"num_kv_shared_layers"`
+	LayerTypes            []string                 `json:"layer_types"`
+	RoPEParameters        map[string]rocmRoPEProbe `json:"rope_parameters"`
+	RMSNormEps            float64                  `json:"rms_norm_eps"`
+	FinalLogitSoftcap     float64                  `json:"final_logit_softcapping"`
+	TieWordEmbeddings     bool                     `json:"tie_word_embeddings"`
+}
+
+type rocmRoPEProbe struct {
+	PartialRotaryFactor float64 `json:"partial_rotary_factor"`
+	RopeTheta           float64 `json:"rope_theta"`
+	RopeType            string  `json:"rope_type"`
+	Factor              float64 `json:"factor"`
 }
 
 type rocmTokenizerJSONProbe struct {
@@ -421,6 +434,28 @@ func rocmConfigTiedWordEmbeddings(cfg rocmModelPackConfigProbe) bool {
 	return cfg.TieWordEmbeddings || cfg.TextConfig.TieWordEmbeddings
 }
 
+func rocmConfigLayerTypes(cfg rocmModelPackConfigProbe) []string {
+	switch {
+	case len(cfg.LayerTypes) > 0:
+		return append([]string(nil), cfg.LayerTypes...)
+	case len(cfg.TextConfig.LayerTypes) > 0:
+		return append([]string(nil), cfg.TextConfig.LayerTypes...)
+	default:
+		return nil
+	}
+}
+
+func rocmConfigKVSharedLayers(cfg rocmModelPackConfigProbe) (int, bool) {
+	switch {
+	case cfg.NumKVSharedLayers != nil:
+		return *cfg.NumKVSharedLayers, true
+	case cfg.TextConfig.NumKVSharedLayers != nil:
+		return *cfg.TextConfig.NumKVSharedLayers, true
+	default:
+		return 0, false
+	}
+}
+
 func applyROCmAttentionConfigLabels(inspection *inference.ModelPackInspection, cfg rocmModelPackConfigProbe) {
 	labels := rocmAttentionConfigLabels(cfg)
 	if len(labels) == 0 {
@@ -441,6 +476,9 @@ func rocmAttentionConfigLabels(cfg rocmModelPackConfigProbe) map[string]string {
 	out := map[string]string{}
 	if slidingWindow := firstPositiveInt(cfg.SlidingWindow, cfg.TextConfig.SlidingWindow); slidingWindow > 0 {
 		out["sliding_window"] = core.Sprintf("%d", slidingWindow)
+	}
+	if kvSharedLayers, ok := rocmConfigKVSharedLayers(cfg); ok {
+		out["attention_kv_shared_layers"] = core.Sprintf("%d", kvSharedLayers)
 	}
 	attentionHeads := firstPositiveInt(cfg.NumAttentionHeads, cfg.TextConfig.NumAttentionHeads)
 	kvHeads := firstPositiveInt(cfg.NumKeyValueHeads, cfg.TextConfig.NumKeyValueHeads)
@@ -480,9 +518,28 @@ func rocmAttentionConfigLabels(cfg rocmModelPackConfigProbe) map[string]string {
 	if cap := firstPositiveFloat(cfg.FinalLogitSoftcap, cfg.TextConfig.FinalLogitSoftcap); cap > 0 {
 		out["final_logit_softcapping"] = formatROCmFloat(cap)
 	}
+	for layerType, params := range rocmNativeGemma4RoPEParameters(cfg) {
+		labelType := core.Replace(layerType, "_attention", "")
+		if params.RopeTheta > 0 {
+			out["attention_rope_"+labelType+"_theta"] = formatROCmFloat(params.RopeTheta)
+		}
+		if params.PartialRotaryFactor > 0 {
+			out["attention_rope_"+labelType+"_partial_rotary_factor"] = formatROCmFloat(params.PartialRotaryFactor)
+		}
+		if params.RopeType != "" {
+			out["attention_rope_"+labelType+"_type"] = params.RopeType
+		}
+		if params.Factor > 0 {
+			out["attention_rope_"+labelType+"_factor"] = formatROCmFloat(params.Factor)
+		}
+	}
 	fullLayers := 0
 	slidingLayers := 0
-	for _, layerType := range append(append([]string(nil), cfg.LayerTypes...), cfg.TextConfig.LayerTypes...) {
+	layerTypes := rocmConfigLayerTypes(cfg)
+	if len(layerTypes) > 0 {
+		out["attention_layer_types"] = core.Join(",", layerTypes...)
+	}
+	for _, layerType := range layerTypes {
 		lower := core.Lower(layerType)
 		switch {
 		case core.Contains(lower, "sliding"):
@@ -659,7 +716,9 @@ func (b *rocmBackend) safetensorsNativeLoadConfig(ctx context.Context, path stri
 		ParallelSlotCount:  loadConfig.ParallelSlots,
 		AdapterPath:        loadConfig.AdapterPath,
 		ModelInfo:          modelInfoFromIdentity(inspection.Model),
+		ModelLabels:        cloneStringMap(inspection.Labels),
 		TokenizerPath:      inspection.Tokenizer.Path,
+		Gemma4TextConfig:   rocmNativeGemma4TextConfig(path),
 		Tensors:            tensors,
 		TiedWordEmbeddings: inspection.Labels["tied_word_embeddings"] == "true",
 	}
@@ -667,6 +726,81 @@ func (b *rocmBackend) safetensorsNativeLoadConfig(ctx context.Context, path stri
 		cfg.DataOffset = tensors[0].DataOffset
 	}
 	return loadPath, cfg, nil
+}
+
+func rocmNativeGemma4TextConfig(path string) nativeGemma4TextConfig {
+	root, err := rocmModelPackRoot(path)
+	if err != nil {
+		return nativeGemma4TextConfig{}
+	}
+	cfg, err := readROCmModelConfig(root)
+	if err != nil || cfg == nil {
+		return nativeGemma4TextConfig{}
+	}
+	return rocmNativeGemma4TextConfigFromProbe(*cfg)
+}
+
+func rocmNativeGemma4TextConfigFromProbe(cfg rocmModelPackConfigProbe) nativeGemma4TextConfig {
+	layerTypes := rocmConfigLayerTypes(cfg)
+	numLayers := firstPositiveInt(cfg.NumHiddenLayers, cfg.NumLayers, cfg.TextConfig.NumHiddenLayers, cfg.TextConfig.NumLayers)
+	if numLayers > 0 && len(layerTypes) >= numLayers {
+		layerTypes = append([]string(nil), layerTypes[:numLayers]...)
+	} else {
+		layerTypes = nil
+	}
+	kvShared, kvSharedSet := rocmConfigKVSharedLayers(cfg)
+	return nativeGemma4TextConfig{
+		LayerTypes:        layerTypes,
+		KVSharedLayers:    kvShared,
+		KVSharedLayersSet: kvSharedSet,
+		SlidingWindow:     firstPositiveInt(cfg.SlidingWindow, cfg.TextConfig.SlidingWindow),
+		HeadDim:           firstPositiveInt(cfg.HeadDim, cfg.TextConfig.HeadDim),
+		GlobalHeadDim:     firstPositiveInt(cfg.GlobalHeadDim, cfg.TextConfig.GlobalHeadDim),
+		RoPEParameters:    rocmNativeGemma4RoPEParameters(cfg),
+	}
+}
+
+func rocmModelPackRoot(path string) (string, error) {
+	resolvedPath := path
+	if abs := core.PathAbs(path); abs.OK {
+		resolvedPath = abs.Value.(string)
+	}
+	stat := core.Stat(resolvedPath)
+	if !stat.OK {
+		return "", stat.Value.(error)
+	}
+	if stat.Value.(core.FsFileInfo).IsDir() {
+		return resolvedPath, nil
+	}
+	return core.PathDir(resolvedPath), nil
+}
+
+func rocmNativeGemma4RoPEParameters(cfg rocmModelPackConfigProbe) map[string]nativeGemma4RoPEParameters {
+	out := map[string]nativeGemma4RoPEParameters{}
+	for layerType, params := range cfg.TextConfig.RoPEParameters {
+		if layerType != "" {
+			out[layerType] = nativeGemma4RoPEParameters{
+				PartialRotaryFactor: params.PartialRotaryFactor,
+				RopeTheta:           params.RopeTheta,
+				RopeType:            params.RopeType,
+				Factor:              params.Factor,
+			}
+		}
+	}
+	for layerType, params := range cfg.RoPEParameters {
+		if layerType != "" {
+			out[layerType] = nativeGemma4RoPEParameters{
+				PartialRotaryFactor: params.PartialRotaryFactor,
+				RopeTheta:           params.RopeTheta,
+				RopeType:            params.RopeType,
+				Factor:              params.Factor,
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func rocmSafetensorsWeightFiles(path string) ([]string, error) {

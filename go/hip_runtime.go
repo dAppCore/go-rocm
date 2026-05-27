@@ -109,13 +109,15 @@ func (runtime *hipRuntime) LoadModel(path string, cfg nativeLoadConfig) (nativeM
 		return nil, core.E("rocm.hip.LoadModel", "validate tensor file ranges", err)
 	}
 	model := &hipLoadedModel{
-		driver:      runtime.driver,
-		kernels:     newHIPRuntimeKernelSet(runtime.driver),
-		modelInfo:   cfg.ModelInfo,
-		contextSize: cfg.ContextSize,
-		tensors:     make(map[string]hipTensor, len(cfg.Tensors)),
-		tokenText:   loadHIPTokenTextDecoderIfPresent(cfg.TokenizerPath),
-		createdAt:   time.Now(),
+		driver:           runtime.driver,
+		kernels:          newHIPRuntimeKernelSet(runtime.driver),
+		modelInfo:        cfg.ModelInfo,
+		modelLabels:      cloneStringMap(cfg.ModelLabels),
+		contextSize:      cfg.ContextSize,
+		gemma4TextConfig: cloneNativeGemma4TextConfig(cfg.Gemma4TextConfig),
+		tensors:          make(map[string]hipTensor, len(cfg.Tensors)),
+		tokenText:        loadHIPTokenTextDecoderIfPresent(cfg.TokenizerPath),
+		createdAt:        time.Now(),
 	}
 	for _, tensor := range cfg.Tensors {
 		if tensor.ByteSize == 0 {
@@ -142,24 +144,26 @@ type hipTensor struct {
 }
 
 type hipLoadedModel struct {
-	driver      nativeHIPDriver
-	kernels     hipKernelSet
-	modelInfo   inference.ModelInfo
-	contextSize int
-	tensors     map[string]hipTensor
-	adapter     inference.AdapterIdentity
-	tinyLoRA    *hipLoadedTinyLoRAAdapter
-	smallLoRA   *hipLoadedSmallLoRAAdapter
-	classLoRA   *hipLoadedClassifierLoRAAdapter
-	tokenText   *hipTokenTextDecoder
-	q4ConfigMu  sync.Mutex
-	q4Config    hipGemma4Q4ForwardConfig
-	q4Layers    int
-	q4ConfigOK  bool
-	q4Suppress  []int32
-	q4Stop      []int32
-	createdAt   time.Time
-	closed      bool
+	driver           nativeHIPDriver
+	kernels          hipKernelSet
+	modelInfo        inference.ModelInfo
+	modelLabels      map[string]string
+	contextSize      int
+	gemma4TextConfig nativeGemma4TextConfig
+	tensors          map[string]hipTensor
+	adapter          inference.AdapterIdentity
+	tinyLoRA         *hipLoadedTinyLoRAAdapter
+	smallLoRA        *hipLoadedSmallLoRAAdapter
+	classLoRA        *hipLoadedClassifierLoRAAdapter
+	tokenText        *hipTokenTextDecoder
+	q4ConfigMu       sync.Mutex
+	q4Config         hipGemma4Q4ForwardConfig
+	q4Layers         int
+	q4ConfigOK       bool
+	q4Suppress       []int32
+	q4Stop           []int32
+	createdAt        time.Time
+	closed           bool
 }
 
 func (model *hipLoadedModel) Generate(ctx context.Context, prompt string, cfg inference.GenerateConfig) (iter.Seq[inference.Token], func() error) {

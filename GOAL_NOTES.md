@@ -15486,3 +15486,68 @@ output: /tmp/go-rocm-book-kernel-per-token-artifact.md
 
 This is instrumentation only. It does not change the accepted 48k retained-book
 baseline or make the goal complete.
+
+## 2026-05-27 Gemma4 Metadata-Driven Layer Geometry
+
+Pulled the current `go-mlx/IDEAS.md` Gemma4 guidance into the ROCm q4 load
+path audit. The important parity bug was that ROCm loaded q4 layers still
+classified attention type from `head_dim >= 512`. That is fine for local E2B
+(`256/512`) but misroutes E4B-style geometry where sliding and full attention
+can be `512/1024`. The native safetensors load config now carries the parsed
+Gemma4 text metadata into `hipLoadedModel`:
+
+- `layer_types`
+- `num_kv_shared_layers`
+- `sliding_window`
+- local/global head dimensions
+- RoPE parameters per attention type
+- inspection labels used by planning/debug output
+
+The q4 layer builder now uses explicit `layer_types` before falling back to
+the old head-dim heuristic, and computes RoPE base/rotary width and local
+sliding-window size from attention type plus config. This keeps a `512`-wide
+sliding layer on the local SWA path and keeps shared-KV source layout aligned
+with go-mlx's type-aware cache layout.
+
+Focused checks:
+
+```text
+go test ./go -run 'TestNativeContract_LoadModelSafetensorsGemma4PropagatesTextRuntimeConfig_Good|TestHIPGemma4Q4LoadedTextConfigOverridesHeadDimHeuristics_Good|TestHIPGemma4Q4E4BSharedKVLayoutUsesLayerTypes_Good|TestNativeContract_ModelPackInspectorGemma4NestedTextConfig_Good' -count=1
+ok dappco.re/go/rocm 0.014s
+
+go test ./go -run '^$' -bench '^BenchmarkHIPGemma4Q4SharedKVSourceByLayer_Cached$' -benchmem -count=1
+BenchmarkHIPGemma4Q4SharedKVSourceByLayer_Cached-32  1000000000  1.091 ns/op  0 B/op  0 allocs/op
+```
+
+Dependency refresh:
+
+```text
+external/go-inference: da38edd perf(parser): lazy-build tool-call visible builder -- zero-alloc on no-call path
+external/go-cgo: f8b6797 (unchanged)
+go test ./external/go-inference/go/... -count=1
+go test ./external/go-cgo/go/... -count=1
+```
+
+Non-live gates passed after the dependency refresh:
+
+```text
+go test ./go -count=1
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+go test ./... -count=1
+go test -tags rocm_legacy_server ./... -count=1
+git diff --check
+```
+
+Single live RX 7800 XT guard, real Gemma4-E2B q4, serial run:
+
+```text
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85
+GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit
+GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100-swa-window.hsaco
+BenchmarkInferenceGemma4Q4Generate-32  18943310251 ns/op  108.1 tok/s  2048 tokens  6667160 B/op  2608 allocs/op
+stderr: /tmp/go-rocm-2048-gemma4-metadata.err (0 bytes)
+```
+
+This is a feature-parity/correctness fix for the next Gemma4 sizes. The local
+E2B performance remained in the accepted 2048-token range; it does not by
+itself close the long-context decode gap.

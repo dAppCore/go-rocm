@@ -333,10 +333,9 @@ func (model *hipLoadedModel) loadedGemma4Q4LayerConfig(layer int) (hipGemma4Q4La
 	headDim := keyRows
 	queryHeads := queryRows / headDim
 	intermediate := gateRows
-	layerType := hipGemma4Q4LayerTypeFromHeadDim(headDim)
-	ropeBase := hipGemma4Q4LayerRoPEBase(headDim)
-	ropeRotaryDim := hipGemma4Q4LayerRoPERotaryDim(headDim)
-	slidingWindow := hipGemma4Q4EffectiveSlidingWindow(headDim, model.contextSize)
+	layerType := model.loadedGemma4Q4LayerType(layer, headDim)
+	ropeBase, ropeRotaryDim := model.loadedGemma4Q4LayerRoPE(layerType, headDim)
+	slidingWindow := model.loadedGemma4Q4EffectiveSlidingWindow(layerType, headDim)
 
 	inputNorm, err := model.loadedGemma4BF16NormConfig(layerPrefix+".input_layernorm.weight", "input_layernorm", hidden)
 	if err != nil {
@@ -433,7 +432,7 @@ func (model *hipLoadedModel) loadedGemma4Q4ForwardConfig(layerCount int) (hipGem
 	}
 	forward := hipGemma4Q4ForwardConfig{
 		Layers:         layers,
-		KVSharedLayers: hipGemma4Q4DefaultKVSharedLayers(layerCount),
+		KVSharedLayers: model.loadedGemma4Q4KVSharedLayers(layerCount),
 	}
 	forward.SharedKVSources = hipGemma4Q4BuildSharedKVSourceByLayer(forward)
 	if err := forward.validate(); err != nil {
@@ -3392,6 +3391,65 @@ func hipGemma4Q4LayerRoPERotaryDim(headDim int) int {
 	return headDim
 }
 
+func (model *hipLoadedModel) loadedGemma4Q4LayerType(layer, headDim int) string {
+	if model != nil && layer >= 0 && layer < len(model.gemma4TextConfig.LayerTypes) {
+		layerType := model.gemma4TextConfig.LayerTypes[layer]
+		if hipGemma4Q4LayerTypeSupported(layerType) && layerType != "" {
+			return layerType
+		}
+	}
+	return hipGemma4Q4LayerTypeFromHeadDim(headDim)
+}
+
+func (model *hipLoadedModel) loadedGemma4Q4LayerRoPE(layerType string, headDim int) (float32, int) {
+	params := nativeGemma4RoPEParameters{}
+	if model != nil && model.gemma4TextConfig.RoPEParameters != nil {
+		params = model.gemma4TextConfig.RoPEParameters[layerType]
+	}
+	base := params.RopeTheta
+	if base <= 0 {
+		switch layerType {
+		case "full_attention":
+			base = 1000000
+		default:
+			base = 10000
+		}
+	}
+	factor := params.PartialRotaryFactor
+	if factor <= 0 {
+		switch layerType {
+		case "full_attention":
+			factor = 0.25
+		default:
+			factor = 1
+		}
+	}
+	return float32(base), hipGemma4Q4RoPERotaryDimFromFactor(headDim, factor)
+}
+
+func hipGemma4Q4RoPERotaryDimFromFactor(headDim int, factor float64) int {
+	if headDim <= 0 {
+		return 0
+	}
+	if factor <= 0 {
+		factor = 1
+	}
+	rotaryDim := int(math.Round(float64(headDim) * factor))
+	if rotaryDim <= 0 {
+		rotaryDim = headDim
+	}
+	if rotaryDim > headDim {
+		rotaryDim = headDim
+	}
+	if rotaryDim%2 != 0 {
+		rotaryDim--
+	}
+	if rotaryDim <= 0 {
+		return headDim
+	}
+	return rotaryDim
+}
+
 func hipGemma4Q4RoPENormConfig(cfg hipRMSNormDeviceWeightConfig, epsilon float32, count int) hipRMSNormDeviceWeightConfig {
 	cfg.Epsilon = epsilon
 	cfg.Count = count
@@ -3424,6 +3482,26 @@ func hipGemma4Q4EffectiveSlidingWindow(headDim, contextSize int) int {
 	return window
 }
 
+func (model *hipLoadedModel) loadedGemma4Q4EffectiveSlidingWindow(layerType string, headDim int) int {
+	if layerType != "sliding_attention" {
+		return 0
+	}
+	window := 0
+	if model != nil {
+		window = model.gemma4TextConfig.SlidingWindow
+	}
+	if window <= 0 {
+		window = 512
+		if hipGemma4Q4LayerSlidingWindow(headDim) > 0 {
+			window = hipGemma4Q4LayerSlidingWindow(headDim)
+		}
+	}
+	if model != nil && model.contextSize > 0 && model.contextSize < window {
+		return model.contextSize
+	}
+	return window
+}
+
 func hipGemma4Q4AttentionScale(_ int) float32 {
 	return 1
 }
@@ -3449,6 +3527,19 @@ func hipGemma4Q4DefaultKVSharedLayers(layerCount int) int {
 		return 20
 	}
 	return 0
+}
+
+func (model *hipLoadedModel) loadedGemma4Q4KVSharedLayers(layerCount int) int {
+	if model != nil && model.gemma4TextConfig.KVSharedLayersSet {
+		if model.gemma4TextConfig.KVSharedLayers < 0 {
+			return 0
+		}
+		if model.gemma4TextConfig.KVSharedLayers > layerCount {
+			return layerCount
+		}
+		return model.gemma4TextConfig.KVSharedLayers
+	}
+	return hipGemma4Q4DefaultKVSharedLayers(layerCount)
 }
 
 func hipGemma4Q4FinalLogitSoftcap() float32 {
