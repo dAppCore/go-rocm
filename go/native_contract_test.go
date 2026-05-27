@@ -866,6 +866,12 @@ func TestNativeContract_LoadModelSafetensorsGemma4PropagatesTextRuntimeConfig_Go
 			"num_kv_shared_layers":2,
 			"hidden_size_per_layer_input":4,
 			"vocab_size_per_layer_input":8,
+			"final_logit_softcapping":42.0,
+			"use_double_wide_mlp":true,
+			"enable_moe_block":true,
+			"num_experts":16,
+			"top_k_experts":2,
+			"moe_intermediate_size":32,
 			"max_position_embeddings":131072,
 			"sliding_window":1024,
 			"layer_types":["sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention","sliding_attention"],
@@ -899,6 +905,12 @@ func TestNativeContract_LoadModelSafetensorsGemma4PropagatesTextRuntimeConfig_Go
 	core.AssertEqual(t, 4, cfg.HiddenSizePerLayerInput)
 	core.AssertEqual(t, 8, cfg.VocabSizePerLayerInput)
 	core.AssertEqual(t, true, cfg.AttentionKEqV)
+	core.AssertEqual(t, float64(42), cfg.FinalLogitSoftcap)
+	core.AssertEqual(t, true, cfg.UseDoubleWideMLP)
+	core.AssertEqual(t, true, cfg.EnableMoEBlock)
+	core.AssertEqual(t, 16, cfg.NumExperts)
+	core.AssertEqual(t, 2, cfg.TopKExperts)
+	core.AssertEqual(t, 32, cfg.MoEIntermediateSize)
 	core.AssertEqual(t, float64(10000), cfg.RoPEParameters["sliding_attention"].RopeTheta)
 	core.AssertEqual(t, float64(1000000), cfg.RoPEParameters["full_attention"].RopeTheta)
 	core.AssertEqual(t, float64(0.25), cfg.RoPEParameters["full_attention"].PartialRotaryFactor)
@@ -906,6 +918,12 @@ func TestNativeContract_LoadModelSafetensorsGemma4PropagatesTextRuntimeConfig_Go
 		runtime.loadConfig.ModelLabels["attention_kv_shared_layers"] != "2" ||
 		runtime.loadConfig.ModelLabels["gemma4_hidden_size_per_layer_input"] != "4" ||
 		runtime.loadConfig.ModelLabels["gemma4_vocab_size_per_layer_input"] != "8" ||
+		runtime.loadConfig.ModelLabels["gemma4_use_double_wide_mlp"] != "true" ||
+		runtime.loadConfig.ModelLabels["gemma4_enable_moe_block"] != "true" ||
+		runtime.loadConfig.ModelLabels["gemma4_num_experts"] != "16" ||
+		runtime.loadConfig.ModelLabels["gemma4_top_k_experts"] != "2" ||
+		runtime.loadConfig.ModelLabels["gemma4_moe_intermediate_size"] != "32" ||
+		runtime.loadConfig.ModelLabels["final_logit_softcapping"] != "42" ||
 		runtime.loadConfig.ModelLabels["attention_k_eq_v"] != "true" ||
 		runtime.loadConfig.ModelLabels["attention_rope_full_theta"] != "1e+06" {
 		t.Fatalf("model labels = %+v, want Gemma4 attention metadata propagated", runtime.loadConfig.ModelLabels)
@@ -3212,6 +3230,7 @@ func TestNativeContract_ModelPackInspectorGemma4NestedTextConfig_Good(t *testing
 			"max_position_embeddings":131072,
 			"sliding_window":512,
 			"layer_types":["full_attention","sliding_attention"],
+			"use_double_wide_mlp":true,
 			"rms_norm_eps":0.000001,
 			"final_logit_softcapping":30.0,
 			"vocab_size":262144
@@ -3264,6 +3283,7 @@ func TestNativeContract_ModelPackInspectorGemma4NestedTextConfig_Good(t *testing
 		inspection.Labels["attention_kv_width"] != "256" ||
 		inspection.Labels["attention_global_kv_width"] != "512" ||
 		inspection.Labels["attention_gqa"] != "true" ||
+		inspection.Labels["gemma4_use_double_wide_mlp"] != "true" ||
 		inspection.Labels["rms_norm_eps"] != "1e-06" ||
 		inspection.Labels["final_logit_softcapping"] != "30" ||
 		inspection.Labels["memory_plan_attention_query_width"] != "2048" {

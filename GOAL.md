@@ -1734,6 +1734,14 @@ endpoint.
   512-token layer-5 QKV prefill graph benchmark completed with empty stderr,
   and the canonical 2048-token generate guard stayed green at `108.7 tok/s`,
   `6625464 B/op`, and `2604 allocs/op`.
+- [x] Carry the remaining `go-mlx` Gemma4 text metadata needed by runtime and
+  inspection: `final_logit_softcapping`, `use_double_wide_mlp`,
+  `enable_moe_block`, expert counts, top-k experts, and MoE intermediate size.
+  The q4 runtime now uses the parsed final-logit softcap instead of hardcoding
+  `30`, while E2B remains behavior-neutral because its config is `30.0`. Focused
+  contract tests assert propagation into the native runtime config and labels;
+  the pinned 2048-token guard stayed green at `108.6 tok/s`, `6625608 B/op`,
+  and `2610 allocs/op` with empty stderr.
 - [x] Add the first batched q4 MLP primitive for prefill. The new
   `rocm_mlx_q4_gelu_tanh_multiply_batch` kernel maps prompt rows onto `GridY`
   for fused gate/up projection plus GELU multiply, and the Gemma4 q4 prefill

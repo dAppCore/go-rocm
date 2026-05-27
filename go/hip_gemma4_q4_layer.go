@@ -400,7 +400,7 @@ func (model *hipLoadedModel) loadedGemma4Q4LayerConfig(layer int) (hipGemma4Q4La
 		RoPERotaryDim:       ropeRotaryDim,
 		SlidingWindow:       slidingWindow,
 		AttentionKEqV:       attentionKEqV,
-		FinalLogitSoftcap:   hipGemma4Q4FinalLogitSoftcap(),
+		FinalLogitSoftcap:   model.loadedGemma4Q4FinalLogitSoftcap(),
 		LayerScalar:         layerScalar,
 		PerLayerInput:       perLayerInput,
 		InputNorm:           inputNorm,
@@ -3639,4 +3639,13 @@ func (model *hipLoadedModel) loadedGemma4Q4KVSharedLayers(layerCount int) int {
 
 func hipGemma4Q4FinalLogitSoftcap() float32 {
 	return 30
+}
+
+func (model *hipLoadedModel) loadedGemma4Q4FinalLogitSoftcap() float32 {
+	if model != nil && model.gemma4TextConfig.FinalLogitSoftcap > 0 &&
+		!math.IsNaN(model.gemma4TextConfig.FinalLogitSoftcap) &&
+		!math.IsInf(model.gemma4TextConfig.FinalLogitSoftcap, 0) {
+		return float32(model.gemma4TextConfig.FinalLogitSoftcap)
+	}
+	return hipGemma4Q4FinalLogitSoftcap()
 }

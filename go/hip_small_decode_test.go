@@ -1937,6 +1937,16 @@ func TestHIPGemma4Q4LoadedTextConfigKEqVOnlyFullAttention_Good(t *testing.T) {
 	core.AssertContains(t, err.Error(), "K=V attention is only valid for full-attention layers")
 }
 
+func TestHIPGemma4Q4LoadedTextConfigFinalLogitSoftcap_Good(t *testing.T) {
+	core.AssertEqual(t, float32(30), (*hipLoadedModel)(nil).loadedGemma4Q4FinalLogitSoftcap())
+	model := &hipLoadedModel{gemma4TextConfig: nativeGemma4TextConfig{FinalLogitSoftcap: 42}}
+	core.AssertEqual(t, float32(42), model.loadedGemma4Q4FinalLogitSoftcap())
+	model.gemma4TextConfig.FinalLogitSoftcap = -1
+	core.AssertEqual(t, float32(30), model.loadedGemma4Q4FinalLogitSoftcap())
+	model.gemma4TextConfig.FinalLogitSoftcap = math.Inf(1)
+	core.AssertEqual(t, float32(30), model.loadedGemma4Q4FinalLogitSoftcap())
+}
+
 func TestHIPGemma4Q4E4BSharedKVLayoutUsesLayerTypes_Good(t *testing.T) {
 	const layerCount = 42
 	layers := make([]hipGemma4Q4Layer0Config, layerCount)

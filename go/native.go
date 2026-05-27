@@ -64,6 +64,12 @@ type nativeGemma4TextConfig struct {
 	HiddenSizePerLayerInput int
 	VocabSizePerLayerInput  int
 	AttentionKEqV           bool
+	FinalLogitSoftcap       float64
+	UseDoubleWideMLP        bool
+	EnableMoEBlock          bool
+	NumExperts              int
+	TopKExperts             int
+	MoEIntermediateSize     int
 	RoPEParameters          map[string]nativeGemma4RoPEParameters
 }
 
@@ -2779,7 +2785,7 @@ func rocmMemoryPlanLabels(memoryBytes uint64, contextLength, layers, hidden int,
 		"recommended_cache_mode":   cacheMode,
 		"speculative_decode":       "planned",
 	}
-	if isROCmMoEArchitecture(model.Architecture) {
+	if isROCmMoEArchitecture(model.Architecture) || model.Labels["gemma4_enable_moe_block"] == "true" {
 		labels["moe_lazy_experts"] = "true"
 		labels["moe_max_resident_experts"] = "2"
 		if memoryBytes >= 24*memoryGiB {
@@ -2810,6 +2816,13 @@ func rocmMemoryPlanLabels(memoryBytes uint64, contextLength, layers, hidden int,
 		"attention_gqa",
 		"gemma4_hidden_size_per_layer_input",
 		"gemma4_vocab_size_per_layer_input",
+		"gemma4_use_double_wide_mlp",
+		"gemma4_enable_moe_block",
+		"gemma4_num_experts",
+		"gemma4_top_k_experts",
+		"gemma4_moe_intermediate_size",
+		"moe_experts",
+		"moe_top_k",
 		"rms_norm_eps",
 		"final_logit_softcapping",
 	} {

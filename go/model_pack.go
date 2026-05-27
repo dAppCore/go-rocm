@@ -23,70 +23,82 @@ import (
 const maxSafetensorsHeaderBytes = 64 << 20
 
 type rocmModelPackConfigProbe struct {
-	ModelType             string                       `json:"model_type"`
-	Architectures         []string                     `json:"architectures"`
-	DType                 string                       `json:"dtype"`
-	HiddenSize            int                          `json:"hidden_size"`
-	NumHiddenLayers       int                          `json:"num_hidden_layers"`
-	NumLayers             int                          `json:"num_layers"`
-	NumAttentionHeads     int                          `json:"num_attention_heads"`
-	NumKeyValueHeads      int                          `json:"num_key_value_heads"`
-	NumGlobalKVHeads      int                          `json:"num_global_key_value_heads"`
-	HeadDim               int                          `json:"head_dim"`
-	GlobalHeadDim         int                          `json:"global_head_dim"`
-	GlobalPartialRotary   float64                      `json:"global_partial_rotary_factor"`
-	VocabSize             int                          `json:"vocab_size"`
-	VocabSizePerLayer     int                          `json:"vocab_size_per_layer_input"`
-	MaxPositionEmbeddings int                          `json:"max_position_embeddings"`
-	MaxSequenceLength     int                          `json:"max_sequence_length"`
-	SeqLength             int                          `json:"seq_length"`
-	SlidingWindow         int                          `json:"sliding_window"`
-	SlidingWindowPattern  int                          `json:"sliding_window_pattern"`
-	NumKVSharedLayers     *int                         `json:"num_kv_shared_layers"`
-	HiddenSizePerLayer    int                          `json:"hidden_size_per_layer_input"`
-	LayerTypes            []string                     `json:"layer_types"`
-	AttentionKEqV         bool                         `json:"attention_k_eq_v"`
-	RoPEParameters        map[string]rocmRoPEProbe     `json:"rope_parameters"`
-	RMSNormEps            float64                      `json:"rms_norm_eps"`
-	FinalLogitSoftcap     float64                      `json:"final_logit_softcapping"`
-	NumLocalExperts       int                          `json:"num_local_experts"`
-	NumExperts            int                          `json:"num_experts"`
-	NumExpertsPerTok      int                          `json:"num_experts_per_tok"`
-	QuantizationConfig    rocmQuantizationConfigProbe  `json:"quantization_config"`
-	Quantization          rocmQuantizationConfigProbe  `json:"quantization"`
-	TaskSpecificParams    map[string]any               `json:"task_specific_params"`
-	TextConfig            rocmModelPackTextConfigProbe `json:"text_config"`
-	TieWordEmbeddings     bool                         `json:"tie_word_embeddings"`
+	ModelType              string                       `json:"model_type"`
+	Architectures          []string                     `json:"architectures"`
+	DType                  string                       `json:"dtype"`
+	HiddenSize             int                          `json:"hidden_size"`
+	NumHiddenLayers        int                          `json:"num_hidden_layers"`
+	NumLayers              int                          `json:"num_layers"`
+	NumAttentionHeads      int                          `json:"num_attention_heads"`
+	NumKeyValueHeads       int                          `json:"num_key_value_heads"`
+	NumGlobalKVHeads       int                          `json:"num_global_key_value_heads"`
+	HeadDim                int                          `json:"head_dim"`
+	GlobalHeadDim          int                          `json:"global_head_dim"`
+	GlobalPartialRotary    float64                      `json:"global_partial_rotary_factor"`
+	VocabSize              int                          `json:"vocab_size"`
+	VocabSizePerLayer      int                          `json:"vocab_size_per_layer_input"`
+	MaxPositionEmbeddings  int                          `json:"max_position_embeddings"`
+	MaxSequenceLength      int                          `json:"max_sequence_length"`
+	SeqLength              int                          `json:"seq_length"`
+	SlidingWindow          int                          `json:"sliding_window"`
+	SlidingWindowPattern   int                          `json:"sliding_window_pattern"`
+	NumKVSharedLayers      *int                         `json:"num_kv_shared_layers"`
+	HiddenSizePerLayer     int                          `json:"hidden_size_per_layer_input"`
+	LayerTypes             []string                     `json:"layer_types"`
+	AttentionKEqV          bool                         `json:"attention_k_eq_v"`
+	RoPEParameters         map[string]rocmRoPEProbe     `json:"rope_parameters"`
+	RMSNormEps             float64                      `json:"rms_norm_eps"`
+	FinalLogitSoftcap      float64                      `json:"final_logit_softcapping"`
+	NumLocalExperts        int                          `json:"num_local_experts"`
+	NumExperts             int                          `json:"num_experts"`
+	NumExpertsPerTok       int                          `json:"num_experts_per_tok"`
+	TopKExperts            int                          `json:"top_k_experts"`
+	MoEIntermediateSize    int                          `json:"moe_intermediate_size"`
+	ExpertIntermediateSize int                          `json:"expert_intermediate_size"`
+	UseDoubleWideMLP       bool                         `json:"use_double_wide_mlp"`
+	EnableMoEBlock         bool                         `json:"enable_moe_block"`
+	QuantizationConfig     rocmQuantizationConfigProbe  `json:"quantization_config"`
+	Quantization           rocmQuantizationConfigProbe  `json:"quantization"`
+	TaskSpecificParams     map[string]any               `json:"task_specific_params"`
+	TextConfig             rocmModelPackTextConfigProbe `json:"text_config"`
+	TieWordEmbeddings      bool                         `json:"tie_word_embeddings"`
 }
 
 type rocmModelPackTextConfigProbe struct {
-	ModelType             string                   `json:"model_type"`
-	Architectures         []string                 `json:"architectures"`
-	DType                 string                   `json:"dtype"`
-	HiddenSize            int                      `json:"hidden_size"`
-	NumHiddenLayers       int                      `json:"num_hidden_layers"`
-	NumLayers             int                      `json:"num_layers"`
-	NumAttentionHeads     int                      `json:"num_attention_heads"`
-	NumKeyValueHeads      int                      `json:"num_key_value_heads"`
-	NumGlobalKVHeads      int                      `json:"num_global_key_value_heads"`
-	HeadDim               int                      `json:"head_dim"`
-	GlobalHeadDim         int                      `json:"global_head_dim"`
-	GlobalPartialRotary   float64                  `json:"global_partial_rotary_factor"`
-	VocabSize             int                      `json:"vocab_size"`
-	VocabSizePerLayer     int                      `json:"vocab_size_per_layer_input"`
-	MaxPositionEmbeddings int                      `json:"max_position_embeddings"`
-	MaxSequenceLength     int                      `json:"max_sequence_length"`
-	SeqLength             int                      `json:"seq_length"`
-	SlidingWindow         int                      `json:"sliding_window"`
-	SlidingWindowPattern  int                      `json:"sliding_window_pattern"`
-	NumKVSharedLayers     *int                     `json:"num_kv_shared_layers"`
-	HiddenSizePerLayer    int                      `json:"hidden_size_per_layer_input"`
-	LayerTypes            []string                 `json:"layer_types"`
-	AttentionKEqV         bool                     `json:"attention_k_eq_v"`
-	RoPEParameters        map[string]rocmRoPEProbe `json:"rope_parameters"`
-	RMSNormEps            float64                  `json:"rms_norm_eps"`
-	FinalLogitSoftcap     float64                  `json:"final_logit_softcapping"`
-	TieWordEmbeddings     bool                     `json:"tie_word_embeddings"`
+	ModelType              string                   `json:"model_type"`
+	Architectures          []string                 `json:"architectures"`
+	DType                  string                   `json:"dtype"`
+	HiddenSize             int                      `json:"hidden_size"`
+	NumHiddenLayers        int                      `json:"num_hidden_layers"`
+	NumLayers              int                      `json:"num_layers"`
+	NumAttentionHeads      int                      `json:"num_attention_heads"`
+	NumKeyValueHeads       int                      `json:"num_key_value_heads"`
+	NumGlobalKVHeads       int                      `json:"num_global_key_value_heads"`
+	HeadDim                int                      `json:"head_dim"`
+	GlobalHeadDim          int                      `json:"global_head_dim"`
+	GlobalPartialRotary    float64                  `json:"global_partial_rotary_factor"`
+	VocabSize              int                      `json:"vocab_size"`
+	VocabSizePerLayer      int                      `json:"vocab_size_per_layer_input"`
+	MaxPositionEmbeddings  int                      `json:"max_position_embeddings"`
+	MaxSequenceLength      int                      `json:"max_sequence_length"`
+	SeqLength              int                      `json:"seq_length"`
+	SlidingWindow          int                      `json:"sliding_window"`
+	SlidingWindowPattern   int                      `json:"sliding_window_pattern"`
+	NumKVSharedLayers      *int                     `json:"num_kv_shared_layers"`
+	HiddenSizePerLayer     int                      `json:"hidden_size_per_layer_input"`
+	LayerTypes             []string                 `json:"layer_types"`
+	AttentionKEqV          bool                     `json:"attention_k_eq_v"`
+	RoPEParameters         map[string]rocmRoPEProbe `json:"rope_parameters"`
+	RMSNormEps             float64                  `json:"rms_norm_eps"`
+	FinalLogitSoftcap      float64                  `json:"final_logit_softcapping"`
+	NumExperts             int                      `json:"num_experts"`
+	NumExpertsPerTok       int                      `json:"num_experts_per_tok"`
+	TopKExperts            int                      `json:"top_k_experts"`
+	MoEIntermediateSize    int                      `json:"moe_intermediate_size"`
+	ExpertIntermediateSize int                      `json:"expert_intermediate_size"`
+	UseDoubleWideMLP       bool                     `json:"use_double_wide_mlp"`
+	EnableMoEBlock         bool                     `json:"enable_moe_block"`
+	TieWordEmbeddings      bool                     `json:"tie_word_embeddings"`
 }
 
 type rocmRoPEProbe struct {
@@ -388,11 +400,11 @@ func applyROCmModelConfig(inspection *inference.ModelPackInspection, cfg rocmMod
 	}
 	model.QuantType = firstNonEmptyString(model.QuantType, quantType)
 	inspection.Model = model
-	if cfg.NumLocalExperts > 0 || cfg.NumExperts > 0 {
-		inspection.Labels["moe_experts"] = core.Sprintf("%d", firstPositiveInt(cfg.NumLocalExperts, cfg.NumExperts))
+	if experts := firstPositiveInt(cfg.NumLocalExperts, cfg.NumExperts, cfg.TextConfig.NumExperts); experts > 0 {
+		inspection.Labels["moe_experts"] = core.Sprintf("%d", experts)
 	}
-	if cfg.NumExpertsPerTok > 0 {
-		inspection.Labels["moe_top_k"] = core.Sprintf("%d", cfg.NumExpertsPerTok)
+	if topK := firstPositiveInt(cfg.NumExpertsPerTok, cfg.TopKExperts, cfg.TextConfig.NumExpertsPerTok, cfg.TextConfig.TopKExperts); topK > 0 {
+		inspection.Labels["moe_top_k"] = core.Sprintf("%d", topK)
 	}
 	if rocmConfigTiedWordEmbeddings(cfg) {
 		inspection.Labels["tied_word_embeddings"] = "true"
@@ -558,6 +570,21 @@ func rocmAttentionConfigLabels(cfg rocmModelPackConfigProbe) map[string]string {
 	}
 	if cap := firstPositiveFloat(cfg.FinalLogitSoftcap, cfg.TextConfig.FinalLogitSoftcap); cap > 0 {
 		out["final_logit_softcapping"] = formatROCmFloat(cap)
+	}
+	if cfg.UseDoubleWideMLP || cfg.TextConfig.UseDoubleWideMLP {
+		out["gemma4_use_double_wide_mlp"] = "true"
+	}
+	if cfg.EnableMoEBlock || cfg.TextConfig.EnableMoEBlock {
+		out["gemma4_enable_moe_block"] = "true"
+	}
+	if experts := firstPositiveInt(cfg.NumExperts, cfg.TextConfig.NumExperts); experts > 0 {
+		out["gemma4_num_experts"] = core.Sprintf("%d", experts)
+	}
+	if topK := firstPositiveInt(cfg.TopKExperts, cfg.NumExpertsPerTok, cfg.TextConfig.TopKExperts, cfg.TextConfig.NumExpertsPerTok); topK > 0 {
+		out["gemma4_top_k_experts"] = core.Sprintf("%d", topK)
+	}
+	if intermediate := firstPositiveInt(cfg.MoEIntermediateSize, cfg.ExpertIntermediateSize, cfg.TextConfig.MoEIntermediateSize, cfg.TextConfig.ExpertIntermediateSize); intermediate > 0 {
+		out["gemma4_moe_intermediate_size"] = core.Sprintf("%d", intermediate)
 	}
 	for layerType, params := range rocmNativeGemma4RoPEParameters(cfg) {
 		labelType := core.Replace(layerType, "_attention", "")
@@ -800,6 +827,12 @@ func rocmNativeGemma4TextConfigFromProbe(cfg rocmModelPackConfigProbe) nativeGem
 		HiddenSizePerLayerInput: firstPositiveInt(cfg.HiddenSizePerLayer, cfg.TextConfig.HiddenSizePerLayer),
 		VocabSizePerLayerInput:  firstPositiveInt(cfg.VocabSizePerLayer, cfg.TextConfig.VocabSizePerLayer),
 		AttentionKEqV:           cfg.AttentionKEqV || cfg.TextConfig.AttentionKEqV,
+		FinalLogitSoftcap:       firstPositiveFloat(cfg.FinalLogitSoftcap, cfg.TextConfig.FinalLogitSoftcap),
+		UseDoubleWideMLP:        cfg.UseDoubleWideMLP || cfg.TextConfig.UseDoubleWideMLP,
+		EnableMoEBlock:          cfg.EnableMoEBlock || cfg.TextConfig.EnableMoEBlock,
+		NumExperts:              firstPositiveInt(cfg.NumExperts, cfg.TextConfig.NumExperts),
+		TopKExperts:             firstPositiveInt(cfg.TopKExperts, cfg.NumExpertsPerTok, cfg.TextConfig.TopKExperts, cfg.TextConfig.NumExpertsPerTok),
+		MoEIntermediateSize:     firstPositiveInt(cfg.MoEIntermediateSize, cfg.ExpertIntermediateSize, cfg.TextConfig.MoEIntermediateSize, cfg.TextConfig.ExpertIntermediateSize),
 		RoPEParameters:          rocmNativeGemma4RoPEParameters(cfg),
 	}
 }
@@ -1390,7 +1423,7 @@ func applyROCmArchitectureInspection(inspection *inference.ModelPackInspection, 
 	inspection.Labels["architecture_supported"] = core.Sprintf("%t", architectureOK)
 	inspection.Labels["quantization_supported"] = core.Sprintf("%t", quantizationOK)
 	inspection.Supported = inspection.Format != "missing" && weightMetadataValid && architectureDetected && architectureOK && quantizationOK
-	if isROCmMoEArchitecture(inspection.Model.Architecture) || inspection.Labels["moe_experts"] != "" {
+	if isROCmMoEArchitecture(inspection.Model.Architecture) || inspection.Labels["moe_experts"] != "" || inspection.Labels["gemma4_enable_moe_block"] == "true" {
 		inspection.Capabilities = append(inspection.Capabilities,
 			rocmMetadataOnlyCapability(inference.CapabilityMoERouting, inference.CapabilityGroupModel, "MoE architecture metadata is recognised; native router kernels are pending"),
 			rocmMetadataOnlyCapability(inference.CapabilityMoELazyExperts, inference.CapabilityGroupRuntime, "MoE lazy expert residency is required for 16GB-class ROCm devices"),
