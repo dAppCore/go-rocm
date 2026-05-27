@@ -654,6 +654,20 @@ stderr empty, but regressed the canonical `text:Hi` 2048-token guard to
 shape in the actual RX 7800 XT kernel. Keep the existing per-packed group64
 path until a tiled q4 GEMM/dequant rewrite replaces this row-dot primitive.
 
+Accepted in-place KV descriptor append cleanup: when retained decode reuses a
+descriptor table allocation and appends one token without trimming, the
+`rocm_kv_descriptor_append` kernel now skips copying every existing page
+descriptor back onto the same address and writes only the appended page plus the
+header update. This preserves the `.kv`/MP4 page order and does not change
+trim/copy cases. Descriptor append tests, package tests, and the `gfx1100`
+HSACO build passed with empty compiler stderr. A serialized 2-turn `2k`
+retained sampled book guard with `block_size=16` completed with empty runtime
+stderr at `12.16s` wall, `11.64s` decode, `1163` generated tokens,
+`95.65 tok/s` average, and `93.70 tok/s` on turn 2. The canonical `text:Hi`
+2048-token guard stayed green at `108.5 tok/s`, `5379432 B/op`, and
+`2605 allocs/op`. This is a small state-kernel cleanup; the long-context
+turn-10 decode target remains open.
+
 Rejected prompt-shortening follow-up: replacing the anchored wording with a
 shorter "advance the arc / keep continuity words alive" instruction reduced
 prompt tokens to `1581` and still passed the arc gate with `3` anchors, but it

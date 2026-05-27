@@ -327,6 +327,17 @@ func TestHIPDriverCGOSource_HotOutputPointersUseResultWrappers_Good(t *testing.T
 	}
 }
 
+func TestHIPKernelSource_KVDescriptorAppendInPlaceSkipsSelfCopy_Good(t *testing.T) {
+	sourceBytes, err := os.ReadFile("../kernels/rocm_kernels.hip")
+	core.RequireNoError(t, err)
+	source := string(sourceBytes)
+
+	appendKernel := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_kv_descriptor_append`)
+	core.AssertTrue(t, strings.Contains(appendKernel, `args.previous_descriptor_pointer == args.output_descriptor_pointer`), "descriptor append must detect in-place table reuse")
+	core.AssertTrue(t, strings.Contains(appendKernel, `args.output_page_count == previous->page_count + 1u`), "descriptor append must keep the no-trim append shape guard")
+	core.AssertTrue(t, strings.Contains(appendKernel, `previous->page_count * ROCM_DEVICE_KV_DESCRIPTOR_PAGE_BYTES`), "descriptor append must write only the appended page in-place")
+}
+
 func TestHIPKernelSource_AttentionChunkedStage1ScoreLaneReduction_Good(t *testing.T) {
 	sourceBytes, err := os.ReadFile("../kernels/rocm_kernels.hip")
 	core.RequireNoError(t, err)
