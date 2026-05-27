@@ -68,38 +68,44 @@ The Metal/go-mlx reference completes that retained-state book profile in about
 chapter 10 still contains the original arc. Above `110s`, the route remains
 experimental/tuning.
 
-Current retained-state ROCm default uses one-token Gemma4 device-KV pages. The
-latest full-cap RX 7800 XT run completes in `74.2s` with empty stderr and
-chapter-10 arc retention, but later-turn decode still decays below the
-`90-100+ tok/s` driver target.
+Current retained-state ROCm default uses one-token Gemma4 device-KV pages. A
+fresh full 10-turn retained sampled run on the RX 7800 XT with the 512-token
+prefill ubatch default completed in `46.11s` wall, `38.29s` decode, `3272`
+generated tokens, `70.96 tok/s` average decode, `64.66 tok/s` turn-10 decode,
+empty stderr, no max-token hits, and chapter-10 arc retention. This is accepted
+wall-time evidence, but later-turn decode still decays below the `90-100+ tok/s`
+driver target.
 
 Current ROCm benchmark surface:
 
 ```sh
 ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 \
 GO_ROCM_RUN_BOOK_BENCHMARKS=1 \
-GO_ROCM_RUN_UNSAFE_REPLAY_BOOK_BENCHMARKS=1 \
+GO_ROCM_RUN_RETAINED_BOOK_BENCHMARKS=1 \
 GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit \
-GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco \
+GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100-current.hsaco \
 GO_ROCM_BOOK_CONTEXT_LEN=48000 \
 GO_ROCM_BOOK_CHAPTER_TOKENS=0 \
+GO_ROCM_BOOK_PREFILL_UBATCH_TOKENS=512 \
 GO_ROCM_BOOK_TURN_TIMEOUT_SECONDS=60 \
-go test ./go -run '^$' -bench '^BenchmarkInferenceGemma4Q4Book10Turn_ReplayBaseline$' -benchmem -benchtime=1x -count=1 -timeout=0
+GO_ROCM_BOOK_OUTPUT_FILE=/tmp/go-rocm-book-retained.md \
+go test ./go -run '^$' -bench '^BenchmarkInferenceGemma4Q4Book10Turn_RetainedState$' -benchmem -benchtime=1x -count=1 -timeout=0 \
+  2>/tmp/go-rocm-book-retained.err
 ```
 
-The current benchmark is a replay baseline and is double-gated because it can
-monopolize the display GPU. The implementation target is to swap this profile
-to retained KV state: each chapter turn should append only the new request and
-distractor while the KV cache carries the book so far. `GO_ROCM_BOOK_TURNS`
-can be used for short smoke runs. Retained book runs default to
-a full-chapter safety cap derived from context length and turn count. With
+This benchmark is retained-state only and is double-gated because it can
+monopolize the display GPU. Each chapter turn appends only the new request and
+distractor while the `.kv` state carries the book so far. Rebuilding the
+manuscript by replaying prompt text is an error, not a fallback.
+`GO_ROCM_BOOK_TURNS` can be used for short smoke runs. Retained book runs
+default to a full-chapter safety cap derived from context length and turn count. With
 `GO_ROCM_BOOK_CONTEXT_LEN=48000` and 10 turns, omitted
 `GO_ROCM_BOOK_CHAPTER_TOKENS` or `GO_ROCM_BOOK_CHAPTER_TOKENS=0` allows up to
 4390 generated tokens per chapter; smaller explicit values such as `512` are
 smoke/debug caps and are not the acceptance workload.
-`GO_ROCM_BOOK_PREFILL_UBATCH_TOKENS` defaults to `16` because a single 87-token
-ubatch can run large enough q4 MLP/down-projection kernels to wedge the
-display-attached RX 7800 XT. Raise it only with an error log/watchdog.
+`GO_ROCM_BOOK_PREFILL_UBATCH_TOKENS` defaults to `512`, matching the Gemma4 q4
+production prefill path. Drop to `16` only for display-safety debugging with an
+error log/watchdog.
 `GO_ROCM_BOOK_LAYERS` is a debug-only layer cap for proving retained-state
 mechanics on a small graph; acceptance runs omit it. `GO_ROCM_BOOK_WARMUP_PROMPT`
 runs a discarded prefill before timing, so it warms the engine without sampling

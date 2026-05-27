@@ -21,11 +21,17 @@ The package was built by Charon (test coverage and build agent, running on the L
 
 **Critical discovery: iGPU crash**
 
-The Ryzen 9 9950X has an integrated GPU that ROCm detects as a second device:
-- Device 0: RX 7800 XT (gfx1100), 16 GB VRAM
-- Device 1: Radeon Graphics iGPU (gfx1100), reports ~100 GB free (system RAM)
+The Ryzen 9 9950X has an integrated GPU that ROCm exposes alongside the RX
+7800 XT. Early llama-server testing treated the RX 7800 XT as ordinal 0 and the
+Radeon Graphics iGPU as the other visible device, but later native HIP testing
+made ordinal selection an explicit non-contract because the onboard GPU can
+appear as device 0. Current native runs pin the RX 7800 XT by UUID with
+`ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85`.
 
-llama-server's auto-fit logic splits the model across both devices. Loading tensors to Device 1 triggers `ROCm error: unspecified launch failure` and a core dump. The fix is `HIP_VISIBLE_DEVICES=0`, which must be set unconditionally when spawning llama-server.
+llama-server's auto-fit logic split the model across both devices. Loading
+tensors to the iGPU triggered `ROCm error: unspecified launch failure` and a
+core dump. The legacy-server workaround was `HIP_VISIBLE_DEVICES=0`; the native
+driver acceptance path instead pins the dGPU by UUID.
 
 **Baseline benchmark (Gemma3-4B-Q4_K_M):**
 
@@ -135,7 +141,7 @@ The native package-first path was brought closer to `go-mlx` contract parity:
 - `BlockCacheService` adds metadata-first block-prefix prompt-cache stats, warm, clear, compatibility checks, stable block IDs, optional `go-inference/state` metadata refs, portable package-local KV snapshot disk refs for ROCm KV cache modes, exact cold rehydrate from deterministic disk-ref URIs, disk-byte accounting, and best-effort HIP device remirroring for warmed/cold-restored portable KV snapshots; cache capability labels report `kv_device_backing=best_effort_remirror` while fully HIP-owned disk KV and native prefill reuse remain pending.
 - `SpeculativeDecode` and `PromptLookupDecode` add package-first wrappers around the shared `go-inference/decode` acceptance harness, with examples, stream-error propagation, and capability status that remains planned until a loaded model reports a linked experimental decode path.
 - `ParserRegistry` is backed by the shared `go-inference/parser` package and adds reasoning/tool parsers and examples for Qwen/Gemma/MiniMax/DeepSeek/GPT-OSS/Mistral/Kimi/GLM/Hermes/Granite families, including `[TOOL_CALLS]` arrays, loaded-model `modelType` fallback, and generic JSON/XML.
-- `StateSession` adds URI-first wake/sleep/fork metadata lifecycle over `go-inference/state`, including examples, hash plus architecture/tokenizer-kind compatibility checks, metadata-only shared `StatefulModel` bundle capture/restore, planned labels for non-KV placeholders, binary `rocm/kv-cache+json` sleep/wake refs when a session owns package-local KV pages, loaded-model persistence for wake-then-sleep KV round trips, adapter/restore/close state reset with owned-runtime cleanup, HIP device-mirror snapshot refs by copying mirrored pages device-to-host into the same portable encoding, and loaded-model best-effort wake/fork remirror of restored portable KV refs back into HIP device pages with package-local fallback until production kernels own restore.
+- `StateSession` adds URI-first wake/sleep/fork metadata lifecycle over `go-inference/state`, including examples, hash plus architecture/tokenizer-kind compatibility checks, metadata-only shared `StatefulModel` bundle capture/restore, planned labels for non-KV placeholders, binary `rocm/kv-cache+json` sleep/wake refs when a session owns package-local KV pages, loaded-model persistence for wake-then-sleep KV round trips, adapter/restore/close state reset with owned-runtime cleanup, HIP device-mirror snapshot refs by copying mirrored pages device-to-host into the same portable encoding, and loaded-model best-effort wake/fork remirror of restored portable KV refs back into HIP device pages with package-local fallback until production kernels own restore. The retained-generation contract was tightened so the `.kv` vector ref is the source of truth: wake must fail when durable KV is missing or incompatible, and retained book turns must not rebuild state by replaying prior prompt/manuscript text.
 - Model-pack inspection now covers safetensors headers, tokenizer sidecars, MiniMax/JANGTQ, shared `go-inference/quant` JANG/codebook validators, MoE hints, Qwen/Gemma/Mistral/Mixtral/Phi/DeepSeek/GPT-OSS/Kimi/GLM/Hermes/Granite/BERT architecture aliases, BERT embedding/rerank/classifier hints, and bounded malformed GGUF/safetensors/codebook errors; malformed weight metadata or missing architecture metadata keeps the inspection report available but `Supported=false`, mixed-shard failures clear partial weight-summary labels, and unsupported packs do not emit memory-fit labels. MoE/JANGTQ/codebook capabilities report experimental metadata-only status with fixture-kernel labels while production model integration remains pending.
 - Memory-planner coverage now pins small, 24GB, 64GB, and long-context cache-mode transitions.
 - Package-local KV cache pages now cover fp16, q8, and k-q8-v-q4 round trips, paged appends, byte counts, hit rate, restore timing, binary snapshot refs, constructibility of planner-selected cache modes through cache warm, and a HIP device-mirror allocation/copy/free smoke path with incremental decoded-token page appends, device-to-host portable snapshots, a fixed descriptor byte layout, device-resident descriptor table, 64-byte KV launch descriptor preflight, 64-byte prefill launch-packet encoding, and 96-byte decode launch-packet encoding before kernels consume device KV pages.

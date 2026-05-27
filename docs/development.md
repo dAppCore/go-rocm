@@ -148,6 +148,39 @@ ZLUDA is the CUDA-on-non-NVIDIA acceptance runner for AMD smoke tests. Unpack ZL
 
 Hot-path changes should follow AX-11: per-token, per-page, per-request, per-frame, public frequently imported, or cross-product functions get `BenchmarkFunctionName_Scenario` coverage with `b.ReportAllocs()`. For the State/KV restore path, `BenchmarkROCmKVCacheBlockFromRawPayload_KQ8VQ4Page` tracks host decode cost and `BenchmarkROCmDeviceKVPageFromRawPayload_KQ8VQ4PinnedCopy` tracks the direct pinned HIP page restore cost.
 
+### Retained Gemma4 Book Profile
+
+The live acceptance workload is the retained 10-turn Gemma4 book profile. It is
+not a replay benchmark. The session `.kv` file, currently a repurposed
+MP4-style vector stream behind `go-inference/state`, carries all previous
+chapters. Each measured turn must restore that state and append only the new
+Gemma4 chat turn; resending the previous prompt, book text, or transcript is a
+bug and should fail fast rather than falling back.
+
+Run only one live book job at a time on the display-attached RX 7800 XT and
+capture stderr to a `.err` file so GPU/runtime resets remain inspectable:
+
+```bash
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 \
+GO_ROCM_RUN_BOOK_BENCHMARKS=1 \
+GO_ROCM_RUN_RETAINED_BOOK_BENCHMARKS=1 \
+GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit \
+GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100-current.hsaco \
+GO_ROCM_BOOK_CONTEXT_LEN=48000 \
+GO_ROCM_BOOK_CHAPTER_TOKENS=0 \
+GO_ROCM_BOOK_PREFILL_UBATCH_TOKENS=512 \
+GO_ROCM_BOOK_MAX_WALL_SECONDS=110 \
+GO_ROCM_BOOK_MAX_MAXED_TURNS=0 \
+GO_ROCM_BOOK_OUTPUT_FILE=/tmp/go-rocm-book-retained.md \
+go test ./go -run '^$' -bench '^BenchmarkInferenceGemma4Q4Book10Turn_RetainedState$' -benchmem -benchtime=1x -count=1 -timeout=0 \
+  2>/tmp/go-rocm-book-retained.err
+```
+
+`GO_ROCM_BOOK_OUTPUT_FILE` is the full generated return for arc inspection, not
+a slice. `GO_ROCM_BOOK_TURNS` may be lowered for mechanics-only smokes, but the
+production decision point is the full 10-turn run with chapter generation left
+uncapped by `GO_ROCM_BOOK_CHAPTER_TOKENS=0`.
+
 ### Benchmarks (GPU required)
 
 ```bash
@@ -195,12 +228,16 @@ Concurrent throughput (4 parallel slots, 4 goroutines, 32 tokens each):
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `ROCM_LLAMA_SERVER_PATH` | PATH lookup | Explicit path to llama-server binary |
-| `HIP_VISIBLE_DEVICES` | overridden to `0` | go-rocm always sets this to 0 when spawning llama-server |
-| `ROCR_VISIBLE_DEVICES` | process default | Native HIP hardware smokes can pin the real dGPU by UUID, e.g. `GPU-880ed6479d653a85` for the RX 7800 XT when the onboard GPU is also visible |
+| `HIP_VISIBLE_DEVICES` | legacy-server override | The `rocm_legacy_server` path still filters HIP env and sets this for its historical llama-server workaround; do not use ordinal `0` for native q4 acceptance |
+| `ROCR_VISIBLE_DEVICES` | process default | Native HIP hardware smokes and benchmarks pin the real dGPU by UUID, e.g. `GPU-880ed6479d653a85` for the RX 7800 XT when the onboard GPU is also visible |
 | `HSA_OVERRIDE_GFX_VERSION` | unset | Not required; GPU is native gfx1100 |
 | `ROCM_MODEL_DIR` | none | Conventional directory for model files (not read by go-rocm itself) |
 
-`HIP_VISIBLE_DEVICES=0` is set unconditionally by `serverEnv()`, overriding any value in the calling process's environment. This masks the Ryzen 9 9950X's iGPU (Device 1), which otherwise causes llama-server to crash when it attempts to split tensors across the iGPU and dGPU.
+For native HIP tests and benchmarks, do not rely on HIP/ROCm ordinal `0`; on
+the current Ryzen 9 machine that ordinal may resolve to the onboard GPU. Pin
+the RX 7800 XT with `ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85`. The old
+`serverEnv()` `HIP_VISIBLE_DEVICES=0` behavior is legacy-server-only bootstrap
+history, not the native driver acceptance path.
 
 ## VRAM Budget
 

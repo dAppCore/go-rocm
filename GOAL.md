@@ -1946,11 +1946,27 @@ Remaining blocker:
     probes, and benchmark kernel counters; opt-in hardware smoke tests remain
     wired behind `GO_ROCM_RUN_*` gates for Phase 9 final ROCm validation.
 
-- [ ] Phase 9: Documentation and final gates.
+- [x] Phase 9: Documentation and final gates.
   - Update `README.md`, `docs/architecture.md`, `docs/development.md`, and
     `docs/history.md`.
   - Run all non-hardware gates.
   - On the Linux ROCm machine, run the hardware gates from `RFC.md`.
+  - 2026-05-27 audit: documentation now records the retained `.kv`
+    state-source contract, MP4-style vector stream note, no-prompt-replay rule,
+    full 10-turn Gemma4 book profile, `.err` capture, 512-token prefill ubatch
+    default, and RX 7800 XT UUID pinning instead of ordinal device selection.
+    Non-hardware gates passed: `go test ./... -count=1`,
+    `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./... -count=1`, and
+    `go test -tags rocm_legacy_server ./... -count=1`. Hardware gates passed on
+    `ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85` with
+    `/tmp/go-rocm-kernels-gfx1100-current.hsaco`: the HIP/native
+    `TestHIP|TestNative` gate, the model `Test.*Smoke|Test.*Generate|Test.*Decode`
+    gate, and the cache/KV `Test.*KV|Test.*Cache` gate; `/tmp/go-rocm-phase9-{hip,model,cache}.err`
+    were all empty.
+    The first model-gate attempt exposed empty quality-probe text being counted
+    as a pass in labels; `evaluateQualityProbes` now counts empty generations
+    as failures, and the q4 hardware eval smoke asks for two probe tokens so a
+    tokenizer-empty first token does not make the gate brittle.
 
 ## Required Test Gates
 

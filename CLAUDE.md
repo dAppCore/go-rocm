@@ -2,7 +2,9 @@
 
 ## What This Is
 
-AMD ROCm GPU inference for Linux via managed `llama-server` subprocess. Module: `dappco.re/go/rocm`.
+AMD ROCm GPU inference for Linux via the native package-first ROCm backend.
+Module: `dappco.re/go/rocm`. The managed `llama-server` subprocess path is
+legacy-only behind the `rocm_legacy_server` build tag.
 
 Implements `inference.Backend` and `inference.TextModel` (from `core/go-inference`) using llama.cpp compiled with `-DGGML_HIP=ON`. Targets AMD RDNA 2+ GPUs (tested on Radeon RX 7800 XT, gfx1100).
 
@@ -10,10 +12,10 @@ Sibling to `go-mlx` (Metal on macOS). Both expose the same interface; users sele
 
 ## Key Facts
 
-- **Subprocess model:** llama-server runs as isolated process, communicates via HTTP/SSE
+- **Native model:** default Linux builds load model packs and route through HIP-owned buffers
 - **GGUF parser:** Reads model metadata (v2/v3) without loading tensors — enables fast discovery
 - **VRAM monitoring:** sysfs-based (no ROCm runtime library dependency)
-- **iGPU masking:** `HIP_VISIBLE_DEVICES=0` hardcoded — Ryzen 9 iGPU crashes llama-server if exposed
+- **GPU selection:** native live tests pin the RX 7800 XT with `ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85`; do not assume ordinal 0 is the dGPU
 - **Auto-register:** `init()` registers backend into `inference.Register()` on linux && amd64
 - **Platform stubs:** Exports no-op funcs on non-Linux/amd64 to avoid build failures
 - **Error wrapping:** All errors use `coreerr.E(scope, msg, cause)` from `go-log`
@@ -55,7 +57,7 @@ dappco.re/go/rocm/
 
 ## Critical Rules
 
-1. **iGPU always masked:** `serverEnv()` enforces `HIP_VISIBLE_DEVICES=0`. This is non-negotiable. Do not accept as config or env var override.
+1. **Pin the real dGPU:** Native HIP tests and benchmarks use `ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85`. Do not rely on device/card ordinal 0 because it may resolve to the onboard GPU. The old `serverEnv()` `HIP_VISIBLE_DEVICES=0` rule applies only to the legacy llama-server tag.
 
 2. **Platform-specific:** Build tags `linux && amd64` for GPU code. Stubs on other platforms prevent build errors.
 
