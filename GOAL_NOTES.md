@@ -1,5 +1,61 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Accepted Retained RoPE Shape Table
+
+- Added a retained-book decode-only RoPE shape table alongside the existing
+  decode-only attention shape table. The generic top-shape table can be
+  dominated by q4 block volume, so the full/global Gemma4 p-RoPE route
+  (`head_dim=512`, `rotary=128`) was not guaranteed to stay visible.
+- This is a benchmark-surface change only. It does not change HIP math,
+  retained KV state, sampling, prompt append behavior, or launch geometry.
+- Verification:
+
+```text
+go test ./go -run 'TestInferenceBenchmark(BookTurnKernelDeltas|HIPKernelCountingDriver)_Good' -count=1 -v
+PASS
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.140s
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.109s
+
+go test ./... -count=1
+ok dappco.re/go/rocm/workspace 0.717s
+
+git diff --check
+PASS
+```
+
+- Live RX 7800 XT 2-turn retained proof, pinned to
+  `ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85`, completed with empty stderr:
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 12072481722 ns/op
+book_wall_s=12.05
+book_generated_tokens=1198
+book_tok/s=99.45
+book_turn01_tok/s=108.9
+book_turn02_tok/s=102.2
+book_turn02_retained_tokens=1509
+B/op=7895360
+allocs/op=9684
+stderr: .bench-errors/book2_rope_shapes_20260527.err (0 bytes)
+```
+
+- The generated artifact `/tmp/go-rocm-book2-rope-shapes.md` now exposes both
+  Gemma4 RoPE paths per retained turn:
+
+```text
+turn 1: 8x256 qg0, 8x512 qg128, 1x256 qg0, 1x512 qg128
+turn 2: 8x256 qg0, 8x512 qg128, 1x256 qg0, 1x512 qg128
+```
+
+Conclusion: the `go-mlx/IDEAS.md` Gemma4 local/full RoPE distinction is now
+directly audited in the retained-book benchmark. The visible split confirms the
+driver is not using a FlashAttention-style `head_dim<=256` assumption for the
+full/global p-RoPE route.
+
 ## 2026-05-27 Accepted p-RoPE Route Instrumentation
 
 - Pulled the Gemma4 p-RoPE details from `../go-mlx/IDEAS.md` and cross-checked
