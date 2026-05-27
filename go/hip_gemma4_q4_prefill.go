@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	hipGemma4Q4PrefillDefaultUBatchTokens = 16
+	hipGemma4Q4PrefillDefaultUBatchTokens = 512
 	hipGemma4Q4PrefillUBatchEnv           = "GO_ROCM_GEMMA4_Q4_PREFILL_UBATCH_TOKENS"
 )
 

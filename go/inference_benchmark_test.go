@@ -1940,9 +1940,11 @@ func inferenceBenchmarkBookPrefillUBatchTokens(b *testing.B) int {
 	} else if ok {
 		return value
 	}
-	const displaySafeUBatchTokens = 16
-	b.Setenv(hipGemma4Q4PrefillUBatchEnv, strconv.Itoa(displaySafeUBatchTokens))
-	return displaySafeUBatchTokens
+	value, err := hipGemma4Q4PrefillUBatchTokens()
+	if err != nil {
+		b.Fatal(err)
+	}
+	return value
 }
 
 func inferenceBenchmarkBookChapterTokensEnv(contextLen, turns int) (int, error) {

@@ -502,6 +502,19 @@ benchmark is appending only the new Gemma4 chat turn to retained `.kv` state
 instead of replaying prior chapter text. This is accepted wall-time evidence,
 but it reinforces that late-turn decode remains the next target.
 
+The book harness no longer forces the old display-safe `16` token prefill
+ubatch when no override is set. The Gemma4 q4 production prefill default is now
+`512`, matching the prompt-prefill acceptance shape while still allowing
+`GO_ROCM_BOOK_PREFILL_UBATCH_TOKENS=16` for display-safety debugging. A full
+10-turn retained sampled run with `GO_ROCM_BOOK_PREFILL_UBATCH_TOKENS=512`
+passed with empty stderr at `46.11s` wall, `38.29s` decode, `3272` generated
+tokens, `70.96 tok/s` average, `64.66 tok/s` on turn 10, `42642296 B/op`,
+`33212 allocs/op`, `0` repeated turns, `0` max-token hits, and `4`
+chapter-10 arc anchors. Peak memory rose to about `5.7GiB`, so the 16-token
+override remains useful when protecting a display session. A 2-turn retained
+smoke without any prefill override reported `book_prefill_ubatch_tokens=512`
+and empty stderr, confirming the new default path is active.
+
 Rejected prompt-shortening follow-up: replacing the anchored wording with a
 shorter "advance the arc / keep continuity words alive" instruction reduced
 prompt tokens to `1581` and still passed the arc gate with `3` anchors, but it
