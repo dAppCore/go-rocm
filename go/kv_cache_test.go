@@ -824,6 +824,27 @@ func TestKVCache_DevicePageSliceCapacity_Good(t *testing.T) {
 	core.AssertEqual(t, rocmDeviceKVPagePoolMaxCapacity+1, rocmDeviceKVPageSliceCapacity(rocmDeviceKVPagePoolMaxCapacity+1))
 }
 
+func TestKVCache_DeviceDescriptorTableAllocationBytes_Good(t *testing.T) {
+	descriptorBytes := func(pages int) uint64 {
+		return uint64(rocmDeviceKVDescriptorHeaderBytes + pages*rocmDeviceKVDescriptorPageBytes)
+	}
+	core.AssertEqual(t, uint64(rocmDeviceKVDescriptorHeaderBytes), rocmDeviceKVDescriptorTableAllocationBytes(uint64(rocmDeviceKVDescriptorHeaderBytes)))
+	core.AssertEqual(t, rocmDeviceKVDescriptorHotTableBytes(), rocmDeviceKVDescriptorTableAllocationBytes(descriptorBytes(1)))
+	core.AssertEqual(t, rocmDeviceKVDescriptorHotTableBytes(), rocmDeviceKVDescriptorTableAllocationBytes(descriptorBytes(rocmDeviceKVHotPageCapacity)))
+	core.AssertEqual(t, descriptorBytes(rocmDeviceKVHotPageCapacity*2), rocmDeviceKVDescriptorTableAllocationBytes(descriptorBytes(rocmDeviceKVHotPageCapacity+1)))
+	core.AssertEqual(t, descriptorBytes(rocmDeviceKVPagePoolMaxCapacity), rocmDeviceKVDescriptorTableAllocationBytes(descriptorBytes(rocmDeviceKVPagePoolMaxCapacity-1)))
+	core.AssertEqual(t, descriptorBytes(rocmDeviceKVPagePoolMaxCapacity+1), rocmDeviceKVDescriptorTableAllocationBytes(descriptorBytes(rocmDeviceKVPagePoolMaxCapacity+1)))
+}
+
+func TestKVCache_DeviceDescriptorTableLogicalAndAllocationBytes_Good(t *testing.T) {
+	logicalBytes := uint64(rocmDeviceKVDescriptorHeaderBytes + rocmDeviceKVDescriptorPageBytes)
+	allocationBytes := rocmDeviceKVDescriptorTableAllocationBytes(logicalBytes)
+	table := rocmBorrowDeviceKVDescriptorTableAllocated(&fakeHIPDriver{available: true}, 4096, logicalBytes, allocationBytes, rocmDeviceKVDescriptorVersion, 1, false, true)
+	core.AssertEqual(t, logicalBytes, table.SizeBytes())
+	core.AssertEqual(t, allocationBytes, table.AllocationBytes())
+	rocmReleaseDeviceKVDescriptorTable(table)
+}
+
 func TestKVCache_Bad_DeviceDescriptorBytesRejectUnsupportedABIValues(t *testing.T) {
 	validPage := rocmDeviceKVPageDescriptor{
 		TokenStart:    0,
@@ -1014,23 +1035,29 @@ func BenchmarkROCmDeviceKVDescriptorPointerPool_HotWindow(b *testing.B) {
 	rocmDeviceKVDescriptorPointerPool.Unlock()
 	driver := &fakeHIPDriver{available: true}
 	sizeBytes := rocmDeviceKVDescriptorHotTableBytes()
-	pointer, err := rocmDeviceKVDescriptorTableMalloc(driver, sizeBytes)
+	pointer, allocationBytes, err := rocmDeviceKVDescriptorTableMalloc(driver, sizeBytes)
 	if err != nil {
 		b.Fatalf("descriptor malloc: %v", err)
 	}
-	if err := rocmDeviceKVDescriptorTableFree(driver, pointer, sizeBytes); err != nil {
+	if allocationBytes != sizeBytes {
+		b.Fatalf("descriptor allocation bytes = %d, want %d", allocationBytes, sizeBytes)
+	}
+	if err := rocmDeviceKVDescriptorTableFree(driver, pointer, allocationBytes); err != nil {
 		b.Fatalf("descriptor free: %v", err)
 	}
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		pointer, err = rocmDeviceKVDescriptorTableMalloc(driver, sizeBytes)
+		pointer, allocationBytes, err = rocmDeviceKVDescriptorTableMalloc(driver, sizeBytes)
 		if err != nil {
 			b.Fatalf("descriptor malloc: %v", err)
 		}
 		if pointer == 0 {
 			b.Fatalf("descriptor pointer is nil")
 		}
-		if err := rocmDeviceKVDescriptorTableFree(driver, pointer, sizeBytes); err != nil {
+		if allocationBytes != sizeBytes {
+			b.Fatalf("descriptor allocation bytes = %d, want %d", allocationBytes, sizeBytes)
+		}
+		if err := rocmDeviceKVDescriptorTableFree(driver, pointer, allocationBytes); err != nil {
 			b.Fatalf("descriptor free: %v", err)
 		}
 	}

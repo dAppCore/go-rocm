@@ -14257,3 +14257,69 @@ allocation volume moved from `230625576 B/op` and `100447 allocs/op` to
 `204914608 B/op` and `96011 allocs/op`. Decode stayed noise-flat around
 `80 tok/s` average and `69-70 tok/s` on turn 10, so the 90-100 tok/s target
 still depends on the q4 projection/GELU/long-context attention path.
+
+## 2026-05-27: Descriptor Capacity Pooling Cleanup
+
+This pass used the exact 1-token-vs-2048-token memprofile delta on `text:Hi`
+to target generation-scaling descriptor churn:
+
+```text
+- Keep descriptor table logical byte counts unchanged in kernel launch packets.
+- Track descriptor table allocation bytes separately from logical bytes.
+- Allocate descriptor backing pointers by page-capacity bucket, matching the
+  existing KV page-slice capacities, so growing global KV descriptors reuse
+  pooled backing storage instead of creating one-off malloc/free sizes.
+- Report retained device-state descriptor memory using allocation bytes so the
+  larger pooled backing is visible in memory accounting.
+```
+
+Rejected during this pass:
+
+```text
+Adding a second inline slot to the cgo HIP memory-pool bucket produced a
+zero-allocation microbenchmark, but the real 2048 text guard regressed/noised
+negative to 7204912 B/op and 4704 allocs/op. It was reverted before accepting
+the descriptor-capacity path.
+```
+
+AX-11 microbenchmarks:
+
+```text
+BenchmarkROCmDeviceKVDescriptorPointerPool_HotWindow-32  24.8 ns/op  0 B/op  0 allocs/op
+BenchmarkROCmDeviceKVAppendEncodedTokenWindow_Hot-32     2596 ns/op  0 B/op  0 allocs/op
+```
+
+2048-token fast guards:
+
+```text
+2048 text:Hi:
+  18829785843 ns/op, 108.8 tok/s, 6606192 B/op, 2526 allocs/op
+
+2048 generated tokens, context_len=4096, chapter-1 lighthouse prompt:
+  20473820695 ns/op, 100.0 tok/s, 8159312 B/op, 3277 allocs/op
+```
+
+Retained-book acceptance:
+
+```text
+book_wall_s/op             37.54
+book_decode_s/op           33.46
+book_generated_tokens/op    3021
+book_tok/s                 80.48
+book_turn01_tok/s         109.8
+book_turn10_tok/s          70.22
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+stderr_bytes                   0
+B/op                    204416384
+allocs/op                   93969
+output: /tmp/go-rocm-book-10turn-fullcap-descriptor-capacity.md
+stderr: /tmp/go-rocm-book-10turn-fullcap-descriptor-capacity.err
+```
+
+This is still an allocation/plumbing cleanup, not the retained decode
+breakthrough. The chapter-shaped 2048 guard moved from `8682136 B/op` and
+`5740 allocs/op` to `8159312 B/op` and `3277 allocs/op`; retained-book average
+decode improved inside normal noise from `80.05 tok/s` to `80.48 tok/s`, and
+turn 10 crossed back over `70 tok/s`. The remaining production target is still
+the q4 projection/GELU/long-context attention hot path.

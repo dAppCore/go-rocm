@@ -416,7 +416,7 @@ func (state *hipGemma4Q4DeviceDecodeState) MemoryBytes() uint64 {
 			total += layer.cache.MemoryBytes()
 		}
 		if !layer.borrowedDescriptorTable && layer.descriptorTable != nil {
-			total += layer.descriptorTable.SizeBytes()
+			total += layer.descriptorTable.AllocationBytes()
 		}
 	}
 	return total

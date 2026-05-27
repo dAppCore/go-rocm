@@ -1596,6 +1596,15 @@ Remaining blocker:
   2048 run. Retained-book acceptance stayed quality-clean at `37.74s` wall,
   `80.05 tok/s` average, turn 10 `69.75 tok/s`, `204914608 B/op`,
   `96011 allocs/op`, `chapter10_arc_anchor_hits=3`.
+- The latest accepted descriptor-capacity pass keeps logical descriptor table
+  byte counts unchanged for kernels, but allocates and pools descriptor backing
+  pointers by page-capacity bucket so growing global KV descriptor tables stop
+  creating one-off malloc/free sizes. Fast guards now measure `108.8 tok/s`,
+  `6606192 B/op`, `2526 allocs/op` on `text:Hi` and `100.0 tok/s`,
+  `8159312 B/op`, `3277 allocs/op` on the chapter-shaped 2048 run.
+  Retained-book acceptance stayed quality-clean at `37.54s` wall,
+  `80.48 tok/s` average, turn 10 `70.22 tok/s`, `204416384 B/op`,
+  `93969 allocs/op`, `chapter10_arc_anchor_hits=3`.
 
 - [ ] Phase 0: Snapshot the tree and establish the baseline.
   - Run `git status --short`.

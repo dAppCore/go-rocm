@@ -105,14 +105,15 @@ type rocmDeviceKVTensor struct {
 }
 
 type rocmDeviceKVDescriptorTable struct {
-	driver    nativeHIPDriver
-	pointer   nativeDevicePointer
-	sizeBytes uint64
-	version   uint32
-	pageCount int
-	closed    bool
-	borrowed  bool
-	poolable  bool
+	driver          nativeHIPDriver
+	pointer         nativeDevicePointer
+	sizeBytes       uint64
+	allocationBytes uint64
+	version         uint32
+	pageCount       int
+	closed          bool
+	borrowed        bool
+	poolable        bool
 }
 
 var rocmDeviceKVDescriptorTablePool = struct {
@@ -149,6 +150,10 @@ type rocmDeviceKVLaunchDescriptor struct {
 }
 
 func rocmBorrowDeviceKVDescriptorTable(driver nativeHIPDriver, pointer nativeDevicePointer, sizeBytes uint64, version uint32, pageCount int, borrowed, poolable bool) *rocmDeviceKVDescriptorTable {
+	return rocmBorrowDeviceKVDescriptorTableAllocated(driver, pointer, sizeBytes, sizeBytes, version, pageCount, borrowed, poolable)
+}
+
+func rocmBorrowDeviceKVDescriptorTableAllocated(driver nativeHIPDriver, pointer nativeDevicePointer, sizeBytes, allocationBytes uint64, version uint32, pageCount int, borrowed, poolable bool) *rocmDeviceKVDescriptorTable {
 	var table *rocmDeviceKVDescriptorTable
 	if poolable {
 		rocmDeviceKVDescriptorTablePool.Lock()
@@ -163,14 +168,18 @@ func rocmBorrowDeviceKVDescriptorTable(driver nativeHIPDriver, pointer nativeDev
 	if table == nil {
 		table = &rocmDeviceKVDescriptorTable{}
 	}
+	if allocationBytes == 0 {
+		allocationBytes = sizeBytes
+	}
 	*table = rocmDeviceKVDescriptorTable{
-		driver:    driver,
-		pointer:   pointer,
-		sizeBytes: sizeBytes,
-		version:   version,
-		pageCount: pageCount,
-		borrowed:  borrowed,
-		poolable:  poolable,
+		driver:          driver,
+		pointer:         pointer,
+		sizeBytes:       sizeBytes,
+		allocationBytes: allocationBytes,
+		version:         version,
+		pageCount:       pageCount,
+		borrowed:        borrowed,
+		poolable:        poolable,
 	}
 	return table
 }
@@ -191,17 +200,32 @@ func rocmDeviceKVDescriptorHotTableBytes() uint64 {
 	return uint64(rocmDeviceKVDescriptorHeaderBytes + rocmDeviceKVHotPageCapacity*rocmDeviceKVDescriptorPageBytes)
 }
 
-func rocmDeviceKVDescriptorPointerPoolable(sizeBytes uint64) bool {
-	return sizeBytes == rocmDeviceKVDescriptorHotTableBytes()
+func rocmDeviceKVDescriptorTableAllocationBytes(sizeBytes uint64) uint64 {
+	if sizeBytes <= uint64(rocmDeviceKVDescriptorHeaderBytes) {
+		return sizeBytes
+	}
+	pageBytes := uint64(rocmDeviceKVDescriptorPageBytes)
+	pageCount := int((sizeBytes - uint64(rocmDeviceKVDescriptorHeaderBytes) + pageBytes - 1) / pageBytes)
+	pageCapacity := rocmDeviceKVPageSliceCapacity(pageCount)
+	if pageCapacity > rocmDeviceKVPagePoolMaxCapacity {
+		return sizeBytes
+	}
+	return uint64(rocmDeviceKVDescriptorHeaderBytes + pageCapacity*rocmDeviceKVDescriptorPageBytes)
 }
 
-func rocmDeviceKVDescriptorTableMalloc(driver nativeHIPDriver, sizeBytes uint64) (nativeDevicePointer, error) {
+func rocmDeviceKVDescriptorPointerPoolable(sizeBytes uint64) bool {
+	return sizeBytes >= rocmDeviceKVDescriptorHotTableBytes() &&
+		sizeBytes <= uint64(rocmDeviceKVDescriptorHeaderBytes+rocmDeviceKVPagePoolMaxCapacity*rocmDeviceKVDescriptorPageBytes)
+}
+
+func rocmDeviceKVDescriptorTableMalloc(driver nativeHIPDriver, sizeBytes uint64) (nativeDevicePointer, uint64, error) {
 	if driver == nil {
-		return 0, core.E("rocm.KVCache.DeviceDescriptor", "HIP driver is nil", nil)
+		return 0, 0, core.E("rocm.KVCache.DeviceDescriptor", "HIP driver is nil", nil)
 	}
-	if rocmDeviceKVDescriptorPointerPoolable(sizeBytes) {
+	allocationBytes := rocmDeviceKVDescriptorTableAllocationBytes(sizeBytes)
+	if rocmDeviceKVDescriptorPointerPoolable(allocationBytes) {
 		rocmDeviceKVDescriptorPointerPool.Lock()
-		entries := rocmDeviceKVDescriptorPointerPool.entries[sizeBytes]
+		entries := rocmDeviceKVDescriptorPointerPool.entries[allocationBytes]
 		for index := len(entries) - 1; index >= 0; index-- {
 			entry := entries[index]
 			if entry.driver != driver {
@@ -210,14 +234,15 @@ func rocmDeviceKVDescriptorTableMalloc(driver nativeHIPDriver, sizeBytes uint64)
 			entries[index] = entries[len(entries)-1]
 			entries[len(entries)-1] = rocmDeviceKVDescriptorPointerPoolEntry{}
 			entries = entries[:len(entries)-1]
-			rocmDeviceKVDescriptorPointerPool.entries[sizeBytes] = entries
-			rocmDeviceKVDescriptorPointerPool.bytes -= sizeBytes
+			rocmDeviceKVDescriptorPointerPool.entries[allocationBytes] = entries
+			rocmDeviceKVDescriptorPointerPool.bytes -= allocationBytes
 			rocmDeviceKVDescriptorPointerPool.Unlock()
-			return entry.pointer, nil
+			return entry.pointer, allocationBytes, nil
 		}
 		rocmDeviceKVDescriptorPointerPool.Unlock()
 	}
-	return driver.Malloc(sizeBytes)
+	pointer, err := driver.Malloc(allocationBytes)
+	return pointer, allocationBytes, err
 }
 
 func rocmDeviceKVDescriptorTableFree(driver nativeHIPDriver, pointer nativeDevicePointer, sizeBytes uint64) error {
@@ -1590,7 +1615,7 @@ func (cache *rocmDeviceKVCache) KernelDescriptorTableFromAppendedToken(ctx conte
 		return nil, err
 	}
 	outputBytes := uint64(rocmDeviceKVDescriptorHeaderBytes + cache.PageCount()*rocmDeviceKVDescriptorPageBytes)
-	pointer, err := rocmDeviceKVDescriptorTableMalloc(cache.driver, outputBytes)
+	pointer, allocationBytes, err := rocmDeviceKVDescriptorTableMalloc(cache.driver, outputBytes)
 	if err != nil {
 		return nil, core.E("rocm.KVCache.DeviceDescriptor", "allocate appended descriptor table", err)
 	}
@@ -1614,7 +1639,7 @@ func (cache *rocmDeviceKVCache) KernelDescriptorTableFromAppendedToken(ctx conte
 		TrimStart:                 trimStart,
 	}).Binary()
 	if err != nil {
-		_ = rocmDeviceKVDescriptorTableFree(cache.driver, pointer, outputBytes)
+		_ = rocmDeviceKVDescriptorTableFree(cache.driver, pointer, allocationBytes)
 		return nil, err
 	}
 	config := hipKernelLaunchConfig{
@@ -1628,10 +1653,10 @@ func (cache *rocmDeviceKVCache) KernelDescriptorTableFromAppendedToken(ctx conte
 		BlockZ: 1,
 	}
 	if err := hipLaunchKernel(cache.driver, config); err != nil {
-		_ = rocmDeviceKVDescriptorTableFree(cache.driver, pointer, outputBytes)
+		_ = rocmDeviceKVDescriptorTableFree(cache.driver, pointer, allocationBytes)
 		return nil, err
 	}
-	return rocmBorrowDeviceKVDescriptorTable(cache.driver, pointer, outputBytes, rocmDeviceKVDescriptorVersion, cache.PageCount(), false, true), nil
+	return rocmBorrowDeviceKVDescriptorTableAllocated(cache.driver, pointer, outputBytes, allocationBytes, rocmDeviceKVDescriptorVersion, cache.PageCount(), false, true), nil
 }
 
 func rocmDeviceKVAppendDescriptorShape(previous, next *rocmDeviceKVCache) (int, int, error) {
@@ -1689,6 +1714,16 @@ func (table *rocmDeviceKVDescriptorTable) Pointer() nativeDevicePointer {
 func (table *rocmDeviceKVDescriptorTable) SizeBytes() uint64 {
 	if table == nil || table.closed {
 		return 0
+	}
+	return table.sizeBytes
+}
+
+func (table *rocmDeviceKVDescriptorTable) AllocationBytes() uint64 {
+	if table == nil || table.closed {
+		return 0
+	}
+	if table.allocationBytes != 0 {
+		return table.allocationBytes
 	}
 	return table.sizeBytes
 }
@@ -1827,7 +1862,7 @@ func (table *rocmDeviceKVDescriptorTable) Close() error {
 		return nil
 	}
 	if table.pointer != 0 {
-		if err := rocmDeviceKVDescriptorTableFree(table.driver, table.pointer, table.sizeBytes); err != nil {
+		if err := rocmDeviceKVDescriptorTableFree(table.driver, table.pointer, table.AllocationBytes()); err != nil {
 			return core.E("rocm.KVCache.DeviceDescriptor", "free descriptor table", err)
 		}
 		table.pointer = 0
