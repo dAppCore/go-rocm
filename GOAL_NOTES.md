@@ -1,5 +1,72 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Accepted Retained Attention Split Table
+
+- `../go-mlx/IDEAS.md` calls out the Gemma4 architecture facts that matter for
+  the ROCm hot path: hybrid local/global attention, local SWA capped at
+  `512`/`1024` tokens, and global/full layers carrying the unbounded retained
+  context. The retained book benchmark now exposes that split directly instead
+  of relying on the raw attention shape table alone.
+- Added a decode-only attention split table that groups
+  `rocm_attention_heads_chunked_stage1` by shared-memory route:
+  `stage1_local_swa` for the local/SWA route (`3072` bytes), and
+  `stage1_full_global` for the full/global route (`4096` bytes). The table also
+  keeps stage2 reduction and batch-causal buckets visible when present.
+- This is a benchmark-surface change only. It does not change HIP math,
+  launch geometry, retained KV state, prompt append behavior, or sampling.
+
+Verification:
+
+```text
+go test ./go -run 'TestInferenceBenchmark(BookTurnKernelDeltas|HIPKernelCountingDriver)_Good' -count=1 -v
+PASS
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.143s
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.108s
+
+go test ./... -count=1
+ok dappco.re/go/rocm/workspace 0.727s
+
+git diff --check
+PASS
+```
+
+Live RX 7800 XT 2-turn retained proof, pinned to
+`ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85`, completed with empty stderr:
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 11485795356 ns/op
+book_wall_s=11.46
+book_decode_s=10.79
+book_generated_tokens=1137
+book_tok/s=99.20
+book_turn01_tok/s=109.3
+book_turn02_tok/s=102.3
+book_turn02_retained_tokens=1448
+B/op=7893872
+allocs/op=9678
+stderr: .bench-errors/book2_attention_split_20260527.err (0 bytes)
+artifact: /tmp/go-rocm-book2-attention-split-20260527.md
+```
+
+The artifact now shows the local route flattening while the full/global route
+continues to scale with retained context:
+
+```text
+turn 1 stage1_local_swa:   13916 launches, 358624 blocks, 676.65 blocks/token
+turn 1 stage1_full_global:  3479 launches,  95928 blocks, 181.00 blocks/token
+turn 2 stage1_local_swa:   16996 launches, 543872 blocks, 896.00 blocks/token
+turn 2 stage1_full_global:  4249 launches, 320824 blocks, 528.54 blocks/token
+```
+
+Conclusion: the benchmark now has a first-class AX-11 metric for the
+`go-mlx/IDEAS.md` Gemma4 split. Local/SWA attention is visibly bounded in the
+retained path; the next 90-100 tok/s late-turn blocker remains full/global
+chunked stage1 block growth and associated memory traffic.
+
 ## 2026-05-27 Rejected Chunk-Aligned Descriptor Page Shortcut
 
 - Tested a guarded HIP-only optimization for
