@@ -1,5 +1,48 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Dependency Refresh and 2048 Guard Baseline
+
+- Fast-forwarded active dev submodules:
+  - `external/go-inference` `10c951b` -> `882da5a`
+    (`perf(capability): pre-size TextModelCapabilities slice — 8.6x faster`).
+  - `external/go-cgo` `e866c96` -> `0ad5431`
+    (`test(bench): AX-11 baseline benchmarks for CString/Call/Buffer/Scope`,
+    `perf(call): stack-resident arg scratch — 1→0 allocs, -144 B, -30%
+    latency`).
+- Verified the refreshed shared modules and ROCm package/workspace surface:
+
+```text
+go test ./external/go-inference/go/... -count=1
+go test ./external/go-cgo/go/... -count=1
+go test ./go -count=1
+go test ./... -count=1
+```
+
+- Fresh single-job RX 7800 XT q4 guard using the current SWA-window HSACO:
+
+```text
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85
+GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100-swa-window.hsaco
+GO_ROCM_BENCH_TOKENS=2048
+GO_ROCM_BENCH_CONTEXT_LEN=4096
+
+BenchmarkInferenceGemma4Q4Generate:
+  20147260071 ns/op
+  101.7 tok/s
+  6715160 B/op
+  2633 allocs/op
+  stderr: /tmp/go-rocm-2048-after-cgo-scratch.err (empty)
+```
+
+- A route-metrics run before the latest `go-cgo` fast-forward stayed green at
+  `101.7 tok/s` and showed `999355` total kernel launches for `2048` generated
+  tokens, about `488` launches/token. The largest launch buckets were q4
+  projection (`255875`), residual-add-norm (`143290`), RoPE heads (`102350`),
+  GELU multiply/projection (`71645` each), decode chunked attention stage 1/2
+  (`67270` each), and QKV triple projection (`30705`). This confirms the next
+  production work is still q4 compute/per-layer decode fusion and long-context
+  attention launch volume, not prompt replay or retained-state fallback.
+
 ## 2026-05-27 Gemma4 SWA Batch Attention Window Bound
 
 - Pulled `external/go-inference` from `e05c165` to `10c951b` on `dev`:

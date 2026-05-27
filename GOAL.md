@@ -61,6 +61,12 @@ can now restore those block refs directly into HIP device KV pages using
 device runtime without the older host-cache remirror step. Keep this layer
 HIP-generic: the same code path should remain usable for a future NVIDIA HIP
 backend profile if the local toolchain targets CUDA through HIP.
+2026-05-27 dependency refresh: `external/go-inference` is at `882da5a`
+(`perf(capability): pre-size TextModelCapabilities slice`) and
+`external/go-cgo` is at `0ad5431` (`perf(call): stack-resident arg scratch`).
+The refreshed dependency surface passed `go test ./external/go-inference/go/...`
+and `go test ./external/go-cgo/go/...`; `go test ./go` and `go test ./...`
+also stayed green.
 
 Cross-target HIP proof is now part of the acceptance surface. The ROCm 7.2 HIP
 source must compile through three routes when the local toolchain is available:
