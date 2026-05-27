@@ -1,5 +1,53 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Prefill Batch Attention Workspace Pass
+
+- Added an AX-11 reuse benchmark for the batch-causal attention weight scratch
+  path. Under the workspace cap it reports:
+
+```text
+BenchmarkHIPAttentionHeadsChunkedWorkspace_BatchAttentionWeightsReused-32  1.790 ns/op  0 B/op  0 allocs/op
+```
+
+- The reusable scratch path is deliberately capped at `64K` float weights.
+  A retained-book run showed that retaining larger long-context prefill weight
+  buffers in the shared workspace is the wrong shape for the book workload, so
+  over-cap buffers stay ephemeral and are released immediately.
+- Rejected an early-release experiment that closed prior prefill body scratch
+  while the next layer was being enqueued. It caused the retained book workload
+  to exceed the per-turn deadline, so the code was removed.
+- Live RX 7800 XT guard after the capped workspace pass:
+
+```text
+2048 text:Hi, context_len=4096:
+  20019464469 ns/op, 102.3 tok/s, 6604288 B/op, 2513 allocs/op
+  stderr: /tmp/go-rocm-2048-batch-weight-cap.err (empty)
+```
+
+- The first retained-book reruns accidentally used the benchmark sampling
+  defaults (`temperature=1`, `top_p=0.95`, `top_k=64`) and hit the 60s turn
+  timeout. Re-running the actual accepted greedy profile passed with empty
+  `/tmp/go-rocm-book-10turn-greedy-batch-weight-cap.err`:
+
+```text
+book_wall_s/op             37.67
+book_decode_s/op           33.59
+book_generated_tokens/op    3021
+book_tok/s                 80.20
+book_turn10_tok/s          69.08
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+B/op                    205150240
+allocs/op                   99123
+output: /tmp/go-rocm-book-10turn-greedy-batch-weight-cap.md
+```
+
+- The 29k opencode session-start diagnostic remains unresolved. A workspace
+  retry was bounded by `timeout 900s` and exited `124` with empty
+  `/tmp/go-rocm-29k-prefill-release.out` and `.err`, so the remaining 29k
+  problem is algorithmic prefill attention throughput rather than prompt-plan
+  allocation or cleanup churn.
+
 ## 2026-05-27 Fresh Retained-Book Gate and Repetition Metric
 
 - Fresh single-job RX 7800 XT guards after the local `dev` commit stack:

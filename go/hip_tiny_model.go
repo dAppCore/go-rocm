@@ -1151,7 +1151,7 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 				priorLayerKVScratch = hipGemma4Q4DeviceLayerCaches(deviceState, priorLayerKVScratch, len(cfg.Layers))
 				priorLayerKV = priorLayerKVScratch
 			}
-			forward, err := hipRunGemma4Q4PrefillForwardBatchWithPrior(ctx, model.driver, cfg, ubatch.Tokens, ubatch.Position, req.Epsilon, deviceKVMode, priorLayerKV, nil, ubatch.OutputTokens, finalGreedyBuffer)
+			forward, err := hipRunGemma4Q4PrefillForwardBatchWithPriorWorkspace(ctx, model.driver, cfg, ubatch.Tokens, ubatch.Position, req.Epsilon, deviceKVMode, priorLayerKV, nil, ubatch.OutputTokens, finalGreedyBuffer, attentionWorkspace)
 			if err != nil {
 				runErr = err
 				return

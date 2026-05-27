@@ -2221,6 +2221,150 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_AttentionOutputReused(b *testing
 	}
 }
 
+func TestHIPAttentionHeadsBatchCausalWorkspaceCap_Good(t *testing.T) {
+	t.Setenv("GO_ROCM_DISABLE_DEVICE_BUFFER_POOL", "1")
+	const (
+		dim        = 1
+		tokenCount = hipAttentionHeadsSharedMaxTokens + 1
+		queryCount = 1
+	)
+	keyValues := make([]float32, tokenCount*dim)
+	valueValues := make([]float32, tokenCount*dim)
+	for index := range keyValues {
+		keyValues[index] = 1
+		valueValues[index] = float32(index + 1)
+	}
+	keyPayload, err := hipFloat32Payload(keyValues)
+	core.RequireNoError(t, err)
+	valuePayload, err := hipFloat32Payload(valueValues)
+	core.RequireNoError(t, err)
+
+	for _, tc := range []struct {
+		name          string
+		headCount     int
+		wantWorkspace bool
+	}{
+		{name: "under_cap", headCount: 1, wantWorkspace: true},
+		{name: "over_cap", headCount: 33, wantWorkspace: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			driver := &fakeHIPDriver{available: true}
+			workspace := &hipAttentionHeadsChunkedWorkspace{}
+			defer workspace.Close()
+			queryValues := make([]float32, queryCount*tc.headCount*dim)
+			for index := range queryValues {
+				queryValues[index] = 1
+			}
+			queryPayload, err := hipFloat32Payload(queryValues)
+			core.RequireNoError(t, err)
+			query, err := hipUploadByteBuffer(driver, "rocm.hip.AttentionHeadsBatchCausalLaunch", "attention batch query", queryPayload, len(queryValues))
+			core.RequireNoError(t, err)
+			defer query.Close()
+			keys, err := hipUploadByteBuffer(driver, "rocm.hip.AttentionHeadsBatchCausalLaunch", "attention batch keys", keyPayload, len(keyValues))
+			core.RequireNoError(t, err)
+			defer keys.Close()
+			values, err := hipUploadByteBuffer(driver, "rocm.hip.AttentionHeadsBatchCausalLaunch", "attention batch values", valuePayload, len(valueValues))
+			core.RequireNoError(t, err)
+			defer values.Close()
+			output, err := hipAllocateByteBuffer(driver, "rocm.hip.AttentionHeadsBatchCausalLaunch", "attention batch output", uint64(len(queryValues)*4), len(queryValues))
+			core.RequireNoError(t, err)
+			defer output.Close()
+
+			err = hipRunAttentionHeadsBatchCausalOutputFromDeviceQueryToDeviceKernelWorkspace(context.Background(), driver, hipAttentionHeadsBatchCausalDeviceRequest{
+				Key:             keys,
+				Value:           values,
+				Dim:             dim,
+				TokenCount:      tokenCount,
+				HeadCount:       tc.headCount,
+				QueryCount:      queryCount,
+				QueryStartToken: tokenCount - 1,
+				Scale:           1,
+			}, query, output, workspace)
+			core.RequireNoError(t, err)
+			launch := driver.launches[len(driver.launches)-1]
+			weightPointer := nativeDevicePointer(binary.LittleEndian.Uint64(launch.Args[40:]))
+			core.AssertEqual(t, uint32(queryCount*tc.headCount*tokenCount*4), binary.LittleEndian.Uint32(launch.Args[84:]))
+			if tc.wantWorkspace {
+				if workspace.BatchAttentionWeight == nil || workspace.BatchAttentionWeight.Pointer() != weightPointer {
+					t.Fatalf("workspace weight pointer = %#v, launch pointer %x", workspace.BatchAttentionWeight, weightPointer)
+				}
+				core.AssertEqual(t, 0, len(driver.frees))
+				return
+			}
+			if workspace.BatchAttentionWeight != nil {
+				t.Fatalf("workspace retained over-cap attention weights")
+			}
+			foundFree := false
+			for _, freed := range driver.frees {
+				if freed == weightPointer {
+					foundFree = true
+					break
+				}
+			}
+			if !foundFree {
+				t.Fatalf("over-cap attention weights %x were not released", weightPointer)
+			}
+		})
+	}
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_BatchAttentionWeightsReused_Good(t *testing.T) {
+	t.Setenv("GO_ROCM_DISABLE_DEVICE_BUFFER_POOL", "1")
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	first, err := workspace.EnsureBatchAttentionWeights(driver, 4096)
+	core.RequireNoError(t, err)
+	if first == nil || first.Count() != 4096 || first.SizeBytes() != 16384 {
+		t.Fatalf("batch attention weights = %#v, want 4096/16384", first)
+	}
+	firstPointer := first.Pointer()
+	core.AssertEqual(t, 1, len(driver.allocations))
+
+	smaller, err := workspace.EnsureBatchAttentionWeights(driver, 2048)
+	core.RequireNoError(t, err)
+	if smaller.Pointer() != firstPointer || smaller.Count() != 4096 {
+		t.Fatalf("smaller weights reused pointer/count = %#v, want pointer %x count 4096", smaller, firstPointer)
+	}
+	core.AssertEqual(t, 1, len(driver.allocations))
+	core.AssertEqual(t, 0, len(driver.frees))
+
+	larger, err := workspace.EnsureBatchAttentionWeights(driver, 8192)
+	core.RequireNoError(t, err)
+	if larger == nil || larger.Pointer() == firstPointer || larger.Count() != 8192 || larger.SizeBytes() != 32768 {
+		t.Fatalf("larger weights = %#v, want fresh 8192/32768 buffer", larger)
+	}
+	core.AssertEqual(t, 2, len(driver.allocations))
+	core.AssertEqual(t, 1, len(driver.frees))
+	core.AssertEqual(t, firstPointer, driver.frees[0])
+}
+
+func BenchmarkHIPAttentionHeadsChunkedWorkspace_BatchAttentionWeightsReused(b *testing.B) {
+	b.Setenv("GO_ROCM_DISABLE_DEVICE_BUFFER_POOL", "1")
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	output, err := workspace.EnsureBatchAttentionWeights(driver, 4096)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if output.Count() != 4096 || output.SizeBytes() != 16384 {
+		b.Fatalf("batch attention weight shape = %d/%d, want 4096/16384", output.Count(), output.SizeBytes())
+	}
+	pointer := output.Pointer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		output, err = workspace.EnsureBatchAttentionWeights(driver, 2048)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if output.Pointer() != pointer || output.Count() != 4096 || output.SizeBytes() != 16384 {
+			b.Fatalf("batch attention weight shape = %x %d/%d, want %x 4096/16384", output.Pointer(), output.Count(), output.SizeBytes(), pointer)
+		}
+	}
+}
+
 func BenchmarkHIPAttentionHeadsChunkedWorkspace_ProjectionOutputReused(b *testing.B) {
 	driver := &fakeHIPDriver{available: true}
 	workspace := &hipAttentionHeadsChunkedWorkspace{}

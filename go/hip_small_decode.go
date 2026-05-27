@@ -1989,7 +1989,13 @@ type hipAttentionHeadsBatchCausalDeviceRequest struct {
 	Scale           float32
 }
 
+const hipAttentionHeadsBatchWorkspaceMaxWeights = 64 * 1024
+
 func hipRunAttentionHeadsBatchCausalOutputFromDeviceQueryToDeviceKernel(ctx context.Context, driver nativeHIPDriver, req hipAttentionHeadsBatchCausalDeviceRequest, query *hipDeviceByteBuffer, output *hipDeviceByteBuffer) error {
+	return hipRunAttentionHeadsBatchCausalOutputFromDeviceQueryToDeviceKernelWorkspace(ctx, driver, req, query, output, nil)
+}
+
+func hipRunAttentionHeadsBatchCausalOutputFromDeviceQueryToDeviceKernelWorkspace(ctx context.Context, driver nativeHIPDriver, req hipAttentionHeadsBatchCausalDeviceRequest, query *hipDeviceByteBuffer, output *hipDeviceByteBuffer, workspace *hipAttentionHeadsChunkedWorkspace) error {
 	if err := hipContextErr(ctx); err != nil {
 		return err
 	}
@@ -2074,13 +2080,20 @@ func hipRunAttentionHeadsBatchCausalOutputFromDeviceQueryToDeviceKernel(ctx cont
 		launch.SharedMemBytes = uint64(sharedMemBytes)
 	} else {
 		weightCount := req.QueryCount * req.HeadCount * req.TokenCount
-		weights, err = hipAllocateByteBuffer(driver, "rocm.hip.AttentionHeadsBatchCausalLaunch", "attention batch head weights", uint64(weightCount)*4, weightCount)
-		if err != nil {
-			return err
+		if workspace != nil && weightCount <= hipAttentionHeadsBatchWorkspaceMaxWeights {
+			weights, err = workspace.EnsureBatchAttentionWeights(driver, weightCount)
+			if err != nil {
+				return err
+			}
+		} else {
+			weights, err = hipAllocateByteBuffer(driver, "rocm.hip.AttentionHeadsBatchCausalLaunch", "attention batch head weights", uint64(weightCount)*4, weightCount)
+			if err != nil {
+				return err
+			}
+			defer weights.Close()
 		}
-		defer weights.Close()
 		launch.WeightPointer = weights.Pointer()
-		launch.WeightBytes = weights.SizeBytes()
+		launch.WeightBytes = uint64(weightCount) * 4
 	}
 	launchBytes, err := launch.Binary()
 	if err != nil {
@@ -2127,6 +2140,7 @@ type hipAttentionHeadsChunkedWorkspace struct {
 	RMSNoScaleOutputs    map[int]*hipDeviceByteBuffer
 	IntermediateOutputs  map[int]*hipDeviceByteBuffer
 	QKVOutputs           map[int]*hipDeviceByteBuffer
+	BatchAttentionWeight *hipDeviceByteBuffer
 	FinalHiddenOutputs   [2]map[int]*hipDeviceByteBuffer
 	NextInputOutputs     [2]map[int]*hipDeviceByteBuffer
 	PerLayerInputSet     hipGemma4Q4PerLayerInputDeviceSet
@@ -2135,6 +2149,7 @@ type hipAttentionHeadsChunkedWorkspace struct {
 	SuppressTokenBuffer  *hipDeviceTokenBuffer
 	partialCap           int
 	statsCap             int
+	batchWeightCap       int
 }
 
 func (workspace *hipAttentionHeadsChunkedWorkspace) Ensure(driver nativeHIPDriver, headCount, dim, tokenCount, chunkSize int) error {
@@ -2328,6 +2343,28 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureAttentionOutput(driver
 	}
 	workspace.AttentionOutputs[count] = output
 	return output, nil
+}
+
+func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureBatchAttentionWeights(driver nativeHIPDriver, count int) (*hipDeviceByteBuffer, error) {
+	if workspace == nil {
+		return nil, core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "attention workspace is required", nil)
+	}
+	if count <= 0 {
+		return nil, core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "attention batch weight count must be positive", nil)
+	}
+	if workspace.BatchAttentionWeight != nil && workspace.BatchAttentionWeight.Pointer() != 0 && workspace.batchWeightCap >= count {
+		return workspace.BatchAttentionWeight, nil
+	}
+	if err := workspace.BatchAttentionWeight.Close(); err != nil {
+		return nil, err
+	}
+	weights, err := hipAllocateByteBuffer(driver, "rocm.hip.AttentionHeadsBatchCausalLaunch", "attention batch head weights", uint64(count)*4, count)
+	if err != nil {
+		return nil, err
+	}
+	workspace.BatchAttentionWeight = weights
+	workspace.batchWeightCap = count
+	return weights, nil
 }
 
 func (workspace *hipAttentionHeadsChunkedWorkspace) ensureMappedOutput(driver nativeHIPDriver, outputs *map[int]*hipDeviceByteBuffer, count int, label string) (*hipDeviceByteBuffer, error) {
@@ -2602,6 +2639,9 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 	if err := workspace.SuppressTokenBuffer.Close(); err != nil {
 		lastErr = err
 	}
+	if err := workspace.BatchAttentionWeight.Close(); err != nil {
+		lastErr = err
+	}
 	for _, output := range workspace.EmbeddingOutputs {
 		if err := output.Close(); err != nil {
 			lastErr = err
@@ -2733,6 +2773,8 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 	workspace.TokenIDValue = 0
 	workspace.SuppressTokenBuffer = nil
 	workspace.SuppressTokenIDs = nil
+	workspace.BatchAttentionWeight = nil
+	workspace.batchWeightCap = 0
 	return lastErr
 }
 

@@ -829,6 +829,10 @@ func hipRunGemma4Q4PrefillLayerQueryBatchWithSharedKV(ctx context.Context, drive
 }
 
 func hipRunGemma4Q4PrefillAttentionBatch(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4Layer0Config, layer *hipGemma4Q4PrefillLayerKVBatch, tokenCount int, queryStartToken int) (*hipDeviceByteBuffer, error) {
+	return hipRunGemma4Q4PrefillAttentionBatchWorkspace(ctx, driver, cfg, layer, tokenCount, queryStartToken, nil)
+}
+
+func hipRunGemma4Q4PrefillAttentionBatchWorkspace(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4Layer0Config, layer *hipGemma4Q4PrefillLayerKVBatch, tokenCount int, queryStartToken int, workspace *hipAttentionHeadsChunkedWorkspace) (*hipDeviceByteBuffer, error) {
 	if err := hipContextErr(ctx); err != nil {
 		return nil, err
 	}
@@ -883,7 +887,7 @@ func hipRunGemma4Q4PrefillAttentionBatch(ctx context.Context, driver nativeHIPDr
 		attentionReq.DeviceKV = layer.DeviceKV.Cache
 		attentionReq.DescriptorTable = layer.DeviceKV.DescriptorTable
 	}
-	err = hipRunAttentionHeadsBatchCausalOutputFromDeviceQueryToDeviceKernel(ctx, driver, attentionReq, layer.QK.Query, output)
+	err = hipRunAttentionHeadsBatchCausalOutputFromDeviceQueryToDeviceKernelWorkspace(ctx, driver, attentionReq, layer.QK.Query, output, workspace)
 	if err != nil {
 		return nil, err
 	}
@@ -1014,6 +1018,10 @@ func hipRunGemma4Q4PrefillLayerBodyBatch(ctx context.Context, driver nativeHIPDr
 	return hipRunGemma4Q4PrefillLayerBodyBatchWithPerLayerInput(ctx, driver, cfg, input, layer, nil, tokenCount, queryStartToken, epsilon)
 }
 
+func hipRunGemma4Q4PrefillLayerBodyBatchWithPerLayerInputWorkspace(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4Layer0Config, input *hipDeviceByteBuffer, layer *hipGemma4Q4PrefillLayerKVBatch, perLayerInput *hipDeviceByteBuffer, tokenCount int, queryStartToken int, epsilon float32, workspace *hipAttentionHeadsChunkedWorkspace) (*hipGemma4Q4PrefillLayerBodyBatch, error) {
+	return hipRunGemma4Q4PrefillLayerBodyBatchWithPerLayerInputInternal(ctx, driver, cfg, input, layer, perLayerInput, tokenCount, queryStartToken, epsilon, workspace)
+}
+
 func hipValidateGemma4Q4PrefillForwardBatch(cfg hipGemma4Q4ForwardConfig, tokens []int32, startPosition int, priorLayerKV []*rocmDeviceKVCache, perLayerInputs []*hipDeviceByteBuffer, outputRows []bool) error {
 	if len(tokens) == 0 {
 		return core.E(hipGemma4Q4Layer0Operation, "prefill forward token span is required", nil)
@@ -1088,6 +1096,10 @@ func hipRunGemma4Q4PrefillForwardBatch(ctx context.Context, driver nativeHIPDriv
 }
 
 func hipRunGemma4Q4PrefillForwardBatchWithPrior(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4ForwardConfig, tokens []int32, startPosition int, epsilon float32, mode string, priorLayerKV []*rocmDeviceKVCache, perLayerInputs []*hipDeviceByteBuffer, outputRows []bool, best *hipDeviceByteBuffer) (*hipGemma4Q4PrefillForwardBatch, error) {
+	return hipRunGemma4Q4PrefillForwardBatchWithPriorWorkspace(ctx, driver, cfg, tokens, startPosition, epsilon, mode, priorLayerKV, perLayerInputs, outputRows, best, nil)
+}
+
+func hipRunGemma4Q4PrefillForwardBatchWithPriorWorkspace(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4ForwardConfig, tokens []int32, startPosition int, epsilon float32, mode string, priorLayerKV []*rocmDeviceKVCache, perLayerInputs []*hipDeviceByteBuffer, outputRows []bool, best *hipDeviceByteBuffer, workspace *hipAttentionHeadsChunkedWorkspace) (*hipGemma4Q4PrefillForwardBatch, error) {
 	if err := hipContextErr(ctx); err != nil {
 		return nil, err
 	}
@@ -1155,7 +1167,7 @@ func hipRunGemma4Q4PrefillForwardBatchWithPrior(ctx context.Context, driver nati
 		if queryStartToken < 0 {
 			return nil, core.E(hipGemma4Q4Layer0Operation, "prefill layer device KV token count is smaller than query batch", nil)
 		}
-		body, err := hipRunGemma4Q4PrefillLayerBodyBatchWithPerLayerInput(ctx, driver, layerCfg, layerInput, layerKV, perLayerInput, tokenCount, queryStartToken, epsilon)
+		body, err := hipRunGemma4Q4PrefillLayerBodyBatchWithPerLayerInputWorkspace(ctx, driver, layerCfg, layerInput, layerKV, perLayerInput, tokenCount, queryStartToken, epsilon, workspace)
 		if err != nil {
 			return nil, err
 		}
@@ -1254,6 +1266,10 @@ func hipRunGemma4Q4PrefillPerLayerInputProjectionBatch(ctx context.Context, driv
 }
 
 func hipRunGemma4Q4PrefillLayerBodyBatchWithPerLayerInput(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4Layer0Config, input *hipDeviceByteBuffer, layer *hipGemma4Q4PrefillLayerKVBatch, perLayerInput *hipDeviceByteBuffer, tokenCount int, queryStartToken int, epsilon float32) (*hipGemma4Q4PrefillLayerBodyBatch, error) {
+	return hipRunGemma4Q4PrefillLayerBodyBatchWithPerLayerInputInternal(ctx, driver, cfg, input, layer, perLayerInput, tokenCount, queryStartToken, epsilon, nil)
+}
+
+func hipRunGemma4Q4PrefillLayerBodyBatchWithPerLayerInputInternal(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4Layer0Config, input *hipDeviceByteBuffer, layer *hipGemma4Q4PrefillLayerKVBatch, perLayerInput *hipDeviceByteBuffer, tokenCount int, queryStartToken int, epsilon float32, workspace *hipAttentionHeadsChunkedWorkspace) (*hipGemma4Q4PrefillLayerBodyBatch, error) {
 	if err := hipContextErr(ctx); err != nil {
 		return nil, err
 	}
@@ -1296,7 +1312,7 @@ func hipRunGemma4Q4PrefillLayerBodyBatchWithPerLayerInput(ctx context.Context, d
 		}
 	}()
 	var err error
-	out.AttentionOutput, err = hipRunGemma4Q4PrefillAttentionBatch(ctx, driver, cfg, layer, tokenCount, queryStartToken)
+	out.AttentionOutput, err = hipRunGemma4Q4PrefillAttentionBatchWorkspace(ctx, driver, cfg, layer, tokenCount, queryStartToken, workspace)
 	if err != nil {
 		return nil, err
 	}
