@@ -46,6 +46,7 @@ func TestHIPRuntime_LoadModelAllocatesAndCopiesGGUFTensors_Good(t *testing.T) {
 	core.AssertNotNil(t, model)
 	core.AssertEqual(t, []uint64{16, 16}, driver.allocations)
 	core.AssertEqual(t, []uint64{16, 16}, driver.copies)
+	core.AssertEqual(t, 2, driver.pinnedCopies)
 	stream, errFn := model.Generate(context.Background(), "hello", inference.DefaultGenerateConfig())
 	for range stream {
 	}
@@ -1740,6 +1741,7 @@ func TestHIPRuntime_LoadModelBadFreesAllTensorsOnSecondCopyFailure_Bad(t *testin
 	core.AssertNil(t, model)
 	core.AssertEqual(t, []uint64{16, 16}, driver.allocations)
 	core.AssertEqual(t, []uint64{16, 16}, driver.copies)
+	core.AssertEqual(t, 2, driver.pinnedCopies)
 	core.AssertEqual(t, 2, len(driver.frees))
 }
 
@@ -1892,6 +1894,7 @@ func TestHIPRuntime_LoadModelCopiesShardedSafetensorsSources_Good(t *testing.T) 
 	core.AssertNotNil(t, model)
 	core.AssertEqual(t, []uint64{64, 32}, driver.allocations)
 	core.AssertEqual(t, []uint64{64, 32}, driver.copies)
+	core.AssertEqual(t, 2, driver.pinnedCopies)
 	core.AssertNoError(t, model.Close())
 	core.AssertEqual(t, 2, len(driver.frees))
 }

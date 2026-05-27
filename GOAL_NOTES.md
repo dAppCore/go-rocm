@@ -17650,3 +17650,51 @@ regressed materially from the accepted `109.4 tok/s`/`18.71s` route, and the
 (`10.83s` wall, `98.93 tok/s`, turn 2 `102.5 tok/s`). The reduced launch/block
 count still does not translate to throughput on the RX 7800 XT. Keep both
 sliding and full/global chunked attention at the 128-token grain.
+
+## 2026-05-27 Accepted Pinned Model Tensor Uploads
+
+The `go-mlx/IDEAS.md` Gemma4 notes reinforce the same direction as the ROCm
+profile: keep retained state contiguous, avoid extra host copies, and use the
+Go pinned-memory path before chasing larger kernel rewrites. The 2048
+memprofile before this change showed model-load allocation space dominated by
+`copyTensorToDevice` (`1113.91MB` flat in `/tmp/go-rocm-2048-current.mem`).
+
+`copyTensorToDevice` now uploads each tensor chunk through
+`hipCopyPinnedHostToDevice`, preserving the fallback for drivers without the
+pinned interface while letting cgo/no-cgo implementations share the same
+`core.PinnedView` route used by retained KV uploads.
+
+Verification:
+
+```text
+go test ./go -run 'TestHIPRuntime_LoadModel(AllocatesAndCopiesGGUFTensors_Good|BadFreesAllTensorsOnSecondCopyFailure_Bad|CopiesShardedSafetensorsSources_Good)$' -count=1 -v
+PASS
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -run 'TestHIPRuntime_LoadModel(AllocatesAndCopiesGGUFTensors_Good|BadFreesAllTensorsOnSecondCopyFailure_Bad|CopiesShardedSafetensorsSources_Good)$' -count=1 -v
+PASS
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.137s
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.110s
+```
+
+2048-token guard on RX 7800 XT:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 18712910058 ns/op
+tok/s=109.4
+tokens=2048
+B/op=5460520
+allocs/op=4700
+kernel_total_launches=999352
+kernel_total_blocks=165483379
+stderr: .bench-errors/2048_pinned_model_copy_20260527.err (0 bytes)
+```
+
+Conclusion: pinned tensor uploads preserve the accepted short decode baseline
+(`109.2 tok/s` before, `109.4 tok/s` after) while moving the load/transfer path
+onto the same pinned-copy primitive needed for the later `.kv`/`.mp4`
+zero-copy work. The open production blocker remains retained full/global
+attention scaling in late book turns.

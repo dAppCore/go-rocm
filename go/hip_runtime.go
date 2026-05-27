@@ -644,7 +644,7 @@ func copyTensorToDevice(driver nativeHIPDriver, path string, dataOffset int64, t
 		if _, err := io.ReadFull(file, buffer[:chunk]); err != nil {
 			return err
 		}
-		if err := driver.CopyHostToDevice(tensor.pointer+nativeDevicePointer(copied), buffer[:chunk]); err != nil {
+		if err := hipCopyPinnedHostToDevice(driver, tensor.pointer+nativeDevicePointer(copied), buffer[:chunk]); err != nil {
 			return err
 		}
 		copied += uint64(chunk)
