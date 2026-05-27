@@ -59,6 +59,11 @@ constexpr uint32_t ROCM_MLX_Q4_PROJECTION_BATCH_TOKENS_PER_BLOCK = 8;
 constexpr uint32_t ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK = 32;
 constexpr uint32_t ROCM_MLX_Q4_PROJECTION_GREEDY_THREADS_PER_ROW = ROCM_MLX_Q4_PROJECTION_BLOCK_SIZE / ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK;
 constexpr uint32_t ROCM_MLX_Q4_PROJECTION_BEST_BYTES = 8;
+constexpr uint32_t ROCM_PACKED_TOPK_LAUNCH_ARGS_VERSION = 1;
+constexpr uint32_t ROCM_PACKED_TOPK_LAUNCH_ARGS_BYTES = 48;
+constexpr uint32_t ROCM_PACKED_TOPK_MAX_K = 128;
+constexpr uint32_t ROCM_PACKED_TOPK_BLOCK_SIZE = 256;
+constexpr uint32_t ROCM_PACKED_TOPK_CHUNK_SIZE = 512;
 constexpr uint32_t ROCM_RMS_NORM_LAUNCH_ARGS_VERSION = 1;
 constexpr uint32_t ROCM_RMS_NORM_LAUNCH_ARGS_BYTES = 64;
 constexpr uint32_t ROCM_RMS_NORM_RESIDUAL_ADD_LAUNCH_ARGS_VERSION = 1;
@@ -340,6 +345,19 @@ struct rocm_mlx_q4_projection_batch_launch_args {
 	uint32_t bias_bytes;
 	uint32_t output_bytes;
 	uint32_t reserved0;
+};
+
+struct rocm_packed_topk_launch_args {
+	uint32_t version;
+	uint32_t total_bytes;
+	uint64_t input_pointer;
+	uint64_t output_pointer;
+	uint32_t input_count;
+	uint32_t output_count;
+	uint32_t top_k;
+	uint32_t chunk_size;
+	uint32_t input_bytes;
+	uint32_t output_bytes;
 };
 
 struct rocm_mlx_q4_triple_projection_launch_args {
@@ -1466,6 +1484,25 @@ __device__ bool rocm_valid_mlx_q4_projection_scores_args(const rocm_mlx_q4_proje
 	return args.weight_bytes == args.rows * packed_per_row * sizeof(uint32_t) &&
 		args.scale_bytes == args.rows * groups_per_row * sizeof(uint16_t) &&
 			args.bias_bytes == args.rows * groups_per_row * sizeof(uint16_t);
+}
+
+__device__ bool rocm_valid_packed_topk_args(const rocm_packed_topk_launch_args &args)
+{
+	if (args.version != ROCM_PACKED_TOPK_LAUNCH_ARGS_VERSION ||
+		args.total_bytes != ROCM_PACKED_TOPK_LAUNCH_ARGS_BYTES ||
+		args.input_pointer == 0 ||
+		args.output_pointer == 0 ||
+		args.input_count == 0 ||
+		args.output_count == 0 ||
+		args.top_k == 0 ||
+		args.top_k > ROCM_PACKED_TOPK_MAX_K ||
+		args.chunk_size != ROCM_PACKED_TOPK_CHUNK_SIZE ||
+		args.input_bytes != args.input_count * ROCM_MLX_Q4_PROJECTION_BEST_BYTES ||
+		args.output_bytes != args.output_count * ROCM_MLX_Q4_PROJECTION_BEST_BYTES) {
+		return false;
+	}
+	const uint32_t chunk_count = (args.input_count + args.chunk_size - 1u) / args.chunk_size;
+	return args.output_count == chunk_count * args.top_k;
 }
 
 __device__ bool rocm_mlx_q4_token_suppressed(uint32_t row, const int32_t *suppress_tokens, uint32_t suppress_count)
@@ -3463,6 +3500,47 @@ extern "C" __global__ void rocm_mlx_q4_projection_scores(const unsigned char *pa
 			packed = static_cast<unsigned long long>(rocm_pack_score_index(sum, row));
 		}
 		scores[row] = packed;
+	}
+}
+
+extern "C" __global__ void rocm_packed_topk(const unsigned char *packet)
+{
+	if (packet == nullptr) {
+		return;
+	}
+	const rocm_packed_topk_launch_args &args = *reinterpret_cast<const rocm_packed_topk_launch_args *>(packet);
+	if (!rocm_valid_packed_topk_args(args) || blockDim.x != ROCM_PACKED_TOPK_BLOCK_SIZE) {
+		return;
+	}
+	__shared__ unsigned long long scratch[ROCM_PACKED_TOPK_CHUNK_SIZE];
+	const uint32_t chunk_begin = blockIdx.x * args.chunk_size;
+	const unsigned long long *input = reinterpret_cast<const unsigned long long *>(static_cast<uintptr_t>(args.input_pointer));
+	unsigned long long *output = reinterpret_cast<unsigned long long *>(static_cast<uintptr_t>(args.output_pointer));
+	for (uint32_t local = threadIdx.x; local < ROCM_PACKED_TOPK_CHUNK_SIZE; local += blockDim.x) {
+		const uint32_t index = chunk_begin + local;
+		scratch[local] = index < args.input_count ? input[index] : 0;
+	}
+	__syncthreads();
+
+	for (uint32_t width = 2u; width <= ROCM_PACKED_TOPK_CHUNK_SIZE; width <<= 1u) {
+		for (uint32_t stride = width >> 1u; stride > 0u; stride >>= 1u) {
+			for (uint32_t local = threadIdx.x; local < ROCM_PACKED_TOPK_CHUNK_SIZE; local += blockDim.x) {
+				const uint32_t other = local ^ stride;
+				if (other > local) {
+					const bool descending = (local & width) == 0u;
+					const unsigned long long left = scratch[local];
+					const unsigned long long right = scratch[other];
+					if ((descending && left < right) || (!descending && left > right)) {
+						scratch[local] = right;
+						scratch[other] = left;
+					}
+				}
+			}
+			__syncthreads();
+		}
+	}
+	if (threadIdx.x < args.top_k) {
+		output[blockIdx.x * args.top_k + threadIdx.x] = scratch[threadIdx.x];
 	}
 }
 

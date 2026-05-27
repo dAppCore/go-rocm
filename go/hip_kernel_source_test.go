@@ -30,6 +30,7 @@ func TestHIPKernelSource_ExportsLaunchABI_Good(t *testing.T) {
 		`extern "C" __global__ void rocm_mlx_q4_projection_batch`,
 		`extern "C" __global__ void rocm_mlx_q4_projection_greedy`,
 		`extern "C" __global__ void rocm_mlx_q4_projection_scores`,
+		`extern "C" __global__ void rocm_packed_topk`,
 		`extern "C" __global__ void rocm_mlx_q4_triple_projection`,
 		`extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply`,
 		`extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply_batch`,
@@ -122,6 +123,10 @@ func TestHIPKernelSource_ExportsLaunchABI_Good(t *testing.T) {
 		core.Sprintf("ROCM_MLX_Q4_PROJECTION_ROWS_PER_BLOCK = %d", hipMLXQ4ProjectionRowsPerBlock),
 		core.Sprintf("ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK = %d", hipMLXQ4ProjectionGreedyRowsPerBlock),
 		core.Sprintf("ROCM_MLX_Q4_PROJECTION_BEST_BYTES = %d", hipMLXQ4ProjectionBestBytes),
+		core.Sprintf("ROCM_PACKED_TOPK_LAUNCH_ARGS_VERSION = %d", hipPackedTopKLaunchArgsVersion),
+		core.Sprintf("ROCM_PACKED_TOPK_LAUNCH_ARGS_BYTES = %d", hipPackedTopKLaunchArgsBytes),
+		core.Sprintf("ROCM_PACKED_TOPK_MAX_K = %d", hipPackedTopKMaxK),
+		core.Sprintf("ROCM_PACKED_TOPK_BLOCK_SIZE = %d", hipPackedTopKBlockSize),
 		core.Sprintf("ROCM_RMS_NORM_LAUNCH_ARGS_VERSION = %d", hipRMSNormLaunchArgsVersion),
 		core.Sprintf("ROCM_RMS_NORM_LAUNCH_ARGS_BYTES = %d", hipRMSNormLaunchArgsBytes),
 		core.Sprintf("ROCM_RMS_NORM_RESIDUAL_ADD_LAUNCH_ARGS_VERSION = %d", hipRMSNormResidualAddArgsVersion),
@@ -273,6 +278,12 @@ func TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good(t *test
 	core.AssertTrue(t, strings.Contains(scores, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK + row_lane`), "score grid uses greedy row blocks")
 	core.AssertTrue(t, strings.Contains(scores, `scores[row] = packed`), "score projection writes one packed score per vocab row")
 	core.AssertTrue(t, strings.Contains(scores, `!rocm_mlx_q4_token_suppressed(row, suppress_tokens, args.suppress_count)`), "score projection filters suppressed rows on device")
+
+	topK := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_packed_topk`)
+	core.AssertTrue(t, strings.Contains(topK, `__shared__ unsigned long long scratch[ROCM_PACKED_TOPK_CHUNK_SIZE]`), "packed top-k uses shared chunk sort")
+	core.AssertTrue(t, strings.Contains(topK, `blockIdx.x * args.chunk_size`), "packed top-k partitions scores by chunk")
+	core.AssertTrue(t, strings.Contains(topK, `local ^ stride`), "packed top-k uses parallel compare-swap passes")
+	core.AssertTrue(t, strings.Contains(topK, `output[blockIdx.x * args.top_k + threadIdx.x] = scratch[threadIdx.x]`), "packed top-k writes chunk-local candidates")
 }
 
 func TestHIPKernelSource_EmbeddingGreedyTokenReadsPackedBest_Good(t *testing.T) {

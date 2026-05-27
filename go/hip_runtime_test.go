@@ -2290,6 +2290,8 @@ func (driver *fakeHIPDriver) LaunchKernel(config hipKernelLaunchConfig) error {
 		return driver.launchMLXQ4ProjectionGreedy(config.Args)
 	case hipKernelNameMLXQ4ProjScores:
 		return driver.launchMLXQ4ProjectionScores(config.Args)
+	case hipKernelNamePackedTopK:
+		return driver.launchPackedTopK(config.Args)
 	case hipKernelNameMLXQ4TripleProj:
 		return driver.launchMLXQ4TripleProjection(config.Args)
 	case hipKernelNameMLXQ4GELUTanhMul:
@@ -3795,6 +3797,56 @@ func (driver *fakeHIPDriver) launchMLXQ4ProjectionScores(args []byte) error {
 			packed = hipPackGreedyBest(score, index)
 		}
 		binary.LittleEndian.PutUint64(outputData[outputOffset+index*8:], packed)
+	}
+	return nil
+}
+
+func (driver *fakeHIPDriver) launchPackedTopK(args []byte) error {
+	if len(args) != hipPackedTopKLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "packed top-k launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipPackedTopKLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipPackedTopKLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "packed top-k launch header mismatch", nil)
+	}
+	inputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	inputCount := int(binary.LittleEndian.Uint32(args[24:]))
+	outputCount := int(binary.LittleEndian.Uint32(args[28:]))
+	topK := int(binary.LittleEndian.Uint32(args[32:]))
+	chunkSize := int(binary.LittleEndian.Uint32(args[36:]))
+	inputBytes := int(binary.LittleEndian.Uint32(args[40:]))
+	outputBytes := int(binary.LittleEndian.Uint32(args[44:]))
+	if inputCount <= 0 || outputCount <= 0 || topK <= 0 || topK > hipPackedTopKMaxK || chunkSize != hipPackedTopKChunkSize ||
+		inputBytes != inputCount*hipMLXQ4ProjectionBestBytes ||
+		outputBytes != outputCount*hipMLXQ4ProjectionBestBytes ||
+		outputCount != ((inputCount+chunkSize-1)/chunkSize)*topK {
+		return core.E("rocm.hip.FakeLaunch", "packed top-k shape metadata mismatch", nil)
+	}
+	inputData, inputOffset, ok := driver.memoryForPointer(inputPointer, inputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "packed top-k input buffer is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "packed top-k output buffer is missing", nil)
+	}
+	chunkCount := (inputCount + chunkSize - 1) / chunkSize
+	for chunk := 0; chunk < chunkCount; chunk++ {
+		begin := inputOffset + chunk*chunkSize*hipMLXQ4ProjectionBestBytes
+		endIndex := (chunk + 1) * chunkSize
+		if endIndex > inputCount {
+			endIndex = inputCount
+		}
+		end := inputOffset + endIndex*hipMLXQ4ProjectionBestBytes
+		top := hipTopPackedScoresBytes(inputData[begin:end], topK)
+		for index := 0; index < topK; index++ {
+			value := uint64(0)
+			if index < len(top) {
+				value = top[index]
+			}
+			binary.LittleEndian.PutUint64(outputData[outputOffset+(chunk*topK+index)*hipMLXQ4ProjectionBestBytes:], value)
+		}
 	}
 	return nil
 }

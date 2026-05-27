@@ -3009,6 +3009,39 @@ func BenchmarkHIPMLXQ4TripleProjLaunchArgsBinary_Hot(b *testing.B) {
 	}
 }
 
+func BenchmarkHIPPackedTopKLaunchArgsBinary_Hot(b *testing.B) {
+	inputCount := 256000
+	topK := 64
+	chunkCount := (inputCount + hipPackedTopKChunkSize - 1) / hipPackedTopKChunkSize
+	outputCount := chunkCount * topK
+	args := hipPackedTopKLaunchArgs{
+		InputPointer:  0x1000,
+		OutputPointer: 0x2000,
+		InputCount:    inputCount,
+		OutputCount:   outputCount,
+		TopK:          topK,
+		ChunkSize:     hipPackedTopKChunkSize,
+		InputBytes:    uint64(inputCount * hipMLXQ4ProjectionBestBytes),
+		OutputBytes:   uint64(outputCount * hipMLXQ4ProjectionBestBytes),
+	}
+	packet, err := args.Binary()
+	if err != nil {
+		b.Fatal(err)
+	}
+	hipReleaseLaunchPacket(packet)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		packet, err = args.Binary()
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(packet) != hipPackedTopKLaunchArgsBytes {
+			b.Fatalf("packet len = %d, want %d", len(packet), hipPackedTopKLaunchArgsBytes)
+		}
+		hipReleaseLaunchPacket(packet)
+	}
+}
+
 func BenchmarkHIPMLXQ4GELUTanhMultiplyLaunchArgsBinary_Hot(b *testing.B) {
 	args := hipMLXQ4GELUTanhMulLaunchArgs{
 		InputPointer:      0x1000,

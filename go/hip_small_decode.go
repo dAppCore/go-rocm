@@ -2286,6 +2286,8 @@ type hipAttentionHeadsChunkedWorkspace struct {
 	QKVOutputs           map[int]*hipDeviceByteBuffer
 	ProjectionScore      *hipDeviceByteBuffer
 	ProjectionScoreBytes []byte
+	ProjectionTopK       *hipDeviceByteBuffer
+	ProjectionTopKBytes  []byte
 	BatchAttentionWeight *hipDeviceByteBuffer
 	FinalHiddenOutputs   [2]map[int]*hipDeviceByteBuffer
 	NextInputOutputs     [2]map[int]*hipDeviceByteBuffer
@@ -2599,6 +2601,41 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) ProjectionScorePayload(count
 	return workspace.ProjectionScoreBytes[:byteCount], nil
 }
 
+func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureProjectionTopKOutput(driver nativeHIPDriver, count int) (*hipDeviceByteBuffer, error) {
+	if workspace == nil {
+		return nil, core.E("rocm.hip.PackedTopKLaunch", "attention workspace is required", nil)
+	}
+	if count <= 0 {
+		return nil, core.E("rocm.hip.PackedTopKLaunch", "projection top-k count must be positive", nil)
+	}
+	if workspace.ProjectionTopK != nil && workspace.ProjectionTopK.Pointer() != 0 && workspace.ProjectionTopK.Count() == count && workspace.ProjectionTopK.SizeBytes() == uint64(count*hipMLXQ4ProjectionBestBytes) {
+		return workspace.ProjectionTopK, nil
+	}
+	if err := workspace.ProjectionTopK.Close(); err != nil {
+		return nil, err
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.PackedTopKLaunch", "MLX q4 projection top-k partial scores", uint64(count*hipMLXQ4ProjectionBestBytes), count)
+	if err != nil {
+		return nil, err
+	}
+	workspace.ProjectionTopK = output
+	return output, nil
+}
+
+func (workspace *hipAttentionHeadsChunkedWorkspace) ProjectionTopKPayload(count int) ([]byte, error) {
+	if workspace == nil {
+		return nil, core.E("rocm.hip.PackedTopKLaunch", "attention workspace is required", nil)
+	}
+	if count <= 0 {
+		return nil, core.E("rocm.hip.PackedTopKLaunch", "projection top-k count must be positive", nil)
+	}
+	byteCount := count * hipMLXQ4ProjectionBestBytes
+	if cap(workspace.ProjectionTopKBytes) < byteCount {
+		workspace.ProjectionTopKBytes = make([]byte, byteCount)
+	}
+	return workspace.ProjectionTopKBytes[:byteCount], nil
+}
+
 func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureActivationOutput(driver nativeHIPDriver, count int) (*hipDeviceByteBuffer, error) {
 	if workspace == nil {
 		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "attention workspace is required", nil)
@@ -2826,6 +2863,9 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 	if err := workspace.ProjectionScore.Close(); err != nil {
 		lastErr = err
 	}
+	if err := workspace.ProjectionTopK.Close(); err != nil {
+		lastErr = err
+	}
 	for _, output := range workspace.EmbeddingOutputs {
 		if err := output.Close(); err != nil {
 			lastErr = err
@@ -2960,6 +3000,8 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 	workspace.BatchAttentionWeight = nil
 	workspace.ProjectionScore = nil
 	workspace.ProjectionScoreBytes = nil
+	workspace.ProjectionTopK = nil
+	workspace.ProjectionTopKBytes = nil
 	workspace.batchWeightCap = 0
 	return lastErr
 }

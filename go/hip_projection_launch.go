@@ -33,12 +33,17 @@ const (
 	hipMLXQ4GELUTanhProjLaunchArgsBytes               = 96
 	hipMLXQ4GELUTanhProjBatchLaunchArgsVersion uint32 = 1
 	hipMLXQ4GELUTanhProjBatchLaunchArgsBytes          = 104
+	hipPackedTopKLaunchArgsVersion             uint32 = 1
+	hipPackedTopKLaunchArgsBytes                      = 48
 	hipMLXQ4ProjectionBits                            = 4
 	hipMLXQ4ProjectionBlockSize                uint32 = 256
 	hipMLXQ4ProjectionRowsPerBlock                    = 8
 	hipMLXQ4ProjectionBatchTokensPerBlock             = 8
 	hipMLXQ4ProjectionGreedyRowsPerBlock              = 32
 	hipMLXQ4ProjectionBestBytes                       = 8
+	hipPackedTopKMaxK                                 = 128
+	hipPackedTopKBlockSize                     uint32 = 256
+	hipPackedTopKChunkSize                            = 512
 )
 
 const (
@@ -181,6 +186,17 @@ type hipMLXQ4ProjectionLaunchArgs struct {
 	ScaleBytes      uint64
 	BiasBytes       uint64
 	OutputBytes     uint64
+}
+
+type hipPackedTopKLaunchArgs struct {
+	InputPointer  nativeDevicePointer
+	OutputPointer nativeDevicePointer
+	InputCount    int
+	OutputCount   int
+	TopK          int
+	ChunkSize     int
+	InputBytes    uint64
+	OutputBytes   uint64
 }
 
 type hipMLXQ4ProjectionBatchLaunchArgs struct {
@@ -755,6 +771,62 @@ func (args hipMLXQ4ProjectionLaunchArgs) GreedyBinary() ([]byte, error) {
 
 func (args hipMLXQ4ProjectionLaunchArgs) ScoresBinary() ([]byte, error) {
 	return args.binary(hipMLXQ4ProjectionOutputScores)
+}
+
+func (args hipPackedTopKLaunchArgs) Binary() ([]byte, error) {
+	if args.InputPointer == 0 || args.OutputPointer == 0 {
+		return nil, core.E("rocm.hip.PackedTopKLaunch", "input and output pointers are required", nil)
+	}
+	inputCount, err := rocmDeviceKVPositiveUint32("packed top-k input count", args.InputCount)
+	if err != nil {
+		return nil, err
+	}
+	outputCount, err := rocmDeviceKVPositiveUint32("packed top-k output count", args.OutputCount)
+	if err != nil {
+		return nil, err
+	}
+	topK, err := rocmDeviceKVPositiveUint32("packed top-k", args.TopK)
+	if err != nil {
+		return nil, err
+	}
+	if topK > hipPackedTopKMaxK {
+		return nil, core.E("rocm.hip.PackedTopKLaunch", "top-k exceeds kernel maximum", nil)
+	}
+	chunkSize, err := rocmDeviceKVPositiveUint32("packed top-k chunk size", args.ChunkSize)
+	if err != nil {
+		return nil, err
+	}
+	if args.ChunkSize != hipPackedTopKChunkSize {
+		return nil, core.E("rocm.hip.PackedTopKLaunch", "chunk size mismatch", nil)
+	}
+	chunkCount := (args.InputCount + args.ChunkSize - 1) / args.ChunkSize
+	if args.OutputCount != chunkCount*args.TopK {
+		return nil, core.E("rocm.hip.PackedTopKLaunch", "output count mismatch", nil)
+	}
+	if args.InputBytes != uint64(args.InputCount*hipMLXQ4ProjectionBestBytes) {
+		return nil, core.E("rocm.hip.PackedTopKLaunch", "input byte count mismatch", nil)
+	}
+	if args.OutputBytes != uint64(args.OutputCount*hipMLXQ4ProjectionBestBytes) {
+		return nil, core.E("rocm.hip.PackedTopKLaunch", "output byte count mismatch", nil)
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.PackedTopKLaunch", "input bytes", args.InputBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.PackedTopKLaunch", "output bytes", args.OutputBytes); err != nil {
+		return nil, err
+	}
+	payload := hipBorrowLaunchPacket(hipPackedTopKLaunchArgsBytes)
+	binary.LittleEndian.PutUint32(payload[0:], hipPackedTopKLaunchArgsVersion)
+	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
+	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
+	binary.LittleEndian.PutUint64(payload[16:], uint64(args.OutputPointer))
+	binary.LittleEndian.PutUint32(payload[24:], inputCount)
+	binary.LittleEndian.PutUint32(payload[28:], outputCount)
+	binary.LittleEndian.PutUint32(payload[32:], topK)
+	binary.LittleEndian.PutUint32(payload[36:], chunkSize)
+	binary.LittleEndian.PutUint32(payload[40:], uint32(args.InputBytes))
+	binary.LittleEndian.PutUint32(payload[44:], uint32(args.OutputBytes))
+	return payload, nil
 }
 
 const (
@@ -2358,6 +2430,48 @@ func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppress(ctx c
 	return hipGreedySampleResult{TokenID: tokenID, Score: score}, nil
 }
 
+func hipRunPackedTopKKernelWithWorkspace(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, inputCount, topK int, workspace *hipAttentionHeadsChunkedWorkspace) (*hipDeviceByteBuffer, int, error) {
+	if input == nil || input.Pointer() == 0 {
+		return nil, 0, core.E("rocm.hip.PackedTopKLaunch", "packed score input is required", nil)
+	}
+	if inputCount <= 0 || input.Count() != inputCount || input.SizeBytes() != uint64(inputCount*hipMLXQ4ProjectionBestBytes) {
+		return nil, 0, core.E("rocm.hip.PackedTopKLaunch", "packed score input shape mismatch", nil)
+	}
+	if topK <= 0 || topK > hipPackedTopKMaxK {
+		return nil, 0, core.E("rocm.hip.PackedTopKLaunch", "top-k must be within kernel maximum", nil)
+	}
+	if workspace == nil {
+		return nil, 0, core.E("rocm.hip.PackedTopKLaunch", "attention workspace is required", nil)
+	}
+	chunkCount := (inputCount + hipPackedTopKChunkSize - 1) / hipPackedTopKChunkSize
+	outputCount := chunkCount * topK
+	output, err := workspace.EnsureProjectionTopKOutput(driver, outputCount)
+	if err != nil {
+		return nil, 0, err
+	}
+	launchBytes, err := (hipPackedTopKLaunchArgs{
+		InputPointer:  input.Pointer(),
+		OutputPointer: output.Pointer(),
+		InputCount:    inputCount,
+		OutputCount:   outputCount,
+		TopK:          topK,
+		ChunkSize:     hipPackedTopKChunkSize,
+		InputBytes:    input.SizeBytes(),
+		OutputBytes:   output.SizeBytes(),
+	}).Binary()
+	if err != nil {
+		return nil, 0, err
+	}
+	config, err := hipPackedTopKLaunchConfig(launchBytes, chunkCount)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := hipLaunchKernel(driver, config); err != nil {
+		return nil, 0, err
+	}
+	return output, outputCount, nil
+}
+
 func hipRunMLXQ4ProjectionSoftcapScoreKernelWithDeviceInputBufferSuppress(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, topK int, suppressTokens []int32, workspace *hipAttentionHeadsChunkedWorkspace) ([]hipGreedySampleResult, error) {
 	if input == nil || input.Pointer() == 0 {
 		return nil, core.E("rocm.hip.MLXQ4ProjectionScoresLaunch", "MLX q4 projection device input is required", nil)
@@ -2435,12 +2549,16 @@ func hipRunMLXQ4ProjectionSoftcapScoreKernelWithDeviceInputBufferSuppress(ctx co
 	}
 	var top []uint64
 	if workspace != nil {
-		payload, err := workspace.ProjectionScorePayload(cfg.Rows)
+		partial, partialCount, err := hipRunPackedTopKKernelWithWorkspace(ctx, driver, scores, cfg.Rows, topK, workspace)
 		if err != nil {
 			return nil, err
 		}
-		if err := driver.CopyDeviceToHost(scores.Pointer(), payload); err != nil {
-			return nil, core.E("rocm.hip.MLXQ4ProjectionScoresLaunch", "copy MLX q4 projection packed scores", err)
+		payload, err := workspace.ProjectionTopKPayload(partialCount)
+		if err != nil {
+			return nil, err
+		}
+		if err := driver.CopyDeviceToHost(partial.Pointer(), payload); err != nil {
+			return nil, core.E("rocm.hip.PackedTopKLaunch", "copy packed top-k partial scores", err)
 		}
 		top = hipTopPackedScoresBytes(payload, topK)
 	} else {
@@ -2547,6 +2665,24 @@ func hipMLXQ4ProjectionScoresLaunchConfig(args []byte, rows int) (hipKernelLaunc
 		GridY:  1,
 		GridZ:  1,
 		BlockX: hipMLXQ4ProjectionBlockSize,
+		BlockY: 1,
+		BlockZ: 1,
+	}
+	return config, config.Validate()
+}
+
+func hipPackedTopKLaunchConfig(args []byte, chunkCount int) (hipKernelLaunchConfig, error) {
+	gridX, err := rocmDeviceKVPositiveUint32("packed top-k chunks", chunkCount)
+	if err != nil {
+		return hipKernelLaunchConfig{}, err
+	}
+	config := hipKernelLaunchConfig{
+		Name:   hipKernelNamePackedTopK,
+		Args:   args,
+		GridX:  gridX,
+		GridY:  1,
+		GridZ:  1,
+		BlockX: hipPackedTopKBlockSize,
 		BlockY: 1,
 		BlockZ: 1,
 	}

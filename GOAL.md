@@ -452,39 +452,38 @@ final q4 LM-head score for every vocab row on device, filters suppressed tokens
 there, and returns packed score/index candidates so host top-k/top-p sampling no
 longer forces the full logits projection/readback path when `TopK > 0` and
 `RepeatPenalty <= 1`. The 2-turn, 8-token retained smoke with sampling defaults
-now completes in `0.628s` wall, `0.1298s` decode, `16` generated tokens,
-`118.8 tok/s` on the last turn, `10203208 B/op`, `16359 allocs/op`, and an
-empty `.err` file after reusing the packed-score device buffer and host payload
-inside the decode workspace. The stricter 2048-token greedy guard remained green
-with the same HSACO at `18784729332 ns/op`, `109.0 tok/s`, `6630256 B/op`, and
-`2517 allocs/op`, so the production greedy path was not regressed.
+now completes in `0.626s` wall, `0.1279s` decode, `16` generated tokens,
+`120.6 tok/s` on the last turn, `8368848 B/op`, `16369 allocs/op`, and an
+empty `.err` file after reusing the packed-score device buffer and reducing
+scores through a parallel shared-memory `rocm_packed_topk` chunk pass before the
+host readback. The stricter 2048-token greedy guard remained green with the same
+HSACO at `18814378103 ns/op`, `108.9 tok/s`, `6629120 B/op`, and
+`2515 allocs/op`, so the production greedy path was not regressed.
 
-Do not treat that sampled path as production-complete yet. The full 10-turn
-retained book with sampling defaults now runs fast enough at `34.83s` wall,
-`30.83s` decode, `2741` generated tokens, `78.69 tok/s` average, and
-`72.72 tok/s` on turn 10, with `208676552 B/op`, `111864 allocs/op`, no cap
-hits, and empty stderr. However, chapter 10 still drifted partly into the turn-10
-architecture distractor and scored only `2` lighthouse/light/ocean arc anchors.
-The current bridge also still transfers `vocab_rows * 8` packed-score bytes from
-device to host per sampled token even though that memory is now pooled. The
-immediate follow-up is a device-side top-k reduction that copies only selected
-candidates, plus sampled-quality tuning against the distractor gate. Until that
-lands, the production acceptance route remains device-greedy: with
+Do not treat that sampled path as production-complete yet. A full 10-turn
+retained book with sampling defaults and the parallel top-k reducer completed at
+`43.54s` wall, `39.01s` decode, `3384` generated tokens, `77.73 tok/s` average,
+and `65.60 tok/s` on turn 10, with `239861224 B/op`, `116712 allocs/op`, no cap
+hits, and empty stderr. That proves the transfer-reduction route is mechanically
+viable, but chapter 10 drifted into the distractor stream and scored `0`
+lighthouse/light/ocean arc anchors. The sampled-quality follow-up is now the
+blocker, not sampled runtime or full-logits readback. Until that lands, the
+production acceptance route remains device-greedy: with
 `GO_ROCM_BOOK_TEMPERATURE=0`, `GO_ROCM_BOOK_TOP_P=0`, and
 `GO_ROCM_BOOK_TOP_K=0`, the full 10-turn retained book passes at `37.63s` wall,
 `33.51s` decode, `3021` generated tokens, `80.29 tok/s` average, `69.20 tok/s`
 on turn 10, `205163552 B/op`, `99123 allocs/op`, empty stderr, no chapter cap
 hits, and `3` chapter-10 arc anchors.
 
-Rejected device-side packed top-k reduction attempt: a second-stage
+Rejected device-side packed top-k reduction attempt: an earlier second-stage
 `rocm_packed_topk` kernel that scanned 512-score chunks on device compiled with
 `--std=c++23` and passed the fake/source tests, but the 2-turn sampled retained
 smoke regressed to `0.746s` wall, `0.2208s` decode, `16` generated tokens, and
 only `71.0 tok/s` on the last turn. Allocation improved slightly to
 `8368784 B/op` with empty stderr, but the serial per-chunk reduction cost more
-than the saved device-to-host copy. Do not reintroduce that shape; the next
-top-k reduction needs a parallel/warp-level reduction or fusion into the q4
-score kernel that keeps sampled decode above the 90 tok/s guard.
+than the saved device-to-host copy. Do not reintroduce that serial shape; keep
+the parallel/shared-memory reducer or fuse an equivalent reduction into the q4
+score kernel while preserving the 90 tok/s sampled smoke guard.
 
 The replay-style book benchmark is deliberately double-gated with
 `GO_ROCM_RUN_UNSAFE_REPLAY_BOOK_BENCHMARKS=1` and has a per-turn timeout because

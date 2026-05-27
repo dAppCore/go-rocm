@@ -718,8 +718,13 @@ func TestHIPKernels_MLXQ4ProjectionGreedySuppressDevice_Good(t *testing.T) {
 	core.RequireTrue(t, len(candidates) == 1)
 	core.AssertEqual(t, 0, candidates[0].TokenID)
 	assertFloat32Near(t, 28, candidates[0].Score)
-	core.AssertEqual(t, hipKernelNameMLXQ4ProjScores, driver.launches[len(driver.launches)-1].Name)
-	core.AssertEqual(t, uint32(1), binary.LittleEndian.Uint32(driver.launches[len(driver.launches)-1].Args[84:]))
+	scoreLaunch := driver.launches[len(driver.launches)-2]
+	topKLaunch := driver.launches[len(driver.launches)-1]
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjScores, scoreLaunch.Name)
+	core.AssertEqual(t, uint32(1), binary.LittleEndian.Uint32(scoreLaunch.Args[84:]))
+	core.AssertEqual(t, hipKernelNamePackedTopK, topKLaunch.Name)
+	core.AssertEqual(t, uint32(req.Rows), binary.LittleEndian.Uint32(topKLaunch.Args[24:]))
+	core.AssertEqual(t, uint32(1), binary.LittleEndian.Uint32(topKLaunch.Args[32:]))
 }
 
 func TestHIPKernels_MLXQ4TripleProjectionLaunchArgs_Good(t *testing.T) {
