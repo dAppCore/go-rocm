@@ -1,5 +1,60 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Rejected Local-Window Shared Attention Decode Route
+
+- Tested the `go-mlx/IDEAS.md` SWA-window hint as a decode-route change:
+  keep descriptor-backed decode attention on the one-launch shared-memory
+  `rocm_attention_heads` path while the retained KV length is within the local
+  512-token window, then switch global layers back to chunked attention above
+  that. This reduced launch count and improved the short 512/2048 guards, but
+  the strict retained-book route got slower and did not move turn-10 decode.
+
+```text
+Baseline 512 route metric before the experiment:
+  4544698312 ns/op
+  112.7 tok/s
+  kernel_total_launches/op 246715
+  kernel_total_blocks/op 43777321
+  B/op 3212560
+  allocs/op 3013
+  stderr: .bench-errors/512_route_current_20260527.err (empty)
+
+Shared attention through 2048, rejected immediately:
+  19740230411 ns/op
+  103.7 tok/s
+  kernel_total_launches/op 932092
+  B/op 6686832
+  allocs/op 4629
+  stderr: .bench-errors/2048_shared_window_attention_candidate_20260527.err (empty)
+
+Shared attention only through the 512 local window:
+  2048 text:Hi:
+    18283304567 ns/op
+    112.0 tok/s
+    kernel_total_launches/op 942844
+    B/op 6691552
+    allocs/op 4679
+    stderr: .bench-errors/2048_local512_shared_attention_candidate_20260527.err (empty)
+
+  strict retained book:
+    66046203747 ns/op
+    book_wall_s/op 65.97
+    book_decode_s/op 54.72
+    book_generated_tokens/op 4160
+    book_tok/s 63.06
+    book_turn10_tok/s 55.64
+    chapter10_arc_anchor_hits 5
+    B/op 18653640
+    allocs/op 35170
+    stderr: .bench-errors/book_retained_local512_shared_attention_20260527.err (empty)
+    output: /tmp/go-rocm-book-retained-local512-shared-attention-20260527.md
+```
+
+- Rejected and reverted. The short synthetic guards look better, but the real
+  endpoint is the retained-book wall-time and late-turn decode curve. The
+  current chunked route remains the default until a change improves the strict
+  book profile, not just 512/2048 token smoke tests.
+
 ## 2026-05-27 Prefill UBatch Ladder Recheck
 
 - Rechecked the prompt-prefill ubatch lever on the accepted
