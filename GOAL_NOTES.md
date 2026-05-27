@@ -1,5 +1,39 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 go-inference Parser/Probe Refresh
+
+- Fast-forwarded `external/go-inference` `858cd0d` -> `fb49548` after the
+  upstream dev push. The picked-up commits cover parser key normalization,
+  probe bus sink allocation, OpenAI SSE frame sizing, discover path separator
+  caching, and Jang quant metadata resolution. `external/go-cgo` was already
+  current at `51d16e8`.
+- Verification:
+
+```text
+go test ./external/go-inference/go/... -count=1
+go test ./external/go-cgo/go/... -count=1
+go test ./go -count=1
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+go test ./... -count=1
+go test -tags rocm_legacy_server ./... -count=1
+```
+
+- Fresh RX 7800 XT 2048-token q4 guard after the dependency refresh:
+
+```text
+BenchmarkInferenceGemma4Q4Generate:
+  18979481808 ns/op
+  107.9 tok/s
+  2048 tokens
+  6673664 B/op
+  2634 allocs/op
+  stderr: .bench-errors/2048_after_inference_fb49548_20260527.err (empty)
+```
+
+- The dependency refresh keeps the short endpoint green. It does not change the
+  remaining retained-book target: q4 projection/GELU launch volume and
+  long-context global attention still need the next kernel/graph pass.
+
 ## 2026-05-27 Triple Projection Wrapper Allocation Cleanup
 
 - Re-read `/home/claude/Code/core/go-mlx/IDEAS.md` for the Gemma4 data points
