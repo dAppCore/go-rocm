@@ -1,5 +1,47 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Prefill UBatch Ladder Recheck
+
+- Rechecked the prompt-prefill ubatch lever on the accepted
+  `/tmp/go-rocm-kernels-gfx1100.hsaco` before changing defaults. UBatch `256`
+  is faster on isolated 2k/4k prompt tok/s, but spends substantially more
+  allocation/byte volume than `512` and did not improve the full retained-book
+  route.
+
+```text
+4k prompt ubatch ladder:
+  ubatch_256:  14976532089 ns/op, 273.5 prompt_tok/s, 13596056 B/op, 16551 allocs/op
+  ubatch_512:  15768223343 ns/op, 259.8 prompt_tok/s,   614976 B/op,  7520 allocs/op
+  ubatch_1024: 16241310509 ns/op, 252.2 prompt_tok/s,  7428504 B/op,  4070 allocs/op
+  ubatch_2048: 15628809724 ns/op, 262.1 prompt_tok/s,  9245136 B/op,  2443 allocs/op
+  stderr: .bench-errors/prompt_4k_ubatch_ladder_20260527.err (empty)
+
+2k prompt ubatch ladder:
+  ubatch_256:  5539857082 ns/op, 369.7 prompt_tok/s, 10234672 B/op, 9068 allocs/op
+  ubatch_512:  5814254198 ns/op, 352.2 prompt_tok/s,   321104 B/op, 3800 allocs/op
+  ubatch_1024: 6309239144 ns/op, 324.6 prompt_tok/s,  4692512 B/op, 2188 allocs/op
+  ubatch_2048: 7027097835 ns/op, 291.4 prompt_tok/s,   137632 B/op,  981 allocs/op
+  stderr: .bench-errors/prompt_2k_ubatch_ladder_20260527.err (empty)
+
+Full retained sampled book with GO_ROCM_BOOK_PREFILL_UBATCH_TOKENS=256:
+  63212096673 ns/op
+  book_wall_s/op 63.13
+  book_decode_s/op 52.48
+  book_prefill_s/op 10.58
+  book_generated_tokens/op 4103
+  book_tok/s 64.99
+  book_turn10_tok/s 56.91
+  chapter10_arc_anchor_hits 5
+  B/op 19022728
+  allocs/op 35328
+  stderr: .bench-errors/book_retained_ubatch256_20260527.err (empty)
+  output: /tmp/go-rocm-book-retained-ubatch256-20260527.md
+```
+
+- Keep `512` as the production default for now. The actual book route is slower
+  at `256`, and the big allocation increase cuts against the current
+  retained-state objective even though isolated prompt tok/s improves.
+
 ## 2026-05-27 Rejected Batched Q4 Group64 Row-Base Specialization
 
 - Tested carrying the single-token q4 `group_size == 64` row-base/index
