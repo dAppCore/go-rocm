@@ -226,11 +226,10 @@ func (decoder *hipTokenTextDecoder) bpeMerge(symbols []string) []string {
 			return symbols
 		}
 		merged := symbols[bestIndex] + symbols[bestIndex+1]
-		next := make([]string, 0, len(symbols)-1)
-		next = append(next, symbols[:bestIndex]...)
-		next = append(next, merged)
-		next = append(next, symbols[bestIndex+2:]...)
-		symbols = next
+		symbols[bestIndex] = merged
+		copy(symbols[bestIndex+1:], symbols[bestIndex+2:])
+		symbols[len(symbols)-1] = ""
+		symbols = symbols[:len(symbols)-1]
 	}
 	return symbols
 }

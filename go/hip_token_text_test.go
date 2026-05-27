@@ -108,6 +108,27 @@ func TestHIPTokenTextDecoder_Gemma4DefaultSuppressTokenIDs_Good(t *testing.T) {
 	core.AssertFalse(t, hipTokenIsSuppressed(106, explicitStopIDs))
 }
 
+func BenchmarkHIPTokenTextDecoder_EncodeRepeatedMerges(b *testing.B) {
+	decoder := &hipTokenTextDecoder{
+		vocab: map[string]int32{
+			"abc": 1,
+			"▁":   2,
+		},
+		mergeRanks: map[string]int{
+			"a b":  0,
+			"ab c": 1,
+		},
+	}
+	text := "abc abc abc abc abc abc abc abc"
+	if got := decoder.Encode(text); len(got) == 0 {
+		b.Fatal("empty tokenization")
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = decoder.Encode(text)
+	}
+}
+
 func BenchmarkHIPGemma4Q4GenerationSuppressTokenIDs_CachedExplicitStop(b *testing.B) {
 	decoder := &hipTokenTextDecoder{
 		specialText: map[string]int32{

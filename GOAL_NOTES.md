@@ -14189,3 +14189,71 @@ chapter guard moved from `15750440 B/op` and `6163 allocs/op` at the baseline
 to `10041992 B/op` and `6065 allocs/op`; retained-book wall and decode speed
 stayed noise-flat and quality-clean. The remaining speed target is still the
 q4 projection/GELU/long-context attention hot path.
+
+## 2026-05-27: Tokenizer BPE In-Place Merge Cleanup
+
+This pass kept the 2048-token acceptance loop focused on host allocation and
+metadata cleanup:
+
+```text
+- Compact tokenizer BPE symbol slices in place during merges instead of
+  allocating a fresh next-symbol slice for every successful merge.
+- Add an AX-11 benchmark around repeated BPE merges so tokenizer churn remains
+  visible during future 2048 fast-loop passes.
+```
+
+AX-11 microbenchmark:
+
+```text
+BenchmarkHIPTokenTextDecoder_EncodeRepeatedMerges-32  6629 ns/op  1112 B/op  51 allocs/op
+```
+
+2048-token fast guards:
+
+```text
+2048 text:Hi:
+  18848046301 ns/op, 108.7 tok/s, 7137696 B/op, 4703 allocs/op
+
+2048 generated tokens, context_len=4096, chapter-1 lighthouse prompt:
+  20430973082 ns/op, 100.2 tok/s, 8682136 B/op, 5740 allocs/op
+```
+
+Retained-book acceptance:
+
+```text
+book_wall_s/op             37.74
+book_decode_s/op           33.53
+book_generated_tokens/op    3021
+book_tok/s                 80.05
+book_turn01_tok/s         109.6
+book_turn10_tok/s          69.75
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+stderr_bytes                   0
+B/op                    204914608
+allocs/op                   96011
+output: /tmp/go-rocm-book-10turn-fullcap-tokenizer-inplace.md
+stderr: /tmp/go-rocm-book-10turn-fullcap-tokenizer-inplace.err
+```
+
+Rejected during this pass:
+
+```text
+Fusing embedding lookup scale into the embedding kernel ABI improved one
+forward component benchmark but regressed the 2048-token prompt prefill guard
+from about 343 prompt tok/s to about 304 prompt tok/s. The ABI and regenerated
+gfx1100 HSACO were reverted.
+
+Lowering small page-slice pool capacity below 512 helped the tiny text guard
+slightly but regressed the chapter-shaped 2048 guard from 10041992 B/op and
+6065 allocs/op to 11274192 B/op and 6142 allocs/op. The pool sizing was
+reverted.
+```
+
+This is another host allocation cleanup, not the retained decode speed
+breakthrough. It moved the chapter-shaped 2048 guard from `10041992 B/op` and
+`6065 allocs/op` to `8682136 B/op` and `5740 allocs/op`; retained-book
+allocation volume moved from `230625576 B/op` and `100447 allocs/op` to
+`204914608 B/op` and `96011 allocs/op`. Decode stayed noise-flat around
+`80 tok/s` average and `69-70 tok/s` on turn 10, so the 90-100 tok/s target
+still depends on the q4 projection/GELU/long-context attention path.

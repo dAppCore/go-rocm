@@ -1589,6 +1589,13 @@ Remaining blocker:
   2048 run. Retained-book acceptance stayed quality-clean at `37.77s` wall,
   `79.99 tok/s` average, turn 10 `69.88 tok/s`, `230625576 B/op`,
   `100447 allocs/op`, `chapter10_arc_anchor_hits=3`.
+- The latest accepted host-side cleanup compacts tokenizer BPE symbols in
+  place instead of allocating a fresh symbol slice for every merge. Fast guards
+  now measure `108.7 tok/s`, `7137696 B/op`, `4703 allocs/op` on `text:Hi`
+  and `100.2 tok/s`, `8682136 B/op`, `5740 allocs/op` on the chapter-shaped
+  2048 run. Retained-book acceptance stayed quality-clean at `37.74s` wall,
+  `80.05 tok/s` average, turn 10 `69.75 tok/s`, `204914608 B/op`,
+  `96011 allocs/op`, `chapter10_arc_anchor_hits=3`.
 
 - [ ] Phase 0: Snapshot the tree and establish the baseline.
   - Run `git status --short`.
