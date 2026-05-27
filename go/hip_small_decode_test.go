@@ -1828,6 +1828,23 @@ func TestHIPGemma4Q4LoadedTextConfigOverridesHeadDimHeuristics_Good(t *testing.T
 	core.AssertEqual(t, 18, model.loadedGemma4Q4KVSharedLayers(42))
 }
 
+func TestHIPGemma4Q4LoadedTextConfigKEqVOnlyFullAttention_Good(t *testing.T) {
+	model := &hipLoadedModel{gemma4TextConfig: nativeGemma4TextConfig{AttentionKEqV: true}}
+
+	core.AssertEqual(t, false, model.loadedGemma4Q4AttentionKEqV("sliding_attention"))
+	core.AssertEqual(t, true, model.loadedGemma4Q4AttentionKEqV("full_attention"))
+
+	cfg, cleanup := hipGemma4Q4Layer0FixtureConfig(t, &fakeHIPDriver{available: true})
+	defer cleanup()
+	cfg.LayerType = "sliding_attention"
+	cfg.AttentionKEqV = true
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("validate K=V sliding layer error = nil")
+	}
+	core.AssertContains(t, err.Error(), "K=V attention is only valid for full-attention layers")
+}
+
 func TestHIPGemma4Q4E4BSharedKVLayoutUsesLayerTypes_Good(t *testing.T) {
 	const layerCount = 42
 	layers := make([]hipGemma4Q4Layer0Config, layerCount)

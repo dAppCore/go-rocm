@@ -862,6 +862,7 @@ func TestNativeContract_LoadModelSafetensorsGemma4PropagatesTextRuntimeConfig_Go
 			"num_global_key_value_heads":1,
 			"head_dim":512,
 			"global_head_dim":1024,
+			"attention_k_eq_v":true,
 			"num_kv_shared_layers":2,
 			"max_position_embeddings":131072,
 			"sliding_window":1024,
@@ -887,20 +888,41 @@ func TestNativeContract_LoadModelSafetensorsGemma4PropagatesTextRuntimeConfig_Go
 	defer model.Close()
 
 	cfg := runtime.loadConfig.Gemma4TextConfig
-	core.AssertEqual(t, []string{"sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention", "sliding_attention"}, cfg.LayerTypes)
+	core.AssertEqual(t, []string{"sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention", "full_attention"}, cfg.LayerTypes)
 	core.AssertEqual(t, true, cfg.KVSharedLayersSet)
 	core.AssertEqual(t, 2, cfg.KVSharedLayers)
 	core.AssertEqual(t, 1024, cfg.SlidingWindow)
 	core.AssertEqual(t, 512, cfg.HeadDim)
 	core.AssertEqual(t, 1024, cfg.GlobalHeadDim)
+	core.AssertEqual(t, true, cfg.AttentionKEqV)
 	core.AssertEqual(t, float64(10000), cfg.RoPEParameters["sliding_attention"].RopeTheta)
 	core.AssertEqual(t, float64(1000000), cfg.RoPEParameters["full_attention"].RopeTheta)
 	core.AssertEqual(t, float64(0.25), cfg.RoPEParameters["full_attention"].PartialRotaryFactor)
 	if runtime.loadConfig.ModelLabels["attention_layer_types"] == "" ||
 		runtime.loadConfig.ModelLabels["attention_kv_shared_layers"] != "2" ||
+		runtime.loadConfig.ModelLabels["attention_k_eq_v"] != "true" ||
 		runtime.loadConfig.ModelLabels["attention_rope_full_theta"] != "1e+06" {
 		t.Fatalf("model labels = %+v, want Gemma4 attention metadata propagated", runtime.loadConfig.ModelLabels)
 	}
+}
+
+func TestNativeContract_Gemma4LayerTypesDefaultPatternForcesFinalFull_Good(t *testing.T) {
+	cfg := rocmNativeGemma4TextConfigFromProbe(rocmModelPackConfigProbe{
+		TextConfig: rocmModelPackTextConfigProbe{
+			NumHiddenLayers:      7,
+			SlidingWindowPattern: 3,
+		},
+	})
+
+	core.AssertEqual(t, []string{
+		"sliding_attention",
+		"sliding_attention",
+		"full_attention",
+		"sliding_attention",
+		"sliding_attention",
+		"full_attention",
+		"full_attention",
+	}, cfg.LayerTypes)
 }
 
 func TestNativeContract_LoadModelSafetensorsShardedPackUsesNativeRuntime_Good(t *testing.T) {

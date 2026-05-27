@@ -15551,3 +15551,28 @@ stderr: /tmp/go-rocm-2048-gemma4-metadata.err (0 bytes)
 This is a feature-parity/correctness fix for the next Gemma4 sizes. The local
 E2B performance remained in the accepted 2048-token range; it does not by
 itself close the long-context decode gap.
+
+## 2026-05-27 go-mlx Gemma4 Loader Parity Data
+
+Pulled the remaining Gemma4 shape rules from `go-mlx/IDEAS.md`,
+`go-mlx/docs/models.md`, and the production Gemma4 loader:
+
+- Missing `layer_types` now default from `sliding_window_pattern` with the
+  go-mlx default pattern of 6, and the final layer is forced to
+  `full_attention` when a complete layer-type table is available.
+- `attention_k_eq_v` is parsed from root or nested `text_config`, propagated
+  into native load metadata, and exposed in model-pack attention labels.
+- Full-attention K=V layers can reuse the K projection source for value
+  normalisation, matching go-mlx semantics. Sliding layers reject K=V because
+  Gemma4 only applies that shortcut to full attention.
+
+The local E2B pack reports `attention_k_eq_v=false`, so this is a feature-parity
+patch rather than a speed win for the current acceptance model. Focused config
+and layer tests passed, and the short RX 7800 XT guard stayed neutral:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32  1  18937430899 ns/op
+context_len=128 max_tokens=2048 prefill_ubatch_tokens=512
+108.1 tok/s, 2048 tokens, 6677024 B/op, 2615 allocs/op
+stderr: /tmp/go-rocm-2048-keqv-parity.err (0 bytes)
+```

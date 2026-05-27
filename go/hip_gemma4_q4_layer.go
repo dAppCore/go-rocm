@@ -29,6 +29,7 @@ type hipGemma4Q4Layer0Config struct {
 	RoPEBase          float32
 	RoPERotaryDim     int
 	SlidingWindow     int
+	AttentionKEqV     bool
 	FinalLogitSoftcap float32
 	LayerScalar       float32
 	PerLayerInput     hipGemma4Q4PerLayerInputConfig
@@ -296,9 +297,17 @@ func (model *hipLoadedModel) loadedGemma4Q4LayerConfig(layer int) (hipGemma4Q4La
 	if err != nil {
 		return hipGemma4Q4Layer0Config{}, err
 	}
-	value, valueRows, valueCols, err := model.loadedGemma4Q4ProjectionConfig(layerPrefix+".self_attn.v_proj", "v_proj", groupSize)
-	if err != nil {
-		return hipGemma4Q4Layer0Config{}, err
+	headDim := keyRows
+	layerType := model.loadedGemma4Q4LayerType(layer, headDim)
+	attentionKEqV := model.loadedGemma4Q4AttentionKEqV(layerType)
+	value := key
+	valueRows := keyRows
+	valueCols := keyCols
+	if !attentionKEqV {
+		value, valueRows, valueCols, err = model.loadedGemma4Q4ProjectionConfig(layerPrefix+".self_attn.v_proj", "v_proj", groupSize)
+		if err != nil {
+			return hipGemma4Q4Layer0Config{}, err
+		}
 	}
 	output, outputRows, outputCols, err := model.loadedGemma4Q4ProjectionConfig(layerPrefix+".self_attn.o_proj", "o_proj", groupSize)
 	if err != nil {
@@ -330,10 +339,8 @@ func (model *hipLoadedModel) loadedGemma4Q4LayerConfig(layer int) (hipGemma4Q4La
 		lmRows != vocab || lmCols != hidden {
 		return hipGemma4Q4Layer0Config{}, core.E(hipGemma4Q4Layer0Operation, "Gemma4 q4 layer-0 tensor shapes are inconsistent", nil)
 	}
-	headDim := keyRows
 	queryHeads := queryRows / headDim
 	intermediate := gateRows
-	layerType := model.loadedGemma4Q4LayerType(layer, headDim)
 	ropeBase, ropeRotaryDim := model.loadedGemma4Q4LayerRoPE(layerType, headDim)
 	slidingWindow := model.loadedGemma4Q4EffectiveSlidingWindow(layerType, headDim)
 
@@ -387,6 +394,7 @@ func (model *hipLoadedModel) loadedGemma4Q4LayerConfig(layer int) (hipGemma4Q4La
 		RoPEBase:            ropeBase,
 		RoPERotaryDim:       ropeRotaryDim,
 		SlidingWindow:       slidingWindow,
+		AttentionKEqV:       attentionKEqV,
 		FinalLogitSoftcap:   hipGemma4Q4FinalLogitSoftcap(),
 		LayerScalar:         layerScalar,
 		PerLayerInput:       perLayerInput,
@@ -1191,6 +1199,7 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 	var valueBufferView hipDeviceByteBuffer
 	projectLocalKV := req.SharedDeviceKV == nil && len(req.SharedKeys) == 0
 	if projectLocalKV &&
+		!cfg.AttentionKEqV &&
 		cfg.QueryProjection.Cols == cfg.KeyProjection.Cols && cfg.QueryProjection.Cols == cfg.ValueProjection.Cols &&
 		cfg.QueryProjection.GroupSize == cfg.KeyProjection.GroupSize && cfg.QueryProjection.GroupSize == cfg.ValueProjection.GroupSize {
 		if req.AttentionWorkspace != nil && req.OmitDebugTensors {
@@ -1272,11 +1281,15 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 			defer keyBuffer.Close()
 		}
 		if valueBuffer == nil {
-			valueBuffer, err = hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx, driver, layerInputBuffer, cfg.ValueProjection)
-			if err != nil {
-				return hipGemma4Q4DecoderLayerResult{}, err
+			if cfg.AttentionKEqV {
+				valueBuffer = keyBuffer
+			} else {
+				valueBuffer, err = hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx, driver, layerInputBuffer, cfg.ValueProjection)
+				if err != nil {
+					return hipGemma4Q4DecoderLayerResult{}, err
+				}
+				defer valueBuffer.Close()
 			}
-			defer valueBuffer.Close()
 		}
 		useDeviceKVToken := req.OmitHostKV && req.DeviceKVAttention
 		if req.AttentionWorkspace != nil && req.OmitDebugTensors {
@@ -1338,11 +1351,15 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 			defer keyBuffer.Close()
 		}
 		if valueBuffer == nil {
-			valueBuffer, err = hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx, driver, layerInputBuffer, cfg.ValueProjection)
-			if err != nil {
-				return hipGemma4Q4DecoderLayerResult{}, err
+			if cfg.AttentionKEqV {
+				valueBuffer = keyBuffer
+			} else {
+				valueBuffer, err = hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx, driver, layerInputBuffer, cfg.ValueProjection)
+				if err != nil {
+					return hipGemma4Q4DecoderLayerResult{}, err
+				}
+				defer valueBuffer.Close()
 			}
-			defer valueBuffer.Close()
 		}
 		useDeviceKVToken := req.OmitHostKV && req.DeviceKVAttention
 		if req.AttentionWorkspace != nil && req.OmitDebugTensors {
@@ -1982,6 +1999,9 @@ func (cfg hipGemma4Q4Layer0Config) validate() error {
 	}
 	if cfg.SlidingWindow < 0 {
 		return core.E(hipGemma4Q4Layer0Operation, "sliding window must be non-negative", nil)
+	}
+	if cfg.AttentionKEqV && cfg.LayerType != "full_attention" {
+		return core.E(hipGemma4Q4Layer0Operation, "K=V attention is only valid for full-attention layers", nil)
 	}
 	if cfg.FinalLogitSoftcap < 0 || math.IsNaN(float64(cfg.FinalLogitSoftcap)) || math.IsInf(float64(cfg.FinalLogitSoftcap), 0) {
 		return core.E(hipGemma4Q4Layer0Operation, "final logit softcap must be non-negative and finite", nil)
@@ -3500,6 +3520,10 @@ func (model *hipLoadedModel) loadedGemma4Q4EffectiveSlidingWindow(layerType stri
 		return model.contextSize
 	}
 	return window
+}
+
+func (model *hipLoadedModel) loadedGemma4Q4AttentionKEqV(layerType string) bool {
+	return layerType == "full_attention" && model != nil && model.gemma4TextConfig.AttentionKEqV
 }
 
 func hipGemma4Q4AttentionScale(_ int) float32 {

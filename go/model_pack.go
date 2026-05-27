@@ -42,6 +42,7 @@ type rocmModelPackConfigProbe struct {
 	SlidingWindowPattern  int                          `json:"sliding_window_pattern"`
 	NumKVSharedLayers     *int                         `json:"num_kv_shared_layers"`
 	LayerTypes            []string                     `json:"layer_types"`
+	AttentionKEqV         bool                         `json:"attention_k_eq_v"`
 	RoPEParameters        map[string]rocmRoPEProbe     `json:"rope_parameters"`
 	RMSNormEps            float64                      `json:"rms_norm_eps"`
 	FinalLogitSoftcap     float64                      `json:"final_logit_softcapping"`
@@ -75,6 +76,7 @@ type rocmModelPackTextConfigProbe struct {
 	SlidingWindowPattern  int                      `json:"sliding_window_pattern"`
 	NumKVSharedLayers     *int                     `json:"num_kv_shared_layers"`
 	LayerTypes            []string                 `json:"layer_types"`
+	AttentionKEqV         bool                     `json:"attention_k_eq_v"`
 	RoPEParameters        map[string]rocmRoPEProbe `json:"rope_parameters"`
 	RMSNormEps            float64                  `json:"rms_norm_eps"`
 	FinalLogitSoftcap     float64                  `json:"final_logit_softcapping"`
@@ -435,14 +437,38 @@ func rocmConfigTiedWordEmbeddings(cfg rocmModelPackConfigProbe) bool {
 }
 
 func rocmConfigLayerTypes(cfg rocmModelPackConfigProbe) []string {
+	numLayers := firstPositiveInt(cfg.NumHiddenLayers, cfg.NumLayers, cfg.TextConfig.NumHiddenLayers, cfg.TextConfig.NumLayers)
+	var layerTypes []string
 	switch {
 	case len(cfg.LayerTypes) > 0:
-		return append([]string(nil), cfg.LayerTypes...)
+		layerTypes = append([]string(nil), cfg.LayerTypes...)
 	case len(cfg.TextConfig.LayerTypes) > 0:
-		return append([]string(nil), cfg.TextConfig.LayerTypes...)
+		layerTypes = append([]string(nil), cfg.TextConfig.LayerTypes...)
 	default:
-		return nil
+		if numLayers <= 0 {
+			return nil
+		}
+		pattern := firstPositiveInt(cfg.SlidingWindowPattern, cfg.TextConfig.SlidingWindowPattern)
+		if pattern <= 0 {
+			pattern = 6
+		}
+		layerTypes = make([]string, numLayers)
+		for index := range layerTypes {
+			if pattern > 1 && (index+1)%pattern != 0 {
+				layerTypes[index] = "sliding_attention"
+			} else {
+				layerTypes[index] = "full_attention"
+			}
+		}
+		if len(layerTypes) > 0 {
+			layerTypes[len(layerTypes)-1] = "full_attention"
+		}
 	}
+	if numLayers > 0 && len(layerTypes) >= numLayers {
+		layerTypes = layerTypes[:numLayers]
+		layerTypes[len(layerTypes)-1] = "full_attention"
+	}
+	return layerTypes
 }
 
 func rocmConfigKVSharedLayers(cfg rocmModelPackConfigProbe) (int, bool) {
@@ -493,6 +519,9 @@ func rocmAttentionConfigLabels(cfg rocmModelPackConfigProbe) map[string]string {
 	}
 	if globalKVHeads > 0 {
 		out["attention_global_kv_heads"] = core.Sprintf("%d", globalKVHeads)
+	}
+	if cfg.AttentionKEqV || cfg.TextConfig.AttentionKEqV {
+		out["attention_k_eq_v"] = "true"
 	}
 	if headDim > 0 {
 		out["attention_head_dim"] = core.Sprintf("%d", headDim)
@@ -756,6 +785,7 @@ func rocmNativeGemma4TextConfigFromProbe(cfg rocmModelPackConfigProbe) nativeGem
 		SlidingWindow:     firstPositiveInt(cfg.SlidingWindow, cfg.TextConfig.SlidingWindow),
 		HeadDim:           firstPositiveInt(cfg.HeadDim, cfg.TextConfig.HeadDim),
 		GlobalHeadDim:     firstPositiveInt(cfg.GlobalHeadDim, cfg.TextConfig.GlobalHeadDim),
+		AttentionKEqV:     cfg.AttentionKEqV || cfg.TextConfig.AttentionKEqV,
 		RoPEParameters:    rocmNativeGemma4RoPEParameters(cfg),
 	}
 }

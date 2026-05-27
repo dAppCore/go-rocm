@@ -61,6 +61,7 @@ type nativeGemma4TextConfig struct {
 	SlidingWindow     int
 	HeadDim           int
 	GlobalHeadDim     int
+	AttentionKEqV     bool
 	RoPEParameters    map[string]nativeGemma4RoPEParameters
 }
 
