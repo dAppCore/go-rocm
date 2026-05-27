@@ -2140,6 +2140,16 @@ Remaining blocker:
   `0` repeated turns, `0` max-token turns, `18900656 B/op`, and `33942 allocs/op`.
   This meets the wall-time production-candidate gate, but the late-turn decode
   target remains open.
+  A metrics-enabled rerun passed at `67.43s` wall with `4` chapter-10 arc
+  anchors and confirmed the remaining launch-volume problem: `2149040` total
+  kernel launches for `4305` generated tokens, or `499.20` launches/generated
+  token. The largest launch contributors are `rocm_mlx_q4_projection`
+  (`125.29` launches/token), `rocm_mlx_q4_gelu_tanh_multiply` plus
+  `rocm_mlx_q4_gelu_tanh_projection` (`70.16` launches/token combined),
+  decode chunked attention stage 1/2 (`69.60` launches/token combined), and
+  RMS/residual/norm chains. The next real 90-100 tok/s late-turn move is still
+  fused per-layer decode or larger fused q4 projection/MLP blocks, not more
+  descriptor plumbing.
 - 2026-05-27 rechecked the current source with a fresh `gfx1100 -O2` HSACO:
   `512` tokens measured `4531496458 ns/op`, `113.0 tok/s`,
   `3157648 B/op`, and `2367 allocs/op` with empty stderr. Rebuilding with
