@@ -284,15 +284,17 @@ func hipGemma4Q4PlanPromptPrefill(promptTokens []int32, startPos int, ubatchToke
 		StartPos:     startPos,
 		UBatchTokens: ubatchTokens,
 		OutputTokens: 1,
+		Batches:      make([]hipGemma4Q4PrefillUBatch, 0, (len(promptTokens)+ubatchTokens-1)/ubatchTokens),
 	}
 	for start := 0; start < len(promptTokens); start += ubatchTokens {
 		end := start + ubatchTokens
 		if end > len(promptTokens) {
 			end = len(promptTokens)
 		}
-		tokens := append([]int32(nil), promptTokens[start:end]...)
-		outputs := make([]bool, len(tokens))
+		tokens := promptTokens[start:end]
+		var outputs []bool
 		if end == len(promptTokens) {
+			outputs = make([]bool, len(tokens))
 			outputs[len(outputs)-1] = true
 		}
 		plan.Batches = append(plan.Batches, hipGemma4Q4PrefillUBatch{

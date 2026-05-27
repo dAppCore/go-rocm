@@ -26,6 +26,15 @@ tokens_512   4528207764 ns/op     113.1 tok/s     713024 B/op  1174 allocs/op
 tokens_2000 18265196384 ns/op     109.5 tok/s    2284760 B/op  1219 allocs/op
 ```
 
+- Tightened the prompt prefill planner used by 29k/48k prompt work: ubatches
+  now hold views of the caller's token span instead of copying prompt tokens
+  into each batch, non-output ubatches avoid allocating an all-false output
+  mask, and the batch slice is pre-sized. The new AX benchmark reports:
+
+```text
+BenchmarkHIPGemma4Q4PlanPromptPrefill_29K-32  643.6 ns/op  5216 B/op  2 allocs/op
+```
+
 ## 2026-05-26 Public Q4 Direct Token Path
 
 - Kept the 2048-token fast loop as the edit gate and promoted only after the

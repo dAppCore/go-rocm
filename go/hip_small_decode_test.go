@@ -518,7 +518,7 @@ func TestHIPGemma4Q4PrefillPlan_Good(t *testing.T) {
 	core.AssertEqual(t, 12, plan.NextPosition())
 	core.AssertEqual(t, 3, len(plan.Batches))
 	core.AssertEqual(t, []int32{2, 10979}, plan.Batches[0].Tokens)
-	core.AssertEqual(t, []bool{false, false}, plan.Batches[0].OutputTokens)
+	core.AssertEqual(t, 0, len(plan.Batches[0].OutputTokens))
 	core.AssertEqual(t, 0, plan.Batches[0].Start)
 	core.AssertEqual(t, 2, plan.Batches[0].End)
 	core.AssertEqual(t, 7, plan.Batches[0].Position)
@@ -527,6 +527,23 @@ func TestHIPGemma4Q4PrefillPlan_Good(t *testing.T) {
 	core.AssertEqual(t, 4, plan.Batches[2].Start)
 	core.AssertEqual(t, 5, plan.Batches[2].End)
 	core.AssertEqual(t, 11, plan.Batches[2].Position)
+}
+
+func BenchmarkHIPGemma4Q4PlanPromptPrefill_29K(b *testing.B) {
+	tokens := make([]int32, 29000)
+	for index := range tokens {
+		tokens[index] = int32(index%32000 + 1)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		plan, err := hipGemma4Q4PlanPromptPrefill(tokens, 0, hipGemma4Q4PrefillDefaultUBatchTokens)
+		if err != nil {
+			b.Fatalf("hipGemma4Q4PlanPromptPrefill: %v", err)
+		}
+		if plan.PromptTokens != len(tokens) || len(plan.Batches) != 57 {
+			b.Fatalf("plan = tokens %d batches %d, want 29000/57", plan.PromptTokens, len(plan.Batches))
+		}
+	}
 }
 
 func TestHIPGemma4Q4PrefillPlan_Bad(t *testing.T) {
