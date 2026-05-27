@@ -4,7 +4,12 @@
 
 package rocm
 
-import core "dappco.re/go"
+import (
+	"runtime"
+	"unsafe"
+
+	core "dappco.re/go"
+)
 
 type unavailableHIPDriver struct{}
 
@@ -33,6 +38,27 @@ func (unavailableHIPDriver) CopyDeviceToHost(nativeDevicePointer, []byte) error 
 	return core.E("rocm.hip.CopyDeviceToHost", "cgo is disabled; native HIP driver is unavailable", nil)
 }
 
+type nativeHIPPinnedHostToDevice interface {
+	CopyPinnedHostToDevice(pointer nativeDevicePointer, host unsafe.Pointer, sizeBytes int) error
+}
+
 func hipCopyPinnedHostToDevice(driver nativeHIPDriver, pointer nativeDevicePointer, data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	if pointer == 0 {
+		return core.E("rocm.hip.CopyPinnedHostToDevice", "device pointer is nil", nil)
+	}
+	pinned, ok := driver.(nativeHIPPinnedHostToDevice)
+	if ok {
+		var view core.PinnedView
+		core.PinSlice(data, &view)
+		defer view.Release()
+		if err := pinned.CopyPinnedHostToDevice(pointer, view.Ptr(), view.Bytes()); err != nil {
+			return err
+		}
+		runtime.KeepAlive(data)
+		return nil
+	}
 	return hipCopyHostToDevice(driver, pointer, data)
 }

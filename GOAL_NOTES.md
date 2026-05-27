@@ -17006,3 +17006,44 @@ no-replay gate. It cuts wall time from `71.03s` to `55.81s`, drops B/op from
 `20085592` to `13352624`, and raises turn-10 decode from `50.12 tok/s` to
 `69.78 tok/s`. The endpoint is still open because late-turn decode remains
 below the `90-100+ tok/s` target.
+
+## 2026-05-27 Accepted No-CGO Pinned Copy Shim Parity
+
+The `go-mlx/IDEAS.md` zero-copy direction relies on Go-owned pinned views being
+visible in the hot KV/state copy path. The cgo build already routes
+`hipCopyPinnedHostToDevice` through drivers implementing
+`CopyPinnedHostToDevice`, but the no-cgo shim always fell back to
+`CopyHostToDevice`. That made the Linux no-cgo package gate fail in fake-driver
+coverage for retained KV mirror/descriptor uploads:
+
+```text
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -run 'TestKVCache_Good_MirrorsPagesToHIPDevice' -count=1 -v
+  kv_cache_test.go:221: AssertEqual want=2 got=0
+  kv_cache_test.go:273: AssertEqual want=3 got=0
+```
+
+Accepted change:
+
+- `go/hip_driver_nocgo.go` now defines the same pinned-copy interface in the
+  no-cgo build, pins the Go byte slice with `core.PinnedView`, calls the
+  fake/driver pinned-copy method when available, keeps the slice alive through
+  the call, and still falls back to `CopyHostToDevice` for drivers without a
+  pinned route.
+- The real no-cgo system HIP driver remains unavailable; this only restores
+  parity for package tests and fake-driver coverage of the pinned handoff.
+
+Verification:
+
+```text
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -run 'TestKVCache_Good_MirrorsPagesToHIPDevice' -count=1 -v
+PASS
+
+go test ./go -run 'TestKVCache_Good_MirrorsPagesToHIPDevice|TestKVCache_Bad_DeviceDescriptorTableRollbackOnCopyFailure' -count=1
+ok dappco.re/go/rocm 0.007s
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.112s
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.140s
+```
