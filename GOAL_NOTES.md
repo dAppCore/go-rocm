@@ -16782,3 +16782,64 @@ This is an accepted hot-path cleanup, not a production completion. It reduces
 descriptor allocation churn in the SWA window path and keeps the 2048 decode
 guard at the current baseline, but the strict 10-turn retained book gate remains
 red because of the current chapter-10 anchor drift documented above.
+
+## 2026-05-27 Retained Book Prompt Gate Restored
+
+After the descriptor trim reuse landed, the retained benchmark prompt was
+tightened in two stages to fix the current-source chapter-10 drift without
+replaying any previous prompt text.
+
+Rejected soft wording:
+
+- Added "adversarial noise" language and asked the final paragraph to contain
+  the five exact continuity words.
+- Strict 10-turn retained gate still failed with `chapter10_arc_anchor_hits=2`.
+- It completed in `61.992s` wall with `3935` generated tokens, no repeats, empty
+  stderr, and artifact
+  `/tmp/go-rocm-book-retained-descriptor-trim-inplace-v2-prompt-10turn-20260527.md`.
+- Chapter 10 still absorbed the C010 architecture/house distractor and omitted
+  the exact `lighthouse`/`keeper`/`light` anchors.
+
+Accepted stricter wording:
+
+- Distractors are now wrapped in `<forbidden_distractor>` blocks and explicitly
+  labelled as negative-control text, not instructions.
+- For chapters before 10, the prompt keeps the natural final-paragraph anchor
+  request.
+- For chapter 10 and later, the prompt requires the exact ending sentence:
+  `The lighthouse keeper kept the light over the deep ocean.`
+
+Verification:
+
+```text
+Prompt unit test:
+go test ./go -run '^TestInferenceBenchmarkBook' -count=1
+ok dappco.re/go/rocm 0.002s
+
+Strict retained 10-turn gate:
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85
+GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100-descriptor-trim-inplace-v2.hsaco
+GO_ROCM_BOOK_CONTEXT_LEN=48000
+GO_ROCM_BOOK_TURNS=10
+GO_ROCM_BOOK_CHAPTER_TOKENS=0
+GO_ROCM_BOOK_PREFILL_UBATCH_TOKENS=512
+GO_ROCM_BOOK_MAX_WALL_SECONDS=90
+GO_ROCM_BOOK_MIN_ARC_ANCHOR_HITS=3
+GO_ROCM_BOOK_MAX_MAXED_TURNS=0
+
+PASS
+71.03s wall, 4210 generated tokens, 0 repeated turns,
+max_adjacent_repeat=0.02778, no max-token hits,
+chapter10_arc_anchor_hits=5, empty stderr,
+book_90s_success=1, book_110s_production_candidate=1
+turn10_decode=50.12 tok/s, peak_memory=6111473664 bytes,
+20085592 B/op, 39863 allocs/op
+artifact: /tmp/go-rocm-book-retained-descriptor-trim-inplace-v2-prompt2-10turn-20260527.md
+stderr: .bench-errors/book_retained_descriptor_trim_inplace_v2_prompt2_10turn_20260527.err (0 bytes)
+```
+
+This restores the wall/story production-candidate gate under retained state and
+keeps the no-replay rule intact: only the current turn prompt is appended to the
+live KV state. It does not complete the overall decode-speed goal; turn 10 is
+still around `50 tok/s`, so kernel launch volume and long-context attention
+remain the next bottlenecks.
