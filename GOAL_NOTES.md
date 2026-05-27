@@ -1,5 +1,81 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Gemma4 Guardrails From go-mlx IDEAS
+
+- Re-read `/home/claude/Code/core/go-mlx/IDEAS.md` for the Gemma4-specific
+  constraints that should gate the ROCm path. The important items for this
+  driver are:
+  - 5:1 hybrid attention: local SWA layers must stay bounded to the model
+    window (`512`/`1024`), while only global-owner layers grow with context.
+  - Retained generation must append only the new turn and generated tokens into
+    the live state. Replaying prompt text is an error path, not a fallback.
+  - KV/state layout work should move toward pinned, mmap-like state handoff and
+    mdspan-compatible stride views. The optimization target is fewer host
+    copies and fewer bytes transferred, even before tok/s visibly improves.
+  - Per-layer embedding and q4 projection traffic is expected to be a major
+    bandwidth source on E2B/E4B, so launch-count shortcuts that do not change
+    memory movement are unlikely to close the retained-book late-turn gap.
+- Checked `external/go-inference` and `external/go-cgo` after the IDEAS refresh;
+  both were already up to date on Forge `dev`.
+
+## 2026-05-27 Rejected Chunked Value-Group Reduction Specialization
+
+- Tested a small HIP source cleanup that specialized the final chunked stage1
+  value-group reduction for the common `value_groups==4` and `value_groups==2`
+  cases. The edit compiled and passed the focused source/hardware guards, and
+  the short 512/2048 runs were neutral-to-slightly-green:
+
+```text
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2:
+  /tmp/go-rocm-kernels-gfx1100-value-reduce.hsaco
+  stderr: .bench-errors/hipcc_gfx1100_value_reduce_20260527.err (empty)
+
+attention-heads-chunked-direct-token-kv hardware smoke:
+  ok
+  stderr: .bench-errors/hardware_attention_value_reduce_20260527.err (empty)
+
+512-token guard:
+  4540877842 ns/op
+  112.8 tok/s
+  3207800 B/op
+  3010 allocs/op
+  stderr: .bench-errors/512_value_reduce_20260527.err (empty)
+
+2048-token guard:
+  18934918172 ns/op
+  108.2 tok/s
+  6672960 B/op
+  2629 allocs/op
+  stderr: .bench-errors/2048_value_reduce_20260527.err (empty)
+```
+
+- The strict retained-book gates did not justify keeping it. Greedy was
+  effectively noise-neutral, and sampled/default generation failed the chapter
+  10 arc-anchor acceptance floor:
+
+```text
+greedy retained book:
+  41845843246 ns/op
+  book_wall_s/op 41.79
+  book_decode_s/op 32.83
+  book_generated_tokens/op 2861
+  book_tok/s 68.47
+  book_turn10_tok/s 64.58
+  chapter10_arc_anchor_hits 5
+  B/op 18336208
+  allocs/op 34836
+  stderr: .bench-errors/book_retained_greedy_value_reduce_20260527.err (empty)
+
+sampled/default retained book:
+  FAIL: chapter 10 anchor hits = 2 below GO_ROCM_BOOK_MIN_ARC_ANCHOR_HITS=3
+  stderr: .bench-errors/book_retained_sampled_value_reduce_20260527.err (empty)
+  output: /tmp/go-rocm-book-retained-sampled-value-reduce-20260527.md
+```
+
+- Rejected and reverted. The change altered floating reduction order without a
+  meaningful retained-book speed win, so it adds quality drift risk without
+  moving the late-turn decode target.
+
 ## 2026-05-27 Current Sampled Retained-Book Baseline
 
 - Ran the real full-cap retained `book.md` workload after the latest
