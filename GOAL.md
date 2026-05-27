@@ -40,17 +40,21 @@ The 100+ tok/s goal is complete only when all of these are true:
 Current status as of 2026-05-27: the q4 2048-token performance endpoint remains
 met on the pinned RX 7800 XT with a fresh live `gfx1100` HSACO. The latest
 stricter `GO_ROCM_BENCH_TOKENS=2048` route-metric `text:Hi` run reports
-`19162439900 ns/op`, `106.9 tok/s`, `5412624 B/op`, and `4673 allocs/op`.
+`18714743561 ns/op`, `109.4 tok/s`, `5460088 B/op`, `4697 allocs/op`,
+`999352` kernel launches/op, and `165483379` kernel blocks/op after the narrow
+`cols=256 group=64` q4 projection specialization.
 The chapter-shaped 2048-token fast guard at `context_len=4096` reports
 `19536530899 ns/op`, `104.8 tok/s`, `8017064 B/op`, and `3438 allocs/op`.
 Full-attention/global Gemma4 device KV pages now use 128-token blocks while
 sliding-window layers keep exact one-token pages for 512/1024 SWA trimming. The
-strict retained 10-turn book gate improved to `55.81s` wall, `3974` generated
-tokens, `5` chapter-10 arc anchors, no repeated turns, no max-token turns,
-`13352624 B/op`, and `39059 allocs/op`; turn 10 decode rose to `69.78 tok/s`.
-This is a large long-context allocation and wall-time win, but late-turn decode
-is still below the final 90-100 tok/s production target. These numbers use the
-benchmark's
+strict retained 10-turn book gate remains inside the production-candidate wall
+window after the cols256 specialization: `62.89s` wall, `4507` generated tokens,
+`5` chapter-10 arc anchors, no repeated n-grams, `19316504 B/op`, and `40600`
+allocs/op; turn 10 decode measured `71.61 tok/s`. This is not a clean retained
+wall-time win against the prior `55.81s`/`3974`-token run because the model
+generated more text, but it keeps the no-replay book proof green and improves
+late-turn decode. Long-context decode is still below the final 90-100 tok/s
+production target. These numbers use the benchmark's
 `inference.WithContextLen` load setting, now correctly applied to Gemma4 q4
 sliding-window layers, and keep full-attention layers uncapped.
 
@@ -70,13 +74,13 @@ can now restore those block refs directly into HIP device KV pages using
 device runtime without the older host-cache remirror step. Keep this layer
 HIP-generic: the same code path should remain usable for a future NVIDIA HIP
 backend profile if the local toolchain targets CUDA through HIP.
-2026-05-27 dependency refresh: `external/go-inference` is at `35a2228`
-(`test(openai/chunkenc): AX-11 baselines for per-token SSE encoder`) and
-`external/go-cgo` is at `f8b6797` (`fix(cstring): AdoptCString routes through
-cgo.Free`).
-The refreshed dependency surface passed `go test ./external/go-inference/go/...`
-and `go test ./external/go-cgo/go/...`; `go test ./go` and `go test ./...`
-also stayed green.
+2026-05-27 dependency refresh: `external/go-inference` is current with
+`origin/dev` at `fb49548` (`perf(quant/jang): share lowered fingerprint between
+quantizationType + packedFormat`), `external/go-cgo` is current with
+`origin/dev` at `51d16e8` (`perf(errno): inline WithErrno by forwarding to
+Errno`), and sibling `go-mlx` is current with `origin/dev` at `d168ecc`
+(`feat(admin): reload accepts modern shape + adapter_path overlay`). The local
+toolchain is `go1.26.2 linux/amd64`.
 
 Cross-target HIP proof is now part of the acceptance surface. The ROCm 7.2 HIP
 source must compile through three routes when the local toolchain is available:
