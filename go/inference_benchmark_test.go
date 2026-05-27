@@ -315,6 +315,8 @@ func TestInferenceBenchmarkHIPKernelCountingDriver_Good(t *testing.T) {
 	var builder strings.Builder
 	inferenceBenchmarkWriteHIPKernelRouteMetrics(&builder, driver, 1, 2)
 	if got := builder.String(); !strings.Contains(got, "HIP Kernel Route Metrics") ||
+		!strings.Contains(got, "Selected Hot Kernels") ||
+		!strings.Contains(got, hipKernelNameMLXQ4PairProj) ||
 		!strings.Contains(got, hipKernelNameAttentionHeadsBatchChunkedStage1) ||
 		!strings.Contains(got, "launches/generated_token") {
 		t.Fatalf("kernel output summary = %q, want route metrics with kernel name", got)
@@ -1451,8 +1453,35 @@ func inferenceBenchmarkWriteHIPKernelRouteMetrics(builder *strings.Builder, driv
 		builder.WriteString(strconv.FormatFloat(float64(total.Blocks)/float64(generatedTokens), 'f', 2, 64))
 	}
 	builder.WriteString("\n\n")
+	inferenceBenchmarkWriteHIPKernelRouteTable(builder, "Selected Hot Kernels", inferenceBenchmarkSelectedHIPKernelEntries(driver), generatedTokens)
 	inferenceBenchmarkWriteHIPKernelRouteTable(builder, "Top By Launches", inferenceBenchmarkTopHIPKernelEntries(driver, limit, inferenceBenchmarkHIPKernelSortByLaunches), generatedTokens)
 	inferenceBenchmarkWriteHIPKernelRouteTable(builder, "Top By Blocks", inferenceBenchmarkTopHIPKernelEntries(driver, limit, inferenceBenchmarkHIPKernelSortByBlocks), generatedTokens)
+}
+
+func inferenceBenchmarkSelectedHIPKernelEntries(driver *inferenceBenchmarkHIPKernelCountingDriver) []inferenceBenchmarkHIPKernelEntry {
+	if driver == nil {
+		return nil
+	}
+	names := []string{
+		hipKernelNameMLXQ4Proj,
+		hipKernelNameMLXQ4TripleProj,
+		hipKernelNameMLXQ4PairProj,
+		hipKernelNameMLXQ4GELUTanhMul,
+		hipKernelNameMLXQ4GELUTanhProj,
+		hipKernelNameMLXQ4ProjGreedy,
+		hipKernelNameMLXQ4ProjScores,
+		hipKernelNamePackedTopK,
+		hipKernelNameAttentionHeadsChunkedStage1,
+		hipKernelNameAttentionHeadsChunkedStage2,
+		hipKernelNameAttentionHeadsBatchCausal,
+		hipKernelNameAttentionHeadsBatchChunkedStage1,
+		hipKernelNameAttentionHeadsBatchChunkedStage2,
+	}
+	entries := make([]inferenceBenchmarkHIPKernelEntry, 0, len(names))
+	for _, name := range names {
+		entries = append(entries, inferenceBenchmarkHIPKernelEntry{name: name, stats: driver.KernelStats(name)})
+	}
+	return entries
 }
 
 func inferenceBenchmarkWriteHIPKernelRouteTable(builder *strings.Builder, title string, entries []inferenceBenchmarkHIPKernelEntry, generatedTokens int) {

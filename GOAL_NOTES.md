@@ -15854,5 +15854,6 @@ This is a correctness and launch-count cleanup, not a throughput win. The pair
 kernel is too small to change the headline while q4 projection remains about
 125 launches/token and GELU-tanh multiply/projection remain about 35
 launches/token each. Route metrics now report q4 projection, triple projection,
-pair projection, and GELU projection/multiply explicitly so future samples do
-not hide the pair route when it falls below the top-k table.
+pair projection, and GELU projection/multiply explicitly through both
+`b.ReportMetric` and a retained-book "Selected Hot Kernels" artifact table, so
+future samples do not hide the pair route when it falls below the top-k table.
