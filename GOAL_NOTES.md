@@ -47,6 +47,12 @@ output: /tmp/go-rocm-book-10turn-fullcap-repeatmetric.md
   headings, generated only `1173` tokens, and failed the chapter-10 arc gate
   with `0` anchor hits. The code was not kept; the next quality fix should not
   blindly suppress repeated token n-grams across the whole book state.
+- Rejected a follow-up prompt-shape change that asked later retained turns to
+  "advance the plot" instead of restating earlier language. It removed adjacent
+  repetition (`book_repeated_turns=0`, `max_adjacent_repeat=0.016`) and
+  produced fuller chapters (`4187` generated tokens), but chapter 10 drifted
+  into the architecture distractor and turn-10 decode fell to `58.41 tok/s`,
+  below the current retained late-turn floor. The prompt was restored.
 
 ## 2026-05-27 Q4 Generation Ladder Gate
 
