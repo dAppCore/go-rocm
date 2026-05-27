@@ -1,5 +1,37 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Dependency Refresh After Scale Cache
+
+- Fast-forwarded active dev submodules again:
+  - `external/go-inference` `da38edd` -> `e857d64`
+    (`perf(openai): lazy-build extractor deltas + cache marker starts -- -54%
+    mem on plain-token streaming`, plus parser/codebook AX-11 perf work).
+  - `external/go-cgo` `f8b6797` -> `38e17b7`
+    (`test(cgo): AX-11 coverage for Scope.Close`, plus new Buffer/Scope
+    allocation-budget coverage).
+- Verified the refreshed dependency surface:
+
+```text
+go test ./external/go-inference/go/... -count=1
+go test ./external/go-cgo/go/... -count=1
+go test ./go -count=1
+go test ./... -count=1
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+go test -tags rocm_legacy_server ./... -count=1
+git diff --check
+```
+
+- Fresh RX 7800 XT 2048-token q4 guard stayed green:
+
+```text
+BenchmarkInferenceGemma4Q4Generate:
+  18927441633 ns/op
+  108.2 tok/s
+  6676672 B/op
+  2617 allocs/op
+  stderr: /tmp/go-rocm-2048-after-deps-4.err (empty)
+```
+
 ## 2026-05-27 Gemma4 Main Embedding Scale Cache Parity
 
 - Extended the Gemma4 scale-cache parity to the main token embedding path.
