@@ -1,5 +1,28 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 go-cgo Finalizer-Clear Refresh
+
+- One-time CoreGO check before narrowing the refresh loop: `external/go` is
+  current with `origin/dev` at `f7a84db` / `v0.10.3`
+  (`feat(unsafe): add PinnedView for zero-copy Go->C tensor handoff`).
+- Rechecked active dependency remotes. `external/go-inference` remains current
+  at `35a2228`; `external/go-cgo` remains current at `63dc2b2`.
+- Advanced the parent `external/go-cgo` gitlink from `3880482` to `63dc2b2`
+  (`perf(buffer): skip finalizer-clear on Free when none was registered`).
+  This is another dependency-side allocation cleanup for unmanaged buffer
+  ownership and does not change ROCm kernel behavior by itself.
+- Gates before recording the gitlink were green:
+
+```text
+go test ./external/go-cgo/go/... -count=1
+go test ./external/go-inference/go/... -count=1
+go test ./go -count=1
+go test ./... -count=1
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+go test -tags rocm_legacy_server ./... -count=1
+git diff --check && git -C external/go-inference diff --check && git -C external/go-cgo diff --check
+```
+
 ## 2026-05-27 Dependency Refresh and Direct KV Restore Copy
 
 - Fast-forwarded active dev submodules again:
