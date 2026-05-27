@@ -600,6 +600,14 @@ turn 2. Because sampled output length varied, treat this as host-overhead and
 allocation cleanup rather than evidence that the GPU projection/attention
 bottleneck moved.
 
+Sampling separation probe: a serialized greedy 2-turn `2k` retained sampled book
+guard (`GO_ROCM_BOOK_TEMPERATURE=0`, `GO_ROCM_BOOK_TOP_K=0`,
+`GO_ROCM_BOOK_TOP_P=0`) completed with empty stderr at `10.79s` wall, `10.27s`
+decode, `1036` generated tokens, `96.01 tok/s` average, and `94.34 tok/s` on
+turn 2. This is only slightly above the host-sampling run, so final sampling is
+not the next high-ROI target. Keep focusing on q4 projection/GELU kernels and
+long-context attention.
+
 Rejected prompt-shortening follow-up: replacing the anchored wording with a
 shorter "advance the arc / keep continuity words alive" instruction reduced
 prompt tokens to `1581` and still passed the arc gate with `3` anchors, but it
