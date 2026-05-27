@@ -21,6 +21,49 @@ func BenchmarkInferenceGemma4Q4Generate(b *testing.B) {
 	benchmarkInferenceGemma4Q4Generate(b)
 }
 
+func BenchmarkInferenceGemma4Q4Generate_Ladder(b *testing.B) {
+	if os.Getenv("GO_ROCM_RUN_BENCHMARKS") != "1" {
+		b.Skip("set GO_ROCM_RUN_BENCHMARKS=1 to run ROCm inference benchmarks")
+	}
+	if os.Getenv("GO_ROCM_RUN_LADDER_BENCHMARKS") != "1" {
+		b.Skip("set GO_ROCM_RUN_LADDER_BENCHMARKS=1 to run the q4 generation performance ladder")
+	}
+	modelPath := os.Getenv("GO_ROCM_MODEL_PATH")
+	if modelPath == "" {
+		b.Skip("set GO_ROCM_MODEL_PATH to a local Gemma4 q4 model pack")
+	}
+	contextLen, err := inferenceBenchmarkPositiveEnv("GO_ROCM_BENCH_CONTEXT_LEN", 128)
+	if err != nil {
+		b.Fatal(err)
+	}
+	benchPrompt, err := inferenceBenchmarkPromptFromEnv()
+	if err != nil {
+		b.Fatal(err)
+	}
+	prefillUBatchTokens, err := hipGemma4Q4PrefillUBatchTokens()
+	if err != nil {
+		b.Fatal(err)
+	}
+	ladderTokens, err := inferenceBenchmarkLadderTokensEnv()
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Setenv("GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE", "1")
+
+	model, err := newROCmBackendWithRuntime(newSystemNativeRuntime()).LoadModel(modelPath, inference.WithContextLen(contextLen))
+	if err != nil {
+		b.Fatalf("LoadModel(%q): %v", modelPath, err)
+	}
+	defer inferenceBenchmarkCloseModel(b, model)
+
+	for _, maxTokens := range ladderTokens {
+		maxTokens := maxTokens
+		b.Run(fmt.Sprintf("tokens_%d", maxTokens), func(b *testing.B) {
+			inferenceBenchmarkRunGemma4Q4GenerateLoaded(b, model, benchPrompt, maxTokens, contextLen, prefillUBatchTokens, "")
+		})
+	}
+}
+
 func BenchmarkInferenceGemma4Q4Generate_OpencodeSessionStart29K(b *testing.B) {
 	if os.Getenv("GO_ROCM_RUN_29K_BENCHMARKS") != "1" {
 		b.Skip("set GO_ROCM_RUN_29K_BENCHMARKS=1 to run the 29k opencode session-start benchmark")
@@ -998,6 +1041,11 @@ func benchmarkInferenceGemma4Q4Generate(b *testing.B) {
 	}
 	defer inferenceBenchmarkCloseModel(b, model)
 
+	inferenceBenchmarkRunGemma4Q4GenerateLoaded(b, model, benchPrompt, maxTokens, contextLen, prefillUBatchTokens, outputPath)
+}
+
+func inferenceBenchmarkRunGemma4Q4GenerateLoaded(b *testing.B, model inference.TextModel, benchPrompt inferenceBenchmarkPrompt, maxTokens, contextLen, prefillUBatchTokens int, outputPath string) {
+	b.Helper()
 	b.ReportAllocs()
 	b.ResetTimer()
 	totalTokens := 0
@@ -1027,8 +1075,10 @@ func benchmarkInferenceGemma4Q4Generate(b *testing.B) {
 			b.Fatalf("write GO_ROCM_BENCH_OUTPUT_FILE=%q: %v", outputPath, err)
 		}
 	}
+	var tokPerSec float64
 	if elapsed > 0 {
-		b.ReportMetric(float64(totalTokens)/elapsed.Seconds(), "tok/s")
+		tokPerSec = float64(totalTokens) / elapsed.Seconds()
+		b.ReportMetric(tokPerSec, "tok/s")
 		if benchPrompt.promptTokens > 0 {
 			promptTokens := benchPrompt.promptTokens * b.N
 			b.ReportMetric(float64(promptTokens)/elapsed.Seconds(), "prompt_tok/s")
@@ -1041,6 +1091,11 @@ func benchmarkInferenceGemma4Q4Generate(b *testing.B) {
 	b.ReportMetric(float64(prefillUBatchTokens), "prefill_ubatch_tokens")
 	if benchPrompt.promptTokens > 0 {
 		b.ReportMetric(float64(benchPrompt.promptTokens), "prompt_tokens/op")
+	}
+	inferenceBenchmarkFailBelowMetric(b, "GO_ROCM_BENCH_MIN_TOK_PER_SEC", "tok/s", tokPerSec)
+	if benchPrompt.promptTokens > 0 && elapsed > 0 {
+		promptTokPerSec := float64(benchPrompt.promptTokens*b.N) / elapsed.Seconds()
+		inferenceBenchmarkFailBelowMetric(b, "GO_ROCM_BENCH_MIN_PROMPT_TOK_PER_SEC", "prompt_tok/s", promptTokPerSec)
 	}
 }
 
@@ -1243,6 +1298,50 @@ func inferenceBenchmarkOptionalPositiveEnv(name string) (int, bool, error) {
 		return 0, true, fmt.Errorf("%s=%q, want positive integer", name, value)
 	}
 	return parsed, true, nil
+}
+
+func inferenceBenchmarkOptionalPositiveFloatEnv(name string) (float64, bool, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return 0, false, nil
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil || parsed <= 0 {
+		return 0, true, fmt.Errorf("%s=%q, want positive float", name, value)
+	}
+	return parsed, true, nil
+}
+
+func inferenceBenchmarkLadderTokensEnv() ([]int, error) {
+	value := strings.TrimSpace(os.Getenv("GO_ROCM_BENCH_LADDER_TOKENS"))
+	if value == "" {
+		return []int{1, 8, 64, 512, 2000}, nil
+	}
+	parts := strings.Split(value, ",")
+	tokens := make([]int, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, fmt.Errorf("GO_ROCM_BENCH_LADDER_TOKENS contains an empty token count")
+		}
+		count, err := strconv.Atoi(part)
+		if err != nil || count <= 0 {
+			return nil, fmt.Errorf("GO_ROCM_BENCH_LADDER_TOKENS token count %q, want positive integer", part)
+		}
+		tokens = append(tokens, count)
+	}
+	return tokens, nil
+}
+
+func inferenceBenchmarkFailBelowMetric(b *testing.B, envName, metricName string, got float64) {
+	b.Helper()
+	minimum, ok, err := inferenceBenchmarkOptionalPositiveFloatEnv(envName)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if ok && got < minimum {
+		b.Fatalf("%s %.3f below %s=%0.3f", metricName, got, envName, minimum)
+	}
 }
 
 func inferenceBenchmarkBookPrefillUBatchTokens(b *testing.B) int {
@@ -1572,6 +1671,44 @@ func TestInferenceBenchmarkOptionalPositiveEnv_Good(t *testing.T) {
 	got, ok, err = inferenceBenchmarkOptionalPositiveEnv("GO_ROCM_BOOK_LAYERS")
 	if err != nil || !ok || got != 2 {
 		t.Fatalf("set optional positive = %d, %t, %v; want 2", got, ok, err)
+	}
+}
+
+func TestInferenceBenchmarkLadderTokensEnv_Good(t *testing.T) {
+	t.Setenv("GO_ROCM_BENCH_LADDER_TOKENS", "")
+	got, err := inferenceBenchmarkLadderTokensEnv()
+	if err != nil || fmt.Sprint(got) != "[1 8 64 512 2000]" {
+		t.Fatalf("default ladder tokens = %v, %v; want 1/8/64/512/2000", got, err)
+	}
+
+	t.Setenv("GO_ROCM_BENCH_LADDER_TOKENS", "1, 2048")
+	got, err = inferenceBenchmarkLadderTokensEnv()
+	if err != nil || fmt.Sprint(got) != "[1 2048]" {
+		t.Fatalf("custom ladder tokens = %v, %v; want [1 2048]", got, err)
+	}
+
+	t.Setenv("GO_ROCM_BENCH_LADDER_TOKENS", "1,,8")
+	if _, err = inferenceBenchmarkLadderTokensEnv(); err == nil {
+		t.Fatal("empty ladder token count error = nil")
+	}
+}
+
+func TestInferenceBenchmarkOptionalPositiveFloatEnv_Good(t *testing.T) {
+	t.Setenv("GO_ROCM_BENCH_MIN_TOK_PER_SEC", "")
+	got, ok, err := inferenceBenchmarkOptionalPositiveFloatEnv("GO_ROCM_BENCH_MIN_TOK_PER_SEC")
+	if err != nil || ok || got != 0 {
+		t.Fatalf("empty optional positive float = %f, %t, %v; want unset", got, ok, err)
+	}
+
+	t.Setenv("GO_ROCM_BENCH_MIN_TOK_PER_SEC", "100.5")
+	got, ok, err = inferenceBenchmarkOptionalPositiveFloatEnv("GO_ROCM_BENCH_MIN_TOK_PER_SEC")
+	if err != nil || !ok || got != 100.5 {
+		t.Fatalf("set optional positive float = %f, %t, %v; want 100.5", got, ok, err)
+	}
+
+	t.Setenv("GO_ROCM_BENCH_MIN_TOK_PER_SEC", "0")
+	if _, _, err = inferenceBenchmarkOptionalPositiveFloatEnv("GO_ROCM_BENCH_MIN_TOK_PER_SEC"); err == nil {
+		t.Fatal("zero optional positive float error = nil")
 	}
 }
 

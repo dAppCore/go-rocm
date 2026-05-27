@@ -1,5 +1,31 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Q4 Generation Ladder Gate
+
+- Added `BenchmarkInferenceGemma4Q4Generate_Ladder` as the AX-11 regression
+  surface requested in `GOAL.md`. It is opt-in behind
+  `GO_ROCM_RUN_LADDER_BENCHMARKS=1`, loads the Gemma4 q4 model once, and runs
+  the default 1/8/64/512/2000 generated-token ladder as sub-benchmarks with
+  `b.ReportAllocs()`.
+- Added `GO_ROCM_BENCH_LADDER_TOKENS` for custom rungs, plus
+  `GO_ROCM_BENCH_MIN_TOK_PER_SEC` and
+  `GO_ROCM_BENCH_MIN_PROMPT_TOK_PER_SEC` so ladder/endpoint runs can fail
+  mechanically when decode or prompt-processing throughput regresses.
+- A fresh single-job RX 7800 XT 2048-token guard before this edit reported
+  `18868546700 ns/op`, `108.5 tok/s`, `6616024 B/op`, and `2533 allocs/op`
+  with empty `/tmp/go-rocm-2048.err`.
+- The new ladder was run once with `-benchtime=1x` on
+  `ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85` and empty
+  `/tmp/go-rocm-ladder.err`:
+
+```text
+tokens_1       23604773 ns/op      42.36 tok/s   1420448 B/op  1992 allocs/op
+tokens_8      104826047 ns/op      76.32 tok/s   1004456 B/op  1211 allocs/op
+tokens_64     538995762 ns/op     118.7 tok/s     251336 B/op  1100 allocs/op
+tokens_512   4528207764 ns/op     113.1 tok/s     713024 B/op  1174 allocs/op
+tokens_2000 18265196384 ns/op     109.5 tok/s    2284760 B/op  1219 allocs/op
+```
+
 ## 2026-05-26 Public Q4 Direct Token Path
 
 - Kept the 2048-token fast loop as the edit gate and promoted only after the

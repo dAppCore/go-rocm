@@ -1403,7 +1403,7 @@ endpoint.
   norm, LM head, and greedy/sample stay on the GPU. Only the selected token ID
   comes back to Go for tokenizer/loop control. The initial device KV cache is
   now bootstrapped from device K/V token buffers instead of host K/V vectors.
-- [ ] Add a performance ladder and fail fast on regressions: 1, 8, 64, 512, and
+- [x] Add a performance ladder and fail fast on regressions: 1, 8, 64, 512, and
   2000 generated tokens.
 - [ ] Once BF16 correctness is stable, use q4 for fast iteration, but do not
   accept q4 speedups that bypass the real Gemma4 q4 packed tensors.
@@ -1453,6 +1453,24 @@ go test ./go -run '^$' -bench BenchmarkInferenceGemma4Q4Generate -benchmem -coun
 
 Use `GO_ROCM_BENCH_TOKENS=2048` for the stricter 2k-token check used in the
 latest fresh-quota pass.
+
+Opt-in q4 performance ladder, with mechanical regression thresholds:
+
+```sh
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 \
+GO_ROCM_RUN_BENCHMARKS=1 \
+GO_ROCM_RUN_LADDER_BENCHMARKS=1 \
+GO_ROCM_RUN_MODEL_TESTS=1 \
+GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit \
+GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100.hsaco \
+GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE=1 \
+go test ./go -run '^$' -bench BenchmarkInferenceGemma4Q4Generate_Ladder -benchmem -count=1
+```
+
+Set `GO_ROCM_BENCH_MIN_TOK_PER_SEC` or
+`GO_ROCM_BENCH_MIN_PROMPT_TOK_PER_SEC` when a run should fail mechanically.
+For an endpoint-only threshold, pair it with
+`GO_ROCM_BENCH_LADDER_TOKENS=2000,2048`.
 
 Correctness anchors:
 
