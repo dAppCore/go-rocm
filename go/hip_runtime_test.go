@@ -4098,6 +4098,13 @@ func (driver *fakeHIPDriver) launchEmbeddingLookup(args []byte, greedyToken bool
 	biasPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[80:]))
 	scaleBytes := int(binary.LittleEndian.Uint32(args[88:]))
 	biasBytes := int(binary.LittleEndian.Uint32(args[92:]))
+	outputScale := float32(1)
+	if bits := binary.LittleEndian.Uint32(args[96:]); bits != 0 {
+		outputScale = math.Float32frombits(bits)
+		if math.IsNaN(float64(outputScale)) || math.IsInf(float64(outputScale), 0) {
+			return core.E("rocm.hip.FakeLaunch", "embedding lookup output scale must be finite", nil)
+		}
+	}
 	wantTokenBytes := tokenCount * 4
 	if greedyToken {
 		wantTokenBytes = hipMLXQ4ProjectionBestBytes
@@ -4180,6 +4187,9 @@ func (driver *fakeHIPDriver) launchEmbeddingLookup(args []byte, greedyToken bool
 				return core.E("rocm.hip.FakeLaunch", "unsupported embedding lookup encoding", nil)
 			}
 		}
+	}
+	for index := range output {
+		output[index] *= outputScale
 	}
 	payload, err := hipFloat32Payload(output)
 	if err != nil {

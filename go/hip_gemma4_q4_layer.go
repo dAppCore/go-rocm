@@ -619,34 +619,25 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 	var perLayerInputs [][]float32
 	var perLayerInputDevices *hipGemma4Q4PerLayerInputDeviceSet
 	if req.OmitDebugTensors {
-		var embeddingBuffer *hipDeviceByteBuffer
 		if req.AttentionWorkspace != nil {
-			embeddingBuffer, err = req.AttentionWorkspace.EnsureEmbeddingOutput(driver, first.HiddenSize)
+			hiddenBuffer, err = req.AttentionWorkspace.EnsureScaledEmbedding(driver, first.HiddenSize)
 			if err == nil && req.TokenIDDeviceBuffer != nil {
-				err = hipRunEmbeddingLookupKernelWithDeviceTableGreedyTokenOutput(ctx, driver, first.Embedding, req.TokenIDDeviceBuffer, embeddingBuffer)
+				err = hipRunEmbeddingLookupKernelWithDeviceTableGreedyTokenScaledOutput(ctx, driver, first.Embedding, req.TokenIDDeviceBuffer, hiddenBuffer, first.embeddingScale())
 			} else if err == nil {
 				tokenBuffer, tokenErr := req.AttentionWorkspace.EnsureTokenIDValue(driver, req.TokenID, first.Embedding.VocabSize)
 				if tokenErr != nil {
 					return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, tokenErr
 				}
-				err = hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferOutput(ctx, driver, first.Embedding, tokenBuffer, embeddingBuffer)
+				err = hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferScaledOutput(ctx, driver, first.Embedding, tokenBuffer, hiddenBuffer, first.embeddingScale())
 			}
+			hiddenBufferBorrowed = err == nil
 		} else {
+			var embeddingBuffer *hipDeviceByteBuffer
 			embeddingBuffer, err = hipRunEmbeddingLookupKernelWithDeviceTableBuffer(ctx, driver, []int32{req.TokenID}, first.Embedding)
-		}
-		if err != nil {
-			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
-		}
-		if req.AttentionWorkspace == nil {
-			defer embeddingBuffer.Close()
-		}
-		if req.AttentionWorkspace != nil {
-			hiddenBuffer, err = req.AttentionWorkspace.EnsureScaledEmbedding(driver, first.HiddenSize)
-			if err == nil {
-				err = hipRunVectorScaleDeviceKernelOutput(ctx, driver, embeddingBuffer, first.embeddingScale(), hiddenBuffer)
-				hiddenBufferBorrowed = err == nil
+			if err != nil {
+				return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
 			}
-		} else {
+			defer embeddingBuffer.Close()
 			hiddenBuffer, err = hipRunVectorScaleDeviceKernel(ctx, driver, embeddingBuffer, first.embeddingScale())
 		}
 		if err != nil {
@@ -2873,41 +2864,32 @@ func hipRunGemma4Q4PerLayerInputConfigDeviceSet(ctx context.Context, driver nati
 		return nil, core.E(hipGemma4Q4Layer0Operation, "per-layer input global shape mismatch", nil)
 	}
 	var err error
-	var perLayerEmbedding *hipDeviceByteBuffer
+	var perLayerEmbeddingScaled *hipDeviceByteBuffer
 	if workspace != nil {
-		perLayerEmbedding, err = workspace.EnsurePerLayerEmbedding(driver, cfg.ModelProjection.Rows)
+		perLayerEmbeddingScaled, err = workspace.EnsurePerLayerScaled(driver, cfg.ModelProjection.Rows)
 		if err == nil && tokenIDDeviceBuffer != nil {
-			err = hipRunEmbeddingLookupKernelWithDeviceTableGreedyTokenOutput(ctx, driver, cfg.Embedding, tokenIDDeviceBuffer, perLayerEmbedding)
+			err = hipRunEmbeddingLookupKernelWithDeviceTableGreedyTokenScaledOutput(ctx, driver, cfg.Embedding, tokenIDDeviceBuffer, perLayerEmbeddingScaled, cfg.embeddingScale())
 		} else if err == nil {
 			tokenBuffer, tokenErr := workspace.EnsureTokenIDValue(driver, tokenID, cfg.Embedding.VocabSize)
 			if tokenErr != nil {
 				return nil, tokenErr
 			}
-			err = hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferOutput(ctx, driver, cfg.Embedding, tokenBuffer, perLayerEmbedding)
+			err = hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferScaledOutput(ctx, driver, cfg.Embedding, tokenBuffer, perLayerEmbeddingScaled, cfg.embeddingScale())
 		}
 		if err != nil {
 			return nil, err
 		}
 	} else {
+		var perLayerEmbedding *hipDeviceByteBuffer
 		perLayerEmbedding, err = hipRunEmbeddingLookupKernelWithDeviceTableBuffer(ctx, driver, []int32{tokenID}, cfg.Embedding)
 		if err != nil {
 			return nil, err
 		}
 		defer perLayerEmbedding.Close()
-	}
-	var perLayerEmbeddingScaled *hipDeviceByteBuffer
-	if workspace != nil {
-		perLayerEmbeddingScaled, err = workspace.EnsurePerLayerScaled(driver, cfg.ModelProjection.Rows)
-		if err == nil {
-			err = hipRunVectorScaleDeviceKernelOutput(ctx, driver, perLayerEmbedding, cfg.embeddingScale(), perLayerEmbeddingScaled)
-		}
-	} else {
 		perLayerEmbeddingScaled, err = hipRunVectorScaleDeviceKernel(ctx, driver, perLayerEmbedding, cfg.embeddingScale())
-	}
-	if err != nil {
-		return nil, err
-	}
-	if workspace == nil {
+		if err != nil {
+			return nil, err
+		}
 		defer perLayerEmbeddingScaled.Close()
 	}
 	var projected *hipDeviceByteBuffer

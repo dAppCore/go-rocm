@@ -306,7 +306,8 @@ func TestHIPKernelSource_EmbeddingGreedyTokenReadsPackedBest_Good(t *testing.T) 
 	core.AssertTrue(t, strings.Contains(embedding, `rocm_valid_embedding_lookup_greedy_token_args(args)`), "greedy-token embedding must validate the packed-token launch shape")
 	core.AssertTrue(t, strings.Contains(embedding, `const uint64_t *best`), "greedy-token embedding must read the packed q4 greedy result")
 	core.AssertTrue(t, strings.Contains(embedding, `~static_cast<uint32_t>(*best)`), "greedy-token embedding must unpack the token ID from the q4 greedy result")
-	core.AssertTrue(t, strings.Contains(embedding, `rocm_embedding_lookup_store(args, index, token_id, index)`), "greedy-token embedding must reuse the normal embedding table path")
+	core.AssertTrue(t, strings.Contains(embedding, `args.output_scale_bits == 0 ? 1.0f : rocm_float_from_bits(args.output_scale_bits)`), "greedy-token embedding must support fused output scaling")
+	core.AssertTrue(t, strings.Contains(embedding, `rocm_embedding_lookup_store(args, index, token_id, index, output_scale)`), "greedy-token embedding must reuse the normal embedding table path")
 }
 
 func TestHIPDriverCGOSource_HotOutputPointersUseResultWrappers_Good(t *testing.T) {

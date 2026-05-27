@@ -81,6 +81,7 @@ func TestHIPEmbeddingLookupLaunch_Good(t *testing.T) {
 	core.AssertEqual(t, uint64(24), binary.LittleEndian.Uint64(payload[48:]))
 	core.AssertEqual(t, uint64(16), binary.LittleEndian.Uint64(payload[56:]))
 	core.AssertEqual(t, hipEmbeddingTableEncodingF32, binary.LittleEndian.Uint32(payload[64:]))
+	core.AssertEqual(t, uint32(0), binary.LittleEndian.Uint32(payload[96:]))
 
 	got, err := hipRunEmbeddingLookupKernel(context.Background(), &fakeHIPDriver{available: true}, req)
 	core.RequireNoError(t, err)
@@ -140,6 +141,21 @@ func TestHIPEmbeddingLookupLaunch_Good(t *testing.T) {
 	noWriteValues, err := (&hipEmbeddingLookupDeviceBuffers{Output: deviceBF16NoWriteOutput, TokenCount: 1, HiddenSize: bf16Req.HiddenSize}).ReadOutput()
 	core.RequireNoError(t, err)
 	assertFloat32SlicesNear(t, []float32{-1, 3}, noWriteValues, 0)
+	deviceBF16ScaledOutput, err := hipAllocateByteBuffer(deviceBF16Driver, "rocm.hip.EmbeddingLookupLaunch", "single token scaled output", uint64(bf16Req.HiddenSize*4), bf16Req.HiddenSize)
+	core.RequireNoError(t, err)
+	defer deviceBF16ScaledOutput.Close()
+	err = hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferScaledOutput(context.Background(), deviceBF16Driver, hipDeviceEmbeddingLookupConfig{
+		EmbeddingPointer: deviceBF16.Pointer(),
+		EmbeddingBytes:   deviceBF16.SizeBytes(),
+		TableEncoding:    hipEmbeddingTableEncodingBF16,
+		VocabSize:        bf16Req.VocabSize,
+		HiddenSize:       bf16Req.HiddenSize,
+	}, tokenWorkspace, deviceBF16ScaledOutput, 0.5)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, math.Float32bits(0.5), binary.LittleEndian.Uint32(deviceBF16Driver.launches[len(deviceBF16Driver.launches)-1].Args[96:]))
+	scaledValues, err := (&hipEmbeddingLookupDeviceBuffers{Output: deviceBF16ScaledOutput, TokenCount: 1, HiddenSize: bf16Req.HiddenSize}).ReadOutput()
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{-0.5, 1.5}, scaledValues, 0)
 	greedyPayload := make([]byte, hipMLXQ4ProjectionBestBytes)
 	binary.LittleEndian.PutUint64(greedyPayload, hipPackGreedyBest(1, 2))
 	greedyToken, err := hipUploadByteBuffer(deviceBF16Driver, "rocm.hip.EmbeddingLookupLaunch", "greedy token", greedyPayload, 1)
@@ -160,6 +176,21 @@ func TestHIPEmbeddingLookupLaunch_Good(t *testing.T) {
 	greedyValues, err := (&hipEmbeddingLookupDeviceBuffers{Output: greedyOutput, TokenCount: 1, HiddenSize: bf16Req.HiddenSize}).ReadOutput()
 	core.RequireNoError(t, err)
 	assertFloat32SlicesNear(t, []float32{-1, 3}, greedyValues, 0)
+	greedyScaledOutput, err := hipAllocateByteBuffer(deviceBF16Driver, "rocm.hip.EmbeddingLookupLaunch", "greedy token scaled output", uint64(bf16Req.HiddenSize*4), bf16Req.HiddenSize)
+	core.RequireNoError(t, err)
+	defer greedyScaledOutput.Close()
+	err = hipRunEmbeddingLookupKernelWithDeviceTableGreedyTokenScaledOutput(context.Background(), deviceBF16Driver, hipDeviceEmbeddingLookupConfig{
+		EmbeddingPointer: deviceBF16.Pointer(),
+		EmbeddingBytes:   deviceBF16.SizeBytes(),
+		TableEncoding:    hipEmbeddingTableEncodingBF16,
+		VocabSize:        bf16Req.VocabSize,
+		HiddenSize:       bf16Req.HiddenSize,
+	}, greedyToken, greedyScaledOutput, 2)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, math.Float32bits(2), binary.LittleEndian.Uint32(deviceBF16Driver.launches[len(deviceBF16Driver.launches)-1].Args[96:]))
+	greedyScaledValues, err := (&hipEmbeddingLookupDeviceBuffers{Output: greedyScaledOutput, TokenCount: 1, HiddenSize: bf16Req.HiddenSize}).ReadOutput()
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{-2, 6}, greedyScaledValues, 0)
 
 	q4Req := hipEmbeddingLookupRequest{
 		TokenIDs:    []int32{2, 0},
@@ -311,6 +342,22 @@ func TestHIPEmbeddingAndRerankLaunch_Bad(t *testing.T) {
 	}).Binary()
 	core.AssertError(t, err)
 	core.AssertContains(t, err.Error(), "q4 embedding byte count")
+
+	_, err = (hipEmbeddingLookupLaunchArgs{
+		TokenPointer:     1,
+		EmbeddingPointer: 2,
+		OutputPointer:    3,
+		TokenCount:       1,
+		VocabSize:        2,
+		HiddenSize:       2,
+		TokenBytes:       4,
+		EmbeddingBytes:   16,
+		OutputBytes:      8,
+		TableEncoding:    hipEmbeddingTableEncodingF32,
+		OutputScale:      float32(math.NaN()),
+	}).Binary()
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "output scale")
 
 	_, err = hipRunEmbeddingLookupKernelWithDeviceTable(context.Background(), driver, []int32{2}, hipDeviceEmbeddingLookupConfig{
 		EmbeddingPointer: 1,

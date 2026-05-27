@@ -7,6 +7,7 @@ package rocm
 import (
 	"context"
 	"encoding/binary"
+	"math"
 
 	core "dappco.re/go"
 )
@@ -15,7 +16,7 @@ const (
 	hipEmbeddingMeanPoolLaunchArgsVersion uint32 = 1
 	hipEmbeddingMeanPoolLaunchArgsBytes          = 64
 	hipEmbeddingLookupLaunchArgsVersion   uint32 = 1
-	hipEmbeddingLookupLaunchArgsBytes            = 96
+	hipEmbeddingLookupLaunchArgsBytes            = 104
 	hipRerankCosineLaunchArgsVersion      uint32 = 1
 	hipRerankCosineLaunchArgsBytes               = 64
 )
@@ -93,6 +94,7 @@ type hipEmbeddingLookupLaunchArgs struct {
 	BiasPointer      nativeDevicePointer
 	ScaleBytes       uint64
 	BiasBytes        uint64
+	OutputScale      float32
 }
 
 type hipDeviceEmbeddingLookupConfig struct {
@@ -619,6 +621,9 @@ func (args hipEmbeddingLookupLaunchArgs) binary(greedyToken bool) ([]byte, error
 	if args.OutputBytes != outputBytes {
 		return nil, core.E("rocm.hip.EmbeddingLookupLaunch", "output byte count mismatch", nil)
 	}
+	if math.IsNaN(float64(args.OutputScale)) || math.IsInf(float64(args.OutputScale), 0) {
+		return nil, core.E("rocm.hip.EmbeddingLookupLaunch", "output scale must be finite", nil)
+	}
 	payload := hipBorrowLaunchPacket(hipEmbeddingLookupLaunchArgsBytes)
 	binary.LittleEndian.PutUint32(payload[0:], hipEmbeddingLookupLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
@@ -637,6 +642,9 @@ func (args hipEmbeddingLookupLaunchArgs) binary(greedyToken bool) ([]byte, error
 	binary.LittleEndian.PutUint64(payload[80:], uint64(args.BiasPointer))
 	binary.LittleEndian.PutUint32(payload[88:], scaleBytes)
 	binary.LittleEndian.PutUint32(payload[92:], biasBytes)
+	if args.OutputScale != 0 && args.OutputScale != 1 {
+		binary.LittleEndian.PutUint32(payload[96:], math.Float32bits(args.OutputScale))
+	}
 	return payload, nil
 }
 
@@ -817,6 +825,10 @@ func hipRunEmbeddingLookupKernelWithDeviceTableSingleTokenBufferOutput(ctx conte
 }
 
 func hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferOutput(ctx context.Context, driver nativeHIPDriver, cfg hipDeviceEmbeddingLookupConfig, tokenBuffer, output *hipDeviceByteBuffer) error {
+	return hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferScaledOutput(ctx, driver, cfg, tokenBuffer, output, 0)
+}
+
+func hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferScaledOutput(ctx context.Context, driver nativeHIPDriver, cfg hipDeviceEmbeddingLookupConfig, tokenBuffer, output *hipDeviceByteBuffer, outputScale float32) error {
 	if err := hipContextErr(ctx); err != nil {
 		return err
 	}
@@ -845,6 +857,7 @@ func hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferOutput(ctx context.Con
 		BiasPointer:      cfg.BiasPointer,
 		ScaleBytes:       cfg.ScaleBytes,
 		BiasBytes:        cfg.BiasBytes,
+		OutputScale:      outputScale,
 	}).Binary()
 	if err != nil {
 		return err
@@ -860,6 +873,10 @@ func hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferOutput(ctx context.Con
 }
 
 func hipRunEmbeddingLookupKernelWithDeviceTableGreedyTokenOutput(ctx context.Context, driver nativeHIPDriver, cfg hipDeviceEmbeddingLookupConfig, greedyToken, output *hipDeviceByteBuffer) error {
+	return hipRunEmbeddingLookupKernelWithDeviceTableGreedyTokenScaledOutput(ctx, driver, cfg, greedyToken, output, 0)
+}
+
+func hipRunEmbeddingLookupKernelWithDeviceTableGreedyTokenScaledOutput(ctx context.Context, driver nativeHIPDriver, cfg hipDeviceEmbeddingLookupConfig, greedyToken, output *hipDeviceByteBuffer, outputScale float32) error {
 	if err := hipContextErr(ctx); err != nil {
 		return err
 	}
@@ -888,6 +905,7 @@ func hipRunEmbeddingLookupKernelWithDeviceTableGreedyTokenOutput(ctx context.Con
 		BiasPointer:      cfg.BiasPointer,
 		ScaleBytes:       cfg.ScaleBytes,
 		BiasBytes:        cfg.BiasBytes,
+		OutputScale:      outputScale,
 	}).GreedyTokenBinary()
 	if err != nil {
 		return err
