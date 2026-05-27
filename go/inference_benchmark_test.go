@@ -128,6 +128,7 @@ func BenchmarkInferenceGemma4Q4Book10Turn_ReplayBaseline(b *testing.B) {
 	} else {
 		b.ReportMetric(0, "book_host_sampling")
 	}
+	inferenceBenchmarkRequireBookThresholds(b, last)
 	if os.Getenv("GO_ROCM_BOOK_REQUIRE_ARC") == "1" && last.Turns >= 10 && last.ArcAnchorHits < 3 {
 		b.Fatalf("chapter 10 anchor hits = %d, want lighthouse/light/ocean arc retained", last.ArcAnchorHits)
 	}
@@ -200,6 +201,7 @@ func BenchmarkInferenceGemma4Q4Book10Turn_RetainedState(b *testing.B) {
 	if warmupPromptTokens > 0 {
 		b.ReportMetric(float64(warmupPromptTokens), "book_warmup_prompt_tokens")
 	}
+	inferenceBenchmarkRequireBookThresholds(b, last)
 	if os.Getenv("GO_ROCM_BOOK_REQUIRE_ARC") == "1" && last.Turns >= 10 && last.ArcAnchorHits < 3 {
 		b.Fatalf("chapter 10 anchor hits = %d, want lighthouse/light/ocean arc retained", last.ArcAnchorHits)
 	}
@@ -1090,6 +1092,51 @@ func inferenceBenchmarkReportBookTurnStats(b *testing.B, run inferenceBenchmarkB
 	b.ReportMetric(lastDecodeTokS, "book_last_turn_tok/s")
 }
 
+func inferenceBenchmarkRequireBookThresholds(b *testing.B, run inferenceBenchmarkBookRun) {
+	b.Helper()
+	if seconds, ok, err := inferenceBenchmarkOptionalPositiveFloatEnv("GO_ROCM_BOOK_MAX_WALL_SECONDS"); err != nil {
+		b.Fatal(err)
+	} else if ok && run.Wall.Seconds() > seconds {
+		b.Fatalf("book wall %.3fs exceeds GO_ROCM_BOOK_MAX_WALL_SECONDS=%.3f", run.Wall.Seconds(), seconds)
+	}
+	if tokS, ok, err := inferenceBenchmarkOptionalPositiveFloatEnv("GO_ROCM_BOOK_MIN_LAST_TOK_PER_SEC"); err != nil {
+		b.Fatal(err)
+	} else if ok && inferenceBenchmarkBookLastTurnTokS(run) < tokS {
+		b.Fatalf("book last turn %.3f tok/s below GO_ROCM_BOOK_MIN_LAST_TOK_PER_SEC=%.3f", inferenceBenchmarkBookLastTurnTokS(run), tokS)
+	}
+	if anchors, ok, err := inferenceBenchmarkOptionalNonNegativeEnv("GO_ROCM_BOOK_MIN_ARC_ANCHOR_HITS"); err != nil {
+		b.Fatal(err)
+	} else if ok && run.Turns >= 10 && run.ArcAnchorHits < anchors {
+		b.Fatalf("chapter 10 anchor hits = %d below GO_ROCM_BOOK_MIN_ARC_ANCHOR_HITS=%d", run.ArcAnchorHits, anchors)
+	}
+	if maxed, ok, err := inferenceBenchmarkOptionalNonNegativeEnv("GO_ROCM_BOOK_MAX_MAXED_TURNS"); err != nil {
+		b.Fatal(err)
+	} else if ok && inferenceBenchmarkBookMaxedTurns(run) > maxed {
+		b.Fatalf("book maxed turns = %d exceeds GO_ROCM_BOOK_MAX_MAXED_TURNS=%d", inferenceBenchmarkBookMaxedTurns(run), maxed)
+	}
+}
+
+func inferenceBenchmarkBookMaxedTurns(run inferenceBenchmarkBookRun) int {
+	maxed := 0
+	for _, stat := range run.TurnStats {
+		if stat.HitMaxTokens {
+			maxed++
+		}
+	}
+	return maxed
+}
+
+func inferenceBenchmarkBookLastTurnTokS(run inferenceBenchmarkBookRun) float64 {
+	if len(run.TurnStats) == 0 {
+		return 0
+	}
+	last := run.TurnStats[len(run.TurnStats)-1]
+	if last.Decode <= 0 {
+		return 0
+	}
+	return float64(last.GeneratedTokens) / last.Decode.Seconds()
+}
+
 func benchmarkInferenceGemma4Q4Generate(b *testing.B) {
 	if os.Getenv("GO_ROCM_RUN_BENCHMARKS") != "1" {
 		b.Skip("set GO_ROCM_RUN_BENCHMARKS=1 to run ROCm inference benchmarks")
@@ -1390,6 +1437,18 @@ func inferenceBenchmarkOptionalPositiveFloatEnv(name string) (float64, bool, err
 	parsed, err := strconv.ParseFloat(value, 64)
 	if err != nil || parsed <= 0 {
 		return 0, true, fmt.Errorf("%s=%q, want positive float", name, value)
+	}
+	return parsed, true, nil
+}
+
+func inferenceBenchmarkOptionalNonNegativeEnv(name string) (int, bool, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return 0, false, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 0 {
+		return 0, true, fmt.Errorf("%s=%q, want non-negative integer", name, value)
 	}
 	return parsed, true, nil
 }
@@ -1791,6 +1850,40 @@ func TestInferenceBenchmarkOptionalPositiveFloatEnv_Good(t *testing.T) {
 	t.Setenv("GO_ROCM_BENCH_MIN_TOK_PER_SEC", "0")
 	if _, _, err = inferenceBenchmarkOptionalPositiveFloatEnv("GO_ROCM_BENCH_MIN_TOK_PER_SEC"); err == nil {
 		t.Fatal("zero optional positive float error = nil")
+	}
+}
+
+func TestInferenceBenchmarkOptionalNonNegativeEnv_Good(t *testing.T) {
+	t.Setenv("GO_ROCM_BOOK_MAX_MAXED_TURNS", "")
+	got, ok, err := inferenceBenchmarkOptionalNonNegativeEnv("GO_ROCM_BOOK_MAX_MAXED_TURNS")
+	if err != nil || ok || got != 0 {
+		t.Fatalf("empty optional non-negative = %d, %t, %v; want unset", got, ok, err)
+	}
+
+	t.Setenv("GO_ROCM_BOOK_MAX_MAXED_TURNS", "0")
+	got, ok, err = inferenceBenchmarkOptionalNonNegativeEnv("GO_ROCM_BOOK_MAX_MAXED_TURNS")
+	if err != nil || !ok || got != 0 {
+		t.Fatalf("zero optional non-negative = %d, %t, %v; want 0", got, ok, err)
+	}
+
+	t.Setenv("GO_ROCM_BOOK_MAX_MAXED_TURNS", "-1")
+	if _, _, err = inferenceBenchmarkOptionalNonNegativeEnv("GO_ROCM_BOOK_MAX_MAXED_TURNS"); err == nil {
+		t.Fatal("negative optional non-negative error = nil")
+	}
+}
+
+func TestInferenceBenchmarkBookThresholdHelpers_Good(t *testing.T) {
+	run := inferenceBenchmarkBookRun{
+		TurnStats: []inferenceBenchmarkBookTurnStat{
+			{GeneratedTokens: 2, Decode: time.Second, HitMaxTokens: true},
+			{GeneratedTokens: 4, Decode: 2 * time.Second},
+		},
+	}
+	if got := inferenceBenchmarkBookMaxedTurns(run); got != 1 {
+		t.Fatalf("maxed turns = %d, want 1", got)
+	}
+	if got := inferenceBenchmarkBookLastTurnTokS(run); got != 2 {
+		t.Fatalf("last turn tok/s = %f, want 2", got)
 	}
 }
 

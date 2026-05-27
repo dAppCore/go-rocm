@@ -80,6 +80,21 @@ book_turn02_allocs/op 8525
 B/op 8026552
 allocs/op 16260
 ```
+- Added optional mechanical book-acceptance thresholds:
+  `GO_ROCM_BOOK_MAX_WALL_SECONDS`, `GO_ROCM_BOOK_MIN_LAST_TOK_PER_SEC`,
+  `GO_ROCM_BOOK_MIN_ARC_ANCHOR_HITS`, and
+  `GO_ROCM_BOOK_MAX_MAXED_TURNS`. A 2-turn/8-token retained greedy smoke on
+  the RX 7800 XT passed with thresholds enabled
+  (`max_wall=5s`, `min_last_tok/s=50`, `max_maxed_turns=2`) and empty
+  `/tmp/go-rocm-book-2x8-thresholds.err`:
+
+```text
+book_wall_s/op 0.6248
+book_last_turn_tok/s 121.7
+book_maxed_turns/op 2
+B/op 8016608
+allocs/op 16256
+```
 
 ## 2026-05-26 Public Q4 Direct Token Path
 
