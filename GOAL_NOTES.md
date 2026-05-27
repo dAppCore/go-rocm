@@ -34,6 +34,15 @@ tokens_2000 18265196384 ns/op     109.5 tok/s    2284760 B/op  1219 allocs/op
 ```text
 BenchmarkHIPGemma4Q4PlanPromptPrefill_29K-32  643.6 ns/op  5216 B/op  2 allocs/op
 ```
+- Reused the prior-layer KV cache slice across batched prefill ubatches in the
+  public q4 stream and retained-book session. This removes one pointer-slice
+  allocation per prior-backed ubatch, which matters for 29k/48k prompt runs.
+  The focused scratch benchmark reports:
+
+```text
+BenchmarkHIPGemma4Q4DeviceLayerCaches_Reused-32  16.93 ns/op  0 B/op  0 allocs/op
+```
+
 - Retained-book benchmark accounting now fills the memory fields for the
   direct retained path and reports per-turn retained-token counts, active
   memory, and peak memory. A 2-turn/8-token greedy smoke on the RX 7800 XT

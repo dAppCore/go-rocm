@@ -403,6 +403,7 @@ type inferenceBenchmarkGemma4Q4RetainedBookSession struct {
 	deviceState        *hipGemma4Q4DeviceDecodeState
 	finalGreedyBuffer  *hipDeviceByteBuffer
 	attentionWorkspace *hipAttentionHeadsChunkedWorkspace
+	priorLayerKV       []*rocmDeviceKVCache
 }
 
 type inferenceBenchmarkGemma4Q4RetainedTurn struct {
@@ -676,10 +677,8 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 		for _, ubatch := range prefillPlan.Batches {
 			priorLayerKV := []*rocmDeviceKVCache(nil)
 			if session.deviceState != nil {
-				priorLayerKV = make([]*rocmDeviceKVCache, len(session.cfg.Layers))
-				for index := range priorLayerKV {
-					priorLayerKV[index] = session.deviceState.layerCache(index)
-				}
+				session.priorLayerKV = hipGemma4Q4DeviceLayerCaches(session.deviceState, session.priorLayerKV, len(session.cfg.Layers))
+				priorLayerKV = session.priorLayerKV
 			}
 			forward, err := hipRunGemma4Q4PrefillForwardBatchWithPrior(ctx, session.model.driver, session.cfg, ubatch.Tokens, ubatch.Position, 1e-6, session.mode, priorLayerKV, nil, nil, nil)
 			if err != nil {

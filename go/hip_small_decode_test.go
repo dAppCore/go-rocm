@@ -548,6 +548,21 @@ func BenchmarkHIPGemma4Q4PlanPromptPrefill_29K(b *testing.B) {
 	}
 }
 
+func BenchmarkHIPGemma4Q4DeviceLayerCaches_Reused(b *testing.B) {
+	state := &hipGemma4Q4DeviceDecodeState{layers: make([]hipGemma4Q4DeviceLayerKVState, 35)}
+	for index := range state.layers {
+		state.layers[index].cache = &rocmDeviceKVCache{}
+	}
+	scratch := make([]*rocmDeviceKVCache, 0, len(state.layers))
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		scratch = hipGemma4Q4DeviceLayerCaches(state, scratch, len(state.layers))
+		if len(scratch) != len(state.layers) || scratch[0] == nil {
+			b.Fatalf("layer cache scratch len=%d first=%v", len(scratch), scratch[0])
+		}
+	}
+}
+
 func TestHIPGemma4Q4PrefillPlan_Bad(t *testing.T) {
 	t.Setenv(hipGemma4Q4PrefillUBatchEnv, "nope")
 	if _, err := hipGemma4Q4PrefillUBatchTokens(); err == nil {

@@ -398,6 +398,25 @@ func (state *hipGemma4Q4DeviceDecodeState) layerCache(index int) *rocmDeviceKVCa
 	return state.layers[index].cache
 }
 
+func hipGemma4Q4DeviceLayerCaches(state *hipGemma4Q4DeviceDecodeState, scratch []*rocmDeviceKVCache, layerCount int) []*rocmDeviceKVCache {
+	if state == nil {
+		return nil
+	}
+	if layerCount <= 0 {
+		layerCount = state.LayerCount()
+	}
+	if cap(scratch) < layerCount {
+		scratch = make([]*rocmDeviceKVCache, layerCount)
+	} else {
+		scratch = scratch[:layerCount]
+		clear(scratch)
+	}
+	for index := range scratch {
+		scratch[index] = state.layerCache(index)
+	}
+	return scratch
+}
+
 func (state *hipGemma4Q4DeviceDecodeState) layerDescriptorTable(index int) *rocmDeviceKVDescriptorTable {
 	if state == nil || index < 0 || index >= len(state.layers) {
 		return nil

@@ -1090,6 +1090,7 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 			history = make([]int32, 0, generate.MaxTokens)
 		}
 		useBatchedPrefill := hipGemma4Q4CanUseBatchedGeneratePrefill(cfg) && !hostSampling
+		var priorLayerKVScratch []*rocmDeviceKVCache
 		for _, ubatch := range prefillPlan.Batches {
 			if !useBatchedPrefill {
 				for index, promptToken := range ubatch.Tokens {
@@ -1147,10 +1148,8 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 			}
 			var priorLayerKV []*rocmDeviceKVCache
 			if deviceState != nil {
-				priorLayerKV = make([]*rocmDeviceKVCache, len(cfg.Layers))
-				for index := range priorLayerKV {
-					priorLayerKV[index] = deviceState.layerCache(index)
-				}
+				priorLayerKVScratch = hipGemma4Q4DeviceLayerCaches(deviceState, priorLayerKVScratch, len(cfg.Layers))
+				priorLayerKV = priorLayerKVScratch
 			}
 			forward, err := hipRunGemma4Q4PrefillForwardBatchWithPrior(ctx, model.driver, cfg, ubatch.Tokens, ubatch.Position, req.Epsilon, deviceKVMode, priorLayerKV, nil, ubatch.OutputTokens, finalGreedyBuffer)
 			if err != nil {
