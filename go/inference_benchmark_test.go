@@ -599,6 +599,10 @@ func inferenceBenchmarkHIPKernelTensorShape(config hipKernelLaunchConfig) (rows,
 		return inferenceBenchmarkU32At(args, 36), inferenceBenchmarkU32At(args, 32), inferenceBenchmarkU32At(args, 76), 0
 	case hipKernelNameRMSNormRoPEHeadsBatch:
 		return inferenceBenchmarkU32At(args, 36), inferenceBenchmarkU32At(args, 32), inferenceBenchmarkU32At(args, 80), inferenceBenchmarkU32At(args, 40)
+	case hipKernelNameAttentionHeadsChunkedStage1, hipKernelNameAttentionHeadsChunkedStage2:
+		return inferenceBenchmarkU32At(args, 64), inferenceBenchmarkU32At(args, 48), inferenceBenchmarkU32At(args, 60), 0
+	case hipKernelNameAttentionHeadsBatchChunkedStage1, hipKernelNameAttentionHeadsBatchChunkedStage2:
+		return inferenceBenchmarkU32At(args, 72), inferenceBenchmarkU32At(args, 48), inferenceBenchmarkU32At(args, 68), inferenceBenchmarkU32At(args, 60)
 	default:
 		return 0, 0, 0, 0
 	}
@@ -1018,6 +1022,100 @@ func TestInferenceBenchmarkBookTurnKernelDeltas_Good(t *testing.T) {
 		!strings.Contains(got, hipKernelNameMLXQ4GELUTanhMul) ||
 		!strings.Contains(got, "2.50") {
 		t.Fatalf("per-turn kernel output = %q, want selected kernel table with per-token ratios", got)
+	}
+}
+
+func TestInferenceBenchmarkBookDecodeAttentionSplitDeltas_UsesAttentionDim(t *testing.T) {
+	snapshot := inferenceBenchmarkHIPKernelStatsSnapshot{Shape: map[inferenceBenchmarkHIPKernelShapeKey]inferenceBenchmarkHIPKernelStats{
+		{
+			name:           hipKernelNameAttentionHeadsChunkedStage1,
+			blockX:         hipAttentionHeadsChunkedBlockSize,
+			sharedMemBytes: 3072,
+			tensorRows:     64,
+			tensorCols:     256,
+			tensorGroup:    64,
+		}: {Launches: 7, Blocks: 70},
+		{
+			name:           hipKernelNameAttentionHeadsChunkedStage1,
+			blockX:         hipAttentionHeadsChunkedBlockSize,
+			sharedMemBytes: 3072,
+			tensorRows:     64,
+			tensorCols:     512,
+			tensorGroup:    64,
+		}: {Launches: 5, Blocks: 50},
+	}}
+
+	splits := inferenceBenchmarkBookDecodeAttentionSplitDeltas(snapshot)
+	if len(splits) != 2 ||
+		splits[0].Kernel != "stage1_local_swa" ||
+		splits[0].Launches != 7 ||
+		splits[0].Blocks != 70 ||
+		splits[1].Kernel != "stage1_full_global" ||
+		splits[1].Launches != 5 ||
+		splits[1].Blocks != 50 {
+		t.Fatalf("attention split deltas = %+v, want dim256 local and dim512 global", splits)
+	}
+}
+
+func TestInferenceBenchmarkHIPKernelTensorShape_AttentionUsesChunkCount(t *testing.T) {
+	decodeArgs, err := (hipAttentionHeadsChunkedLaunchArgs{
+		QueryPointer:      1,
+		DescriptorPointer: 2,
+		PartialPointer:    3,
+		StatsPointer:      4,
+		OutputPointer:     5,
+		Dim:               512,
+		TokenCount:        4097,
+		HeadCount:         8,
+		ChunkSize:         64,
+		ChunkCount:        65,
+		QueryBytes:        512 * 8 * 4,
+		DescriptorBytes:   rocmDeviceKVDescriptorHeaderBytes,
+		PartialBytes:      8 * 65 * 512 * 4,
+		StatsBytes:        8 * 65 * 2 * 4,
+		OutputBytes:       512 * 8 * 4,
+		Scale:             1,
+	}).Binary()
+	if err != nil {
+		t.Fatalf("chunked attention args: %v", err)
+	}
+	defer hipReleaseLaunchPacket(decodeArgs)
+	rows, cols, group, batch := inferenceBenchmarkHIPKernelTensorShape(hipKernelLaunchConfig{
+		Name: hipKernelNameAttentionHeadsChunkedStage1,
+		Args: decodeArgs,
+	})
+	if rows != 65 || cols != 512 || group != 64 || batch != 0 {
+		t.Fatalf("chunked attention shape = %dx%d qg%d batch%d, want chunk_count=65 dim512 qg64", rows, cols, group, batch)
+	}
+	batchArgs, err := (hipAttentionHeadsBatchChunkedLaunchArgs{
+		QueryPointer:      1,
+		DescriptorPointer: 2,
+		PartialPointer:    3,
+		StatsPointer:      4,
+		OutputPointer:     5,
+		Dim:               256,
+		TokenCount:        2049,
+		HeadCount:         8,
+		QueryCount:        3,
+		ChunkSize:         64,
+		ChunkCount:        33,
+		QueryBytes:        256 * 8 * 3 * 4,
+		DescriptorBytes:   rocmDeviceKVDescriptorHeaderBytes,
+		PartialBytes:      256 * 8 * 3 * 33 * 4,
+		StatsBytes:        3 * 8 * 33 * 2 * 4,
+		OutputBytes:       256 * 8 * 3 * 4,
+		Scale:             1,
+	}).Binary()
+	if err != nil {
+		t.Fatalf("batch chunked attention args: %v", err)
+	}
+	defer hipReleaseLaunchPacket(batchArgs)
+	rows, cols, group, batch = inferenceBenchmarkHIPKernelTensorShape(hipKernelLaunchConfig{
+		Name: hipKernelNameAttentionHeadsBatchChunkedStage1,
+		Args: batchArgs,
+	})
+	if rows != 33 || cols != 256 || group != 64 || batch != 3 {
+		t.Fatalf("batch chunked attention shape = %dx%d qg%d batch%d, want chunk_count=33 dim256 qg64 batch3", rows, cols, group, batch)
 	}
 }
 
@@ -2600,11 +2698,15 @@ func inferenceBenchmarkBookDecodeAttentionSplitDeltas(snapshot inferenceBenchmar
 		route := ""
 		switch key.name {
 		case hipKernelNameAttentionHeadsChunkedStage1:
-			switch key.sharedMemBytes {
-			case 3072:
-				route = stage1Local
-			case 4096:
+			switch {
+			case key.tensorCols >= 512:
 				route = stage1Global
+			case key.tensorCols > 0:
+				route = stage1Local
+			case key.sharedMemBytes == 4096:
+				route = stage1Global
+			case key.sharedMemBytes == 3072:
+				route = stage1Local
 			default:
 				route = stage1Other
 			}

@@ -18593,3 +18593,106 @@ the strict book wall-time over the embedding-scale confirmation run, and keeps
 the no-replay retained-state acceptance path green. The remaining target is
 still full/global `head_dim=512` chunked attention growth and q4 projection
 block volume so later turns stay above `90-100 tok/s`.
+
+## 2026-05-27 Chunk64 Attention Retune And Metric Cardinality Fix
+
+`go-mlx/IDEAS.md` confirms the useful Gemma4 distinction for this pass:
+local/SWA layers are bounded at `512`/`1024`, while global/full layers carry the
+long retained context and use `head_dim=512`. After the SWA route and stage2
+weight-cache changes, the older rejected 64-token chunk experiment was worth
+retesting because `ROCM_ATTENTION_HEADS_CHUNK_SIZE=64` doubles chunk count but
+also doubles the per-block score lanes on the 512-thread chunked attention
+kernel.
+
+Code changes:
+
+- Set `ROCM_ATTENTION_HEADS_CHUNK_SIZE` and the Go mirror
+  `hipAttentionHeadsChunkSize` from `128` to `64`.
+- Teach the benchmark route-metric shape parser to read chunked attention
+  `dim`, `chunk_size`, and `chunk_count` from launch args.
+- Classify chunked stage1 local/global splits by `dim` first, so Gemma4
+  `dim=512` global/full attention is no longer misreported as local just because
+  the chunk64 shared-memory size matches the dim256 local/SWA route.
+- Bucket route metrics by `chunk_count` rather than raw `token_count`; the raw
+  token count created a new shape key for nearly every generated token and
+  inflated the benchmark accounting path to `88756312 B/op` and
+  `1153008 allocs/op` without representing model work.
+
+Validation:
+
+```text
+go test ./go -run 'TestInferenceBenchmark(BookTurnKernelDeltas|BookDecodeAttentionSplitDeltas|HIPKernelCountingDriver)_Good|TestInferenceBenchmarkBookDecodeAttentionSplitDeltas_UsesAttentionDim|TestInferenceBenchmarkHIPKernelTensorShape_AttentionUsesChunkCount|TestHIPAttentionHeads(ChunkedSharedMemBytes|ChunkedEligible)_Good|TestHIPAttentionHeadsChunkedEligible_Gemma4HeadDim512_Good|TestHIPKernels_AttentionHeadsBatchChunked|TestHIPKernelSource_ExportsLaunchABI_Good' -count=1
+PASS
+
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-attn-chunk64-retune-20260528.hsaco
+stderr: .bench-errors/hipcc_gfx1100_attn_chunk64_retune_20260528.err (0 bytes)
+```
+
+512-token route guard:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 4291483359 ns/op
+tok/s=119.3
+tokens=512
+B/op=3267240
+allocs/op=2480
+device_mallocs/op=8223
+device_malloc_bytes/op=11424176
+kernel_attention_decode_chunked_stage1_launches=3150
+kernel_attention_decode_chunked_stage2_launches=3150
+kernel_total_launches=235330
+stderr: .bench-errors/512_attn_chunk64_retune_20260528.err (0 bytes)
+```
+
+2048-token route guard after the chunk-count metric fix:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 17563788511 ns/op
+tok/s=116.6
+tokens=2048
+B/op=6499080
+allocs/op=2694
+device_mallocs/op=31316
+device_malloc_bytes/op=31300464
+kernel_attention_decode_chunked_stage1_launches=13902
+kernel_attention_decode_chunked_stage2_launches=13902
+kernel_total_launches=941890
+stderr: .bench-errors/2048_attn_chunk64_chunkcount_metrics_20260528.err (0 bytes)
+```
+
+Strict retained 48k 10-turn book with the chunk-count metric fix:
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 24600376724 ns/op
+book_wall_s=24.58
+book_decode_s=17.35
+book_generated_tokens=1707
+book_tok/s=69.45
+book_turn10_tok/s=91.81
+book_turn10_retained_tokens=3860
+book_maxed_turns=0
+book_repeated_turns=0
+book_max_adjacent_repeat=0.01370
+chapter10_arc_anchor_hits=1
+B/op=18619792
+allocs/op=58815
+peak_memory_bytes=5872721920
+device_mallocs/op=58000
+device_malloc_bytes/op=11656143740
+kernel_total_launches=827394
+kernel_total_blocks=172639522
+stderr: .bench-errors/book10_attn_chunk64_chunkcount_metrics_20260528.err (0 bytes)
+output: /tmp/go-rocm-book-attn-chunk64-chunkcount-metrics-20260528.md
+```
+
+Conclusion: accepted as a kernel/benchmark-accounting step, not as the final
+production gate. The short 2048-token guard improved from the stage2
+weight-cache baseline (`115.3 tok/s`) to `116.6 tok/s`, and the metric
+cardinality fix brought route-enabled book allocation back down from the
+per-token shape-key blowup to `18.6MB/op`. The latest strict retained book
+sample crossed `90 tok/s` on turn 10, but missed the chapter-10 lexical anchor
+floor (`1/3`), so `book_90s_success` and `book_110s_production_candidate`
+remained `0`. A same-kernel sample before the metric cardinality fix kept `5`
+chapter-10 anchors at `87.30 tok/s` on turn 10; the remaining endpoint is to
+make the `90+ tok/s` late-turn result and the `>=3` anchor result coincide in
+the strict no-replay retained-state benchmark.

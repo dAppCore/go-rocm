@@ -41,31 +41,35 @@ Current status as of 2026-05-27: the q4 2048-token performance endpoint remains
 met on the pinned RX 7800 XT with a fresh live `gfx1100` HSACO. The latest
 route-metric `GO_ROCM_BENCH_TOKENS=2048` `text:Hi` run, after contiguous encoded
 K/V pair allocation, fused embedding-output scaling, Gemma4 SWA-window-aware
-decode attention routing, and chunked stage2 per-chunk weight caching, reports
-`17765767163 ns/op`, `115.3 tok/s`, `6452280 B/op`, and `2635 allocs/op`. It
-also reports `31285` device mallocs/op, `24591728` device malloc bytes/op,
-`941442` kernel launches/op, and keeps chunked stage1/stage2 launches at `13454`
-each. This stays ahead of the accepted SWA-window-aware route (`115.1 tok/s`)
-while slightly reducing allocation volume.
+decode attention routing, chunked stage2 per-chunk weight caching, and a
+64-token chunked-attention grain, reports `17563788511 ns/op`, `116.6 tok/s`,
+`6499080 B/op`, and `2694 allocs/op`. It also reports `31316` device mallocs/op,
+`31300464` device malloc bytes/op, `941890` kernel launches/op, and keeps
+chunked stage1/stage2 launches at `13902` each. This is the best current
+2048-token short guard, but it spends more temporary device workspace than the
+128-token chunk baseline because chunk count doubles.
 The chapter-shaped 2048-token fast guard at `context_len=4096` reports
 `19536530899 ns/op`, `104.8 tok/s`, `8017064 B/op`, and `3438 allocs/op`.
 Full-attention/global Gemma4 device KV pages now use 128-token blocks while
 sliding-window layers keep exact one-token pages for 512/1024 SWA trimming. A
 fresh strict retained 10-turn book gate with device-reduced sampled top-k
 partials, contiguous encoded K/V pair allocation, fused embedding-output
-scaling, SWA-window-aware decode routing, and chunked stage2 per-chunk weight
-caching remains inside the production-candidate wall window: `44.68s` wall,
-`35.57s` decode, `3235` generated tokens, `4` chapter-10 arc anchors, no
-repeated or maxed turns, `22564192 B/op`, and `63329` allocs/op; turn 10 decode
-measured `77.00 tok/s`.
-The artifact `/tmp/go-rocm-book-stage2-weight-cache-20260527.md` keeps sampled
-book output coherent while the route avoids separate HIP allocations for
-encoded K/V pages, removes avoidable embedding vector-scale launches, keeps
-bounded local/SWA layers off the chunked global-attention decode path, and stops
-recomputing the same stage2 chunk weights for every output dimension.
+scaling, SWA-window-aware decode routing, chunked stage2 per-chunk weight
+caching, and the 64-token chunked-attention grain produced a fast but not
+production-green sample: `24.58s` wall, `17.35s` decode, `1707` generated
+tokens, `91.81 tok/s` on turn 10, no repeated or maxed turns, `18619792 B/op`,
+and `58815` allocs/op, but only `1` chapter-10 arc anchor. The artifact
+`/tmp/go-rocm-book-attn-chunk64-chunkcount-metrics-20260528.md` confirms the
+story stayed abstractly on the same arc but did not pass the lexical
+`lighthouse`/`keeper`/`light`/`ocean`/`deep` anchor floor, so
+`book_90s_success` and `book_110s_production_candidate` correctly remained `0`.
+A same-kernel strict sample before the route-metric shape-key fix kept `5`
+chapter-10 anchors and measured `87.30 tok/s` on turn 10, so chunk64 is a valid
+decode candidate, not a final production gate.
 Local/SWA attention remains bounded, q4/RoPE work stays flat per generated
 token, and full/global chunked stage1 remains the late-turn scaling blocker.
-Long-context decode is still below the final 90-100 tok/s production target.
+Long-context decode now has one sampled turn-10 result above `90 tok/s`, but the
+combined wall/story production gate is still not complete.
 These numbers use the
 benchmark's
 `inference.WithContextLen` load setting, now correctly applied to Gemma4 q4
