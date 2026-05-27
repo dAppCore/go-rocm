@@ -542,8 +542,8 @@ func BenchmarkHIPGemma4Q4PlanPromptPrefill_29K(b *testing.B) {
 		if err != nil {
 			b.Fatalf("hipGemma4Q4PlanPromptPrefill: %v", err)
 		}
-		if plan.PromptTokens != len(tokens) || len(plan.Batches) != 57 {
-			b.Fatalf("plan = tokens %d batches %d, want 29000/57", plan.PromptTokens, len(plan.Batches))
+		if plan.PromptTokens != len(tokens) || len(plan.Batches) != 1813 {
+			b.Fatalf("plan = tokens %d batches %d, want 29000/1813", plan.PromptTokens, len(plan.Batches))
 		}
 	}
 }

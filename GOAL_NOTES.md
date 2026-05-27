@@ -2,6 +2,41 @@
 
 ## 2026-05-27 Prefill Batch Attention Workspace Pass
 
+- Changed the default Gemma4 q4 public prefill ubatch size from `512` to `16`
+  after a measured 8k session-start sweep showed the current
+  `rocm_attention_heads_batch_causal` path is dominated by materialized
+  `queryCount * heads * tokenCount` weight buffers. The 8k results were:
+
+```text
+ubatch=1024  106.6 prompt_tok/s   71630760 B/op     9451 allocs/op
+ubatch=512   124.0 prompt_tok/s   88715152 B/op    16828 allocs/op
+ubatch=256   130.2 prompt_tok/s  135631640 B/op    31932 allocs/op
+ubatch=128   134.1 prompt_tok/s  238097048 B/op    62123 allocs/op
+ubatch=64    138.6 prompt_tok/s  430403664 B/op   122486 allocs/op
+ubatch=32    156.4 prompt_tok/s  838454360 B/op   243070 allocs/op
+ubatch=16    221.9 prompt_tok/s 1654580896 B/op   484256 allocs/op
+ubatch=8     196.2 prompt_tok/s 3286707584 B/op   966474 allocs/op
+```
+
+- Fresh default-16 8k and 29k session-start diagnostics on the RX 7800 XT:
+
+```text
+8k default:
+  34873220114 ns/op, 234.9 prompt_tok/s, 16 prefill_ubatch_tokens
+  stderr: /tmp/go-rocm-session-start-8k-default16.err (empty)
+
+29k default:
+  734546229821 ns/op, 39.48 prompt_tok/s, 16 prefill_ubatch_tokens
+  stderr: /tmp/go-rocm-29k-default16.err (empty)
+```
+
+- Default 16 is accepted as a public long-prompt improvement because it makes
+  29k complete instead of timing out, and it keeps the 2048 decode and retained
+  book acceptance routes green. It is not the final 29k fix: the remaining
+  work is a non-materializing/chunked batch prefill attention kernel so prompt
+  throughput can approach the `100 prompt_tok/s` line without enormous
+  allocation volume.
+
 - Added an AX-11 reuse benchmark for the batch-causal attention weight scratch
   path. Under the workspace cap it reports:
 
@@ -42,11 +77,9 @@ allocs/op                   99123
 output: /tmp/go-rocm-book-10turn-greedy-batch-weight-cap.md
 ```
 
-- The 29k opencode session-start diagnostic remains unresolved. A workspace
-  retry was bounded by `timeout 900s` and exited `124` with empty
-  `/tmp/go-rocm-29k-prefill-release.out` and `.err`, so the remaining 29k
-  problem is algorithmic prefill attention throughput rather than prompt-plan
-  allocation or cleanup churn.
+- The older 29k workspace retry (`/tmp/go-rocm-29k-prefill-release.*`) timed
+  out before the ubatch default changed. The current default-16 result above is
+  the active baseline for the next long-prefill kernel pass.
 
 ## 2026-05-27 Fresh Retained-Book Gate and Repetition Metric
 
