@@ -374,8 +374,13 @@ func TestHIPKernelSource_AttentionChunkedStage1ScoreLaneReduction_Good(t *testin
 	core.AssertTrue(t, strings.Contains(stage1, `out1 += value_scratch1[value_group * pair_count + tid]`), "stage1 value reduction must reduce dim1 from the second scratch buffer")
 	core.AssertTrue(t, !strings.Contains(stage1, `scratch[tid] = partial1`), "stage1 value reduction must not reintroduce the second shared-memory pass")
 
+	stage2 := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_attention_heads_chunked_stage2`)
+	core.AssertTrue(t, strings.Contains(stage2, `const bool cached_chunk_weights = chunk_count <= threads`), "stage2 must cache per-chunk softmax weights when they fit in shared scratch")
+	core.AssertTrue(t, strings.Contains(stage2, `scratch[tid] = chunk_sum == 0.0f ? 0.0f : rocm_fast_expf`), "stage2 must compute each cached chunk weight once")
 	batchStage1 := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_attention_heads_batch_chunked_stage1`)
 	core.AssertTrue(t, strings.Contains(batchStage1, `device_kv_header->block_size == 1u`), "batch stage1 direct token-page fast path must reject mixed block/page MP4 KV streams")
+	batchStage2 := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_attention_heads_batch_chunked_stage2`)
+	core.AssertTrue(t, strings.Contains(batchStage2, `const bool cached_chunk_weights = chunk_count <= threads`), "batch stage2 must cache per-chunk softmax weights when they fit in shared scratch")
 	heads := hipKernelSourceFunctionBodyForTest(t, source, `__device__ void rocm_run_single_head_attention_token_parallel`)
 	core.AssertTrue(t, strings.Contains(heads, `device_kv_header->block_size == 1u`), "shared attention direct token-page fast path must reject mixed block/page MP4 KV streams")
 	core.AssertTrue(t, strings.Contains(heads, `cached_pointer = page->value_pointer + rocm_device_kv_tensor_payload_offset(page->value_encoding, page->token_count) + (value_base >> 1u)`), "shared attention must cache MP4 block q4 value row payload pointers")

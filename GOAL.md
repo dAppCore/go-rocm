@@ -40,27 +40,29 @@ The 100+ tok/s goal is complete only when all of these are true:
 Current status as of 2026-05-27: the q4 2048-token performance endpoint remains
 met on the pinned RX 7800 XT with a fresh live `gfx1100` HSACO. The latest
 route-metric `GO_ROCM_BENCH_TOKENS=2048` `text:Hi` run, after contiguous encoded
-K/V pair allocation, fused embedding-output scaling, and Gemma4 SWA-window-aware
-decode attention routing, reports `17791173716 ns/op`, `115.1 tok/s`,
-`6453176 B/op`, and `2640 allocs/op`. It also reports `31285` device mallocs/op,
-`24591728` device malloc bytes/op, `941442` kernel launches/op, and keeps
-chunked stage1/stage2 launches at `13454` each. This beats the previous
-embedding-scale short guard (`111.0 tok/s`) while keeping allocation volume near
-the accepted pair-allocation route.
+K/V pair allocation, fused embedding-output scaling, Gemma4 SWA-window-aware
+decode attention routing, and chunked stage2 per-chunk weight caching, reports
+`17765767163 ns/op`, `115.3 tok/s`, `6452280 B/op`, and `2635 allocs/op`. It
+also reports `31285` device mallocs/op, `24591728` device malloc bytes/op,
+`941442` kernel launches/op, and keeps chunked stage1/stage2 launches at `13454`
+each. This stays ahead of the accepted SWA-window-aware route (`115.1 tok/s`)
+while slightly reducing allocation volume.
 The chapter-shaped 2048-token fast guard at `context_len=4096` reports
 `19536530899 ns/op`, `104.8 tok/s`, `8017064 B/op`, and `3438 allocs/op`.
 Full-attention/global Gemma4 device KV pages now use 128-token blocks while
 sliding-window layers keep exact one-token pages for 512/1024 SWA trimming. A
 fresh strict retained 10-turn book gate with device-reduced sampled top-k
 partials, contiguous encoded K/V pair allocation, fused embedding-output
-scaling, and SWA-window-aware decode routing remains inside the
-production-candidate wall window: `48.18s` wall, `38.56s` decode, `3470`
-generated tokens, `5` chapter-10 arc anchors, no repeated or maxed turns,
-`22726072 B/op`, and `67468` allocs/op; turn 10 decode measured `76.04 tok/s`.
-The artifact `/tmp/go-rocm-book-swa-single-attention-20260527.md` keeps sampled
+scaling, SWA-window-aware decode routing, and chunked stage2 per-chunk weight
+caching remains inside the production-candidate wall window: `44.68s` wall,
+`35.57s` decode, `3235` generated tokens, `4` chapter-10 arc anchors, no
+repeated or maxed turns, `22564192 B/op`, and `63329` allocs/op; turn 10 decode
+measured `77.00 tok/s`.
+The artifact `/tmp/go-rocm-book-stage2-weight-cache-20260527.md` keeps sampled
 book output coherent while the route avoids separate HIP allocations for
-encoded K/V pages, removes avoidable embedding vector-scale launches, and keeps
-bounded local/SWA layers off the chunked global-attention decode path.
+encoded K/V pages, removes avoidable embedding vector-scale launches, keeps
+bounded local/SWA layers off the chunked global-attention decode path, and stops
+recomputing the same stage2 chunk weights for every output dimension.
 Local/SWA attention remains bounded, q4/RoPE work stays flat per generated
 token, and full/global chunked stage1 remains the late-turn scaling blocker.
 Long-context decode is still below the final 90-100 tok/s production target.
@@ -428,7 +430,7 @@ avoid the second local-window page-slice copy was rejected: it reduced the
 chapter-shaped 2048-token allocation count but slowed the retained book to
 `38.24s` wall and `79.01 tok/s`.
 This is still not the final driver endpoint: the latest sampled retained-book
-run improved turn-10 decode to `72.88 tok/s`, but that remains below the
+run improved turn-10 decode to `77.00 tok/s`, but that remains below the
 `90-100+ tok/s` target. Keep tuning retained long-context attention and state
 quality until the later turns stay near the target.
 
@@ -466,6 +468,7 @@ max_new_tokens  route                    tok/s   B/op       allocs/op
 2048 text:Hi    scalar greedy read     108.9     7.39M        8814
 2048 chapter    scalar greedy read     101.5    15.38M       10428
 10-turn book    top-k device reduce     71.9    15.64M       41008
+10-turn book    stage2 weight cache     72.4    22.56M       63329
 ```
 
 The earlier 256-token chunked route was rejected because it fell to `58.24

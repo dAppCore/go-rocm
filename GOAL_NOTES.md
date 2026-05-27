@@ -1,5 +1,80 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Accepted Chunked Stage2 Weight Cache
+
+- `rocm_attention_heads_chunked_stage2` and the batch stage2 variant previously
+  recomputed `exp(chunk_max - shared_max)` once per output dimension for each
+  chunk. The retained-book route usually has `chunk_count <= threads`, so the
+  kernel now caches that per-chunk softmax weight in the existing shared scratch
+  once, then reuses it while reducing the output vector.
+- This is a narrow HIP stage2 change. It does not change stage1 scoring,
+  chunk geometry, retained KV layout, prompt append behavior, or sampling.
+
+Verification:
+
+```text
+go test ./go -run 'TestHIPKernelSource_AttentionChunkedStage1ScoreLaneReduction_Good|TestHIPAttentionHeads(ChunkedSharedMemBytes|ChunkedEligible)_Good|TestHIPAttentionHeadsChunkedEligible_Gemma4HeadDim512_Good|TestHIPKernels_AttentionHeadsBatchChunked' -count=1 -v
+PASS
+
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-stage2-weight-cache-final-20260527.hsaco
+stderr: .bench-errors/hipcc_gfx1100_stage2_weight_cache_final_20260527.err (0 bytes)
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_HIP_TESTS=1 GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100-stage2-weight-cache-final-20260527.hsaco go test ./go -run '^TestHIPHardwareTransformerKernelSource_Good$' -count=1 -v
+PASS
+stderr: .bench-errors/hip_transformer_stage2_weight_cache_final_20260527.err (0 bytes)
+```
+
+Live RX 7800 XT route guards:
+
+```text
+512 text:Hi:
+BenchmarkInferenceGemma4Q4Generate-32 1 4305603802 ns/op
+tok/s=118.9
+B/op=3264000
+allocs/op=2462
+kernel_attention_decode_chunked_stage1_launches=2702
+kernel_attention_decode_chunked_stage2_launches=2702
+kernel_total_launches=234882
+stderr: .bench-errors/512_stage2_weight_cache_20260527.err (0 bytes)
+
+2048 text:Hi:
+BenchmarkInferenceGemma4Q4Generate-32 1 17765767163 ns/op
+tok/s=115.3
+B/op=6452280
+allocs/op=2635
+kernel_attention_decode_chunked_stage1_launches=13454
+kernel_attention_decode_chunked_stage2_launches=13454
+kernel_total_launches=941442
+stderr: .bench-errors/2048_stage2_weight_cache_20260527.err (0 bytes)
+
+Strict 48k retained book:
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 44703507243 ns/op
+book_wall_s=44.68
+book_decode_s=35.57
+book_generated_tokens=3235
+book_tok/s=72.41
+book_turn10_tok/s=77.00
+book_turn10_retained_tokens=5388
+book_maxed_turns=0
+book_repeated_turns=0
+chapter10_arc_anchor_hits=4
+B/op=22564192
+allocs/op=63329
+peak_memory_bytes=5881085952
+kernel_attention_decode_chunked_stage1_launches=22477
+kernel_attention_decode_chunked_stage2_launches=22477
+kernel_total_launches=1534620
+stderr: .bench-errors/book10_stage2_weight_cache_20260527.err (0 bytes)
+artifact: /tmp/go-rocm-book-stage2-weight-cache-20260527.md
+```
+
+Accepted reason: the change is small, keeps the 512/2048 guards above the
+accepted SWA-window-aware route, improves strict retained-book wall/decode
+time, reduces `B/op` and `allocs/op`, and passes chapter-10 arc/repeat/max
+gates. It is not the final endpoint: turn 10 remains `77.00 tok/s`, below the
+`90-100+ tok/s` production target. The next meaningful blocker is still
+full/global stage1 growth plus q4 projection/GELU fixed volume.
+
 ## 2026-05-27 Rejected Launch-Argument Event/Ring Retunes
 
 - Retested the cgo HIP launch-argument path because the short q4 guard issues

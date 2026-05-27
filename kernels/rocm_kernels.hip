@@ -6534,14 +6534,27 @@ extern "C" __global__ void rocm_attention_heads_chunked_stage2(const unsigned ch
 		return;
 	}
 	const float inv_sum = 1.0f / shared_sum;
+	const bool cached_chunk_weights = chunk_count <= threads;
+	if (cached_chunk_weights) {
+		if (tid < chunk_count) {
+			const float chunk_sum = stats[tid * 2u + 1u];
+			scratch[tid] = chunk_sum == 0.0f ? 0.0f : rocm_fast_expf(stats[tid * 2u] - shared_max_score);
+		}
+		__syncthreads();
+	}
 	for (uint32_t dim = tid; dim < args.dim; dim += threads) {
 		float out = 0.0f;
 		for (uint32_t chunk = 0; chunk < chunk_count; ++chunk) {
-			const float chunk_sum = stats[chunk * 2u + 1u];
-			if (chunk_sum == 0.0f) {
-				continue;
+			float chunk_weight = 0.0f;
+			if (cached_chunk_weights) {
+				chunk_weight = scratch[chunk];
+			} else {
+				const float chunk_sum = stats[chunk * 2u + 1u];
+				if (chunk_sum == 0.0f) {
+					continue;
+				}
+				chunk_weight = rocm_fast_expf(stats[chunk * 2u] - shared_max_score);
 			}
-			const float chunk_weight = rocm_fast_expf(stats[chunk * 2u] - shared_max_score);
 			out += partials[chunk * args.dim + dim] * chunk_weight;
 		}
 		output[dim] = out * inv_sum;
@@ -6852,14 +6865,27 @@ extern "C" __global__ void rocm_attention_heads_batch_chunked_stage2(const unsig
 		return;
 	}
 	const float inv_sum = 1.0f / shared_sum;
+	const bool cached_chunk_weights = chunk_count <= threads;
+	if (cached_chunk_weights) {
+		if (tid < chunk_count) {
+			const float chunk_sum = stats[tid * 2u + 1u];
+			scratch[tid] = chunk_sum == 0.0f ? 0.0f : rocm_fast_expf(stats[tid * 2u] - shared_max_score);
+		}
+		__syncthreads();
+	}
 	for (uint32_t dim = tid; dim < args.dim; dim += threads) {
 		float out = 0.0f;
 		for (uint32_t chunk = 0; chunk < chunk_count; ++chunk) {
-			const float chunk_sum = stats[chunk * 2u + 1u];
-			if (chunk_sum == 0.0f) {
-				continue;
+			float chunk_weight = 0.0f;
+			if (cached_chunk_weights) {
+				chunk_weight = scratch[chunk];
+			} else {
+				const float chunk_sum = stats[chunk * 2u + 1u];
+				if (chunk_sum == 0.0f) {
+					continue;
+				}
+				chunk_weight = rocm_fast_expf(stats[chunk * 2u] - shared_max_score);
 			}
-			const float chunk_weight = rocm_fast_expf(stats[chunk * 2u] - shared_max_score);
 			out += partials[chunk * args.dim + dim] * chunk_weight;
 		}
 		output[dim] = out * inv_sum;
