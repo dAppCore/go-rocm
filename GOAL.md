@@ -466,8 +466,24 @@ accepted speed win: 4096 tokens at `prefill_ubatch=16` measured
 `241318 allocs/op`; 8192 tokens measured `35267564072 ns/op`,
 `232.3 prompt_tok/s`, `1654383904 B/op`, and `481431 allocs/op`, essentially
 flat with the previous 8k default-16 baseline aside from a small allocation
-drop. Next pass should use clean kernel tracing or explicit route counters to
-prove how often this path runs before changing the 29k/48k acceptance runs.
+drop.
+
+The main generate benchmarks and prompt prefill ubatch ladder can now opt into
+HIP kernel route metrics with `GO_ROCM_BENCH_KERNEL_ROUTE_METRICS=1`, without
+adding counters to the normal hot path. A 4096-token `prefill_ubatch=16` check
+proved the route is active: `rocm_attention_heads_batch_causal` launched `8064`
+times, while `rocm_attention_heads_batch_chunked_stage1` and `_stage2` launched
+`896` times each with `2809856` stage-1 blocks and `114688` stage-2 blocks. The
+next target is therefore not route selection; it is reducing the remaining
+batch-causal launch count and making the batch-chunked stage cheaper.
+Rejected threshold tuning: moving the batch-chunked route below the 2048-token
+shared-weight cutoff is not a good default yet. A `512` threshold improved the
+2k prompt to `417.1 prompt_tok/s` but dropped the 4k prompt to
+`290.2 prompt_tok/s` by launching `7840` batch-chunked stages. A `1024`
+threshold was flat at 4k and worse at 2k (`374.0 prompt_tok/s`). A `1536`
+threshold reached `403.4 prompt_tok/s` at 2k but reduced 4k to
+`330.9 prompt_tok/s`. Keep the 2048 cutoff until the stage cost is lower or
+local-window attention has its own specialized kernel.
 
 For comparison, upstream llama.cpp built locally with HIP for `gfx1100` and run
 against the Hugging Face Gemma4 GGUF

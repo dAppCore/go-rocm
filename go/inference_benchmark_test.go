@@ -12,11 +12,173 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"dappco.re/go/inference"
 )
+
+const inferenceBenchmarkKernelRouteMetricsEnv = "GO_ROCM_BENCH_KERNEL_ROUTE_METRICS"
+
+type inferenceBenchmarkHIPKernelStats struct {
+	Launches uint64
+	Blocks   uint64
+}
+
+type inferenceBenchmarkHIPKernelCountingDriver struct {
+	nativeHIPDriver
+	mu     sync.Mutex
+	kernel map[string]inferenceBenchmarkHIPKernelStats
+	total  inferenceBenchmarkHIPKernelStats
+}
+
+func newInferenceBenchmarkHIPKernelCountingDriver(driver nativeHIPDriver) *inferenceBenchmarkHIPKernelCountingDriver {
+	return &inferenceBenchmarkHIPKernelCountingDriver{
+		nativeHIPDriver: driver,
+		kernel:          make(map[string]inferenceBenchmarkHIPKernelStats),
+	}
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) CopyHostToDeviceAsync(pointer nativeDevicePointer, data []byte) error {
+	if async, ok := driver.nativeHIPDriver.(nativeHIPAsyncHostToDevice); ok {
+		return async.CopyHostToDeviceAsync(pointer, data)
+	}
+	return driver.nativeHIPDriver.CopyHostToDevice(pointer, data)
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) MemsetAsync(pointer nativeDevicePointer, value byte, size uint64) error {
+	if memset, ok := driver.nativeHIPDriver.(nativeHIPDeviceMemset); ok {
+		return memset.MemsetAsync(pointer, value, size)
+	}
+	return hipMemsetDevice(driver.nativeHIPDriver, pointer, value, size)
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) LaunchKernel(config hipKernelLaunchConfig) error {
+	if err := hipLaunchKernel(driver.nativeHIPDriver, config); err != nil {
+		return err
+	}
+	blocks := uint64(config.GridX)
+	if config.GridY > 0 {
+		blocks *= uint64(config.GridY)
+	}
+	if config.GridZ > 0 {
+		blocks *= uint64(config.GridZ)
+	}
+	driver.mu.Lock()
+	stats := driver.kernel[config.Name]
+	stats.Launches++
+	stats.Blocks += blocks
+	driver.kernel[config.Name] = stats
+	driver.total.Launches++
+	driver.total.Blocks += blocks
+	driver.mu.Unlock()
+	return nil
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) ResetKernelStats() {
+	driver.mu.Lock()
+	clear(driver.kernel)
+	driver.total = inferenceBenchmarkHIPKernelStats{}
+	driver.mu.Unlock()
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) KernelStats(name string) inferenceBenchmarkHIPKernelStats {
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	return driver.kernel[name]
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) TotalKernelStats() inferenceBenchmarkHIPKernelStats {
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	return driver.total
+}
+
+func inferenceBenchmarkReportHIPKernelRouteMetrics(b *testing.B, driver *inferenceBenchmarkHIPKernelCountingDriver) {
+	b.Helper()
+	if driver == nil || b.N <= 0 {
+		return
+	}
+	report := func(name, label string) {
+		stats := driver.KernelStats(name)
+		b.ReportMetric(float64(stats.Launches)/float64(b.N), label+"_launches/op")
+		b.ReportMetric(float64(stats.Blocks)/float64(b.N), label+"_blocks/op")
+	}
+	total := driver.TotalKernelStats()
+	b.ReportMetric(float64(total.Launches)/float64(b.N), "kernel_total_launches/op")
+	b.ReportMetric(float64(total.Blocks)/float64(b.N), "kernel_total_blocks/op")
+	report(hipKernelNameAttentionHeadsBatchCausal, "kernel_attention_batch_causal")
+	report(hipKernelNameAttentionHeadsBatchChunkedStage1, "kernel_attention_batch_chunked_stage1")
+	report(hipKernelNameAttentionHeadsBatchChunkedStage2, "kernel_attention_batch_chunked_stage2")
+	report(hipKernelNameAttentionHeadsChunkedStage1, "kernel_attention_decode_chunked_stage1")
+	report(hipKernelNameAttentionHeadsChunkedStage2, "kernel_attention_decode_chunked_stage2")
+}
+
+func inferenceBenchmarkNativeRuntimeAndKernelCounter() (nativeRuntime, *inferenceBenchmarkHIPKernelCountingDriver) {
+	if os.Getenv(inferenceBenchmarkKernelRouteMetricsEnv) != "1" {
+		return newSystemNativeRuntime(), nil
+	}
+	counter := newInferenceBenchmarkHIPKernelCountingDriver(newSystemHIPDriver())
+	return newHIPRuntime(counter), counter
+}
+
+type inferenceBenchmarkHIPKernelCountingStubDriver struct{}
+
+func (inferenceBenchmarkHIPKernelCountingStubDriver) Available() bool { return true }
+
+func (inferenceBenchmarkHIPKernelCountingStubDriver) DeviceInfo() nativeDeviceInfo {
+	return nativeDeviceInfo{}
+}
+
+func (inferenceBenchmarkHIPKernelCountingStubDriver) Malloc(uint64) (nativeDevicePointer, error) {
+	return 1, nil
+}
+
+func (inferenceBenchmarkHIPKernelCountingStubDriver) Free(nativeDevicePointer) error {
+	return nil
+}
+
+func (inferenceBenchmarkHIPKernelCountingStubDriver) CopyHostToDevice(nativeDevicePointer, []byte) error {
+	return nil
+}
+
+func (inferenceBenchmarkHIPKernelCountingStubDriver) CopyDeviceToHost(nativeDevicePointer, []byte) error {
+	return nil
+}
+
+func (inferenceBenchmarkHIPKernelCountingStubDriver) LaunchKernel(hipKernelLaunchConfig) error {
+	return nil
+}
+
+func TestInferenceBenchmarkHIPKernelCountingDriver_Good(t *testing.T) {
+	driver := newInferenceBenchmarkHIPKernelCountingDriver(inferenceBenchmarkHIPKernelCountingStubDriver{})
+	err := driver.LaunchKernel(hipKernelLaunchConfig{
+		Name:   hipKernelNameAttentionHeadsBatchChunkedStage1,
+		Args:   []byte{1},
+		GridX:  2,
+		GridY:  3,
+		GridZ:  4,
+		BlockX: 1,
+		BlockY: 1,
+		BlockZ: 1,
+	})
+	if err != nil {
+		t.Fatalf("LaunchKernel: %v", err)
+	}
+	stats := driver.KernelStats(hipKernelNameAttentionHeadsBatchChunkedStage1)
+	if stats.Launches != 1 || stats.Blocks != 24 {
+		t.Fatalf("kernel stats = %+v, want 1 launch and 24 blocks", stats)
+	}
+	total := driver.TotalKernelStats()
+	if total != stats {
+		t.Fatalf("total stats = %+v, want %+v", total, stats)
+	}
+	driver.ResetKernelStats()
+	if got := driver.TotalKernelStats(); got != (inferenceBenchmarkHIPKernelStats{}) {
+		t.Fatalf("reset total stats = %+v, want zero", got)
+	}
+}
 
 func BenchmarkInferenceGemma4Q4Generate(b *testing.B) {
 	benchmarkInferenceGemma4Q4Generate(b)
@@ -51,7 +213,8 @@ func BenchmarkInferenceGemma4Q4Generate_Ladder(b *testing.B) {
 	}
 	b.Setenv("GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE", "1")
 
-	model, err := newROCmBackendWithRuntime(newSystemNativeRuntime()).LoadModel(modelPath, inference.WithContextLen(contextLen))
+	nativeRuntime, kernelCounter := inferenceBenchmarkNativeRuntimeAndKernelCounter()
+	model, err := newROCmBackendWithRuntime(nativeRuntime).LoadModel(modelPath, inference.WithContextLen(contextLen))
 	if err != nil {
 		b.Fatalf("LoadModel(%q): %v", modelPath, err)
 	}
@@ -60,7 +223,11 @@ func BenchmarkInferenceGemma4Q4Generate_Ladder(b *testing.B) {
 	for _, maxTokens := range ladderTokens {
 		maxTokens := maxTokens
 		b.Run(fmt.Sprintf("tokens_%d", maxTokens), func(b *testing.B) {
+			if kernelCounter != nil {
+				kernelCounter.ResetKernelStats()
+			}
 			inferenceBenchmarkRunGemma4Q4GenerateLoaded(b, model, benchPrompt, maxTokens, contextLen, prefillUBatchTokens, "")
+			inferenceBenchmarkReportHIPKernelRouteMetrics(b, kernelCounter)
 		})
 	}
 }
@@ -99,7 +266,8 @@ func BenchmarkInferenceGemma4Q4PromptPrefillUBatchLadder(b *testing.B) {
 	}
 	b.Setenv("GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE", "1")
 
-	model, err := newROCmBackendWithRuntime(newSystemNativeRuntime()).LoadModel(modelPath, inference.WithContextLen(contextLen))
+	nativeRuntime, kernelCounter := inferenceBenchmarkNativeRuntimeAndKernelCounter()
+	model, err := newROCmBackendWithRuntime(nativeRuntime).LoadModel(modelPath, inference.WithContextLen(contextLen))
 	if err != nil {
 		b.Fatalf("LoadModel(%q): %v", modelPath, err)
 	}
@@ -109,7 +277,11 @@ func BenchmarkInferenceGemma4Q4PromptPrefillUBatchLadder(b *testing.B) {
 		ubatchTokens := ubatchTokens
 		b.Run(fmt.Sprintf("ubatch_%d", ubatchTokens), func(b *testing.B) {
 			b.Setenv(hipGemma4Q4PrefillUBatchEnv, strconv.Itoa(ubatchTokens))
+			if kernelCounter != nil {
+				kernelCounter.ResetKernelStats()
+			}
 			inferenceBenchmarkRunGemma4Q4GenerateLoaded(b, model, benchPrompt, maxTokens, contextLen, ubatchTokens, "")
+			inferenceBenchmarkReportHIPKernelRouteMetrics(b, kernelCounter)
 		})
 	}
 }
@@ -1305,13 +1477,18 @@ func benchmarkInferenceGemma4Q4Generate(b *testing.B) {
 	b.Setenv("GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE", "1")
 	outputPath := strings.TrimSpace(os.Getenv("GO_ROCM_BENCH_OUTPUT_FILE"))
 
-	model, err := newROCmBackendWithRuntime(newSystemNativeRuntime()).LoadModel(modelPath, inference.WithContextLen(contextLen))
+	nativeRuntime, kernelCounter := inferenceBenchmarkNativeRuntimeAndKernelCounter()
+	model, err := newROCmBackendWithRuntime(nativeRuntime).LoadModel(modelPath, inference.WithContextLen(contextLen))
 	if err != nil {
 		b.Fatalf("LoadModel(%q): %v", modelPath, err)
 	}
 	defer inferenceBenchmarkCloseModel(b, model)
 
+	if kernelCounter != nil {
+		kernelCounter.ResetKernelStats()
+	}
 	inferenceBenchmarkRunGemma4Q4GenerateLoaded(b, model, benchPrompt, maxTokens, contextLen, prefillUBatchTokens, outputPath)
+	inferenceBenchmarkReportHIPKernelRouteMetrics(b, kernelCounter)
 }
 
 func inferenceBenchmarkRunGemma4Q4GenerateLoaded(b *testing.B, model inference.TextModel, benchPrompt inferenceBenchmarkPrompt, maxTokens, contextLen, prefillUBatchTokens int, outputPath string) {
