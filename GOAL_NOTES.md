@@ -16843,3 +16843,53 @@ keeps the no-replay rule intact: only the current turn prompt is appended to the
 live KV state. It does not complete the overall decode-speed goal; turn 10 is
 still around `50 tok/s`, so kernel launch volume and long-context attention
 remain the next bottlenecks.
+
+## 2026-05-27 Rejected PLE RMSNorm/Add Fusion
+
+Pulled `../go-mlx/IDEAS.md` back into the ROCm audit and targeted the Gemma4
+per-layer embedding precompute path. The experiment added a fused
+`rocm_rms_norm_heads_add_scaled` kernel for:
+
+```text
+output = (RMSNorm(projected_scaled) + per_layer_embedding * embedding_scale) * 0.70710678
+```
+
+This was the broader PLE fusion suggested by the earlier rejected one-launch
+scale experiments: it removed the separate PLE embedding `rocm_vector_scale`,
+`rocm_rms_norm_heads`, and final `rocm_vector_add_scaled` sequence from the
+decode precompute path and replaced them with one exact fused kernel.
+
+Verification before rejection:
+
+```text
+Focused fake/source tests:
+go test ./go -run 'TestHIPKernels_RMSNormHeads|TestHIPKernelSource_(ExportsLaunchABI|ABIConstants)_Good|TestHIPSmallDecode|TestGemma4|TestInferenceBenchmarkBook' -count=1
+ok dappco.re/go/rocm 0.014s
+
+Package test:
+go test ./go -count=1
+ok dappco.re/go/rocm 0.141s
+
+Compiled cleanly:
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-ple-rms-add-scaled.hsaco
+stderr: .bench-errors/hipcc_gfx1100_ple_rms_add_scaled_20260527.err (0 bytes)
+
+Q4 smoke:
+prompt_tokens=[2 10979], generated tokens=[107 4968], text=["\n" "Model"]
+stderr: .bench-errors/q4_smoke_ple_rms_add_scaled_20260527.err (0 bytes)
+
+512 route-metric guard:
+4568186431 ns/op, 112.1 tok/s, 3205512 B/op, 2992 allocs/op
+stderr: .bench-errors/512_ple_rms_add_scaled_20260527.err (0 bytes)
+
+2048 non-route guard:
+BenchmarkInferenceGemma4Q4Generate-32  1  19072593027 ns/op
+107.4 tok/s, 2048 tokens, 6682648 B/op, 2634 allocs/op
+stderr: .bench-errors/2048_ple_rms_add_scaled_20260527.err (0 bytes)
+```
+
+Rejected reason: despite reducing conceptual PLE launch count, the accepted
+2048 fast guard regressed versus the current source notes (`108+ tok/s`) and did
+not improve the `B/op` or allocation contract. The fused kernel was reverted.
+Keep PLE fusion on the table only if the next attempt also improves the
+2048-token guard or retained-book late-turn decode, not merely launch count.
