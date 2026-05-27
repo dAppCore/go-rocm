@@ -1,5 +1,38 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 go-cgo CString Tracker Refresh and Chunk Threshold Probe
+
+- Rechecked the active dependency remotes only. `external/go-inference` remains
+  current at `35a2228`; `external/go-cgo` advanced from `63dc2b2` to
+  `f8b6797` (`fix(cstring): AdoptCString routes through cgo.Free`).
+- Focused gates after the fast-forward were green:
+
+```text
+go test ./external/go-cgo/go/... -count=1
+go test ./go -count=1
+```
+
+- Rejected a decode chunking threshold experiment that kept the workspace
+  enabled but forced `rocm_attention_heads` until token count exceeded the
+  `2048` shared-weight threshold. The existing unit expectation for chunking at
+  `320` tokens failed under the experiment, and the live RX 7800 XT guard was
+  slower than the accepted default:
+
+```text
+GO_ROCM_GEMMA4_Q4_CHUNKED_ATTENTION=0, workspace disabled:
+  19808062111 ns/op, 103.4 tok/s, 78230768 B/op, 1025966 allocs/op
+  stderr: /tmp/go-rocm-2048-nochunk-current.err (empty)
+
+workspace enabled, chunk only after >2048 tokens:
+  19659558188 ns/op, 104.2 tok/s, 6672920 B/op, 2564 allocs/op
+  stderr: /tmp/go-rocm-2048-chunk-after-shared-threshold.err (empty)
+```
+
+- The accepted default remains better at about `108.2 tok/s` on the same 2048
+  guard, so the chunk threshold probe was reverted. The next attention work
+  should target long-context full-layer chunk geometry or kernel math, not a
+  simple shared-kernel threshold rollback.
+
 ## 2026-05-27 go-cgo Finalizer-Clear Refresh
 
 - One-time CoreGO check before narrowing the refresh loop: `external/go` is
