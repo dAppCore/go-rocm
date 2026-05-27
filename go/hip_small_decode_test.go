@@ -787,6 +787,44 @@ func TestHIPGemma4Q4PrefillQKVProjectionBatch_Good(t *testing.T) {
 	}
 }
 
+func TestHIPGemma4Q4PrefillQKVProjectionBatch_AttentionKEqVBorrowsKeyProjection_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4Layer0FixtureConfig(t, driver)
+	defer cleanup()
+	cfg.LayerType = "full_attention"
+	cfg.AttentionKEqV = true
+	cfg.ValueProjection = cfg.KeyProjection
+
+	tokenCount := 2
+	inputValues := make([]float32, tokenCount*cfg.HiddenSize)
+	for index := range inputValues {
+		inputValues[index] = float32(index%cfg.HiddenSize + 1)
+	}
+	payload, err := hipFloat32Payload(inputValues)
+	core.RequireNoError(t, err)
+	input, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill K=V QKV fixture", payload, len(inputValues))
+	core.RequireNoError(t, err)
+	defer input.Close()
+
+	start := len(driver.launches)
+	qkv, err := hipRunGemma4Q4PrefillQKVProjectionBatch(context.Background(), driver, cfg, input, tokenCount)
+	core.RequireNoError(t, err)
+	defer qkv.Close()
+
+	core.AssertEqual(t, tokenCount*cfg.QueryProjection.Rows, qkv.Query.Count())
+	core.AssertEqual(t, tokenCount*cfg.KeyProjection.Rows, qkv.Key.Count())
+	core.AssertEqual(t, tokenCount*cfg.ValueProjection.Rows, qkv.Value.Count())
+	core.AssertEqual(t, qkv.Key.Pointer(), qkv.Value.Pointer())
+	core.AssertEqual(t, true, qkv.Value.borrowed)
+	launches := driver.launches[start:]
+	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameMLXQ4ProjBatch))
+	wantRows := []int{cfg.QueryProjection.Rows, cfg.KeyProjection.Rows}
+	for index, launch := range launches {
+		core.AssertEqual(t, hipKernelNameMLXQ4ProjBatch, launch.Name)
+		core.AssertEqual(t, uint32(wantRows[index]), binary.LittleEndian.Uint32(launch.Args[48:]))
+	}
+}
+
 func TestHIPGemma4Q4PrefillQKVProjectionBatch_Bad(t *testing.T) {
 	driver := &fakeHIPDriver{available: true}
 	cfg, cleanup := hipGemma4Q4Layer0FixtureConfig(t, driver)

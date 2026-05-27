@@ -1725,6 +1725,15 @@ endpoint.
   wrapped by a Gemma4 q4 Q/K/V prefill helper. This replaces one class of
   per-token projection launches, but batched MLP, KV writes, RoPE, and attention
   are still open.
+- [x] Match the `go-mlx` Gemma4 `attention_k_eq_v` prefill shape. Full-attention
+  K=V layers now borrow the batched K projection as the V projection source,
+  then keep the separate KNorm+RoPE and value RMSNorm paths. This removes one
+  redundant q4 batch projection launch for each K=V prefill layer while
+  preserving the distinct final K/V cache tensors. The focused fake-driver test
+  asserts only two Q/K projection launches and a borrowed value buffer; a live
+  512-token layer-5 QKV prefill graph benchmark completed with empty stderr,
+  and the canonical 2048-token generate guard stayed green at `108.7 tok/s`,
+  `6625464 B/op`, and `2604 allocs/op`.
 - [x] Add the first batched q4 MLP primitive for prefill. The new
   `rocm_mlx_q4_gelu_tanh_multiply_batch` kernel maps prompt rows onto `GridY`
   for fused gate/up projection plus GELU multiply, and the Gemma4 q4 prefill

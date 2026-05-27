@@ -585,6 +585,15 @@ func BenchmarkHIPGemma4Q4PrefillComputeGraph_UBatch(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
+	layerIndex := 0
+	if value, ok, err := inferenceBenchmarkOptionalNonNegativeEnv("GO_ROCM_BENCH_PREFILL_GRAPH_LAYER_INDEX"); err != nil {
+		b.Fatal(err)
+	} else if ok {
+		layerIndex = value
+		if layerIndex >= layerCount {
+			layerCount = layerIndex + 1
+		}
+	}
 	contextLen, err := inferenceBenchmarkPositiveEnv("GO_ROCM_BENCH_CONTEXT_LEN", 48000)
 	if err != nil {
 		b.Fatal(err)
@@ -598,8 +607,17 @@ func BenchmarkHIPGemma4Q4PrefillComputeGraph_UBatch(b *testing.B) {
 	defer inferenceBenchmarkCloseModel(b, model)
 	ctx := context.Background()
 	driver := loaded.driver
-	layer := cfg.Layers[0]
+	if layerIndex >= len(cfg.Layers) {
+		b.Fatalf("GO_ROCM_BENCH_PREFILL_GRAPH_LAYER_INDEX=%d exceeds loaded layer count %d", layerIndex, len(cfg.Layers))
+	}
+	layer := cfg.Layers[layerIndex]
 	const epsilon = 1e-6
+	b.ReportMetric(float64(layerIndex), "prefill_graph_layer_index")
+	if layer.AttentionKEqV {
+		b.ReportMetric(1, "prefill_graph_attention_k_eq_v")
+	} else {
+		b.ReportMetric(0, "prefill_graph_attention_k_eq_v")
+	}
 
 	b.Run("Embedding", func(b *testing.B) {
 		inferenceBenchmarkReportPrefillGraph(b, tokenCount, 1)
@@ -621,7 +639,11 @@ func BenchmarkHIPGemma4Q4PrefillComputeGraph_UBatch(b *testing.B) {
 
 	b.Run("QKVProjection", func(b *testing.B) {
 		inferenceBenchmarkReportPrefillGraph(b, tokenCount, 1)
-		b.ReportMetric(3, "q4_projection_ops/op")
+		projectionOps := 3
+		if layer.AttentionKEqV {
+			projectionOps = 2
+		}
+		b.ReportMetric(float64(projectionOps), "q4_projection_ops/op")
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {

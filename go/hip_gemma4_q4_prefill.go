@@ -535,9 +535,15 @@ func hipRunGemma4Q4PrefillQKVProjectionBatch(ctx context.Context, driver nativeH
 	if err != nil {
 		return nil, err
 	}
-	out.Value, err = hipRunMLXQ4ProjectionBatchKernelWithDeviceInput(ctx, driver, input, cfg.ValueProjection, tokenCount)
-	if err != nil {
-		return nil, err
+	if cfg.AttentionKEqV {
+		value := *out.Key
+		value.borrowed = true
+		out.Value = &value
+	} else {
+		out.Value, err = hipRunMLXQ4ProjectionBatchKernelWithDeviceInput(ctx, driver, input, cfg.ValueProjection, tokenCount)
+		if err != nil {
+			return nil, err
+		}
 	}
 	success = true
 	return out, nil
