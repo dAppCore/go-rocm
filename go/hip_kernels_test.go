@@ -631,6 +631,25 @@ func TestHIPKernels_MLXQ4ProjectionLaunchArgs_Good(t *testing.T) {
 	assertFloat32Near(t, 38, greedy.Score)
 	core.AssertEqual(t, []uint64{hipMLXQ4ProjectionBestBytes}, driver.memsets)
 	core.AssertEqual(t, hipKernelNameMLXQ4ProjGreedy, driver.launches[len(driver.launches)-1].Name)
+
+	candidates, err := hipRunMLXQ4ProjectionSoftcapScoreKernelWithDeviceInputBufferSuppress(context.Background(), driver, buffers.Input, hipMLXQ4DeviceWeightConfig{
+		WeightPointer: buffers.Weight.Pointer(),
+		ScalePointer:  buffers.Scales.Pointer(),
+		BiasPointer:   buffers.Biases.Pointer(),
+		WeightBytes:   buffers.Weight.SizeBytes(),
+		ScaleBytes:    buffers.Scales.SizeBytes(),
+		BiasBytes:     buffers.Biases.SizeBytes(),
+		Rows:          req.Rows,
+		Cols:          req.Cols,
+		GroupSize:     req.GroupSize,
+	}, 0, 2, nil, nil)
+	core.AssertNoError(t, err)
+	core.RequireTrue(t, len(candidates) == 2)
+	core.AssertEqual(t, 1, candidates[0].TokenID)
+	assertFloat32Near(t, 38, candidates[0].Score)
+	core.AssertEqual(t, 0, candidates[1].TokenID)
+	assertFloat32Near(t, 28, candidates[1].Score)
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjScores, driver.launches[len(driver.launches)-1].Name)
 }
 
 func TestHIPKernels_MLXQ4ProjectionGreedySuppressDevice_Good(t *testing.T) {
@@ -673,6 +692,33 @@ func TestHIPKernels_MLXQ4ProjectionGreedySuppressDevice_Good(t *testing.T) {
 	core.AssertEqual(t, 0, got.TokenID)
 	assertFloat32Near(t, 28, got.Score)
 	core.AssertEqual(t, hipKernelNameMLXQ4ProjGreedy, driver.launches[len(driver.launches)-1].Name)
+	core.AssertEqual(t, uint32(1), binary.LittleEndian.Uint32(driver.launches[len(driver.launches)-1].Args[84:]))
+
+	candidates, err := hipRunMLXQ4ProjectionSoftcapScoreKernelWithDeviceInputBufferSuppress(
+		context.Background(),
+		driver,
+		buffers.Input,
+		hipMLXQ4DeviceWeightConfig{
+			WeightPointer: buffers.Weight.Pointer(),
+			ScalePointer:  buffers.Scales.Pointer(),
+			BiasPointer:   buffers.Biases.Pointer(),
+			WeightBytes:   buffers.Weight.SizeBytes(),
+			ScaleBytes:    buffers.Scales.SizeBytes(),
+			BiasBytes:     buffers.Biases.SizeBytes(),
+			Rows:          req.Rows,
+			Cols:          req.Cols,
+			GroupSize:     req.GroupSize,
+		},
+		0,
+		1,
+		[]int32{1},
+		workspace,
+	)
+	core.AssertNoError(t, err)
+	core.RequireTrue(t, len(candidates) == 1)
+	core.AssertEqual(t, 0, candidates[0].TokenID)
+	assertFloat32Near(t, 28, candidates[0].Score)
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjScores, driver.launches[len(driver.launches)-1].Name)
 	core.AssertEqual(t, uint32(1), binary.LittleEndian.Uint32(driver.launches[len(driver.launches)-1].Args[84:]))
 }
 

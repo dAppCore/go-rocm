@@ -120,6 +120,8 @@ type hipGemma4Q4ForwardRequest struct {
 	PriorDeviceState    *hipGemma4Q4DeviceDecodeState
 	ReturnDeviceState   bool
 	DeviceFinalSample   bool
+	DeviceFinalScores   bool
+	FinalCandidateCount int
 	SkipFinalSample     bool
 	FinalGreedyBuffer   *hipDeviceByteBuffer
 	TokenIDDeviceBuffer *hipDeviceByteBuffer
@@ -241,6 +243,7 @@ type hipGemma4Q4ForwardResult struct {
 	FinalHidden     []float32
 	Logits          []float32
 	Greedy          hipGreedySampleResult
+	Candidates      []hipGreedySampleResult
 	DeviceState     *hipGemma4Q4DeviceDecodeState
 	Labels          map[string]string
 }
@@ -572,6 +575,15 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 	if req.DeviceFinalSample && req.SkipFinalSample {
 		return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, core.E(hipGemma4Q4Layer0Operation, "final sample cannot be both requested and skipped", nil)
 	}
+	if req.DeviceFinalScores && req.SkipFinalSample {
+		return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, core.E(hipGemma4Q4Layer0Operation, "final scores cannot be both requested and skipped", nil)
+	}
+	if req.DeviceFinalSample && req.DeviceFinalScores {
+		return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, core.E(hipGemma4Q4Layer0Operation, "final sample and final scores are mutually exclusive", nil)
+	}
+	if req.DeviceFinalScores && req.FinalCandidateCount <= 0 {
+		return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, core.E(hipGemma4Q4Layer0Operation, "final score candidate count must be positive", nil)
+	}
 	first := cfg.Layers[0]
 	if validate {
 		if err := (hipGemma4Q4Layer0Request{
@@ -732,7 +744,7 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 			} else {
 				if req.SkipFinalSample {
 					nextInputNormCfg = hipRMSNormDeviceWeightConfig{}
-				} else if req.DeviceFinalSample {
+				} else if req.DeviceFinalSample || req.DeviceFinalScores {
 					nextInputNormCfg = layerCfg.FinalNorm
 				}
 			}
@@ -838,10 +850,11 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 	finalNormCfg.Epsilon = req.Epsilon
 	var logits []float32
 	var greedy hipGreedySampleResult
+	var candidates []hipGreedySampleResult
 	if req.SkipFinalSample {
 		// Prompt prefill only needs updated KV state; sampling every intermediate
 		// prompt token wastes a full LM-head projection.
-	} else if req.DeviceFinalSample {
+	} else if req.DeviceFinalSample || req.DeviceFinalScores {
 		finalHiddenBuffer := hiddenBuffer
 		if finalHiddenBuffer == nil {
 			finalHiddenBuffer, err = hipUploadGemma4Q4Float32Input(driver, "Gemma4 q4 final hidden", hidden)
@@ -858,9 +871,19 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 			}
 			defer finalNormBuffer.Close()
 		}
-		greedy, err = hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppress(ctx, driver, finalNormBuffer, last.LMHeadProjection, last.FinalLogitSoftcap, req.FinalGreedyBuffer, req.SuppressTokens, req.AttentionWorkspace)
-		if err != nil {
-			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+		if req.DeviceFinalScores {
+			candidates, err = hipRunMLXQ4ProjectionSoftcapScoreKernelWithDeviceInputBufferSuppress(ctx, driver, finalNormBuffer, last.LMHeadProjection, last.FinalLogitSoftcap, req.FinalCandidateCount, req.SuppressTokens, req.AttentionWorkspace)
+			if err != nil {
+				return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+			}
+			if len(candidates) > 0 {
+				greedy = candidates[0]
+			}
+		} else {
+			greedy, err = hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppress(ctx, driver, finalNormBuffer, last.LMHeadProjection, last.FinalLogitSoftcap, req.FinalGreedyBuffer, req.SuppressTokens, req.AttentionWorkspace)
+			if err != nil {
+				return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
+			}
 		}
 	} else {
 		if hidden == nil && hiddenBuffer != nil {
@@ -899,6 +922,9 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 		if req.DeviceFinalSample {
 			labels["gemma4_q4_final_sample"] = "device_q4_projection_softcap_greedy"
 		}
+		if req.DeviceFinalScores {
+			labels["gemma4_q4_final_sample"] = "device_q4_projection_softcap_scores"
+		}
 		if req.SkipFinalSample {
 			labels["gemma4_q4_final_sample"] = "skipped"
 		}
@@ -926,6 +952,7 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 		LayerResults: layerResults,
 		Logits:       logits,
 		Greedy:       greedy,
+		Candidates:   candidates,
 		DeviceState:  nextDeviceState,
 		Labels:       labels,
 	}

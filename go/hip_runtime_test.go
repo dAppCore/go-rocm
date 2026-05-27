@@ -2288,6 +2288,8 @@ func (driver *fakeHIPDriver) LaunchKernel(config hipKernelLaunchConfig) error {
 		return driver.launchMLXQ4ProjectionBatch(config.Args)
 	case hipKernelNameMLXQ4ProjGreedy:
 		return driver.launchMLXQ4ProjectionGreedy(config.Args)
+	case hipKernelNameMLXQ4ProjScores:
+		return driver.launchMLXQ4ProjectionScores(config.Args)
 	case hipKernelNameMLXQ4TripleProj:
 		return driver.launchMLXQ4TripleProjection(config.Args)
 	case hipKernelNameMLXQ4GELUTanhMul:
@@ -3701,6 +3703,99 @@ func (driver *fakeHIPDriver) launchMLXQ4ProjectionGreedy(args []byte) error {
 		return err
 	}
 	binary.LittleEndian.PutUint64(outputData[outputOffset:outputOffset+outputBytes], hipPackGreedyBest(bestScore, bestIndex))
+	return nil
+}
+
+func (driver *fakeHIPDriver) launchMLXQ4ProjectionScores(args []byte) error {
+	if len(args) != hipMLXQ4ProjectionLaunchArgsBytes {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 score projection launch args size mismatch", nil)
+	}
+	if binary.LittleEndian.Uint32(args[0:]) != hipMLXQ4ProjectionLaunchArgsVersion ||
+		binary.LittleEndian.Uint32(args[4:]) != uint32(hipMLXQ4ProjectionLaunchArgsBytes) {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 score projection launch header mismatch", nil)
+	}
+	inputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[8:]))
+	weightPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[16:]))
+	scalePointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[24:]))
+	biasPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[32:]))
+	outputPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[40:]))
+	rows := int(binary.LittleEndian.Uint32(args[48:]))
+	cols := int(binary.LittleEndian.Uint32(args[52:]))
+	groupSize := int(binary.LittleEndian.Uint32(args[56:]))
+	bits := int(binary.LittleEndian.Uint32(args[60:]))
+	inputBytes := int(binary.LittleEndian.Uint32(args[64:]))
+	weightBytes := int(binary.LittleEndian.Uint32(args[68:]))
+	scaleBytes := int(binary.LittleEndian.Uint32(args[72:]))
+	biasBytes := int(binary.LittleEndian.Uint32(args[76:]))
+	outputBytes := int(binary.LittleEndian.Uint32(args[80:]))
+	suppressCount := int(binary.LittleEndian.Uint32(args[84:]))
+	suppressPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[88:]))
+	if bits != hipMLXQ4ProjectionBits ||
+		validateHIPMLXQ4ProjectionShape(cols, weightBytes/4, scaleBytes/2, biasBytes/2, rows, cols, groupSize) != nil ||
+		inputBytes != cols*4 ||
+		outputBytes != rows*hipMLXQ4ProjectionBestBytes ||
+		(suppressCount > 0 && suppressPointer == 0) {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 score projection shape metadata mismatch", nil)
+	}
+	inputData, inputOffset, ok := driver.memoryForPointer(inputPointer, inputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 score projection input buffer is missing", nil)
+	}
+	weightData, weightOffset, ok := driver.memoryForPointer(weightPointer, weightBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 score projection packed weight buffer is missing", nil)
+	}
+	scaleData, scaleOffset, ok := driver.memoryForPointer(scalePointer, scaleBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 score projection scale buffer is missing", nil)
+	}
+	biasData, biasOffset, ok := driver.memoryForPointer(biasPointer, biasBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 score projection bias buffer is missing", nil)
+	}
+	outputData, outputOffset, ok := driver.memoryForPointer(outputPointer, outputBytes)
+	if !ok {
+		return core.E("rocm.hip.FakeLaunch", "MLX q4 score projection output buffer is missing", nil)
+	}
+	input, err := hipFloat32PayloadValues(inputData[inputOffset : inputOffset+inputBytes])
+	if err != nil {
+		return err
+	}
+	weights := make([]uint32, weightBytes/4)
+	for index := range weights {
+		weights[index] = binary.LittleEndian.Uint32(weightData[weightOffset+index*4:])
+	}
+	scales := make([]uint16, scaleBytes/2)
+	for index := range scales {
+		scales[index] = binary.LittleEndian.Uint16(scaleData[scaleOffset+index*2:])
+	}
+	biases := make([]uint16, biasBytes/2)
+	for index := range biases {
+		biases[index] = binary.LittleEndian.Uint16(biasData[biasOffset+index*2:])
+	}
+	output, err := hipReferenceMLXQ4Projection(input, weights, scales, biases, rows, cols, groupSize)
+	if err != nil {
+		return err
+	}
+	var suppressTokens []int32
+	if suppressCount > 0 {
+		suppressBytes := suppressCount * 4
+		suppressData, suppressOffset, ok := driver.memoryForPointer(suppressPointer, suppressBytes)
+		if !ok {
+			return core.E("rocm.hip.FakeLaunch", "MLX q4 score suppress token buffer is missing", nil)
+		}
+		suppressTokens = make([]int32, suppressCount)
+		for index := range suppressTokens {
+			suppressTokens[index] = int32(binary.LittleEndian.Uint32(suppressData[suppressOffset+index*4:]))
+		}
+	}
+	for index, score := range output {
+		packed := uint64(0)
+		if !hipTokenIsSuppressed(int32(index), suppressTokens) {
+			packed = hipPackGreedyBest(score, index)
+		}
+		binary.LittleEndian.PutUint64(outputData[outputOffset+index*8:], packed)
+	}
 	return nil
 }
 

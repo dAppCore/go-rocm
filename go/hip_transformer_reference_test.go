@@ -5,11 +5,17 @@
 package rocm
 
 import (
+	"encoding/binary"
 	"math"
 	"testing"
 
 	core "dappco.re/go"
 	"dappco.re/go/inference"
+)
+
+var (
+	benchmarkHIPTopPackedScoresSink       []uint64
+	benchmarkHIPCandidateSampleResultSink hipGreedySampleResult
 )
 
 func TestHIPTransformerReferenceEmbeddingLookup_Good(t *testing.T) {
@@ -353,6 +359,36 @@ func TestHIPTransformerReferenceSamplerBadInputsAndTies_Bad(t *testing.T) {
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, 2, penalized.TokenID)
 
+	candidateSampled, err := hipGemma4Q4HostSampleCandidateResult(
+		[]hipGreedySampleResult{{TokenID: 1, Score: 5}, {TokenID: 2, Score: 4}},
+		inference.GenerateConfig{Temperature: 1, TopK: 2, TopP: 1, RepeatPenalty: 1},
+		nil,
+		0,
+	)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 1, candidateSampled.TokenID)
+
+	candidatePenalized, err := hipGemma4Q4HostSampleCandidateResult(
+		[]hipGreedySampleResult{{TokenID: 1, Score: 5}, {TokenID: 2, Score: 4}},
+		inference.GenerateConfig{RepeatPenalty: 2},
+		[]int32{1},
+		0,
+	)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 2, candidatePenalized.TokenID)
+	core.AssertTrue(t, hipGemma4Q4DeviceCandidateSamplingRequested(inference.GenerateConfig{Temperature: 1, TopK: 2, TopP: 1, RepeatPenalty: 1}), "top-k sampling can use device candidates without repeat penalty")
+	core.AssertTrue(t, !hipGemma4Q4DeviceCandidateSamplingRequested(inference.GenerateConfig{Temperature: 1, TopK: 2, TopP: 1, RepeatPenalty: 2}), "repeat penalty changes the top-k set and must use full logits")
+	packed := []uint64{
+		hipPackGreedyBest(1, 0),
+		hipPackGreedyBest(3, 1),
+		hipPackGreedyBest(2, 2),
+	}
+	payload := make([]byte, len(packed)*hipMLXQ4ProjectionBestBytes)
+	for index, value := range packed {
+		binary.LittleEndian.PutUint64(payload[index*hipMLXQ4ProjectionBestBytes:], value)
+	}
+	core.AssertEqual(t, hipTopPackedScores(packed, 2), hipTopPackedScoresBytes(payload, 2))
+
 	probs, err := hipReferenceTopKProbabilities([]float32{1, 2, 2}, 1, 1)
 	core.RequireNoError(t, err)
 	if !math.IsInf(float64(probs[0]), -1) || !math.IsInf(float64(probs[2]), -1) {
@@ -435,6 +471,59 @@ func TestHIPTransformerReferenceBadInputs_Bad(t *testing.T) {
 	_, err = hipReferenceTopKProbabilities([]float32{1}, 2, 1)
 	core.AssertError(t, err)
 	core.AssertContains(t, err.Error(), "top-k")
+}
+
+func BenchmarkHIPTopPackedScores_VocabTopK64(b *testing.B) {
+	const vocabSize = 256000
+	values := make([]uint64, vocabSize)
+	for index := range values {
+		score := float32((index*1103515245+12345)&0xffff) / 4096
+		if index%257 == 0 {
+			score += 100
+		}
+		values[index] = hipPackGreedyBest(score, index)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		benchmarkHIPTopPackedScoresSink = hipTopPackedScores(values, 64)
+	}
+}
+
+func BenchmarkHIPTopPackedScoresBytes_VocabTopK64(b *testing.B) {
+	const vocabSize = 256000
+	payload := make([]byte, vocabSize*hipMLXQ4ProjectionBestBytes)
+	for index := 0; index < vocabSize; index++ {
+		score := float32((index*1103515245+12345)&0xffff) / 4096
+		if index%257 == 0 {
+			score += 100
+		}
+		binary.LittleEndian.PutUint64(payload[index*hipMLXQ4ProjectionBestBytes:], hipPackGreedyBest(score, index))
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		benchmarkHIPTopPackedScoresSink = hipTopPackedScoresBytes(payload, 64)
+	}
+}
+
+func BenchmarkHIPGemma4Q4HostSampleCandidateResult_TopK64(b *testing.B) {
+	candidates := make([]hipGreedySampleResult, 64)
+	for index := range candidates {
+		candidates[index] = hipGreedySampleResult{TokenID: index, Score: float32(64 - index)}
+	}
+	generate := inference.GenerateConfig{Temperature: 1, TopK: 64, TopP: 0.95, RepeatPenalty: 1}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		result, err := hipGemma4Q4HostSampleCandidateResult(candidates, generate, nil, 0.42)
+		if err != nil {
+			b.Fatal(err)
+		}
+		benchmarkHIPCandidateSampleResultSink = result
+	}
 }
 
 func hipReferenceTinyLMFixture() hipReferenceTinyLMConfig {

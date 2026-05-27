@@ -1089,6 +1089,7 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 		if hostSampling {
 			history = make([]int32, 0, generate.MaxTokens)
 		}
+		deviceCandidateSampling := hipGemma4Q4DeviceCandidateSamplingRequested(generate)
 		useBatchedPrefill := hipGemma4Q4CanUseBatchedGeneratePrefill(cfg) && !hostSampling
 		var priorLayerKVScratch []*rocmDeviceKVCache
 		for _, ubatch := range prefillPlan.Batches {
@@ -1101,21 +1102,23 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 					outputToken := ubatch.OutputToken(index)
 					var err error
 					current, state, err = hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx, model.driver, cfg, state, hipGemma4Q4ForwardRequest{
-						TokenID:            promptToken,
-						Position:           ubatch.Position + index,
-						Epsilon:            req.Epsilon,
-						DeviceKVAttention:  true,
-						DeviceKVMode:       deviceKVMode,
-						PriorDeviceState:   deviceState,
-						ReturnDeviceState:  true,
-						DeviceFinalSample:  outputToken && !hostSampling,
-						SkipFinalSample:    !outputToken,
-						FinalGreedyBuffer:  finalGreedyBuffer,
-						SuppressTokens:     suppressTokens,
-						AttentionWorkspace: attentionWorkspace,
-						OmitDebugTensors:   true,
-						OmitLabels:         true,
-						OmitHostState:      true,
+						TokenID:             promptToken,
+						Position:            ubatch.Position + index,
+						Epsilon:             req.Epsilon,
+						DeviceKVAttention:   true,
+						DeviceKVMode:        deviceKVMode,
+						PriorDeviceState:    deviceState,
+						ReturnDeviceState:   true,
+						DeviceFinalSample:   outputToken && !hostSampling,
+						DeviceFinalScores:   outputToken && deviceCandidateSampling,
+						FinalCandidateCount: generate.TopK,
+						SkipFinalSample:     !outputToken,
+						FinalGreedyBuffer:   finalGreedyBuffer,
+						SuppressTokens:      suppressTokens,
+						AttentionWorkspace:  attentionWorkspace,
+						OmitDebugTensors:    true,
+						OmitLabels:          true,
+						OmitHostState:       true,
 					}, false)
 					if err != nil {
 						runErr = err
@@ -1131,7 +1134,11 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 					hipReleaseClosedGemma4Q4DeviceDecodeState(previousDeviceState)
 					if outputToken {
 						if hostSampling {
-							current.Greedy, err = hipGemma4Q4HostSampleResult(current.Logits, generate, suppressTokens, history, rand.Float64())
+							if len(current.Candidates) > 0 {
+								current.Greedy, err = hipGemma4Q4HostSampleCandidateResult(current.Candidates, generate, history, rand.Float64())
+							} else {
+								current.Greedy, err = hipGemma4Q4HostSampleResult(current.Logits, generate, suppressTokens, history, rand.Float64())
+							}
 							if err != nil {
 								runErr = err
 								return
@@ -1231,6 +1238,8 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 				PriorDeviceState:    deviceState,
 				ReturnDeviceState:   true,
 				DeviceFinalSample:   !hostSampling,
+				DeviceFinalScores:   deviceCandidateSampling,
+				FinalCandidateCount: generate.TopK,
 				FinalGreedyBuffer:   finalGreedyBuffer,
 				TokenIDDeviceBuffer: tokenIDDeviceBuffer,
 				SuppressTokens:      suppressTokens,
@@ -1252,7 +1261,11 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 			current.DeviceState = nil
 			hipReleaseClosedGemma4Q4DeviceDecodeState(previousDeviceState)
 			if hostSampling {
-				current.Greedy, err = hipGemma4Q4HostSampleResult(current.Logits, generate, suppressTokens, history, rand.Float64())
+				if len(current.Candidates) > 0 {
+					current.Greedy, err = hipGemma4Q4HostSampleCandidateResult(current.Candidates, generate, history, rand.Float64())
+				} else {
+					current.Greedy, err = hipGemma4Q4HostSampleResult(current.Logits, generate, suppressTokens, history, rand.Float64())
+				}
 				if err != nil {
 					runErr = err
 					return
@@ -1733,6 +1746,10 @@ func hipGemma4Q4HostSamplingRequested(generate inference.GenerateConfig) bool {
 		generate.RepeatPenalty > 1
 }
 
+func hipGemma4Q4DeviceCandidateSamplingRequested(generate inference.GenerateConfig) bool {
+	return hipGemma4Q4HostSamplingRequested(generate) && generate.TopK > 0 && generate.RepeatPenalty <= 1
+}
+
 func hipGemma4Q4HostSampleResult(logits []float32, generate inference.GenerateConfig, suppressTokens []int32, history []int32, draw float64) (hipGreedySampleResult, error) {
 	if len(logits) == 0 {
 		return hipGreedySampleResult{}, core.E("rocm.hip.Gemma4Q4HostSampler", "logits are required", nil)
@@ -1840,6 +1857,103 @@ func hipGemma4Q4HostSampleResult(logits []float32, generate inference.GenerateCo
 		}
 	}
 	candidate := candidates[limit-1]
+	return hipGreedySampleResult{TokenID: candidate.index, Score: candidate.value}, nil
+}
+
+func hipGemma4Q4HostSampleCandidateResult(candidates []hipGreedySampleResult, generate inference.GenerateConfig, history []int32, draw float64) (hipGreedySampleResult, error) {
+	if len(candidates) == 0 {
+		return hipGreedySampleResult{}, core.E("rocm.hip.Gemma4Q4HostSampler", "candidates are required", nil)
+	}
+	working := make([]hipReferenceCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.TokenID < 0 || math.IsNaN(float64(candidate.Score)) || math.IsInf(float64(candidate.Score), 0) {
+			continue
+		}
+		working = append(working, hipReferenceCandidate{index: candidate.TokenID, value: candidate.Score})
+	}
+	if len(working) == 0 {
+		return hipGreedySampleResult{}, core.E("rocm.hip.Gemma4Q4HostSampler", "all candidates are invalid", nil)
+	}
+	if generate.RepeatPenalty > 1 {
+		if math.IsNaN(float64(generate.RepeatPenalty)) || math.IsInf(float64(generate.RepeatPenalty), 0) {
+			return hipGreedySampleResult{}, core.E("rocm.hip.Gemma4Q4HostSampler", "repeat penalty must be finite", nil)
+		}
+		for index := range working {
+			for _, id := range history {
+				if int32(working[index].index) != id {
+					continue
+				}
+				if working[index].value < 0 {
+					working[index].value *= generate.RepeatPenalty
+				} else {
+					working[index].value /= generate.RepeatPenalty
+				}
+				break
+			}
+		}
+	}
+	if generate.Temperature <= 0 && generate.TopP <= 0 {
+		sortHIPReferenceCandidates(working)
+		candidate := working[0]
+		return hipGreedySampleResult{TokenID: candidate.index, Score: candidate.value}, nil
+	}
+	temperature := generate.Temperature
+	if temperature == 0 {
+		temperature = 1
+	}
+	if temperature <= 0 || math.IsNaN(float64(temperature)) || math.IsInf(float64(temperature), 0) {
+		return hipGreedySampleResult{}, core.E("rocm.hip.Gemma4Q4HostSampler", "temperature must be positive and finite", nil)
+	}
+	topP := generate.TopP
+	if topP == 0 {
+		topP = 1
+	}
+	if topP <= 0 || topP > 1 || math.IsNaN(float64(topP)) || math.IsInf(float64(topP), 0) {
+		return hipGreedySampleResult{}, core.E("rocm.hip.Gemma4Q4HostSampler", "top-p must be in (0, 1]", nil)
+	}
+	sortHIPReferenceCandidates(working)
+	maxValue := float64(working[0].value) / float64(temperature)
+	weights := make([]float64, len(working))
+	total := 0.0
+	for index, candidate := range working {
+		weight := math.Exp(float64(candidate.value)/float64(temperature) - maxValue)
+		weights[index] = weight
+		total += weight
+	}
+	if total <= 0 || math.IsNaN(total) || math.IsInf(total, 0) {
+		return hipGreedySampleResult{}, core.E("rocm.hip.Gemma4Q4HostSampler", "sampling distribution is invalid", nil)
+	}
+	limit := len(working)
+	if topP < 1 {
+		cumulative := 0.0
+		for index, weight := range weights {
+			cumulative += weight
+			if cumulative/total >= float64(topP) {
+				limit = index + 1
+				break
+			}
+		}
+	}
+	selectedTotal := 0.0
+	for _, weight := range weights[:limit] {
+		selectedTotal += weight
+	}
+	if draw < 0 {
+		draw = 0
+	}
+	if draw >= 1 {
+		draw = math.Nextafter(1, 0)
+	}
+	target := draw * selectedTotal
+	cumulative := 0.0
+	for index, weight := range weights[:limit] {
+		cumulative += weight
+		if target <= cumulative {
+			candidate := working[index]
+			return hipGreedySampleResult{TokenID: candidate.index, Score: candidate.value}, nil
+		}
+	}
+	candidate := working[limit-1]
 	return hipGreedySampleResult{TokenID: candidate.index, Score: candidate.value}, nil
 }
 

@@ -1006,6 +1006,7 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 	}
 	suppressTokens := hipGemma4Q4GenerationSuppressTokenIDs(session.model, generate.StopTokens)
 	hostSampling := hipGemma4Q4HostSamplingRequested(generate)
+	deviceCandidateSampling := hipGemma4Q4DeviceCandidateSamplingRequested(generate)
 	ubatchTokens, err := hipGemma4Q4PrefillUBatchTokens()
 	if err != nil {
 		return inferenceBenchmarkGemma4Q4RetainedTurn{}, err
@@ -1048,20 +1049,22 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 		session.position = prefillPlan.NextPosition()
 	}
 	finalForward, nextHostState, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx, session.model.driver, session.cfg, session.hostState, hipGemma4Q4ForwardRequest{
-		TokenID:            finalPromptToken,
-		Position:           session.position,
-		Epsilon:            1e-6,
-		DeviceKVAttention:  true,
-		DeviceKVMode:       session.mode,
-		PriorDeviceState:   session.deviceState,
-		ReturnDeviceState:  true,
-		DeviceFinalSample:  !hostSampling,
-		FinalGreedyBuffer:  session.finalGreedyBuffer,
-		SuppressTokens:     suppressTokens,
-		AttentionWorkspace: session.attentionWorkspace,
-		OmitDebugTensors:   true,
-		OmitLabels:         true,
-		OmitHostState:      true,
+		TokenID:             finalPromptToken,
+		Position:            session.position,
+		Epsilon:             1e-6,
+		DeviceKVAttention:   true,
+		DeviceKVMode:        session.mode,
+		PriorDeviceState:    session.deviceState,
+		ReturnDeviceState:   true,
+		DeviceFinalSample:   !hostSampling,
+		DeviceFinalScores:   deviceCandidateSampling,
+		FinalCandidateCount: generate.TopK,
+		FinalGreedyBuffer:   session.finalGreedyBuffer,
+		SuppressTokens:      suppressTokens,
+		AttentionWorkspace:  session.attentionWorkspace,
+		OmitDebugTensors:    true,
+		OmitLabels:          true,
+		OmitHostState:       true,
 	}, false)
 	if err != nil {
 		return inferenceBenchmarkGemma4Q4RetainedTurn{}, err
@@ -1072,7 +1075,11 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 	current := finalForward.Greedy
 	var history []int32
 	if hostSampling {
-		current, err = hipGemma4Q4HostSampleResult(finalForward.Logits, generate, suppressTokens, history, rand.Float64())
+		if len(finalForward.Candidates) > 0 {
+			current, err = hipGemma4Q4HostSampleCandidateResult(finalForward.Candidates, generate, history, rand.Float64())
+		} else {
+			current, err = hipGemma4Q4HostSampleResult(finalForward.Logits, generate, suppressTokens, history, rand.Float64())
+		}
 		if err != nil {
 			return inferenceBenchmarkGemma4Q4RetainedTurn{}, err
 		}
@@ -1105,21 +1112,23 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 		}
 		generatedCount++
 		request := hipGemma4Q4ForwardRequest{
-			TokenID:            tokenID,
-			Position:           session.position,
-			Epsilon:            1e-6,
-			DeviceKVAttention:  true,
-			DeviceKVMode:       session.mode,
-			PriorDeviceState:   session.deviceState,
-			ReturnDeviceState:  true,
-			DeviceFinalSample:  !hostSampling && generated+1 < generate.MaxTokens,
-			SkipFinalSample:    generated+1 == generate.MaxTokens,
-			FinalGreedyBuffer:  session.finalGreedyBuffer,
-			SuppressTokens:     suppressTokens,
-			AttentionWorkspace: session.attentionWorkspace,
-			OmitDebugTensors:   true,
-			OmitLabels:         true,
-			OmitHostState:      true,
+			TokenID:             tokenID,
+			Position:            session.position,
+			Epsilon:             1e-6,
+			DeviceKVAttention:   true,
+			DeviceKVMode:        session.mode,
+			PriorDeviceState:    session.deviceState,
+			ReturnDeviceState:   true,
+			DeviceFinalSample:   !hostSampling && generated+1 < generate.MaxTokens,
+			DeviceFinalScores:   deviceCandidateSampling && generated+1 < generate.MaxTokens,
+			FinalCandidateCount: generate.TopK,
+			SkipFinalSample:     generated+1 == generate.MaxTokens,
+			FinalGreedyBuffer:   session.finalGreedyBuffer,
+			SuppressTokens:      suppressTokens,
+			AttentionWorkspace:  session.attentionWorkspace,
+			OmitDebugTensors:    true,
+			OmitLabels:          true,
+			OmitHostState:       true,
 		}
 		forward, nextHostState, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx, session.model.driver, session.cfg, session.hostState, request, false)
 		if err != nil {
@@ -1136,7 +1145,11 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 		if generated+1 < generate.MaxTokens {
 			current = forward.Greedy
 			if hostSampling {
-				current, err = hipGemma4Q4HostSampleResult(forward.Logits, generate, suppressTokens, history, rand.Float64())
+				if len(forward.Candidates) > 0 {
+					current, err = hipGemma4Q4HostSampleCandidateResult(forward.Candidates, generate, history, rand.Float64())
+				} else {
+					current, err = hipGemma4Q4HostSampleResult(forward.Logits, generate, suppressTokens, history, rand.Float64())
+				}
 				if err != nil {
 					return inferenceBenchmarkGemma4Q4RetainedTurn{}, err
 				}

@@ -2284,6 +2284,8 @@ type hipAttentionHeadsChunkedWorkspace struct {
 	RMSNoScaleOutputs    map[int]*hipDeviceByteBuffer
 	IntermediateOutputs  map[int]*hipDeviceByteBuffer
 	QKVOutputs           map[int]*hipDeviceByteBuffer
+	ProjectionScore      *hipDeviceByteBuffer
+	ProjectionScoreBytes []byte
 	BatchAttentionWeight *hipDeviceByteBuffer
 	FinalHiddenOutputs   [2]map[int]*hipDeviceByteBuffer
 	NextInputOutputs     [2]map[int]*hipDeviceByteBuffer
@@ -2562,6 +2564,41 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureProjectionOutput(drive
 	return output, nil
 }
 
+func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureProjectionScoreOutput(driver nativeHIPDriver, count int) (*hipDeviceByteBuffer, error) {
+	if workspace == nil {
+		return nil, core.E("rocm.hip.MLXQ4ProjectionScoresLaunch", "attention workspace is required", nil)
+	}
+	if count <= 0 {
+		return nil, core.E("rocm.hip.MLXQ4ProjectionScoresLaunch", "projection score count must be positive", nil)
+	}
+	if workspace.ProjectionScore != nil && workspace.ProjectionScore.Pointer() != 0 && workspace.ProjectionScore.Count() == count && workspace.ProjectionScore.SizeBytes() == uint64(count*hipMLXQ4ProjectionBestBytes) {
+		return workspace.ProjectionScore, nil
+	}
+	if err := workspace.ProjectionScore.Close(); err != nil {
+		return nil, err
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.MLXQ4ProjectionScoresLaunch", "MLX q4 projection packed scores", uint64(count*hipMLXQ4ProjectionBestBytes), count)
+	if err != nil {
+		return nil, err
+	}
+	workspace.ProjectionScore = output
+	return output, nil
+}
+
+func (workspace *hipAttentionHeadsChunkedWorkspace) ProjectionScorePayload(count int) ([]byte, error) {
+	if workspace == nil {
+		return nil, core.E("rocm.hip.MLXQ4ProjectionScoresLaunch", "attention workspace is required", nil)
+	}
+	if count <= 0 {
+		return nil, core.E("rocm.hip.MLXQ4ProjectionScoresLaunch", "projection score count must be positive", nil)
+	}
+	byteCount := count * hipMLXQ4ProjectionBestBytes
+	if cap(workspace.ProjectionScoreBytes) < byteCount {
+		workspace.ProjectionScoreBytes = make([]byte, byteCount)
+	}
+	return workspace.ProjectionScoreBytes[:byteCount], nil
+}
+
 func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureActivationOutput(driver nativeHIPDriver, count int) (*hipDeviceByteBuffer, error) {
 	if workspace == nil {
 		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "attention workspace is required", nil)
@@ -2786,6 +2823,9 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 	if err := workspace.BatchAttentionWeight.Close(); err != nil {
 		lastErr = err
 	}
+	if err := workspace.ProjectionScore.Close(); err != nil {
+		lastErr = err
+	}
 	for _, output := range workspace.EmbeddingOutputs {
 		if err := output.Close(); err != nil {
 			lastErr = err
@@ -2918,6 +2958,8 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 	workspace.SuppressTokenBuffer = nil
 	workspace.SuppressTokenIDs = nil
 	workspace.BatchAttentionWeight = nil
+	workspace.ProjectionScore = nil
+	workspace.ProjectionScoreBytes = nil
 	workspace.batchWeightCap = 0
 	return lastErr
 }

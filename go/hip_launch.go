@@ -20,6 +20,7 @@ const (
 	hipKernelNameMLXQ4Proj                        = "rocm_mlx_q4_projection"
 	hipKernelNameMLXQ4ProjBatch                   = "rocm_mlx_q4_projection_batch"
 	hipKernelNameMLXQ4ProjGreedy                  = "rocm_mlx_q4_projection_greedy"
+	hipKernelNameMLXQ4ProjScores                  = "rocm_mlx_q4_projection_scores"
 	hipKernelNameMLXQ4TripleProj                  = "rocm_mlx_q4_triple_projection"
 	hipKernelNameMLXQ4GELUTanhMul                 = "rocm_mlx_q4_gelu_tanh_multiply"
 	hipKernelNameMLXQ4GELUTanhMulBatch            = "rocm_mlx_q4_gelu_tanh_multiply_batch"

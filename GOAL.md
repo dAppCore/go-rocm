@@ -447,6 +447,35 @@ last turn, `142272528 B/op`, `16462 allocs/op`, and an empty `.err` file. The
 slow path is not just the final hidden readback; a real device-side top-k/top-p
 sampler or greedy/device-resident production default is still required.
 
+Accepted sampled-runtime fix: `rocm_mlx_q4_projection_scores` now computes the
+final q4 LM-head score for every vocab row on device, filters suppressed tokens
+there, and returns packed score/index candidates so host top-k/top-p sampling no
+longer forces the full logits projection/readback path when `TopK > 0` and
+`RepeatPenalty <= 1`. The 2-turn, 8-token retained smoke with sampling defaults
+now completes in `0.628s` wall, `0.1298s` decode, `16` generated tokens,
+`118.8 tok/s` on the last turn, `10203208 B/op`, `16359 allocs/op`, and an
+empty `.err` file after reusing the packed-score device buffer and host payload
+inside the decode workspace. The stricter 2048-token greedy guard remained green
+with the same HSACO at `18784729332 ns/op`, `109.0 tok/s`, `6630256 B/op`, and
+`2517 allocs/op`, so the production greedy path was not regressed.
+
+Do not treat that sampled path as production-complete yet. The full 10-turn
+retained book with sampling defaults now runs fast enough at `34.83s` wall,
+`30.83s` decode, `2741` generated tokens, `78.69 tok/s` average, and
+`72.72 tok/s` on turn 10, with `208676552 B/op`, `111864 allocs/op`, no cap
+hits, and empty stderr. However, chapter 10 still drifted partly into the turn-10
+architecture distractor and scored only `2` lighthouse/light/ocean arc anchors.
+The current bridge also still transfers `vocab_rows * 8` packed-score bytes from
+device to host per sampled token even though that memory is now pooled. The
+immediate follow-up is a device-side top-k reduction that copies only selected
+candidates, plus sampled-quality tuning against the distractor gate. Until that
+lands, the production acceptance route remains device-greedy: with
+`GO_ROCM_BOOK_TEMPERATURE=0`, `GO_ROCM_BOOK_TOP_P=0`, and
+`GO_ROCM_BOOK_TOP_K=0`, the full 10-turn retained book passes at `37.63s` wall,
+`33.51s` decode, `3021` generated tokens, `80.29 tok/s` average, `69.20 tok/s`
+on turn 10, `205163552 B/op`, `99123 allocs/op`, empty stderr, no chapter cap
+hits, and `3` chapter-10 arc anchors.
+
 The replay-style book benchmark is deliberately double-gated with
 `GO_ROCM_RUN_UNSAFE_REPLAY_BOOK_BENCHMARKS=1` and has a per-turn timeout because
 it can monopolize a display GPU. Use it only as a baseline/debug aid. The route
