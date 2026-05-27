@@ -62,6 +62,36 @@ rocm_mlx_q4_projection_scores blocks/generated_token 8214
   candidate-score/top-k path is visible but already has rejected larger-chunk
   and multi-round top-k experiments, so do not revisit those exact shapes.
 
+- Ran the same full-cap route with greedy/device sampling to isolate the
+  sampled top-k path:
+
+```text
+GO_ROCM_BOOK_TEMPERATURE=0
+GO_ROCM_BOOK_TOP_P=0
+GO_ROCM_BOOK_TOP_K=0
+
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState:
+  41833081300 ns/op
+  book_wall_s/op 41.77
+  book_decode_s/op 32.82
+  book_generated_tokens/op 2861
+  book_tok/s 68.49
+  book_turn10_tok/s 64.55
+  book_turn10_retained_tokens/op 4532
+  book_host_sampling 0
+  chapter10_arc_anchor_hits 5
+  book_maxed_turns/op 0
+  B/op 18327016
+  allocs/op 34837
+  stderr: .bench-errors/book_retained_greedy_current_20260527.err (empty)
+  output: /tmp/go-rocm-book-retained-greedy-current-20260527.md
+```
+
+- Greedy removes the candidate-score/top-k path and shortens the generated
+  book, but the late-turn curve remains far below `90 tok/s`. That confirms
+  candidate readback is secondary. Keep the next speed pass focused on
+  chunked-attention stage 1 and q4 projection/GELU throughput.
+
 ## 2026-05-27 Current Route Shape After IDEAS Refresh
 
 - Took a fresh selected-kernel route sample after reading the Gemma4 notes in
