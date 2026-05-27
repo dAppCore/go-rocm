@@ -485,6 +485,9 @@ func BenchmarkInferenceGemma4Q4Book10Turn_ReplayBaseline(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		run, err := inferenceBenchmarkRunBookReplay(context.Background(), model, workload, generate, turns, turnTimeout)
 		if err != nil {
+			b.StopTimer()
+			inferenceBenchmarkMaybeWriteBookOutput(b, run, "replay", nil)
+			inferenceBenchmarkReportBookRun(b, run, contextLen, maxTokens, turnTimeout, "replay")
 			b.Fatalf("book replay workload: %v", err)
 		}
 		last = run
@@ -552,6 +555,11 @@ func BenchmarkInferenceGemma4Q4Book10Turn_RetainedState(b *testing.B) {
 		}
 		run, err := inferenceBenchmarkRunBookRetained(context.Background(), loaded, cfg, workload, generate, turns, turnTimeout)
 		if err != nil {
+			b.StopTimer()
+			inferenceBenchmarkMaybeWriteBookOutput(b, run, "retained", kernelCounter)
+			inferenceBenchmarkReportBookRun(b, run, contextLen, generate.MaxTokens, turnTimeout, "retained")
+			inferenceBenchmarkReportHIPKernelRouteMetrics(b, kernelCounter)
+			inferenceBenchmarkReportHIPKernelGeneratedTokenMetrics(b, kernelCounter, run.GeneratedTokens)
 			b.Fatalf("book retained workload: %v", err)
 		}
 		last = run
@@ -779,6 +787,7 @@ type inferenceBenchmarkBookRun struct {
 	Chapter10         string
 	Chapters          []string
 	TurnStats         []inferenceBenchmarkBookTurnStat
+	Failure           string
 }
 
 type inferenceBenchmarkBookTurnStat struct {
@@ -868,11 +877,12 @@ func inferenceBenchmarkRunBookRetained(ctx context.Context, model *hipLoadedMode
 		allocBytes, allocs := inferenceBenchmarkAllocDelta(allocBefore, inferenceBenchmarkAllocSnapshot())
 		if err != nil {
 			cancel()
-			return inferenceBenchmarkBookRun{}, err
+			return inferenceBenchmarkFinalizeFailedBookRun(run, time.Since(start), err), err
 		}
 		if err := turnCtx.Err(); err != nil {
 			cancel()
-			return inferenceBenchmarkBookRun{}, fmt.Errorf("chapter %d exceeded turn timeout %s: %w", chapter, turnTimeout, err)
+			err = fmt.Errorf("chapter %d exceeded turn timeout %s: %w", chapter, turnTimeout, err)
+			return inferenceBenchmarkFinalizeFailedBookRun(run, time.Since(start), err), err
 		}
 		cancel()
 		run.PromptTokens += turn.PromptTokens
@@ -945,11 +955,12 @@ func inferenceBenchmarkRunBookReplay(ctx context.Context, model inference.TextMo
 		allocBytes, allocs := inferenceBenchmarkAllocDelta(allocBefore, inferenceBenchmarkAllocSnapshot())
 		if err := model.Err(); err != nil {
 			cancel()
-			return inferenceBenchmarkBookRun{}, err
+			return inferenceBenchmarkFinalizeFailedBookRun(run, time.Since(start), err), err
 		}
 		if err := turnCtx.Err(); err != nil {
 			cancel()
-			return inferenceBenchmarkBookRun{}, fmt.Errorf("chapter %d exceeded turn timeout %s: %w", chapter, turnTimeout, err)
+			err = fmt.Errorf("chapter %d exceeded turn timeout %s: %w", chapter, turnTimeout, err)
+			return inferenceBenchmarkFinalizeFailedBookRun(run, time.Since(start), err), err
 		}
 		cancel()
 		metrics := model.Metrics()
@@ -993,6 +1004,16 @@ func inferenceBenchmarkRunBookReplay(ctx context.Context, model inference.TextMo
 	run.ArcAnchorHits = inferenceBenchmarkBookArcAnchorHits(run.Chapter10)
 	run.RepeatedTurns, run.MaxAdjacentRepeat = inferenceBenchmarkBookRepetitionStats(run.Chapters)
 	return run, nil
+}
+
+func inferenceBenchmarkFinalizeFailedBookRun(run inferenceBenchmarkBookRun, wall time.Duration, err error) inferenceBenchmarkBookRun {
+	run.Wall = wall
+	if err != nil {
+		run.Failure = err.Error()
+	}
+	run.ArcAnchorHits = inferenceBenchmarkBookArcAnchorHits(run.Chapter10)
+	run.RepeatedTurns, run.MaxAdjacentRepeat = inferenceBenchmarkBookRepetitionStats(run.Chapters)
+	return run
 }
 
 func inferenceBenchmarkAllocSnapshot() runtime.MemStats {
@@ -1375,6 +1396,10 @@ func inferenceBenchmarkMaybeWriteBookOutput(b *testing.B, run inferenceBenchmark
 	builder.WriteString(strconv.FormatFloat(run.MaxAdjacentRepeat, 'f', 3, 64))
 	builder.WriteString("\n- repeat_similarity_threshold: ")
 	builder.WriteString(strconv.FormatFloat(inferenceBenchmarkBookRepeatSimilarityThreshold, 'f', 3, 64))
+	if run.Failure != "" {
+		builder.WriteString("\n- failure: ")
+		builder.WriteString(run.Failure)
+	}
 	builder.WriteString("\n\n")
 	if len(run.TurnStats) > 0 {
 		builder.WriteString("| turn | prompt_tokens | generated_tokens | retained_tokens | wake_s | prefill_s | decode_s | wall_s | decode_tok_s | active_mib | peak_mib | alloc_bytes | allocs | hit_max_tokens |\n")

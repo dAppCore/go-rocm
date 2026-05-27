@@ -16519,3 +16519,24 @@ Rows4 is a useful clue: short decode likes more q4 projection parallelism, but
 the retained book endpoint is less stable and timed out under the 60s turn
 guard. Keep rows8 until the row-grain change can be paired with a retained-book
 stable sampling/decode path.
+
+## 2026-05-27 Accepted Partial Book Failure Artifacts
+
+The rows4 retained-book timeout exposed a benchmark instrumentation gap: failed
+book runs returned only the `go test` failure line and did not write the
+configured `GO_ROCM_BOOK_OUTPUT_FILE`, even when earlier turns completed. The
+book benchmark now keeps the partial run on replay/retained errors, records the
+failure string in the book artifact, writes completed chapters/turn stats before
+`b.Fatalf`, and reports partial metrics plus retained kernel route counts.
+
+Verification:
+
+```text
+go test ./go -run 'TestInferenceBenchmarkBook|TestHIPKernelSource_ABIConstants_Good' -count=1
+go test ./go -count=1
+git diff --check
+```
+
+This does not change driver performance. It makes future failed acceptance runs
+actionable: a timeout should now leave the completed turn table and kernel route
+shape in the output file instead of requiring a blind rerun.
