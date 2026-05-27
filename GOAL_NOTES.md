@@ -14631,3 +14631,78 @@ CGO_ENABLED=0 go test ./go -count=1
 go test ./go -run '^$' -bench 'BenchmarkROCmDeviceKVDescriptorAppendInPlace_HotWindow' -benchmem -count=1
 git diff --check
 ```
+
+## 2026-05-27: MP4 Block-Page KV Guard and 48k Route Metrics
+
+The retained state file is a `.kv` reference over an MP4-style vector stream,
+not a flat token array. This pass kept the direct token-page fast path strict:
+descriptor tables may only be indexed as `token * page_bytes` when
+`device_kv_header->block_size == 1`. Mixed MP4 block streams continue through
+descriptor lookup and page validation.
+
+Accepted kernel-side correction:
+
+```text
+- Shared attention q4 value metadata now accepts validated KQ8/VQ4 block pages,
+  computes the local token row inside the MP4 block, and caches the q4 row
+  payload pointer plus its per-row scale.
+- Cached q4 consumers now treat that pointer as the value payload itself rather
+  than adding a token-page scale header offset.
+- Source guards assert both the block-page row pointer and the direct-token-page
+  block-size gate, so future edits cannot silently flatten the MP4 state model.
+```
+
+Rejected during this pass:
+
+```text
+Routing local dim-256 retained attention through the old single-block shared
+attention kernel up to 2048 tokens reduced launch count but slowed the 2048
+book guard. Turn 10 moved from about 95.7 tok/s to 91.8 tok/s because that path
+uses one thread per token dot product. It was reverted; chunked attention stays
+the default retained path.
+```
+
+2048 retained route check, relaxed quality gate:
+
+```text
+book_wall_s/op              19.13
+book_decode_s/op            14.86
+book_generated_tokens/op     1530
+book_tok/s                  79.96
+book_turn10_tok/s           95.63
+kernel_attention_decode_chunked_stage1_launches  52710
+stderr_bytes                    0
+output: /tmp/go-rocm-book-retained-block16-2k-cache-relaxed.md
+stderr: /tmp/go-rocm-book-retained-block16-2k-cache-relaxed.err
+```
+
+48k retained route check, strict book gate:
+
+```text
+book_wall_s/op              58.26
+book_decode_s/op            50.86
+book_generated_tokens/op     4155
+book_tok/s                  71.32
+book_turn10_retained_tokens  5826
+book_turn10_generated_tokens  276
+book_turn10_tok/s           66.46
+book_peak_memory_bytes/op 5974597632
+B/op                     36870136
+allocs/op                  35607
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+repeated_turns                 0
+stderr_bytes                   0
+kernel_attention_decode_chunked_stage1_launches 144585
+kernel_attention_decode_chunked_stage2_launches 144585
+kernel_rocm_mlx_q4_projection_launches          520625
+kernel_total_launches                          2052110
+output: /tmp/go-rocm-book-retained-block16-48k-cache-route.md
+stderr: /tmp/go-rocm-book-retained-block16-48k-cache-route.err
+```
+
+The story and wall-time acceptance are green, and the descriptor-backed retained
+state contract is behaving like state rather than prompt replay. The real driver
+target is still open: the 48k route decays to `66.46 tok/s` on turn 10, so the
+next useful speed work is q4 projection/GELU launch reduction and chunked
+long-context attention, not benchmark accounting.

@@ -5423,15 +5423,12 @@ __device__ void rocm_run_single_head_attention_token_parallel(const rocm_attenti
 		if (cache_value_metadata) {
 			uint64_t cached_pointer = 0;
 			float cached_scale = 0.0f;
-			if (page != nullptr &&
-				page->token_start == token &&
-				page->token_count == 1u &&
-				page->value_width == args.dim &&
-				page->value_encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4 &&
-				page->value_pointer != 0) {
-				cached_pointer = page->value_pointer;
-				const unsigned char *bytes = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(cached_pointer));
-				cached_scale = rocm_float_from_bits(*reinterpret_cast<const uint32_t *>(bytes));
+			if (rocm_attention_kq8vq4_page_valid(page, token, args.dim)) {
+				const uint64_t local_token = static_cast<uint64_t>(token) - page->token_start;
+				const uint64_t value_base = local_token * page->value_width;
+				const unsigned char *bytes = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(page->value_pointer));
+				cached_pointer = page->value_pointer + rocm_device_kv_tensor_payload_offset(page->value_encoding, page->token_count) + (value_base >> 1u);
+				cached_scale = rocm_device_kv_tensor_scale(bytes, page->value_encoding, local_token);
 			}
 			cached_value_pointers[token] = cached_pointer;
 			cached_value_scales[token] = cached_scale;
@@ -5484,53 +5481,53 @@ __device__ void rocm_run_single_head_attention_token_parallel(const rocm_attenti
 				const uint32_t pair = tid % pair_count;
 				const uint32_t group = tid / pair_count;
 				const uint32_t dim0 = pair << 1u;
-			const uint32_t dim1 = dim0 + 1u;
-			float partial0 = 0.0f;
-			float partial1 = 0.0f;
-			if (group < value_groups && dim0 < args.dim) {
-				for (uint32_t token = group; token < args.token_count; token += value_groups) {
-					const uint64_t cached_pointer = cached_value_pointers[token];
-					if (cached_pointer == 0u) {
-						continue;
-					}
-					const unsigned char *values = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(cached_pointer) + sizeof(uint32_t));
-					const unsigned char packed = values[dim0 >> 1u];
-					const float weighted_scale = weights[token] * cached_value_scales[token];
-					int q0 = static_cast<int>(packed & 0x0fu);
-					if (q0 >= 8) {
-						q0 -= 16;
-					}
-					partial0 += weighted_scale * static_cast<float>(q0);
-					if (dim1 < args.dim) {
-						int q1 = static_cast<int>((packed >> 4) & 0x0fu);
-						if (q1 >= 8) {
-							q1 -= 16;
+				const uint32_t dim1 = dim0 + 1u;
+				float partial0 = 0.0f;
+				float partial1 = 0.0f;
+				if (group < value_groups && dim0 < args.dim) {
+					for (uint32_t token = group; token < args.token_count; token += value_groups) {
+						const uint64_t cached_pointer = cached_value_pointers[token];
+						if (cached_pointer == 0u) {
+							continue;
 						}
-						partial1 += weighted_scale * static_cast<float>(q1);
+						const unsigned char *values = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(cached_pointer));
+						const unsigned char packed = values[dim0 >> 1u];
+						const float weighted_scale = weights[token] * cached_value_scales[token];
+						int q0 = static_cast<int>(packed & 0x0fu);
+						if (q0 >= 8) {
+							q0 -= 16;
+						}
+						partial0 += weighted_scale * static_cast<float>(q0);
+						if (dim1 < args.dim) {
+							int q1 = static_cast<int>((packed >> 4) & 0x0fu);
+							if (q1 >= 8) {
+								q1 -= 16;
+							}
+							partial1 += weighted_scale * static_cast<float>(q1);
+						}
 					}
 				}
-			}
-			scratch[tid] = partial0;
-			__syncthreads();
-			if (tid < pair_count) {
-				float out0 = 0.0f;
-				for (uint32_t value_group = 0; value_group < value_groups; ++value_group) {
-					out0 += scratch[value_group * pair_count + tid];
-				}
-				output[tid << 1u] = out0;
-			}
-			__syncthreads();
-			scratch[tid] = partial1;
-			__syncthreads();
-			if (tid < pair_count) {
-				const uint32_t output_dim = (tid << 1u) + 1u;
-				if (output_dim < args.dim) {
-					float out1 = 0.0f;
+				scratch[tid] = partial0;
+				__syncthreads();
+				if (tid < pair_count) {
+					float out0 = 0.0f;
 					for (uint32_t value_group = 0; value_group < value_groups; ++value_group) {
-						out1 += scratch[value_group * pair_count + tid];
+						out0 += scratch[value_group * pair_count + tid];
 					}
-					output[output_dim] = out1;
+					output[tid << 1u] = out0;
 				}
+				__syncthreads();
+				scratch[tid] = partial1;
+				__syncthreads();
+				if (tid < pair_count) {
+					const uint32_t output_dim = (tid << 1u) + 1u;
+					if (output_dim < args.dim) {
+						float out1 = 0.0f;
+						for (uint32_t value_group = 0; value_group < value_groups; ++value_group) {
+							out1 += scratch[value_group * pair_count + tid];
+						}
+						output[output_dim] = out1;
+					}
 				}
 				return;
 			}
@@ -5591,10 +5588,10 @@ __device__ void rocm_run_single_head_attention_token_parallel(const rocm_attenti
 				return;
 			}
 			if (value_groups > 1u) {
-					const uint32_t pair = tid % pair_count;
-					const uint32_t group = tid / pair_count;
-					const uint32_t dim0 = pair << 1u;
-					const uint32_t dim1 = dim0 + 1u;
+				const uint32_t pair = tid % pair_count;
+				const uint32_t group = tid / pair_count;
+				const uint32_t dim0 = pair << 1u;
+				const uint32_t dim1 = dim0 + 1u;
 				float partial0 = 0.0f;
 				float partial1 = 0.0f;
 				if (group < value_groups && dim0 < args.dim) {
@@ -5602,7 +5599,7 @@ __device__ void rocm_run_single_head_attention_token_parallel(const rocm_attenti
 						const float weight = weights[token];
 						const uint64_t cached_pointer = cache_value_metadata ? cached_value_pointers[token] : 0u;
 						if (cached_pointer != 0u) {
-							const unsigned char *values = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(cached_pointer) + sizeof(uint32_t));
+							const unsigned char *values = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(cached_pointer));
 							const unsigned char packed = values[dim0 >> 1u];
 							const float weighted_scale = weight * cached_value_scales[token];
 							int q0 = static_cast<int>(packed & 0x0fu);

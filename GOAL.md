@@ -2247,6 +2247,16 @@ Remaining blocker:
 
 ## Required Test Gates
 
+Latest retained-state driver checkpoint, 2026-05-27: the `.kv` file is treated
+as the state source over MP4-style vector pages, not as replayable prompt text.
+Direct token-page indexing remains gated on `block_size == 1`; mixed block-page
+state uses descriptor lookup and validation. The current 48k retained book route
+passes strict story/wall acceptance at `58.26s` wall, `50.86s` decode, `4155`
+generated tokens, empty stderr, and chapter-10 anchor hits of `3`, but turn-10
+decode is still only `66.46 tok/s`. The open endpoint remains `90-100+ tok/s`
+late-turn decode by reducing q4 projection/GELU launches and long-context
+attention cost, not by replaying prompt text.
+
 Run these before handoff:
 
 ```sh
