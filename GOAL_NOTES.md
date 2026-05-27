@@ -16893,3 +16893,34 @@ Rejected reason: despite reducing conceptual PLE launch count, the accepted
 not improve the `B/op` or allocation contract. The fused kernel was reverted.
 Keep PLE fusion on the table only if the next attempt also improves the
 2048-token guard or retained-book late-turn decode, not merely launch count.
+
+## 2026-05-27 Current Accepted-Source Route Baseline After PLE Rejection
+
+After reverting the rejected PLE RMSNorm/add fusion, rebuilt the current source
+HSACO to reset the next optimization pass against an accepted kernel artifact:
+
+```text
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-current-after-ple-reject.hsaco
+stderr: .bench-errors/hipcc_gfx1100_current_after_ple_reject_20260527.err (0 bytes)
+
+2048 route-metric guard:
+BenchmarkInferenceGemma4Q4Generate-32  1  18996031421 ns/op
+107.8 tok/s, 2048 tokens, 6690600 B/op, 4680 allocs/op
+stderr: .bench-errors/2048_current_after_ple_reject_route_20260527.err (0 bytes)
+
+route metrics:
+kernel_total_launches/op=999355
+kernel_total_blocks/op=175800265
+rocm_mlx_q4_projection_launches=255875
+rocm_mlx_q4_gelu_tanh_multiply_launches=71645
+rocm_mlx_q4_gelu_tanh_projection_launches=71645
+decode chunked attention stage1 launches=67270
+decode chunked attention stage2 launches=67270
+rocm_rms_norm_residual_add_norm_launches=143290
+rocm_rms_norm_rope_heads_launches=102350
+```
+
+This accepted-source baseline reinforces the same diagnosis as `GOAL.md`: the
+remaining long-context work is dominated by q4 projection/GELU, RMS/residual,
+and decode attention launch volume. Descriptor/KV append work is visible but no
+longer the main speed target.
