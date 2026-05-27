@@ -548,7 +548,9 @@ import (
 	corecgo "dappco.re/go/cgo"
 )
 
-type cgoHIPDriver struct{}
+type cgoHIPDriver struct {
+	kernelModulePath string
+}
 
 const rocmHIPPinnedHostCopySupported = true
 
@@ -580,6 +582,13 @@ var cgoHIPModuleCache = struct {
 }{
 	modules: map[string]*cgoHIPCachedModule{},
 }
+
+type cgoHIPFunctionCacheKey struct {
+	module string
+	kernel string
+}
+
+var cgoHIPFunctionCache sync.Map
 
 var cgoHIPLaunchArgBuffer = struct {
 	sync.Mutex
@@ -663,7 +672,7 @@ var cgoHIPMemoryPool = struct {
 }
 
 func newSystemHIPDriver() nativeHIPDriver {
-	return cgoHIPDriver{}
+	return cgoHIPDriver{kernelModulePath: os.Getenv("GO_ROCM_KERNEL_HSACO")}
 }
 
 func (cgoHIPDriver) Available() bool {
@@ -910,7 +919,10 @@ func (driver cgoHIPDriver) LaunchKernel(config hipKernelLaunchConfig) error {
 	if !driver.Available() {
 		return core.E("rocm.hip.LaunchKernel", "HIP driver is not available", nil)
 	}
-	modulePath := os.Getenv("GO_ROCM_KERNEL_HSACO")
+	modulePath := driver.kernelModulePath
+	if modulePath == "" {
+		modulePath = os.Getenv("GO_ROCM_KERNEL_HSACO")
+	}
 	if modulePath == "" {
 		return core.E("rocm.hip.LaunchKernel", "GO_ROCM_KERNEL_HSACO is not set; native HIP kernels are not linked yet", nil)
 	}
@@ -1250,8 +1262,15 @@ func (driver cgoHIPDriver) freeLaunchArgBuffer(host unsafe.Pointer, pointer nati
 }
 
 func cgoHIPCachedFunction(modulePath, kernelName string) (C.uintptr_t, error) {
+	key := cgoHIPFunctionCacheKey{module: modulePath, kernel: kernelName}
+	if cached, ok := cgoHIPFunctionCache.Load(key); ok {
+		return cached.(C.uintptr_t), nil
+	}
 	cgoHIPModuleCache.Lock()
 	defer cgoHIPModuleCache.Unlock()
+	if cached, ok := cgoHIPFunctionCache.Load(key); ok {
+		return cached.(C.uintptr_t), nil
+	}
 	module := cgoHIPModuleCache.modules[modulePath]
 	if module == nil {
 		loaded, err := cgoHIPLoadModule(modulePath)
@@ -1262,6 +1281,7 @@ func cgoHIPCachedFunction(modulePath, kernelName string) (C.uintptr_t, error) {
 		cgoHIPModuleCache.modules[modulePath] = module
 	}
 	if function, ok := module.functions[kernelName]; ok {
+		cgoHIPFunctionCache.Store(key, function)
 		return function, nil
 	}
 	function, err := cgoHIPModuleFunction(module.module, kernelName)
@@ -1269,6 +1289,7 @@ func cgoHIPCachedFunction(modulePath, kernelName string) (C.uintptr_t, error) {
 		return 0, err
 	}
 	module.functions[kernelName] = function
+	cgoHIPFunctionCache.Store(key, function)
 	return function, nil
 }
 

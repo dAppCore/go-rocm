@@ -588,6 +588,18 @@ rejection rather than a crash/correctness rejection. Do not restore a serial
 thread-0 page preloader; a future token-to-page index must be device-resident
 and append/trim-aware, or it will cost more than the current per-token lookup.
 
+Accepted host-launch cache cleanup: the cgo HIP driver now keeps a lock-light
+function cache keyed by HSACO path and kernel name, and captures the stable
+`GO_ROCM_KERNEL_HSACO` path on the system driver so the hot launch path no
+longer reads the environment or takes the module-cache mutex after warmup. This
+does not change kernel arguments, retained KV semantics, or generated output
+math. A serialized 2-turn `2k` retained sampled book guard with `block_size=16`
+and empty stderr stayed above the working floor at `11.69s` wall, `11.19s`
+decode, `1111` generated tokens, `95.07 tok/s` average, and `94.76 tok/s` on
+turn 2. Because sampled output length varied, treat this as host-overhead and
+allocation cleanup rather than evidence that the GPU projection/attention
+bottleneck moved.
+
 Rejected prompt-shortening follow-up: replacing the anchored wording with a
 shorter "advance the arc / keep continuity words alive" instruction reduced
 prompt tokens to `1581` and still passed the arc gate with `3` anchors, but it
