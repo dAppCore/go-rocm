@@ -540,9 +540,14 @@ A first 2-turn retained sampled book probe with `block_size=16`,
 with empty stderr at `16.25s` wall, `15.73s` decode, `1275` generated tokens,
 `78.48 tok/s` average, `97.08 tok/s` on turn 1, `67.81 tok/s` on turn 2,
 `8.82MB/op`, and `7831 allocs/op`. This repairs the scale-corruption bug in
-block pages but is not yet production acceptance: the 10-turn `48k` book route
-and chapter-10 arc gate still need to be rerun before block pages can replace
-the one-token default.
+block pages but is not production acceptance. The full 10-turn `48k` rerun with
+the same row-scaled block pages failed the `110s` production gate at `134.08s`
+wall with empty stderr, `4169` generated tokens, `0` repeated turns, and no
+max-token hits. Decode still decayed from `93.54 tok/s` on turn 1 to
+`17.33 tok/s` on turn 10. The output retained lighthouse/deep/keeper themes
+better than the rejected page-scale run, but block pages cannot replace the
+one-token default until attention can address the block layout without the
+current long-context page lookup/payload overhead.
 
 Rejected prompt-shortening follow-up: replacing the anchored wording with a
 shorter "advance the arc / keep continuity words alive" instruction reduced
@@ -1619,8 +1624,9 @@ endpoint.
   chasing a tiny page for every key/value access.
   - 2026-05-27 progress: row-scaled `q8-rows`/`q4-rows` block pages now preserve
     per-token scales and pass fake plus live `gfx1100` row-encode/attention
-    tests. Remaining work is the production full/SWA slot layout and a full
-    10-turn `48k` retained-book acceptance run.
+    tests. A full 10-turn `48k` retained-book run still failed the `110s` gate
+    at `134.08s` wall and `17.33 tok/s` on turn 10, so the remaining work is
+    the production full/SWA slot layout and block-aware attention kernel.
 - [ ] Move GELU/SwiGLU/multiply and residual/norm chaining into HIP kernels or a
   fused per-layer kernel. No q4 MLP intermediate should become a Go `[]float32`.
 - [ ] Keep attention update and KV cache reads on device while replacing the
