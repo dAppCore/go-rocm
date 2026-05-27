@@ -479,6 +479,13 @@ book passed at `37.63s` wall, `33.51s` decode, `3021` generated tokens,
 `99123 allocs/op`, empty stderr, no chapter cap hits, and `3` chapter-10 arc
 anchors.
 
+Rejected prompt-shortening follow-up: replacing the anchored wording with a
+shorter "advance the arc / keep continuity words alive" instruction reduced
+prompt tokens to `1581` and still passed the arc gate with `3` anchors, but it
+made the model write `4241` generated tokens, stretched wall time to `59.35s`,
+and dropped turn 10 to `59.10 tok/s`. Keep the longer accepted anchor wording
+until a better quality prompt is measured.
+
 Rejected device-side packed top-k reduction attempt: an earlier second-stage
 `rocm_packed_topk` kernel that scanned 512-score chunks on device compiled with
 `--std=c++23` and passed the fake/source tests, but the 2-turn sampled retained
