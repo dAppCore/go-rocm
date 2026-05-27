@@ -498,9 +498,9 @@ wall and arc gates with empty stderr at `51.58s` wall, `45.73s` decode,
 `292265176 B/op`, `125865 allocs/op`, `0` repeated turns, `0` max-token hits,
 and `3` chapter-10 arc anchors. The per-turn prompt-token counts stayed small
 after turn 1 (`161-180`) while retained tokens grew to `5403`, confirming the
-benchmark is appending only the new Gemma4 chat turn to retained `.kv` state
-instead of replaying prior chapter text. This is accepted wall-time evidence,
-but it reinforces that late-turn decode remains the next target.
+benchmark is appending only the new Gemma4 chat turn to the retained device KV
+state instead of replaying prior chapter text. This is accepted wall-time
+evidence, but it reinforces that late-turn decode remains the next target.
 
 The book harness no longer forces the old display-safe `16` token prefill
 ubatch when no override is set. The Gemma4 q4 production prefill default is now
@@ -514,6 +514,19 @@ chapter-10 arc anchors. Peak memory rose to about `5.7GiB`, so the 16-token
 override remains useful when protecting a display session. A 2-turn retained
 smoke without any prefill override reported `book_prefill_ubatch_tokens=512`
 and empty stderr, confirming the new default path is active.
+
+Rejected device-KV block-size 16 follow-up: a full retained 10-turn sampled run
+with `GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE=16`,
+`GO_ROCM_BOOK_CONTEXT_LEN=48000`, and `GO_ROCM_BOOK_PREFILL_UBATCH_TOKENS=512`
+completed with empty stderr at `71.09s` wall, `64.95s` decode, `2581`
+generated tokens, `36.31 tok/s` average, `21.45 tok/s` on turn 10,
+`24968304 B/op`, and `39751 allocs/op`, but chapter 10 retained `0` arc
+anchors and the `book_110s_production_candidate` metric stayed `0`. Do not
+promote larger page defaults by only changing `rocmGemma4Q4DeviceKVBlockSize`:
+the current multi-token page encoding still has page-level q8/q4 scales and
+falls off the direct-token KQ8/VQ4 attention fast path. The production block
+layout must preserve per-token scales inside block pages and keep attention
+able to address them without pointer chasing one descriptor per token.
 
 Rejected prompt-shortening follow-up: replacing the anchored wording with a
 shorter "advance the arc / keep continuity words alive" instruction reduced
