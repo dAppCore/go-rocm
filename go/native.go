@@ -288,6 +288,27 @@ func (m *rocmModel) Generate(ctx context.Context, prompt string, opts ...inferen
 		return emptyTokenSeq
 	}
 	cfg := cloneGenerateConfig(inference.ApplyGenerateOpts(opts))
+	if loaded, ok := m.native.(*hipLoadedModel); ok {
+		if _, linked := loaded.kernelSet().(hipNativeProjectionKernelSet); linked {
+			promptTokenIDs, matched, err := hipGemma4Q4PromptTokenIDs(prompt, loaded)
+			if err != nil {
+				return m.wrapTokenStream(emptyTokenSeq, func() error { return err }, 0, time.Now(), nil)
+			}
+			if matched {
+				start := time.Now()
+				if loaded.modelInfo.NumLayers <= 0 {
+					err := core.E(hipGemma4Q4Layer0Operation, "loaded Gemma4 q4 layer count is required", nil)
+					return m.wrapTokenStream(emptyTokenSeq, func() error { return err }, len(promptTokenIDs), start, nil)
+				}
+				q4Cfg, err := loaded.cachedGemma4Q4ForwardConfig(loaded.modelInfo.NumLayers)
+				if err != nil {
+					return m.wrapTokenStream(emptyTokenSeq, func() error { return err }, len(promptTokenIDs), start, nil)
+				}
+				stream, streamError := hipGemma4Q4GenerateTokenSeq(ctx, loaded, q4Cfg, promptTokenIDs, cloneGenerateConfig(cfg))
+				return m.wrapTokenStream(stream, streamError, len(promptTokenIDs), start, nil)
+			}
+		}
+	}
 	promptTokens := m.promptTokenCount(prompt)
 	start := time.Now()
 	stream, streamError := m.native.Generate(ctx, prompt, cloneGenerateConfig(cfg))

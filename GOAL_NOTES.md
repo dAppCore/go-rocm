@@ -1,5 +1,51 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-26 Public Q4 Direct Token Path
+
+- Kept the 2048-token fast loop as the edit gate and promoted only after the
+  retained 10-turn full-cap book acceptance passed.
+- The public `rocmModel.Generate` path now recognizes loaded Gemma4 q4 text or
+  token prompts before calling the native model surface. It reuses that first
+  tokenization and calls the q4 token-sequence runner directly when the linked
+  projection kernel set is active, avoiding the previous metrics tokenization
+  plus native tokenization duplicate.
+- Rejected a GELU-only 16-row q4 multiply geometry experiment. The 2048 guard
+  was speed-neutral, but the retained book quality gate dropped chapter-10 arc
+  anchors from `3` to `2`, so the kernel geometry was reverted and the stable
+  8-row reduction order was restored.
+- Live RX 7800 XT 2048-token guards after the kept direct path:
+
+```text
+2048 text:Hi:
+  18858747504 ns/op, 108.6 tok/s, 7137112 B/op, 4706 allocs/op
+
+2048 generated tokens, context_len=4096, chapter-1 lighthouse prompt:
+  20423455765 ns/op, 100.3 tok/s, 15682288 B/op, 6159 allocs/op
+```
+
+- Retained 10-turn full-cap greedy book acceptance stayed green:
+
+```text
+book_wall_s/op             37.80
+book_decode_s/op           33.57
+book_generated_tokens/op    3021
+book_tok/s                 79.92
+book_turn01_tok/s         109.7
+book_turn10_tok/s          69.45
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+stderr_bytes                   0
+B/op                    230626144
+allocs/op                  100428
+output: /tmp/go-rocm-book-10turn-fullcap-direct.md
+stderr: /tmp/go-rocm-book-10turn-fullcap-direct.err
+```
+
+- This is accepted as a public-generate allocation cleanup. It materially
+  improves the 2048 chapter guard allocation shape while leaving retained
+  decode throughput noise-flat, so the next decode-speed target remains the
+  compute graph rather than prompt setup.
+
 ## 2026-05-26 Retained KV Transfer Fast Path
 
 - Kept the 2048-token fast loop as the edit gate and promoted only after the
