@@ -1579,6 +1579,11 @@ func (m *rocmModel) evaluateQualityProbes(ctx context.Context, probes []inferenc
 		result.Passed = core.Trim(text) != ""
 		if result.Passed {
 			result.Score = 1
+		} else {
+			failures++
+			if firstFailure == "" {
+				firstFailure = "quality probe produced empty response"
+			}
 		}
 		results = append(results, result)
 	}

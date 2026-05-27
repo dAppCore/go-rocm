@@ -2578,6 +2578,28 @@ func TestNativeContract_EvaluateQualityProbes_Bad_RecordsUnavailableGeneration(t
 	}
 }
 
+func TestNativeContract_EvaluateQualityProbes_Bad_RecordsEmptyGeneration(t *testing.T) {
+	model := &rocmModel{
+		modelType: "qwen3",
+		modelInfo: inference.ModelInfo{Architecture: "qwen3"},
+		native:    &fakeNativeModel{tokens: []inference.Token{{ID: 1, Text: ""}}},
+	}
+
+	eval, err := model.Evaluate(context.Background(), &singleInferenceSample{sample: inference.DatasetSample{Text: "hello world"}}, inference.EvalConfig{
+		MaxSamples: 1,
+		Probes:     []inference.QualityProbe{{Name: "empty", Prompt: "say hi"}},
+	})
+
+	core.RequireNoError(t, err)
+	if len(eval.Probes) != 1 || eval.Probes[0].Passed || eval.Probes[0].Score != 0 {
+		t.Fatalf("eval probes = %+v, want empty qualitative probe recorded as failed", eval.Probes)
+	}
+	if eval.Labels["quality_probe_count"] != "1" || eval.Labels["quality_probe_passes"] != "0" || eval.Labels["quality_probe_failures"] != "1" || eval.Labels["quality_probe_status"] != "generation_unavailable" {
+		t.Fatalf("eval labels = %+v, want empty generation counted as unavailable", eval.Labels)
+	}
+	core.AssertContains(t, eval.Labels["quality_probe_error"], "empty response")
+}
+
 func TestNativeContract_EvaluateSuccessClearsLastError_Good(t *testing.T) {
 	model := &rocmModel{
 		modelType: "qwen3",

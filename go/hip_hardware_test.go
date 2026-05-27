@@ -871,7 +871,7 @@ func assertLoadedGemma4Q4PublicGenerateSmoke(t *testing.T, textModel inference.T
 			Labels: map[string]string{"target_token_id": "0"},
 		}}, inference.EvalConfig{
 			MaxSamples: 1,
-			MaxSeqLen:  1,
+			MaxSeqLen:  2,
 			Probes:     []inference.QualityProbe{{Name: "q4-eval", Prompt: "Hi"}},
 		})
 		if err != nil {
