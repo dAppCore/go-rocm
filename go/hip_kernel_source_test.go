@@ -251,7 +251,8 @@ func TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good(t *test
 	core.AssertTrue(t, strings.Contains(gelu, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_THREADS_PER_ROW`), "GELU multiply rows use projection row geometry")
 	core.AssertTrue(t, strings.Contains(gelu, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_ROWS_PER_BLOCK + row_lane`), "GELU multiply grid uses projection row blocks")
 	core.AssertTrue(t, strings.Contains(gelu, `args.group_size == 64u`), "GELU multiply must keep the Gemma group64 index fast path")
-	core.AssertTrue(t, strings.Contains(gelu, `row * groups_per_row + (packed >> 3u)`), "GELU multiply group64 path must avoid runtime group division")
+	core.AssertTrue(t, strings.Contains(gelu, `const uint32_t row_group_base = row * groups_per_row`), "GELU multiply must hoist the row group base")
+	core.AssertTrue(t, strings.Contains(gelu, `row_group_base + (packed >> 3u)`), "GELU multiply group64 path must avoid runtime group division")
 
 	geluBatch := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply_batch`)
 	core.AssertTrue(t, strings.Contains(geluBatch, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_THREADS_PER_ROW`), "batch GELU multiply rows use projection row geometry")

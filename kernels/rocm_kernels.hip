@@ -3721,7 +3721,7 @@ extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply(const unsigned char *p
 			const uint32_t gate_word = gate_weights[row_packed_base + packed];
 			const uint32_t up_word = up_weights[row_packed_base + packed];
 			const uint32_t col = packed << 3;
-			const uint32_t group = row * groups_per_row + (packed >> 3u);
+			const uint32_t group = row_group_base + (packed >> 3u);
 			const float gate_scale = rocm_bfloat16_to_float(gate_scales[group]);
 			const float gate_bias = rocm_bfloat16_to_float(gate_biases[group]);
 			const float up_scale = rocm_bfloat16_to_float(up_scales[group]);

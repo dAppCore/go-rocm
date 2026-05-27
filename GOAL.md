@@ -2044,6 +2044,20 @@ Remaining blocker:
   max-token or repeated-turn failures, `41243712 B/op`, and `38212 allocs/op`;
   this confirms the MP4 descriptor fix is correctness-preserving, but later-turn
   decode remains below the final `90-100+ tok/s` scaling target.
+- Accepted q4 GELU group64 row-base cleanup: the single-token
+  `rocm_mlx_q4_gelu_tanh_multiply` path now reuses the already-computed
+  `row_group_base` for scale/bias lookup instead of recomputing
+  `row * groups_per_row` inside the packed-column loop. This is an arithmetic
+  cleanup only; it does not change `.kv`/MP4 state semantics. Source/package
+  tests, no-cgo tests, and the `gfx1100 -O2` HSACO build passed with empty
+  compiler stderr. The `text:Hi` 512-token guard measured `112.8 tok/s`,
+  `3186336 B/op`, and `2462 allocs/op`; the `text:Hi` 2048-token guard measured
+  `108.2 tok/s`, `6660048 B/op`, and `2617 allocs/op`; and the serialized
+  `block_size=16` 2-turn retained book guard completed with empty stderr at
+  `9.15s` wall, `8.64s` decode, `857` generated tokens, `93.68 tok/s` average,
+  turn 2 `91.64 tok/s`, `1112` retained tokens, `5887264 B/op`, and
+  `7174 allocs/op`. Keep treating this as a tiny accepted hot-path simplifier;
+  the final `48k` later-turn decode target remains open.
 
 - [x] Phase 0: Snapshot the tree and establish the baseline.
   - Run `git status --short`.
