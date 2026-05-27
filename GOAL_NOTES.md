@@ -16645,3 +16645,54 @@ This is close to neutral but still does not improve the accepted 2048 guard or
 the benchmark allocation/byte contract. Keep the explicit vector-scale pass for
 now; future PLE work should fuse a larger group of operations or target device
 workspace lifetime instead of only removing this one launch.
+
+## 2026-05-27 Rejected Q4 Group64 Unroll Pragmas
+
+Tested explicit `#pragma unroll` on the fixed eight-packed-word loop in the
+group-64 q4 projection row-sum helper. A broader variant also added pragmas to
+the variable batch loops, but `hipcc` warned that those loops could not be
+unrolled, so the clean candidate kept only the fixed-size decode projection
+loop.
+
+Short guards looked attractive:
+
+```text
+Current route baseline:
+BenchmarkInferenceGemma4Q4Generate-32  1  18987207636 ns/op
+107.9 tok/s, 2048 tokens, 6692808 B/op, 4696 allocs/op
+stderr: .bench-errors/2048_current_goalpass_route_20260527.err (0 bytes)
+
+Clean fixed-loop unroll:
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-q4-fixed-unroll.hsaco
+stderr: .bench-errors/hipcc_gfx1100_q4_fixed_unroll_20260527.err (0 bytes)
+
+2048 live route guard:
+BenchmarkInferenceGemma4Q4Generate-32  1  18723242542 ns/op
+109.4 tok/s, 2048 tokens, 6684216 B/op, 4695 allocs/op
+stderr: .bench-errors/2048_q4_fixed_unroll_route_20260527.err (0 bytes)
+
+2048 live non-route guard:
+BenchmarkInferenceGemma4Q4Generate-32  1  18724782479 ns/op
+109.4 tok/s, 2048 tokens, 6665152 B/op, 2633 allocs/op
+stderr: .bench-errors/2048_q4_fixed_unroll_noroute_20260527.err (0 bytes)
+
+2-turn retained guard:
+13.37s wall, 12.77s decode, 1317 generated tokens, 98.49 tok/s average,
+100.0 tok/s on turn 2, empty stderr
+```
+
+Rejected by the strict retained-book gate:
+
+```text
+10-turn retained 48k gate:
+FAILED chapter10_arc_anchor_hits=2 below minimum 3
+38.204s wall, 2645 generated tokens, 8 repeated turns,
+max_adjacent_repeat=0.933, 67.27 tok/s on turn 10
+stderr: .bench-errors/book_retained_q4_fixed_unroll_10turn_20260527.err (0 bytes)
+artifact: /tmp/go-rocm-book-retained-q4-fixed-unroll-10turn-20260527.md
+```
+
+The short speedup is real, but the book output collapsed into repeated chapter
+openings and failed the story-retention correctness gate. Do not keep q4
+projection codegen changes on 2048 speed alone; the retained state/quality gate
+must stay green.
