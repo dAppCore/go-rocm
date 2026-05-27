@@ -646,6 +646,14 @@ The canonical `text:Hi` 2048-token guard stayed green at `108.0 tok/s`,
 allocation-shape cleanup; full `48k` acceptance still requires the strict arc
 gate and later-turn decode target.
 
+Rejected q4 GELU group-level scale/bias hoist: rewriting the
+`group_size == 64` GELU multiply branch so each lane owned a whole 64-value
+group and loaded gate/up scale+bias once per group compiled cleanly and kept
+stderr empty, but regressed the canonical `text:Hi` 2048-token guard to
+`106.8 tok/s`. The likely cost is extra register pressure and a worse loop
+shape in the actual RX 7800 XT kernel. Keep the existing per-packed group64
+path until a tiled q4 GEMM/dequant rewrite replaces this row-dot primitive.
+
 Rejected prompt-shortening follow-up: replacing the anchored wording with a
 shorter "advance the arc / keep continuity words alive" instruction reduced
 prompt tokens to `1581` and still passed the arc gate with `3` anchors, but it
