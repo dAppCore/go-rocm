@@ -570,6 +570,21 @@ func BenchmarkHIPTopPackedScoresBytesInto_VocabTopK64(b *testing.B) {
 	}
 }
 
+func BenchmarkHIPPackedTopKPartialPayload_VocabTopK64(b *testing.B) {
+	const (
+		vocabSize = 256000
+		topK      = 64
+	)
+	chunks := (vocabSize + hipPackedTopKChunkSize - 1) / hipPackedTopKChunkSize
+	partialCount := chunks * topK
+	b.ReportAllocs()
+	for b.Loop() {
+		benchmarkHIPTopPackedScoreSink ^= uint64(partialCount)
+	}
+	b.ReportMetric(float64(chunks), "chunks/op")
+	b.ReportMetric(float64(partialCount*hipMLXQ4ProjectionBestBytes), "partial_payload_bytes/op")
+}
+
 func BenchmarkHIPGemma4Q4HostSampleCandidateResult_TopK64(b *testing.B) {
 	candidates := make([]hipGreedySampleResult, 64)
 	for index := range candidates {

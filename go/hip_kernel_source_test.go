@@ -129,6 +129,7 @@ func TestHIPKernelSource_ExportsLaunchABI_Good(t *testing.T) {
 		core.Sprintf("ROCM_PACKED_TOPK_LAUNCH_ARGS_BYTES = %d", hipPackedTopKLaunchArgsBytes),
 		core.Sprintf("ROCM_PACKED_TOPK_MAX_K = %d", hipPackedTopKMaxK),
 		core.Sprintf("ROCM_PACKED_TOPK_BLOCK_SIZE = %d", hipPackedTopKBlockSize),
+		core.Sprintf("ROCM_PACKED_TOPK_CHUNK_SIZE = %d", hipPackedTopKChunkSize),
 		core.Sprintf("ROCM_RMS_NORM_LAUNCH_ARGS_VERSION = %d", hipRMSNormLaunchArgsVersion),
 		core.Sprintf("ROCM_RMS_NORM_LAUNCH_ARGS_BYTES = %d", hipRMSNormLaunchArgsBytes),
 		core.Sprintf("ROCM_RMS_NORM_RESIDUAL_ADD_LAUNCH_ARGS_VERSION = %d", hipRMSNormResidualAddArgsVersion),

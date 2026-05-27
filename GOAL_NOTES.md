@@ -14914,3 +14914,71 @@ output includes:
   ### Top By Launches
   ### Top By Blocks
 ```
+
+## 2026-05-27: Rejected Packed Top-K 1024-Chunk Candidate Path
+
+Tried reducing sampled-route host transfer by changing
+`ROCM_PACKED_TOPK_CHUNK_SIZE` / `hipPackedTopKChunkSize` from `512` to `1024`.
+The mathematical intent was exact: each larger chunk still emits `top_k`
+candidates, so the global top-k remains covered while the candidate payload
+copied back to the host is halved for a 256k vocabulary.
+
+Kept from the experiment:
+
+```text
+- The HIP source ABI guard now checks ROCM_PACKED_TOPK_CHUNK_SIZE against the
+  Go launch constant.
+- Added BenchmarkHIPPackedTopKPartialPayload_VocabTopK64 so the candidate
+  payload is visible in normal AX-11 benchmark output.
+```
+
+Focused checks on the temporary 1024-chunk source passed:
+
+```text
+go test ./go -run '^(TestHIPKernelSource_ExportsLaunchABI_Good|TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good|TestHIPTransformerReferenceSamplerBadInputsAndTies_Bad)$' -count=1
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-topk1024.hsaco
+build stderr: /tmp/go-rocm-topk1024-build.err (0 bytes)
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_HIP_TESTS=1 GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100-topk1024.hsaco go test ./go -run '^TestHIPHardwareTransformerKernelSource_Good$' -count=1
+transformer stderr: /tmp/go-rocm-topk1024-transformer.err (0 bytes)
+```
+
+Short guards looked mechanically healthy:
+
+```text
+BenchmarkHIPPackedTopKPartialPayload_VocabTopK64
+  250.0 chunks/op, 128000 partial_payload_bytes/op, 0 B/op, 0 allocs/op
+
+text:Hi 512:
+  4559563088 ns/op, 112.3 tok/s, 3777232 B/op, 2525 allocs/op
+  stderr: /tmp/go-rocm-topk1024-512.err (0 bytes)
+
+text:Hi 2048:
+  20158269583 ns/op, 101.6 tok/s, 6656912 B/op, 2602 allocs/op
+  stderr: /tmp/go-rocm-topk1024-2048.err (0 bytes)
+
+2-turn retained sampled route:
+  book_wall_s/op 11.40
+  book_generated_tokens/op 1124
+  book_tok/s 98.55
+  book_turn02_tok/s 100.4
+  stderr: /tmp/go-rocm-book-retained-topk1024-2turn.err (0 bytes)
+  output: /tmp/go-rocm-book-retained-topk1024-2turn.md
+```
+
+Rejected by the strict 48k retained-book gate:
+
+```text
+book_wall_s/op 64.735
+book_generated_tokens/op 4213
+book_turn10_retained_tokens 5884
+book_turn10_generated_tokens 299
+book_turn10_tok/s 55.63
+repeated_turns 0
+stderr: /tmp/go-rocm-book-retained-topk1024-48k.err (0 bytes)
+output: /tmp/go-rocm-book-retained-topk1024-48k.md
+failure: book last turn 55.628 tok/s below GO_ROCM_BOOK_MIN_LAST_TOK_PER_SEC=65
+```
+
+The 1024 chunk-size source change was reverted. The transfer-size benchmark and
+source guard remain because they document the sampled candidate path and will
+catch future HIP/Go constant drift.
