@@ -16440,3 +16440,39 @@ stderr: .bench-errors/2048_attn_chunk256_20260527.err (0 bytes)
 The reduced launch/block count did not translate to throughput. Keep the
 128-token chunk grain on the RX 7800 XT; it appears to be the better balance for
 Gemma4's 256/512 head dimensions.
+
+## 2026-05-27 Rejected Q4 Rows16 Projection Blocks
+
+Tested raising `ROCM_MLX_Q4_PROJECTION_ROWS_PER_BLOCK` and
+`hipMLXQ4ProjectionRowsPerBlock` from 8 to 16 rows per 256-thread block. This
+halved normal q4/GELU/triple projection block counts, but also reduced
+per-row dot-product parallelism from 32 to 16 threads.
+
+Rejected result:
+
+```text
+Focused tests passed:
+go test ./go -run 'TestHIPKernelSource_ABIConstants_Good|TestHIPKernelSource_MLXQ4Projection|TestHIPKernels_MLXQ4Projection|TestHIPGemma4Q4DeviceGELUTanhMLP' -count=1
+
+Compiled cleanly:
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-q4-rows16.hsaco
+stderr: .bench-errors/hipcc_gfx1100_q4_rows16_20260527.err (0 bytes)
+
+2048 live route guard:
+BenchmarkInferenceGemma4Q4Generate-32  1  19006259253 ns/op
+107.8 tok/s, 2048 tokens, 6683896 B/op, 4692 allocs/op
+kernel_mlx_q4_projection_blocks/op=26922144
+kernel_mlx_q4_gelu_tanh_multiply_blocks/op=43232640
+kernel_mlx_q4_gelu_tanh_projection_blocks/op=1146320
+kernel_mlx_q4_triple_projection_blocks/op=5895360
+kernel_total_blocks/op=98565529
+stderr: .bench-errors/2048_q4_rows16_20260527.err (0 bytes)
+
+2048 live non-route guard:
+BenchmarkInferenceGemma4Q4Generate-32  1  19002705597 ns/op
+107.8 tok/s, 2048 tokens, 6675576 B/op, 2644 allocs/op
+stderr: .bench-errors/2048_q4_rows16_noroute_20260527.err (0 bytes)
+```
+
+The block reduction was real, but throughput and allocation shape did not beat
+the accepted rows8 path. Keep rows8 on gfx1100 for now.
