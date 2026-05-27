@@ -2770,6 +2770,50 @@ func TestHIPAttentionHeadsChunkedEligible_BlockPagesGood(t *testing.T) {
 	core.AssertEqual(t, false, hipAttentionHeadsChunkedEligible(req, 256, 320))
 }
 
+func TestHIPAttentionHeadsChunkedEligible_Gemma4HeadDim512_Good(t *testing.T) {
+	cache := &rocmDeviceKVCache{
+		mode:       rocmKVCacheModeKQ8VQ4,
+		blockSize:  1,
+		pages:      []rocmDeviceKVPage{{tokenStart: 0, tokenCount: 513, keyWidth: 512, valueWidth: 512}},
+		tokenCount: 513,
+	}
+	descriptor := &rocmDeviceKVDescriptorTable{}
+	core.AssertEqual(t, true, hipAttentionHeadsChunkedEligible(hipAttentionRequest{
+		DeviceKV:        cache,
+		DescriptorTable: descriptor,
+	}, 512, 513))
+	core.AssertEqual(t, false, hipAttentionHeadsChunkedEligible(hipAttentionRequest{
+		DeviceKV:        cache,
+		DescriptorTable: descriptor,
+	}, 513, 513))
+
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	core.AssertEqual(t, false, hipAttentionHeadsBatchChunkedEligible(hipAttentionHeadsBatchCausalDeviceRequest{
+		DeviceKV:        cache,
+		DescriptorTable: descriptor,
+		Dim:             512,
+		TokenCount:      512,
+		HeadCount:       1,
+		QueryCount:      1,
+	}, workspace))
+	core.AssertEqual(t, true, hipAttentionHeadsBatchChunkedEligible(hipAttentionHeadsBatchCausalDeviceRequest{
+		DeviceKV:        cache,
+		DescriptorTable: descriptor,
+		Dim:             512,
+		TokenCount:      513,
+		HeadCount:       1,
+		QueryCount:      1,
+	}, workspace))
+	core.AssertEqual(t, false, hipAttentionHeadsBatchChunkedEligible(hipAttentionHeadsBatchCausalDeviceRequest{
+		DeviceKV:        cache,
+		DescriptorTable: descriptor,
+		Dim:             513,
+		TokenCount:      513,
+		HeadCount:       1,
+		QueryCount:      1,
+	}, workspace))
+}
+
 func BenchmarkHIPDeviceByteBufferPool_ReusedSize(b *testing.B) {
 	driver := &fakeHIPDriver{available: true}
 	const sizeBytes uint64 = 4096

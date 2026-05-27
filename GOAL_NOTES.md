@@ -17047,3 +17047,29 @@ ok dappco.re/go/rocm 0.112s
 go test ./go -count=1
 ok dappco.re/go/rocm 0.140s
 ```
+
+## 2026-05-27 Accepted Gemma4 Head-Dim 512 Attention Guard
+
+Rechecked the `go-mlx/IDEAS.md` Gemma4 note about engines falling off fast
+attention paths when `head_dim=512`. ROCm does not use a FlashAttention2 path
+with a 256-dim cap: the chunked attention ABI and HIP kernel block width are
+already `512`, and `hipAttentionHeadsChunkedSharedMemBytes(128, 512)` has
+existing coverage.
+
+Accepted guard:
+
+- `TestHIPAttentionHeadsChunkedEligible_Gemma4HeadDim512_Good` now locks the
+  single-token decode route to accept `dim=512` and reject `dim=513`.
+- The same guard locks the batch/chapter-prefill route to switch to chunked
+  attention above the 512-token threshold for `dim=512`, instead of treating
+  512-wide Gemma4 full-attention heads as unsupported.
+
+Verification:
+
+```text
+go test ./go -run 'TestHIPAttentionHeads(ChunkedSharedMemBytes|ChunkedEligible)_Good|TestHIPAttentionHeadsChunkedEligible_Gemma4HeadDim512_Good' -count=1 -v
+PASS
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -run 'TestHIPAttentionHeadsChunkedEligible_Gemma4HeadDim512_Good' -count=1 -v
+PASS
+```
