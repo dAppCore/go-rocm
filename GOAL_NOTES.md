@@ -1,5 +1,48 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Tokenizer Merge-Rank Load Parser Cleanup
+
+- Replaced the tokenizer merge-rank loader's nested `json.Unmarshal` path with
+  a byte-level JSON array parser. Gemma4 tokenizer merges are large
+  `[[left,right], ...]` arrays, and the old path materialized nested Go slices
+  even though the runtime only needs the final rank map.
+- Added AX-11 benchmark coverage:
+
+```text
+BenchmarkHIPTokenTextMergeRanks_ArrayPairs:
+  730-745 ns/op
+  1035 B/op
+  20 allocs/op
+
+GO_ROCM_GEMMA4_Q4_TOKENIZER_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit/tokenizer.json
+BenchmarkHIPTokenTextDecoder_LoadLocalGemma4:
+  611875021 ns/op
+  332244728 B/op
+  4220032 allocs/op
+```
+
+- This is model-load cleanup, not a decode-kernel change. The q4 decode guard
+  stayed green on the RX 7800 XT with the current SWA-window HSACO:
+
+```text
+BenchmarkInferenceGemma4Q4Generate, 2048 tokens, context_len=4096:
+  20207382488 ns/op
+  101.3 tok/s
+  6667744 B/op
+  2613 allocs/op
+  stderr: /tmp/go-rocm-2048-token-merge-parser.err (empty)
+```
+
+- Verification:
+
+```text
+go test ./go -run 'TestHIPTokenTextDecoder' -count=1
+go test ./go -count=1
+go test ./... -count=1
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./... -count=1
+go test -tags rocm_legacy_server ./... -count=1
+```
+
 ## 2026-05-27 Dependency Refresh and 2048 Guard Baseline
 
 - Fast-forwarded active dev submodules:

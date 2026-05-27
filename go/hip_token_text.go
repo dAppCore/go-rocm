@@ -5,6 +5,7 @@
 package rocm
 
 import (
+	"bytes"
 	"encoding/json"
 	"strconv"
 	"strings"
@@ -116,26 +117,174 @@ func hipTokenTextMergeRanks(raw json.RawMessage) map[string]int {
 	if len(raw) == 0 {
 		return nil
 	}
-	ranks := map[string]int{}
-	var stringMerges []string
-	if err := json.Unmarshal(raw, &stringMerges); err == nil {
-		for rank, merge := range stringMerges {
-			parts := strings.SplitN(merge, " ", 2)
-			if len(parts) == 2 {
-				ranks[parts[0]+" "+parts[1]] = rank
-			}
-		}
-		return ranks
+	index := hipTokenTextSkipJSONSpace(raw, 0)
+	if index >= len(raw) || raw[index] != '[' {
+		return nil
 	}
-	var arrayMerges [][]string
-	if err := json.Unmarshal(raw, &arrayMerges); err == nil {
-		for rank, pair := range arrayMerges {
-			if len(pair) == 2 {
-				ranks[pair[0]+" "+pair[1]] = rank
+	ranks := make(map[string]int, hipTokenTextMergeRankCapacity(raw))
+	index++
+	for rank := 0; index < len(raw); rank++ {
+		index = hipTokenTextSkipJSONListSeparator(raw, index)
+		if index >= len(raw) || raw[index] == ']' {
+			break
+		}
+		switch raw[index] {
+		case '"':
+			value, next, ok := hipTokenTextReadJSONString(raw, index)
+			index = next
+			if ok {
+				left, right, ok := strings.Cut(value, " ")
+				if !ok {
+					continue
+				}
+				ranks[left+" "+right] = rank
 			}
+		case '[':
+			left, right, next, ok := hipTokenTextReadJSONMergePair(raw, index)
+			index = next
+			if ok {
+				ranks[left+" "+right] = rank
+			}
+		default:
+			index = hipTokenTextSkipJSONValue(raw, index)
 		}
 	}
 	return ranks
+}
+
+func hipTokenTextMergeRankCapacity(raw json.RawMessage) int {
+	if len(raw) < 4 {
+		return 0
+	}
+	const maxMergeRankCapacity = 1 << 20
+	count := bytes.Count(raw, []byte("],"))
+	if count == 0 {
+		count = bytes.Count(raw, []byte(`","`))
+	}
+	if count > maxMergeRankCapacity {
+		count = maxMergeRankCapacity
+	}
+	return count + 1
+}
+
+func hipTokenTextReadJSONMergePair(raw []byte, index int) (string, string, int, bool) {
+	if index >= len(raw) || raw[index] != '[' {
+		return "", "", index, false
+	}
+	index++
+	var parts [2]string
+	valueCount := 0
+	stringParts := 0
+	for index < len(raw) {
+		index = hipTokenTextSkipJSONListSeparator(raw, index)
+		if index >= len(raw) {
+			return "", "", index, false
+		}
+		if raw[index] == ']' {
+			index++
+			return parts[0], parts[1], index, valueCount == 2 && stringParts == 2
+		}
+		valueCount++
+		if raw[index] == '"' {
+			value, next, ok := hipTokenTextReadJSONString(raw, index)
+			index = next
+			if ok && valueCount <= len(parts) {
+				parts[valueCount-1] = value
+				stringParts++
+			}
+			continue
+		}
+		index = hipTokenTextSkipJSONValue(raw, index)
+	}
+	return "", "", index, false
+}
+
+func hipTokenTextReadJSONString(raw []byte, index int) (string, int, bool) {
+	if index >= len(raw) || raw[index] != '"' {
+		return "", index, false
+	}
+	start := index
+	index++
+	escaped := false
+	for index < len(raw) {
+		switch raw[index] {
+		case '\\':
+			escaped = true
+			index += 2
+			continue
+		case '"':
+			index++
+			if !escaped {
+				return string(raw[start+1 : index-1]), index, true
+			}
+			value, err := strconv.Unquote(string(raw[start:index]))
+			return value, index, err == nil
+		}
+		index++
+	}
+	return "", len(raw), false
+}
+
+func hipTokenTextSkipJSONValue(raw []byte, index int) int {
+	index = hipTokenTextSkipJSONSpace(raw, index)
+	if index >= len(raw) {
+		return index
+	}
+	switch raw[index] {
+	case '"':
+		_, next, _ := hipTokenTextReadJSONString(raw, index)
+		return next
+	case '[', '{':
+		depth := 0
+		for index < len(raw) {
+			switch raw[index] {
+			case '"':
+				_, next, _ := hipTokenTextReadJSONString(raw, index)
+				index = next
+				continue
+			case '[', '{':
+				depth++
+			case ']', '}':
+				depth--
+				index++
+				if depth <= 0 {
+					return index
+				}
+				continue
+			}
+			index++
+		}
+		return index
+	default:
+		for index < len(raw) && raw[index] != ',' && raw[index] != ']' && raw[index] != '}' {
+			index++
+		}
+		return index
+	}
+}
+
+func hipTokenTextSkipJSONListSeparator(raw []byte, index int) int {
+	for index < len(raw) {
+		switch raw[index] {
+		case ' ', '\n', '\r', '\t', ',':
+			index++
+			continue
+		}
+		return index
+	}
+	return index
+}
+
+func hipTokenTextSkipJSONSpace(raw []byte, index int) int {
+	for index < len(raw) {
+		switch raw[index] {
+		case ' ', '\n', '\r', '\t':
+			index++
+			continue
+		}
+		return index
+	}
+	return index
 }
 
 func (decoder *hipTokenTextDecoder) Encode(text string) []int32 {

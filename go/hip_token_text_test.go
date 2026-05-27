@@ -162,6 +162,9 @@ func TestHIPTokenTextDecoder_Bad_MergeAndFallbackEdges(t *testing.T) {
 	arrayRanks := hipTokenTextMergeRanks([]byte(`[["x","y"],["bad"],["y","z"]]`))
 	core.AssertEqual(t, 0, arrayRanks["x y"])
 	core.AssertEqual(t, 2, arrayRanks["y z"])
+	escapedRanks := hipTokenTextMergeRanks([]byte(`[["\n","x"],"y z"]`))
+	core.AssertEqual(t, 0, escapedRanks["\n x"])
+	core.AssertEqual(t, 1, escapedRanks["y z"])
 	core.AssertEqual(t, 0, len(hipTokenTextMergeRanks(nil)))
 	core.AssertEqual(t, 0, len(hipTokenTextMergeRanks([]byte(`{"not":"a merge list"}`))))
 
@@ -174,6 +177,44 @@ func TestHIPTokenTextDecoder_Bad_MergeAndFallbackEdges(t *testing.T) {
 	core.AssertEqual(t, []int32{7, 7}, decoder.Encode("é"))
 	core.AssertEqual(t, "", (*hipTokenTextDecoder)(nil).Decode([]int32{1}))
 	core.AssertEqual(t, "", decoder.DecodeToken(404))
+}
+
+func BenchmarkHIPTokenTextMergeRanks_ArrayPairs(b *testing.B) {
+	raw := []byte(`[["a","b"],["b","c"],["c","d"],["d","e"],["e","f"],["f","g"],["g","h"],["h","i"],["i","j"],["j","k"],["k","l"],["l","m"],["m","n"],["n","o"],["o","p"],["p","q"]]`)
+	if got := hipTokenTextMergeRanks(raw); got["a b"] != 0 || got["p q"] != 15 {
+		b.Fatalf("merge ranks = %#v", got)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		got := hipTokenTextMergeRanks(raw)
+		if got["a b"] != 0 || got["p q"] != 15 {
+			b.Fatalf("merge ranks = %#v", got)
+		}
+	}
+}
+
+func BenchmarkHIPTokenTextDecoder_LoadLocalGemma4(b *testing.B) {
+	path := os.Getenv("GO_ROCM_GEMMA4_Q4_TOKENIZER_PATH")
+	if path == "" {
+		b.Skip("set GO_ROCM_GEMMA4_Q4_TOKENIZER_PATH to benchmark local Gemma4 tokenizer loading")
+	}
+	decoder, err := loadHIPTokenTextDecoder(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if decoder == nil || len(decoder.mergeRanks) == 0 {
+		b.Fatal("Gemma4 tokenizer loaded without merge ranks")
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		decoder, err := loadHIPTokenTextDecoder(path)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(decoder.mergeRanks) == 0 {
+			b.Fatal("Gemma4 tokenizer loaded without merge ranks")
+		}
+	}
 }
 
 func BenchmarkHIPTokenTextDecoder_DecodeTokenCached(b *testing.B) {
