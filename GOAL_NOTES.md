@@ -16406,3 +16406,37 @@ guard, but it moved the actual endpoint backward: 2048 tok/s stayed flat, book
 decode dropped below the accepted retained-state samples, and allocations rose.
 Keep the separate PLE scale for now; chase larger projection/GELU/attention
 traffic reductions before revisiting this micro-fusion.
+
+## 2026-05-27 Rejected Chunk256 Attention Grain
+
+`go-mlx/IDEAS.md` calls out the need to validate the compute graph and local
+SWA windowing, so ROCm's chunked attention grain was tested as a direct
+hot-path knob. The candidate raised `ROCM_ATTENTION_HEADS_CHUNK_SIZE` and
+`hipAttentionHeadsChunkSize` from 128 to 256 tokens. It reduced stage1
+chunk-count traffic, but each block had less per-token dot-product parallelism.
+
+Rejected result:
+
+```text
+Focused tests passed:
+go test ./go -run 'TestHIPAttentionHeadsChunkedSharedMemBytes_Good|TestHIPKernelSource_ABIConstants_Good|TestHIPKernels_AttentionHeadsBatchChunked' -count=1
+
+Compiled cleanly:
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-attn-chunk256.hsaco
+stderr: .bench-errors/hipcc_gfx1100_attn_chunk256_20260527.err (0 bytes)
+
+2048 live route guard:
+BenchmarkInferenceGemma4Q4Generate-32  1  19241648638 ns/op
+106.4 tok/s, 2048 tokens, 6690784 B/op, 4662 allocs/op
+kernel_attention_decode_chunked_stage1_launches/op=12558
+kernel_attention_decode_chunked_stage1_blocks/op=502320
+kernel_attention_decode_chunked_stage2_launches/op=12558
+kernel_attention_decode_chunked_stage2_blocks/op=100464
+kernel_total_launches/op=944643
+kernel_total_blocks/op=174903369
+stderr: .bench-errors/2048_attn_chunk256_20260527.err (0 bytes)
+```
+
+The reduced launch/block count did not translate to throughput. Keep the
+128-token chunk grain on the RX 7800 XT; it appears to be the better balance for
+Gemma4's 256/512 head dimensions.
