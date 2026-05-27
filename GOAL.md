@@ -563,6 +563,20 @@ and `4` chapter-10 arc anchors. This makes row-scaled block pages a valid
 production-candidate route, but the later-turn decode rate is still below the
 `90-100+ tok/s` long-context target.
 
+Rejected mixed-page direct lookup shortcut: a direct `token / block_size`
+resolver for block-paged KQ8/VQ4 descriptors looked attractive but is invalid
+for the retained `.kv`/MP4 stream layout because prompt block pages and
+generated single-token suffix pages are interleaved over turns. The no-fallback
+version was fast (`18.35s` wall) but corrupted later chapters and got `0`
+chapter-10 arc anchors. A fallback-to-generic version kept stderr empty and
+measured `43.72s` wall, `36.63s` decode, `3197` generated tokens, `73.13
+tok/s` average, and `71.97 tok/s` on turn 10, but still failed quality with
+`0` arc anchors, `2` repeated turns, and `book_max_adjacent_repeat=0.9415`.
+Do not reintroduce this shape without a real token-to-page index or a
+deterministic equivalence test against the descriptor walk. The accepted
+block16 route remains the generic descriptor lookup plus row-scaled block
+payloads.
+
 Rejected prompt-shortening follow-up: replacing the anchored wording with a
 shorter "advance the arc / keep continuity words alive" instruction reduced
 prompt tokens to `1581` and still passed the arc gate with `3` anchors, but it
