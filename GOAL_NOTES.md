@@ -1,5 +1,47 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Gemma4 Main Embedding Scale Cache Parity
+
+- Extended the Gemma4 scale-cache parity to the main token embedding path.
+  ROCm now caches `sqrt(hidden_size)` on each q4 layer config and uses that
+  cached value in single-token decode and prefill embedding scaling, matching
+  the `go-mlx` config shape from `IDEAS.md`.
+- AX-11 scale microbenchmarks:
+
+```text
+BenchmarkHIPGemma4Q4PerLayerInputConfigScales_Cached:
+  6.193 ns/op, 0 B/op, 0 allocs/op
+BenchmarkHIPGemma4Q4LayerConfigEmbeddingScale_Cached:
+  13.25 ns/op, 0 B/op, 0 allocs/op
+```
+
+- Verification:
+
+```text
+go test ./go -run 'TestHIPGemma4Q4PerLayerInputConfigScalesCached_Good|TestHIPGemma4Q4PerLayerInputPrecompute_Good|TestHIPGemma4Q4PrefillForwardBatchWithGeneratedPerLayerInput_Good' -count=1
+go test ./go -run '^$' -bench 'BenchmarkHIPGemma4Q4(PerLayerInputConfigScales|LayerConfigEmbeddingScale)_Cached$' -benchmem -count=1
+go test ./go -count=1
+go test ./... -count=1
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+go test -tags rocm_legacy_server ./... -count=1
+git diff --check
+```
+
+- Fresh RX 7800 XT 2048-token q4 guard stayed green:
+
+```text
+BenchmarkInferenceGemma4Q4Generate:
+  18925494987 ns/op
+  108.2 tok/s
+  6667848 B/op
+  2613 allocs/op
+  stderr: /tmp/go-rocm-2048-layer-scale-cache.err (empty)
+```
+
+- This is another small graph-prep cleanup. It keeps the short decode endpoint
+  green but does not address the remaining q4 projection/GELU and long-context
+  attention launch volume.
+
 ## 2026-05-27 Gemma4 PLE Scale Cache Parity
 
 - Read `/home/claude/Code/core/go-mlx/IDEAS.md` and mirrored the cheap

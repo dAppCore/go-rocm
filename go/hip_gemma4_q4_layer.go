@@ -23,6 +23,7 @@ type hipGemma4Q4Layer0Config struct {
 	LayerType         string
 	Embedding         hipDeviceEmbeddingLookupConfig
 	HiddenSize        int
+	EmbeddingScale    float32
 	VocabSize         int
 	GroupSize         int
 	HeadDim           int
@@ -418,6 +419,7 @@ func (model *hipLoadedModel) loadedGemma4Q4LayerConfig(layer int) (hipGemma4Q4La
 		DownProjection:      down,
 		LMHeadProjection:    lmHead,
 	}
+	cfg.finalizeScales()
 	if err := cfg.validate(); err != nil {
 		return hipGemma4Q4Layer0Config{}, err
 	}
@@ -495,7 +497,7 @@ func hipRunGemma4Q4Layer0(ctx context.Context, driver nativeHIPDriver, cfg hipGe
 	}
 	scaledEmbedding, err := hipRunVectorScaleKernel(ctx, driver, hipVectorScaleRequest{
 		Input: embedding,
-		Scale: float32(math.Sqrt(float64(cfg.HiddenSize))),
+		Scale: cfg.embeddingScale(),
 	})
 	if err != nil {
 		return hipGemma4Q4Layer0Result{}, err
@@ -639,11 +641,11 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 		if req.AttentionWorkspace != nil {
 			hiddenBuffer, err = req.AttentionWorkspace.EnsureScaledEmbedding(driver, first.HiddenSize)
 			if err == nil {
-				err = hipRunVectorScaleDeviceKernelOutput(ctx, driver, embeddingBuffer, float32(math.Sqrt(float64(first.HiddenSize))), hiddenBuffer)
+				err = hipRunVectorScaleDeviceKernelOutput(ctx, driver, embeddingBuffer, first.embeddingScale(), hiddenBuffer)
 				hiddenBufferBorrowed = err == nil
 			}
 		} else {
-			hiddenBuffer, err = hipRunVectorScaleDeviceKernel(ctx, driver, embeddingBuffer, float32(math.Sqrt(float64(first.HiddenSize))))
+			hiddenBuffer, err = hipRunVectorScaleDeviceKernel(ctx, driver, embeddingBuffer, first.embeddingScale())
 		}
 		if err != nil {
 			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
@@ -660,7 +662,7 @@ func hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx context.Context, driv
 		}
 		scaledEmbedding, err = hipRunVectorScaleKernel(ctx, driver, hipVectorScaleRequest{
 			Input: embedding,
-			Scale: float32(math.Sqrt(float64(first.HiddenSize))),
+			Scale: first.embeddingScale(),
 		})
 		if err != nil {
 			return hipGemma4Q4ForwardResult{}, hipGemma4Q4DecodeState{}, err
@@ -2174,6 +2176,28 @@ func (cfg hipGemma4Q4PerLayerInputConfig) hasGlobalPrecompute() bool {
 		cfg.Embedding.BiasPointer != 0 &&
 		cfg.ModelProjection.WeightPointer != 0 &&
 		cfg.ProjectionNorm.WeightPointer != 0
+}
+
+func (cfg *hipGemma4Q4Layer0Config) finalizeScales() {
+	if cfg == nil {
+		return
+	}
+	if cfg.HiddenSize > 0 {
+		cfg.EmbeddingScale = float32(math.Sqrt(float64(cfg.HiddenSize)))
+	} else {
+		cfg.EmbeddingScale = 0
+	}
+	cfg.PerLayerInput.finalizeScales()
+}
+
+func (cfg hipGemma4Q4Layer0Config) embeddingScale() float32 {
+	if cfg.EmbeddingScale != 0 {
+		return cfg.EmbeddingScale
+	}
+	if cfg.HiddenSize <= 0 {
+		return 0
+	}
+	return float32(math.Sqrt(float64(cfg.HiddenSize)))
 }
 
 func (cfg *hipGemma4Q4PerLayerInputConfig) finalizeScales() {

@@ -327,7 +327,7 @@ func hipRunGemma4Q4PrefillEmbeddingBatch(ctx context.Context, driver nativeHIPDr
 		return nil, err
 	}
 	defer embedding.Close()
-	scaled, err := hipRunVectorScaleDeviceKernel(ctx, driver, embedding, float32(math.Sqrt(float64(cfg.HiddenSize))))
+	scaled, err := hipRunVectorScaleDeviceKernel(ctx, driver, embedding, cfg.embeddingScale())
 	if err != nil {
 		return nil, err
 	}
