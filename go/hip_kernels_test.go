@@ -727,6 +727,83 @@ func TestHIPKernels_MLXQ4ProjectionGreedySuppressDevice_Good(t *testing.T) {
 	core.AssertEqual(t, uint32(1), binary.LittleEndian.Uint32(topKLaunch.Args[32:]))
 }
 
+func TestHIPKernels_PackedTopKReduceWorkspace_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	const (
+		inputCount = hipPackedTopKChunkSize * 16
+		topK       = 64
+	)
+	input, err := hipAllocateByteBuffer(driver, "rocm.hip.PackedTopKLaunch", "packed top-k test input", uint64(inputCount*hipMLXQ4ProjectionBestBytes), inputCount)
+	core.RequireNoError(t, err)
+	defer input.Close()
+	payload := make([]byte, inputCount*hipMLXQ4ProjectionBestBytes)
+	for index := 0; index < inputCount; index++ {
+		score := float32((index*1103515245+12345)&0xffff) / 4096
+		if index%997 == 0 {
+			score += 1000
+		}
+		binary.LittleEndian.PutUint64(payload[index*hipMLXQ4ProjectionBestBytes:], hipPackGreedyBest(score, index))
+	}
+	core.RequireNoError(t, driver.CopyHostToDevice(input.Pointer(), payload))
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	output, outputCount, err := hipRunPackedTopKReduceKernelWithWorkspace(context.Background(), driver, input, inputCount, topK, workspace)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 2, countLaunchName(driver.launches, hipKernelNamePackedTopK))
+	core.AssertEqual(t, 128, outputCount)
+	outputPayload := make([]byte, outputCount*hipMLXQ4ProjectionBestBytes)
+	core.RequireNoError(t, driver.CopyDeviceToHost(output.Pointer(), outputPayload))
+	got := hipTopPackedScoresBytes(outputPayload, topK)
+	want := hipTopPackedScoresBytes(payload, topK)
+	core.AssertEqual(t, want, got)
+}
+
+func BenchmarkHIPPackedTopKReduceWorkspace_VocabTopK64(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	const (
+		inputCount = 262144
+		topK       = 64
+	)
+	input, err := hipAllocateByteBuffer(driver, "rocm.hip.PackedTopKLaunch", "packed top-k benchmark input", uint64(inputCount*hipMLXQ4ProjectionBestBytes), inputCount)
+	core.RequireNoError(b, err)
+	defer input.Close()
+	payload := make([]byte, inputCount*hipMLXQ4ProjectionBestBytes)
+	for index := 0; index < inputCount; index++ {
+		score := float32((index*1103515245+12345)&0xffff) / 4096
+		if index%997 == 0 {
+			score += 1000
+		}
+		binary.LittleEndian.PutUint64(payload[index*hipMLXQ4ProjectionBestBytes:], hipPackGreedyBest(score, index))
+	}
+	core.RequireNoError(b, driver.CopyHostToDevice(input.Pointer(), payload))
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		driver.launches = driver.launches[:0]
+		output, outputCount, err := hipRunPackedTopKReduceKernelWithWorkspace(context.Background(), driver, input, inputCount, topK, workspace)
+		if err != nil {
+			b.Fatal(err)
+		}
+		outputPayload, err := workspace.ProjectionTopKPayload(outputCount)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := driver.CopyDeviceToHost(output.Pointer(), outputPayload); err != nil {
+			b.Fatal(err)
+		}
+		top := hipTopPackedScoresBytesInto(outputPayload, topK, workspace.ProjectionTopPacked)
+		workspace.ProjectionTopPacked = top
+		benchmarkHIPTopPackedScoreSink ^= top[0]
+		benchmarkHIPTopPackedScoreSink ^= uint64(outputCount)
+	}
+	b.ReportMetric(3, "device_topk_rounds/op")
+	b.ReportMetric(float64(512*hipMLXQ4ProjectionBestBytes), "reduced_payload_bytes/op")
+}
+
 func TestHIPKernels_MLXQ4TripleProjectionLaunchArgs_Good(t *testing.T) {
 	driver := &fakeHIPDriver{available: true}
 	firstReq := hipMLXQ4ProjectionRequest{

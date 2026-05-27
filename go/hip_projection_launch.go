@@ -2579,6 +2579,10 @@ func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppress(ctx c
 }
 
 func hipRunPackedTopKKernelWithWorkspace(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, inputCount, topK int, workspace *hipAttentionHeadsChunkedWorkspace) (*hipDeviceByteBuffer, int, error) {
+	return hipRunPackedTopKKernelWithWorkspaceOutput(ctx, driver, input, inputCount, topK, workspace, false)
+}
+
+func hipRunPackedTopKKernelWithWorkspaceOutput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, inputCount, topK int, workspace *hipAttentionHeadsChunkedWorkspace, workOutput bool) (*hipDeviceByteBuffer, int, error) {
 	if input == nil || input.Pointer() == 0 {
 		return nil, 0, core.E("rocm.hip.PackedTopKLaunch", "packed score input is required", nil)
 	}
@@ -2593,7 +2597,13 @@ func hipRunPackedTopKKernelWithWorkspace(ctx context.Context, driver nativeHIPDr
 	}
 	chunkCount := (inputCount + hipPackedTopKChunkSize - 1) / hipPackedTopKChunkSize
 	outputCount := chunkCount * topK
-	output, err := workspace.EnsureProjectionTopKOutput(driver, outputCount)
+	var output *hipDeviceByteBuffer
+	var err error
+	if workOutput {
+		output, err = workspace.EnsureProjectionTopKWorkOutput(driver, outputCount)
+	} else {
+		output, err = workspace.EnsureProjectionTopKOutput(driver, outputCount)
+	}
 	if err != nil {
 		return nil, 0, err
 	}
@@ -2618,6 +2628,24 @@ func hipRunPackedTopKKernelWithWorkspace(ctx context.Context, driver nativeHIPDr
 		return nil, 0, err
 	}
 	return output, outputCount, nil
+}
+
+func hipRunPackedTopKReduceKernelWithWorkspace(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, inputCount, topK int, workspace *hipAttentionHeadsChunkedWorkspace) (*hipDeviceByteBuffer, int, error) {
+	current := input
+	currentCount := inputCount
+	workOutput := false
+	for {
+		output, outputCount, err := hipRunPackedTopKKernelWithWorkspaceOutput(ctx, driver, current, currentCount, topK, workspace, workOutput)
+		if err != nil {
+			return nil, 0, err
+		}
+		if outputCount <= hipPackedTopKChunkSize {
+			return output, outputCount, nil
+		}
+		current = output
+		currentCount = outputCount
+		workOutput = !workOutput
+	}
 }
 
 func hipRunMLXQ4ProjectionSoftcapScoreKernelWithDeviceInputBufferSuppress(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, topK int, suppressTokens []int32, workspace *hipAttentionHeadsChunkedWorkspace) ([]hipGreedySampleResult, error) {
@@ -2697,7 +2725,7 @@ func hipRunMLXQ4ProjectionSoftcapScoreKernelWithDeviceInputBufferSuppress(ctx co
 	}
 	var top []uint64
 	if workspace != nil {
-		partial, partialCount, err := hipRunPackedTopKKernelWithWorkspace(ctx, driver, scores, cfg.Rows, topK, workspace)
+		partial, partialCount, err := hipRunPackedTopKReduceKernelWithWorkspace(ctx, driver, scores, cfg.Rows, topK, workspace)
 		if err != nil {
 			return nil, err
 		}

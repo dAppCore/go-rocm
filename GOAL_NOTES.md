@@ -17799,3 +17799,84 @@ Conclusion: future global-attention work should treat the E2B topology as
 `28/7` local/full with `512`-dim global attention and a 20-layer shared-KV
 suffix. The remaining late-turn slowdown is not a missing FA2 fallback; it is
 the custom global attention memory path doing too much repeated K/V traffic.
+
+## 2026-05-27 Accepted Workspace-View Packed Top-K Reduction
+
+The sampled book route still needs `temperature=1`, `top_p=0.95`, and
+`top_k=64`, so replacing it with greedy sampling would not measure the real
+book workload. The final LM-head candidate path now keeps the existing 512-row
+packed top-k kernel but runs additional device-side reduction rounds until the
+host readback is at most one 512-entry chunk. For Gemma4's 262144-row vocab and
+`top_k=64`, this reduces the sampled-token top-k readback from `32768` packed
+partials (`262144` bytes) to `512` packed partials (`4096` bytes) while
+preserving exact top-k coverage.
+
+This reopens the earlier rejected multi-round idea because the implementation no
+longer allocates borrowed buffer wrappers per top-k pass: the workspace owns two
+capacity-retained device buffers plus reusable view structs. The previous
+attempt reduced transfer size but added enough allocation/launch overhead to
+fail the then-current retained gate; this pass keeps allocation count below the
+current retained baseline and passes the strict book route.
+
+Verification:
+
+```text
+go test ./go -run 'TestHIPKernels_(PackedTopKReduceWorkspace|MLXQ4ProjectionGreedySuppressDevice)_Good' -count=1 -v
+PASS
+
+go test ./go -run 'TestHIPKernels_PackedTopKReduceWorkspace_Good' -bench '^BenchmarkHIPPackedTopKReduceWorkspace_VocabTopK64$' -benchtime=1x -count=1 -benchmem
+BenchmarkHIPPackedTopKReduceWorkspace_VocabTopK64-32 1 1846940 ns/op
+device_topk_rounds/op=3.000
+reduced_payload_bytes/op=4096
+B/op=599568
+allocs/op=602
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.139s
+
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-topk-reduce-goonly-20260527.hsaco
+stderr: .bench-errors/hipcc_gfx1100_topk_reduce_goonly_20260527.err (0 bytes)
+```
+
+2-turn retained sampled check on the pinned RX 7800 XT:
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 9010912732 ns/op
+book_wall_s=8.989
+book_decode_s=8.351
+book_generated_tokens=886
+book_tok/s=98.57
+book_turn02_tok/s=102.7
+B/op=5738872
+allocs/op=9124
+rocm_packed_topk_launches=2664
+rocm_packed_topk_blocks=518592
+stderr: .bench-errors/book2_topk_reduce_views_20260527.err (0 bytes)
+output: /tmp/go-rocm-book2-topk-reduce-views-20260527.md
+```
+
+Strict 48k retained-book gate:
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 53365550934 ns/op
+book_wall_s=53.31
+book_decode_s=42.40
+book_generated_tokens=3831
+book_tok/s=71.87
+book_turn10_tok/s=72.88
+chapter10_arc_anchor_hits=5
+B/op=15637712
+allocs/op=41008
+peak_memory_bytes=5990137856
+rocm_packed_topk_launches=11523
+rocm_packed_topk_blocks=2243144
+stderr: .bench-errors/book10_topk_reduce_views_20260527.err (0 bytes)
+output: /tmp/go-rocm-book10-topk-reduce-views-20260527.md
+```
+
+Conclusion: accepted. The change does not solve the late-turn global-attention
+scaling target, but it removes a large sampled-route host transfer and improves
+the current strict retained book profile from the previous `57.03s` wall,
+`21.58MB/op`, `41801 allocs/op` baseline to `53.31s` wall, `15.64MB/op`, and
+`41008 allocs/op`. Continue targeting full/global chunked stage1 and q4
+projection for the 90-100+ tok/s late-turn goal.

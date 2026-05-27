@@ -2284,47 +2284,52 @@ func hipRunAttentionHeadsBatchChunkedOutputFromDeviceQueryToDeviceKernelWorkspac
 }
 
 type hipAttentionHeadsChunkedWorkspace struct {
-	Partial              *hipDeviceByteBuffer
-	Stats                *hipDeviceByteBuffer
-	TokenID              *hipDeviceByteBuffer
-	TokenIDLoaded        bool
-	TokenIDValue         int32
-	EmbeddingOutputs     map[int]*hipDeviceByteBuffer
-	ScaledEmbeddings     map[int]*hipDeviceByteBuffer
-	PerLayerEmbeddings   map[int]*hipDeviceByteBuffer
-	PerLayerProjected    map[int]*hipDeviceByteBuffer
-	PerLayerScaled       map[int]*hipDeviceByteBuffer
-	PerLayerProjScaled   map[int]*hipDeviceByteBuffer
-	PerLayerNorm         map[int]*hipDeviceByteBuffer
-	PerLayerCombined     map[int]*hipDeviceByteBuffer
-	PerLayerOutput       map[int]*hipDeviceByteBuffer
-	AttentionOutputs     map[int]*hipDeviceByteBuffer
-	ProjectionOutputs    map[int]*hipDeviceByteBuffer
-	ActivationOutputs    map[int]*hipDeviceByteBuffer
-	RMSResidualOutputs   map[int]*hipDeviceByteBuffer
-	RMSNormOutputs       map[int]*hipDeviceByteBuffer
-	RMSRoPEOutputs       map[int]*hipDeviceByteBuffer
-	RMSNoScaleOutputs    map[int]*hipDeviceByteBuffer
-	IntermediateOutputs  map[int]*hipDeviceByteBuffer
-	QKVOutputs           map[int]*hipDeviceByteBuffer
-	ProjectionScore      *hipDeviceByteBuffer
-	ProjectionScoreBytes []byte
-	ProjectionTopK       *hipDeviceByteBuffer
-	ProjectionTopKBytes  []byte
-	ProjectionTopPacked  []uint64
-	ProjectionCandidates []hipGreedySampleResult
-	SampleCandidates     []hipReferenceCandidate
-	SampleWeights        []float64
-	BatchAttentionWeight *hipDeviceByteBuffer
-	FinalHiddenOutputs   [2]map[int]*hipDeviceByteBuffer
-	NextInputOutputs     [2]map[int]*hipDeviceByteBuffer
-	PerLayerInputSet     hipGemma4Q4PerLayerInputDeviceSet
-	PerLayerInputBacking [1]*hipDeviceByteBuffer
-	SuppressTokenIDs     []int32
-	SuppressTokenBuffer  *hipDeviceTokenBuffer
-	partialCap           int
-	statsCap             int
-	batchWeightCap       int
+	Partial                *hipDeviceByteBuffer
+	Stats                  *hipDeviceByteBuffer
+	TokenID                *hipDeviceByteBuffer
+	TokenIDLoaded          bool
+	TokenIDValue           int32
+	EmbeddingOutputs       map[int]*hipDeviceByteBuffer
+	ScaledEmbeddings       map[int]*hipDeviceByteBuffer
+	PerLayerEmbeddings     map[int]*hipDeviceByteBuffer
+	PerLayerProjected      map[int]*hipDeviceByteBuffer
+	PerLayerScaled         map[int]*hipDeviceByteBuffer
+	PerLayerProjScaled     map[int]*hipDeviceByteBuffer
+	PerLayerNorm           map[int]*hipDeviceByteBuffer
+	PerLayerCombined       map[int]*hipDeviceByteBuffer
+	PerLayerOutput         map[int]*hipDeviceByteBuffer
+	AttentionOutputs       map[int]*hipDeviceByteBuffer
+	ProjectionOutputs      map[int]*hipDeviceByteBuffer
+	ActivationOutputs      map[int]*hipDeviceByteBuffer
+	RMSResidualOutputs     map[int]*hipDeviceByteBuffer
+	RMSNormOutputs         map[int]*hipDeviceByteBuffer
+	RMSRoPEOutputs         map[int]*hipDeviceByteBuffer
+	RMSNoScaleOutputs      map[int]*hipDeviceByteBuffer
+	IntermediateOutputs    map[int]*hipDeviceByteBuffer
+	QKVOutputs             map[int]*hipDeviceByteBuffer
+	ProjectionScore        *hipDeviceByteBuffer
+	ProjectionScoreBytes   []byte
+	ProjectionTopK         *hipDeviceByteBuffer
+	ProjectionTopKCap      int
+	ProjectionTopKView     hipDeviceByteBuffer
+	ProjectionTopKWork     *hipDeviceByteBuffer
+	ProjectionTopKWorkCap  int
+	ProjectionTopKWorkView hipDeviceByteBuffer
+	ProjectionTopKBytes    []byte
+	ProjectionTopPacked    []uint64
+	ProjectionCandidates   []hipGreedySampleResult
+	SampleCandidates       []hipReferenceCandidate
+	SampleWeights          []float64
+	BatchAttentionWeight   *hipDeviceByteBuffer
+	FinalHiddenOutputs     [2]map[int]*hipDeviceByteBuffer
+	NextInputOutputs       [2]map[int]*hipDeviceByteBuffer
+	PerLayerInputSet       hipGemma4Q4PerLayerInputDeviceSet
+	PerLayerInputBacking   [1]*hipDeviceByteBuffer
+	SuppressTokenIDs       []int32
+	SuppressTokenBuffer    *hipDeviceTokenBuffer
+	partialCap             int
+	statsCap               int
+	batchWeightCap         int
 }
 
 func (workspace *hipAttentionHeadsChunkedWorkspace) Ensure(driver nativeHIPDriver, headCount, dim, tokenCount, chunkSize int) error {
@@ -2629,24 +2634,63 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) ProjectionScorePayload(count
 }
 
 func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureProjectionTopKOutput(driver nativeHIPDriver, count int) (*hipDeviceByteBuffer, error) {
+	return workspace.ensureProjectionTopKOutput(driver, count, false)
+}
+
+func (workspace *hipAttentionHeadsChunkedWorkspace) EnsureProjectionTopKWorkOutput(driver nativeHIPDriver, count int) (*hipDeviceByteBuffer, error) {
+	return workspace.ensureProjectionTopKOutput(driver, count, true)
+}
+
+func (workspace *hipAttentionHeadsChunkedWorkspace) ensureProjectionTopKOutput(driver nativeHIPDriver, count int, work bool) (*hipDeviceByteBuffer, error) {
 	if workspace == nil {
 		return nil, core.E("rocm.hip.PackedTopKLaunch", "attention workspace is required", nil)
 	}
 	if count <= 0 {
 		return nil, core.E("rocm.hip.PackedTopKLaunch", "projection top-k count must be positive", nil)
 	}
-	if workspace.ProjectionTopK != nil && workspace.ProjectionTopK.Pointer() != 0 && workspace.ProjectionTopK.Count() == count && workspace.ProjectionTopK.SizeBytes() == uint64(count*hipMLXQ4ProjectionBestBytes) {
-		return workspace.ProjectionTopK, nil
+	buffer := workspace.ProjectionTopK
+	capCount := workspace.ProjectionTopKCap
+	label := "MLX q4 projection top-k partial scores"
+	if work {
+		buffer = workspace.ProjectionTopKWork
+		capCount = workspace.ProjectionTopKWorkCap
+		label = "MLX q4 projection top-k work scores"
 	}
-	if err := workspace.ProjectionTopK.Close(); err != nil {
+	byteCount := uint64(count * hipMLXQ4ProjectionBestBytes)
+	if buffer != nil && buffer.Pointer() != 0 && capCount >= count && buffer.SizeBytes() >= byteCount {
+		return workspace.projectionTopKView(driver, buffer.Pointer(), byteCount, count, label, work), nil
+	}
+	if err := buffer.Close(); err != nil {
 		return nil, err
 	}
-	output, err := hipAllocateByteBuffer(driver, "rocm.hip.PackedTopKLaunch", "MLX q4 projection top-k partial scores", uint64(count*hipMLXQ4ProjectionBestBytes), count)
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.PackedTopKLaunch", label, byteCount, count)
 	if err != nil {
 		return nil, err
 	}
-	workspace.ProjectionTopK = output
-	return output, nil
+	if work {
+		workspace.ProjectionTopKWork = output
+		workspace.ProjectionTopKWorkCap = count
+	} else {
+		workspace.ProjectionTopK = output
+		workspace.ProjectionTopKCap = count
+	}
+	return workspace.projectionTopKView(driver, output.Pointer(), byteCount, count, label, work), nil
+}
+
+func (workspace *hipAttentionHeadsChunkedWorkspace) projectionTopKView(driver nativeHIPDriver, pointer nativeDevicePointer, sizeBytes uint64, count int, label string, work bool) *hipDeviceByteBuffer {
+	view := &workspace.ProjectionTopKView
+	if work {
+		view = &workspace.ProjectionTopKWorkView
+	}
+	*view = hipDeviceByteBuffer{
+		driver:    driver,
+		pointer:   pointer,
+		count:     count,
+		sizeBytes: sizeBytes,
+		borrowed:  true,
+		label:     label,
+	}
+	return view
 }
 
 func (workspace *hipAttentionHeadsChunkedWorkspace) ProjectionTopKPayload(count int) ([]byte, error) {
@@ -2893,6 +2937,9 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 	if err := workspace.ProjectionTopK.Close(); err != nil {
 		lastErr = err
 	}
+	if err := workspace.ProjectionTopKWork.Close(); err != nil {
+		lastErr = err
+	}
 	for _, output := range workspace.EmbeddingOutputs {
 		if err := output.Close(); err != nil {
 			lastErr = err
@@ -3028,6 +3075,11 @@ func (workspace *hipAttentionHeadsChunkedWorkspace) Close() error {
 	workspace.ProjectionScore = nil
 	workspace.ProjectionScoreBytes = nil
 	workspace.ProjectionTopK = nil
+	workspace.ProjectionTopKCap = 0
+	workspace.ProjectionTopKView = hipDeviceByteBuffer{}
+	workspace.ProjectionTopKWork = nil
+	workspace.ProjectionTopKWorkCap = 0
+	workspace.ProjectionTopKWorkView = hipDeviceByteBuffer{}
 	workspace.ProjectionTopKBytes = nil
 	workspace.ProjectionTopPacked = nil
 	workspace.ProjectionCandidates = nil
