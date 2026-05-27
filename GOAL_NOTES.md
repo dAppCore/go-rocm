@@ -1,5 +1,79 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Rejected Contiguous Score-Lane Q8 Dot
+
+- Tested a HIP-only q8 key dot specialization inside
+  `rocm_attention_heads_chunked_stage1` and the batch variant. The candidate
+  split each score lane into a contiguous segment and used packed `int32_t`
+  q8 loads for Gemma4's `head_dim=256`/`global_head_dim=512` paths.
+- This followed the `../go-mlx/IDEAS.md` direction to look for full/global
+  memory traffic and stride waste, but the live ROCm counters showed the same
+  launch/block shape and no measurable retained-state gain. The source edit was
+  reverted.
+
+Verification while the candidate was applied:
+
+```text
+go test ./go -run 'TestHIPKernelSource_AttentionChunkedStage1ScoreLaneReduction_Good|TestHIPAttentionHeads(ChunkedSharedMemBytes|ChunkedEligible)_Good|TestHIPAttentionHeadsChunkedEligible_Gemma4HeadDim512_Good' -count=1 -v
+PASS
+
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-q8-contig-scorelane.hsaco
+stderr: .bench-errors/hipcc_gfx1100_q8_contig_scorelane_20260527.err (0 bytes)
+```
+
+Short 2048 guard stayed neutral:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 18729325357 ns/op
+tok/s=109.3
+tokens=2048
+B/op=5460504
+allocs/op=4698
+kernel_total_launches=999352
+kernel_total_blocks=165483379
+stderr: .bench-errors/2048_q8_contig_scorelane_20260527.err (0 bytes)
+```
+
+2-turn retained smoke was also neutral/slightly worse than the accepted
+attention-split baseline:
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 11374977081 ns/op
+book_wall_s=11.35
+book_decode_s=10.68
+book_generated_tokens=1123
+book_tok/s=98.94
+book_turn01_tok/s=108.8
+book_turn02_tok/s=100.6
+B/op=7877032
+allocs/op=9634
+stderr: .bench-errors/book2_q8_contig_scorelane_20260527.err (0 bytes)
+artifact: /tmp/go-rocm-book2-q8-contig-scorelane-20260527.md
+```
+
+Accepted comparison immediately before the candidate:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 18714743561 ns/op
+tok/s=109.4
+B/op=5460088
+allocs/op=4697
+
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 11485795356 ns/op
+book_wall_s=11.46
+book_decode_s=10.79
+book_generated_tokens=1137
+book_tok/s=99.20
+book_turn02_tok/s=102.3
+```
+
+Rejected reason: this only changed the arithmetic shape inside an unchanged
+chunked-stage1 launch pattern. The `go-mlx/IDEAS.md` Gemma4 data points to
+local/SWA ring bounds, shared-KV aliasing, p-RoPE correctness, and zero-copy KV
+traffic. The retained artifact still showed local/SWA bounded while full/global
+stage1 grew with context, so this micro-optimization added kernel complexity
+without attacking the measured bottleneck.
+
 ## 2026-05-27 Accepted Retained Attention Split Table
 
 - `../go-mlx/IDEAS.md` calls out the Gemma4 architecture facts that matter for
