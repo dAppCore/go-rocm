@@ -2024,6 +2024,26 @@ Remaining blocker:
   empty stderr and both below the kept `32` rows per block shape. A q4 row-sum
   `__restrict__` pointer hint was neutral at `113.0 tok/s` and was also
   reverted rather than kept without a measurable gain.
+- Accepted retained `.kv`/MP4 descriptor correctness guard: direct token-page
+  attention indexing now requires `block_size == 1` in addition to
+  `page_count == token_count`. Mixed prompt block pages plus appended generated
+  token pages can otherwise accidentally satisfy the old equality in a retained
+  window and be read as flat token order, which explains chapter drift without a
+  hard kernel failure. The `gfx1100 -O2` HSACO rebuilt with empty compiler
+  stderr; source/package/no-cgo gates passed; the live transformer hardware
+  test passed with empty stderr; and a serialized `block_size=16` 2-turn
+  retained book guard completed with empty stderr at `8.06s` wall,
+  `92.33 tok/s` average, turn 2 `90.68 tok/s`, `999` retained tokens,
+  `5629408 B/op`, and `6946 allocs/op`. The default one-token descriptor fast
+  path stayed healthy: `text:Hi` with `512` generated tokens measured
+  `4542930686 ns/op`, `112.7 tok/s`, `3186176 B/op`, and `2465 allocs/op`
+  with empty stderr. The full `48k` 10-turn retained book guard with
+  `block_size=16` then passed the strict wall/story gates at `77.93s` wall,
+  `69.01s` decode, `5406` generated tokens, `69.37 tok/s` average, turn 10
+  `61.99 tok/s`, `7059` retained tokens, `chapter10_arc_anchor_hits=4`, no
+  max-token or repeated-turn failures, `41243712 B/op`, and `38212 allocs/op`;
+  this confirms the MP4 descriptor fix is correctness-preserving, but later-turn
+  decode remains below the final `90-100+ tok/s` scaling target.
 
 - [x] Phase 0: Snapshot the tree and establish the baseline.
   - Run `git status --short`.

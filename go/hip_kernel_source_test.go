@@ -351,6 +351,7 @@ func TestHIPKernelSource_AttentionChunkedStage1ScoreLaneReduction_Good(t *testin
 	core.AssertTrue(t, !strings.Contains(batchChunkedLookup, `rocm_attention_launch_args lookup`), "batch chunked lookup must not rebuild generic launch args per token")
 
 	stage1 := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_attention_heads_chunked_stage1`)
+	core.AssertTrue(t, strings.Contains(stage1, `device_kv_header->block_size == 1u`), "stage1 direct token-page fast path must reject mixed block/page MP4 KV streams")
 	core.AssertTrue(t, strings.Contains(stage1, `(score_lanes & (score_lanes - 1u)) == 0u`), "stage1 score lanes must stay shuffle-width safe")
 	core.AssertTrue(t, strings.Contains(stage1, `local < local_count && lane == 0u`), "stage1 score lanes must resolve KV pages once per token")
 	core.AssertTrue(t, strings.Contains(stage1, `key_pointer = rocm_shfl_u64(key_pointer, 0, static_cast<int>(score_lanes))`), "stage1 score lanes must broadcast key pointers from lane zero")
@@ -361,6 +362,11 @@ func TestHIPKernelSource_AttentionChunkedStage1ScoreLaneReduction_Good(t *testin
 	core.AssertTrue(t, strings.Contains(stage1, `value_scratch1[tid] = partial1`), "stage1 value reduction must write dim1 before the shared barrier")
 	core.AssertTrue(t, strings.Contains(stage1, `out1 += value_scratch1[value_group * pair_count + tid]`), "stage1 value reduction must reduce dim1 from the second scratch buffer")
 	core.AssertTrue(t, !strings.Contains(stage1, `scratch[tid] = partial1`), "stage1 value reduction must not reintroduce the second shared-memory pass")
+
+	batchStage1 := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_attention_heads_batch_chunked_stage1`)
+	core.AssertTrue(t, strings.Contains(batchStage1, `device_kv_header->block_size == 1u`), "batch stage1 direct token-page fast path must reject mixed block/page MP4 KV streams")
+	heads := hipKernelSourceFunctionBodyForTest(t, source, `__device__ void rocm_run_single_head_attention_token_parallel`)
+	core.AssertTrue(t, strings.Contains(heads, `device_kv_header->block_size == 1u`), "shared attention direct token-page fast path must reject mixed block/page MP4 KV streams")
 }
 
 func TestHIPKernelSource_NVIDIAHIPCompile_Good(t *testing.T) {

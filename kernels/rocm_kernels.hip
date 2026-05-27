@@ -5382,7 +5382,10 @@ __device__ void rocm_run_single_head_attention_token_parallel(const rocm_attenti
 		? reinterpret_cast<const rocm_device_kv_descriptor_header *>(static_cast<uintptr_t>(args.descriptor_pointer))
 		: nullptr;
 	const unsigned char *device_kv_base = reinterpret_cast<const unsigned char *>(device_kv_header);
-	const bool direct_token_pages = device_kv_header != nullptr && device_kv_header->page_count == args.token_count;
+	const bool direct_token_pages =
+		device_kv_header != nullptr &&
+		device_kv_header->block_size == 1u &&
+		device_kv_header->page_count == args.token_count;
 	const uint64_t shared_weight_bytes = args.weight_pointer == 0 ? static_cast<uint64_t>(args.token_count) * sizeof(float) : 0u;
 	uint64_t shared_offset = rocm_attention_align_shared_offset(shared_weight_bytes, sizeof(uint64_t));
 	const uint64_t pointer_bytes = static_cast<uint64_t>(args.token_count) * sizeof(uint64_t);
@@ -5988,6 +5991,7 @@ extern "C" __global__ void rocm_attention_heads_chunked_stage1(const unsigned ch
 	const unsigned char *device_kv_base = reinterpret_cast<const unsigned char *>(device_kv_header);
 	const bool direct_kq8vq4_token_pages =
 		device_kv_header != nullptr &&
+		device_kv_header->block_size == 1u &&
 		device_kv_header->page_count == args.token_count &&
 		device_kv_header->mode_code == ROCM_DEVICE_KV_DESCRIPTOR_MODE_KQ8VQ4;
 
@@ -6299,6 +6303,7 @@ extern "C" __global__ void rocm_attention_heads_batch_chunked_stage1(const unsig
 	const unsigned char *device_kv_base = reinterpret_cast<const unsigned char *>(device_kv_header);
 	const bool direct_kq8vq4_token_pages =
 		device_kv_header != nullptr &&
+		device_kv_header->block_size == 1u &&
 		device_kv_header->page_count == args.token_count &&
 		device_kv_header->mode_code == ROCM_DEVICE_KV_DESCRIPTOR_MODE_KQ8VQ4;
 
