@@ -59,6 +59,11 @@ type inferenceBenchmarkHIPKernelShapeEntry struct {
 	stats inferenceBenchmarkHIPKernelStats
 }
 
+type inferenceBenchmarkHIPKernelStatsSnapshot struct {
+	Kernel map[string]inferenceBenchmarkHIPKernelStats
+	Total  inferenceBenchmarkHIPKernelStats
+}
+
 type inferenceBenchmarkHIPKernelCountingDriver struct {
 	nativeHIPDriver
 	mu     sync.Mutex
@@ -167,6 +172,45 @@ func (driver *inferenceBenchmarkHIPKernelCountingDriver) TotalKernelStats() infe
 	driver.mu.Lock()
 	defer driver.mu.Unlock()
 	return driver.total
+}
+
+func inferenceBenchmarkBookKernelSnapshot(driver *inferenceBenchmarkHIPKernelCountingDriver) inferenceBenchmarkHIPKernelStatsSnapshot {
+	if driver == nil {
+		return inferenceBenchmarkHIPKernelStatsSnapshot{}
+	}
+	return inferenceBenchmarkHIPKernelStatsSnapshot{
+		Kernel: driver.KernelStatsSnapshot(),
+		Total:  driver.TotalKernelStats(),
+	}
+}
+
+func inferenceBenchmarkBookKernelDelta(driver *inferenceBenchmarkHIPKernelCountingDriver, before inferenceBenchmarkHIPKernelStatsSnapshot) inferenceBenchmarkHIPKernelStatsSnapshot {
+	if driver == nil {
+		return inferenceBenchmarkHIPKernelStatsSnapshot{}
+	}
+	after := inferenceBenchmarkBookKernelSnapshot(driver)
+	delta := inferenceBenchmarkHIPKernelStatsSnapshot{
+		Kernel: make(map[string]inferenceBenchmarkHIPKernelStats, len(after.Kernel)),
+		Total:  inferenceBenchmarkHIPKernelStatsDelta(after.Total, before.Total),
+	}
+	for name, stats := range after.Kernel {
+		delta.Kernel[name] = inferenceBenchmarkHIPKernelStatsDelta(stats, before.Kernel[name])
+	}
+	return delta
+}
+
+func inferenceBenchmarkHIPKernelStatsDelta(after, before inferenceBenchmarkHIPKernelStats) inferenceBenchmarkHIPKernelStats {
+	return inferenceBenchmarkHIPKernelStats{
+		Launches: inferenceBenchmarkUint64Delta(after.Launches, before.Launches),
+		Blocks:   inferenceBenchmarkUint64Delta(after.Blocks, before.Blocks),
+	}
+}
+
+func inferenceBenchmarkUint64Delta(after, before uint64) uint64 {
+	if after < before {
+		return 0
+	}
+	return after - before
 }
 
 func inferenceBenchmarkReportHIPKernelRouteMetrics(b *testing.B, driver *inferenceBenchmarkHIPKernelCountingDriver) {
@@ -552,6 +596,66 @@ func TestInferenceBenchmarkHIPKernelCountingDriver_Good(t *testing.T) {
 	}
 }
 
+func TestInferenceBenchmarkBookTurnKernelDeltas_Good(t *testing.T) {
+	driver := newInferenceBenchmarkHIPKernelCountingDriver(inferenceBenchmarkHIPKernelCountingStubDriver{})
+	before := inferenceBenchmarkBookKernelSnapshot(driver)
+	err := driver.LaunchKernel(hipKernelLaunchConfig{
+		Name:   hipKernelNameMLXQ4GELUTanhMul,
+		Args:   []byte{1},
+		GridX:  5,
+		GridY:  1,
+		GridZ:  1,
+		BlockX: 2,
+		BlockY: 1,
+		BlockZ: 1,
+	})
+	if err != nil {
+		t.Fatalf("LaunchKernel gelu: %v", err)
+	}
+	err = driver.LaunchKernel(hipKernelLaunchConfig{
+		Name:   hipKernelNameAttentionHeadsChunkedStage1,
+		Args:   []byte{1},
+		GridX:  2,
+		GridY:  1,
+		GridZ:  1,
+		BlockX: 512,
+		BlockY: 1,
+		BlockZ: 1,
+	})
+	if err != nil {
+		t.Fatalf("LaunchKernel attention: %v", err)
+	}
+	delta := inferenceBenchmarkBookKernelDelta(driver, before)
+	if delta.Total.Launches != 2 || delta.Total.Blocks != 7 {
+		t.Fatalf("book kernel delta total = %+v, want 2 launches and 7 blocks", delta.Total)
+	}
+	stats := inferenceBenchmarkBookSelectedKernelDeltas(delta)
+	if len(stats) != 2 ||
+		stats[0].Kernel != hipKernelNameMLXQ4GELUTanhMul ||
+		stats[0].Launches != 1 ||
+		stats[0].Blocks != 5 ||
+		stats[1].Kernel != hipKernelNameAttentionHeadsChunkedStage1 ||
+		stats[1].Launches != 1 ||
+		stats[1].Blocks != 2 {
+		t.Fatalf("selected book kernel deltas = %+v, want gelu and chunked attention deltas", stats)
+	}
+	run := inferenceBenchmarkBookRun{
+		TurnStats: []inferenceBenchmarkBookTurnStat{{
+			Chapter:         10,
+			GeneratedTokens: 2,
+			KernelStats:     stats,
+		}},
+	}
+	var builder strings.Builder
+	inferenceBenchmarkWriteBookTurnKernelRouteMetrics(&builder, run)
+	got := builder.String()
+	if !strings.Contains(got, "Per-Turn Selected HIP Kernels") ||
+		!strings.Contains(got, hipKernelNameMLXQ4GELUTanhMul) ||
+		!strings.Contains(got, "2.50") {
+		t.Fatalf("per-turn kernel output = %q, want selected kernel table with per-token ratios", got)
+	}
+}
+
 func BenchmarkInferenceGemma4Q4Generate(b *testing.B) {
 	benchmarkInferenceGemma4Q4Generate(b)
 }
@@ -778,7 +882,7 @@ func BenchmarkInferenceGemma4Q4Book10Turn_RetainedState(b *testing.B) {
 		if kernelCounter != nil {
 			kernelCounter.ResetKernelStats()
 		}
-		run, err := inferenceBenchmarkRunBookRetained(context.Background(), loaded, cfg, workload, generate, turns, turnTimeout)
+		run, err := inferenceBenchmarkRunBookRetained(context.Background(), loaded, cfg, workload, generate, turns, turnTimeout, kernelCounter)
 		if err != nil {
 			b.StopTimer()
 			inferenceBenchmarkMaybeWriteBookOutput(b, run, "retained", kernelCounter)
@@ -1028,7 +1132,16 @@ type inferenceBenchmarkBookTurnStat struct {
 	ActiveMemoryBytes uint64
 	AllocBytes        uint64
 	Allocs            uint64
+	KernelLaunches    uint64
+	KernelBlocks      uint64
+	KernelStats       []inferenceBenchmarkBookTurnKernelStat
 	HitMaxTokens      bool
+}
+
+type inferenceBenchmarkBookTurnKernelStat struct {
+	Kernel   string
+	Launches uint64
+	Blocks   uint64
 }
 
 type inferenceBenchmarkGemma4Q4RetainedBookSession struct {
@@ -1071,7 +1184,7 @@ func inferenceBenchmarkBookWorkload() inferenceBenchmarkBookWorkloadSpec {
 	}
 }
 
-func inferenceBenchmarkRunBookRetained(ctx context.Context, model *hipLoadedModel, cfg hipGemma4Q4ForwardConfig, workload inferenceBenchmarkBookWorkloadSpec, generate inference.GenerateConfig, turns int, turnTimeout time.Duration) (inferenceBenchmarkBookRun, error) {
+func inferenceBenchmarkRunBookRetained(ctx context.Context, model *hipLoadedModel, cfg hipGemma4Q4ForwardConfig, workload inferenceBenchmarkBookWorkloadSpec, generate inference.GenerateConfig, turns int, turnTimeout time.Duration, kernelCounter *inferenceBenchmarkHIPKernelCountingDriver) (inferenceBenchmarkBookRun, error) {
 	if model == nil {
 		return inferenceBenchmarkBookRun{}, fmt.Errorf("retained book workload model is nil")
 	}
@@ -1096,10 +1209,12 @@ func inferenceBenchmarkRunBookRetained(ctx context.Context, model *hipLoadedMode
 			turnCtx, cancel = context.WithTimeout(ctx, turnTimeout)
 		}
 		allocBefore := inferenceBenchmarkAllocSnapshot()
+		kernelBefore := inferenceBenchmarkBookKernelSnapshot(kernelCounter)
 		turnStart := time.Now()
 		turn, err := session.Generate(turnCtx, prompt, generate)
 		turnWall := time.Since(turnStart)
 		allocBytes, allocs := inferenceBenchmarkAllocDelta(allocBefore, inferenceBenchmarkAllocSnapshot())
+		kernelDelta := inferenceBenchmarkBookKernelDelta(kernelCounter, kernelBefore)
 		if err != nil {
 			cancel()
 			return inferenceBenchmarkFinalizeFailedBookRun(run, time.Since(start), err), err
@@ -1134,6 +1249,9 @@ func inferenceBenchmarkRunBookRetained(ctx context.Context, model *hipLoadedMode
 			ActiveMemoryBytes: activeMemory,
 			AllocBytes:        allocBytes,
 			Allocs:            allocs,
+			KernelLaunches:    kernelDelta.Total.Launches,
+			KernelBlocks:      kernelDelta.Total.Blocks,
+			KernelStats:       inferenceBenchmarkBookSelectedKernelDeltas(kernelDelta),
 			HitMaxTokens:      turn.GeneratedTokens >= generate.MaxTokens,
 		})
 		if chapter == 10 {
@@ -1643,8 +1761,8 @@ func inferenceBenchmarkMaybeWriteBookOutput(b *testing.B, run inferenceBenchmark
 	}
 	builder.WriteString("\n\n")
 	if len(run.TurnStats) > 0 {
-		builder.WriteString("| turn | prompt_tokens | generated_tokens | retained_tokens | wake_s | prefill_s | decode_s | wall_s | decode_tok_s | active_mib | peak_mib | alloc_bytes | allocs | hit_max_tokens |\n")
-		builder.WriteString("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|\n")
+		builder.WriteString("| turn | prompt_tokens | generated_tokens | retained_tokens | wake_s | prefill_s | decode_s | wall_s | decode_tok_s | active_mib | peak_mib | alloc_bytes | allocs | kernel_launches | kernel_blocks | hit_max_tokens |\n")
+		builder.WriteString("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|\n")
 		for _, stat := range run.TurnStats {
 			decodeTokS := 0.0
 			if stat.Decode > 0 {
@@ -1677,6 +1795,10 @@ func inferenceBenchmarkMaybeWriteBookOutput(b *testing.B, run inferenceBenchmark
 			builder.WriteString(" | ")
 			builder.WriteString(strconv.FormatUint(stat.Allocs, 10))
 			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatUint(stat.KernelLaunches, 10))
+			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatUint(stat.KernelBlocks, 10))
+			builder.WriteString(" | ")
 			if stat.HitMaxTokens {
 				builder.WriteString("yes")
 			} else {
@@ -1686,6 +1808,7 @@ func inferenceBenchmarkMaybeWriteBookOutput(b *testing.B, run inferenceBenchmark
 		}
 		builder.WriteString("\n")
 	}
+	inferenceBenchmarkWriteBookTurnKernelRouteMetrics(&builder, run)
 	inferenceBenchmarkWriteHIPKernelRouteMetrics(&builder, kernelCounter, 12, run.GeneratedTokens)
 	for index, chapter := range run.Chapters {
 		builder.WriteString("## Chapter ")
@@ -1697,6 +1820,47 @@ func inferenceBenchmarkMaybeWriteBookOutput(b *testing.B, run inferenceBenchmark
 	if err := os.WriteFile(path, []byte(builder.String()), 0644); err != nil {
 		b.Fatalf("write GO_ROCM_BOOK_OUTPUT_FILE=%q: %v", path, err)
 	}
+}
+
+func inferenceBenchmarkWriteBookTurnKernelRouteMetrics(builder *strings.Builder, run inferenceBenchmarkBookRun) {
+	if builder == nil {
+		return
+	}
+	hasStats := false
+	for _, turn := range run.TurnStats {
+		if len(turn.KernelStats) > 0 {
+			hasStats = true
+			break
+		}
+	}
+	if !hasStats {
+		return
+	}
+	builder.WriteString("## Per-Turn Selected HIP Kernels\n\n")
+	builder.WriteString("| turn | kernel | launches | blocks | launches/generated_token | blocks/generated_token |\n")
+	builder.WriteString("|---:|---|---:|---:|---:|---:|\n")
+	for _, turn := range run.TurnStats {
+		for _, stat := range turn.KernelStats {
+			builder.WriteString("| ")
+			builder.WriteString(strconv.Itoa(turn.Chapter))
+			builder.WriteString(" | `")
+			builder.WriteString(stat.Kernel)
+			builder.WriteString("` | ")
+			builder.WriteString(strconv.FormatUint(stat.Launches, 10))
+			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatUint(stat.Blocks, 10))
+			if turn.GeneratedTokens > 0 {
+				builder.WriteString(" | ")
+				builder.WriteString(strconv.FormatFloat(float64(stat.Launches)/float64(turn.GeneratedTokens), 'f', 2, 64))
+				builder.WriteString(" | ")
+				builder.WriteString(strconv.FormatFloat(float64(stat.Blocks)/float64(turn.GeneratedTokens), 'f', 2, 64))
+			} else {
+				builder.WriteString(" | 0.00 | 0.00")
+			}
+			builder.WriteString(" |\n")
+		}
+	}
+	builder.WriteString("\n")
 }
 
 func inferenceBenchmarkWriteHIPKernelRouteMetrics(builder *strings.Builder, driver *inferenceBenchmarkHIPKernelCountingDriver, limit, generatedTokens int) {
@@ -1730,7 +1894,36 @@ func inferenceBenchmarkSelectedHIPKernelEntries(driver *inferenceBenchmarkHIPKer
 	if driver == nil {
 		return nil
 	}
-	names := []string{
+	names := inferenceBenchmarkSelectedHIPKernelNames()
+	entries := make([]inferenceBenchmarkHIPKernelEntry, 0, len(names))
+	for _, name := range names {
+		entries = append(entries, inferenceBenchmarkHIPKernelEntry{name: name, stats: driver.KernelStats(name)})
+	}
+	return entries
+}
+
+func inferenceBenchmarkBookSelectedKernelDeltas(snapshot inferenceBenchmarkHIPKernelStatsSnapshot) []inferenceBenchmarkBookTurnKernelStat {
+	if len(snapshot.Kernel) == 0 {
+		return nil
+	}
+	names := inferenceBenchmarkSelectedHIPKernelNames()
+	out := make([]inferenceBenchmarkBookTurnKernelStat, 0, len(names))
+	for _, name := range names {
+		stats := snapshot.Kernel[name]
+		if stats.Launches == 0 && stats.Blocks == 0 {
+			continue
+		}
+		out = append(out, inferenceBenchmarkBookTurnKernelStat{
+			Kernel:   name,
+			Launches: stats.Launches,
+			Blocks:   stats.Blocks,
+		})
+	}
+	return out
+}
+
+func inferenceBenchmarkSelectedHIPKernelNames() []string {
+	return []string{
 		hipKernelNameMLXQ4Proj,
 		hipKernelNameMLXQ4ProjCols256,
 		hipKernelNameMLXQ4TripleProj,
@@ -1746,11 +1939,6 @@ func inferenceBenchmarkSelectedHIPKernelEntries(driver *inferenceBenchmarkHIPKer
 		hipKernelNameAttentionHeadsBatchChunkedStage1,
 		hipKernelNameAttentionHeadsBatchChunkedStage2,
 	}
-	entries := make([]inferenceBenchmarkHIPKernelEntry, 0, len(names))
-	for _, name := range names {
-		entries = append(entries, inferenceBenchmarkHIPKernelEntry{name: name, stats: driver.KernelStats(name)})
-	}
-	return entries
 }
 
 func inferenceBenchmarkWriteHIPKernelRouteTable(builder *strings.Builder, title string, entries []inferenceBenchmarkHIPKernelEntry, generatedTokens int) {
@@ -1920,6 +2108,10 @@ func inferenceBenchmarkReportBookTurnStats(b *testing.B, run inferenceBenchmarkB
 		b.ReportMetric(float64(stat.PeakMemoryBytes), fmt.Sprintf("book_turn%02d_peak_memory_bytes", stat.Chapter))
 		b.ReportMetric(float64(stat.AllocBytes), fmt.Sprintf("book_turn%02d_alloc_bytes/op", stat.Chapter))
 		b.ReportMetric(float64(stat.Allocs), fmt.Sprintf("book_turn%02d_allocs/op", stat.Chapter))
+		if stat.KernelLaunches > 0 || stat.KernelBlocks > 0 {
+			b.ReportMetric(float64(stat.KernelLaunches), fmt.Sprintf("book_turn%02d_kernel_launches/op", stat.Chapter))
+			b.ReportMetric(float64(stat.KernelBlocks), fmt.Sprintf("book_turn%02d_kernel_blocks/op", stat.Chapter))
+		}
 	}
 	b.ReportMetric(float64(maxedTurns), "book_maxed_turns/op")
 	b.ReportMetric(float64(maxTurnGenerated), "book_max_turn_generated_tokens/op")

@@ -17198,3 +17198,58 @@ ok dappco.re/go/rocm 0.156s
 go test ./... -count=1
 ok dappco.re/go/rocm/workspace 0.696s
 ```
+
+## 2026-05-27 Accepted Per-Turn Book Kernel Metrics
+
+Added per-turn HIP kernel deltas to the retained `book.md` benchmark artifact
+and benchmark metrics. The aggregate route table was hiding which kernels bend
+as retained context grows; each turn now records total launched blocks/launches
+and a selected-hot-kernel table with per-generated-token ratios.
+
+Focused verification:
+
+```text
+go test ./go -run 'TestInferenceBenchmark(HIPKernelCountingDriver|BookTurnKernelDeltas|BookThresholdHelpers|BookRepetitionStats|BookPrompt)' -count=1 -v
+PASS
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.142s
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.107s
+```
+
+2-turn retained artifact proof on the RX 7800 XT:
+
+```text
+GO_ROCM_BOOK_TURNS=2
+GO_ROCM_BENCH_KERNEL_ROUTE_METRICS=1
+GO_ROCM_BOOK_OUTPUT_FILE=/tmp/go-rocm-book2-turn-kernel-metrics.md
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 11097132823 ns/op
+book_wall_s=11.07
+book_generated_tokens=1098
+book_turn01_tok/s=108.8
+book_turn02_tok/s=102.3
+book_turn01_kernel_launches=283901
+book_turn02_kernel_launches=260056
+book_turn01_kernel_blocks=48413682
+book_turn02_kernel_blocks=46067912
+stderr: .bench-errors/book2_turn_kernel_metrics_20260527.err (0 bytes)
+```
+
+The per-turn table shows q4 projection/GELU work staying essentially flat per
+generated token while retained attention grows with context:
+
+```text
+turn 1 q4 GELU blocks/generated_token: 42313
+turn 2 q4 GELU blocks/generated_token: 42321
+turn 1 q4 projection blocks/generated_token: 19618
+turn 2 q4 projection blocks/generated_token: 19622
+turn 1 chunked attention stage1 blocks/generated_token: 886
+turn 2 chunked attention stage1 blocks/generated_token: 1428
+```
+
+This does not complete the decode goal. It narrows the next speed target:
+late-turn retained slowdown is now easier to distinguish from fixed per-token
+q4 math, and the next optimization pass should target retained chunked
+attention scaling rather than another already-rejected generic q4 geometry.
