@@ -1,5 +1,62 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Dependency Refresh and Direct KV Restore Copy
+
+- Fast-forwarded active dev submodules again:
+  - `external/go-inference` `62babf7` -> `35a2228`
+    (`test(openai/chunkenc): AX-11 baselines for per-token SSE encoder`).
+  - `external/go-cgo` `9fc855d` -> `3880482`
+    (`perf(buffer): NewBufferUnmanaged`, `perf(free): drop redundant
+    freedPointers.Store after LoadOrStore`).
+- Verified the refreshed dependency surface:
+
+```text
+go test ./external/go-inference/go/... -count=1
+go test ./external/go-cgo/go/... -count=1
+go test ./go -count=1
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+```
+
+- Accepted a synchronous KV restore copy cleanup in `hipCopyPinnedHostToDevice`.
+  The cgo HIP path now passes the Go slice pointer directly to the blocking
+  `hipMemcpy` call and keeps it alive through the call instead of creating a
+  `go-cgo` `Scope` and `PinIn` view per copy. This matches the current
+  `go-cgo` guidance for one-shot C calls; scoped pins remain for data that C may
+  retain across calls, such as loaded module images.
+- The targeted KV restore benchmark improved versus the older note's
+  `12163 ns/op`, `115360 B/op`, and `14 allocs/op` baseline:
+
+```text
+BenchmarkROCmDeviceKVPageFromRawPayload_KQ8VQ4PinnedCopy:
+  9814 ns/op, 10026.84 MB/s, 114981 B/op, 3 allocs/op
+  10012 ns/op, 9828.74 MB/s, 114981 B/op, 3 allocs/op
+  9507 ns/op, 10351.30 MB/s, 114980 B/op, 3 allocs/op
+```
+
+- Fresh RX 7800 XT 2048-token q4 guards on the accepted SWA-window HSACO stayed
+  green after the dependency refresh and copy cleanup:
+
+```text
+Route metrics on:
+  18924435132 ns/op
+  108.2 tok/s
+  6684640 B/op
+  4662 allocs/op
+  kernel_total_launches/op 999355
+  stderr: /tmp/go-rocm-2048-route-after-deps-3.err (empty)
+
+Route metrics off:
+  18969426792 ns/op, 108.0 tok/s, 6665752 B/op, 2606 allocs/op
+  18931078471 ns/op, 108.2 tok/s, 6667064 B/op, 2609 allocs/op
+  stderr: /tmp/go-rocm-2048-after-deps-3.err and
+          /tmp/go-rocm-2048-direct-pinned-copy.err (empty)
+```
+
+- The copy cleanup is restore/cache-copy progress, not a decode-kernel win. The
+  route-metric shape is still dominated by q4 projection, GELU
+  multiply/projection, residual/norm, and chunked decode attention launch
+  volume.
+
 ## 2026-05-27 Dependency Refresh and Rejected Batch Row-Base Probe
 
 - Fast-forwarded active dev submodules again:

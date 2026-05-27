@@ -804,10 +804,7 @@ func hipCopyPinnedHostToDevice(driver nativeHIPDriver, pointer nativeDevicePoint
 	if !ok {
 		return hipCopyHostToDevice(driver, pointer, data)
 	}
-	scope := corecgo.NewScope()
-	defer scope.FreeAll()
-	host, sizeBytes := cgoHIPPinnedBytes(scope, data)
-	if err := pinned.CopyPinnedHostToDevice(pointer, host, sizeBytes); err != nil {
+	if err := pinned.CopyPinnedHostToDevice(pointer, unsafe.Pointer(&data[0]), len(data)); err != nil {
 		return err
 	}
 	runtime.KeepAlive(data)
@@ -828,20 +825,6 @@ func (cgoHIPDriver) CopyPinnedHostToDevice(pointer nativeDevicePointer, host uns
 		return hipReturnError("hipMemcpyHostToDevice", int(rc))
 	}
 	return nil
-}
-
-func cgoHIPPinnedBytes(scope *corecgo.Scope, data []byte) (host unsafe.Pointer, sizeBytes int) {
-	if len(data) == 0 {
-		return nil, 0
-	}
-	defer func() {
-		if recover() != nil {
-			host = unsafe.Pointer(&data[0])
-			sizeBytes = len(data)
-		}
-	}()
-	view := corecgo.PinIn(scope, data)
-	return view.Ptr(), view.Bytes()
 }
 
 func (driver cgoHIPDriver) CopyHostToDeviceAsync(pointer nativeDevicePointer, data []byte) error {

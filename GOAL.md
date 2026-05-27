@@ -61,9 +61,10 @@ can now restore those block refs directly into HIP device KV pages using
 device runtime without the older host-cache remirror step. Keep this layer
 HIP-generic: the same code path should remain usable for a future NVIDIA HIP
 backend profile if the local toolchain targets CUDA through HIP.
-2026-05-27 dependency refresh: `external/go-inference` is at `62babf7`
-(`perf(model/pack): cache Fs handle via sync.Once`) and `external/go-cgo` is
-at `9fc855d` (`test(bench): extend AX-11 coverage`).
+2026-05-27 dependency refresh: `external/go-inference` is at `35a2228`
+(`test(openai/chunkenc): AX-11 baselines for per-token SSE encoder`) and
+`external/go-cgo` is at `3880482` (`perf(free): drop redundant
+freedPointers.Store after LoadOrStore`).
 The refreshed dependency surface passed `go test ./external/go-inference/go/...`
 and `go test ./external/go-cgo/go/...`; `go test ./go` and `go test ./...`
 also stayed green.
