@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -386,11 +387,14 @@ type inferenceBenchmarkBookTurnStat struct {
 	PromptTokens      int
 	GeneratedTokens   int
 	RetainedTokens    int
+	Wake              time.Duration
 	Wall              time.Duration
 	Prefill           time.Duration
 	Decode            time.Duration
 	PeakMemoryBytes   uint64
 	ActiveMemoryBytes uint64
+	AllocBytes        uint64
+	Allocs            uint64
 	HitMaxTokens      bool
 }
 
@@ -410,6 +414,7 @@ type inferenceBenchmarkGemma4Q4RetainedTurn struct {
 	Text            string
 	PromptTokens    int
 	GeneratedTokens int
+	Wake            time.Duration
 	Prefill         time.Duration
 	Decode          time.Duration
 }
@@ -457,9 +462,11 @@ func inferenceBenchmarkRunBookRetained(ctx context.Context, model *hipLoadedMode
 		if turnTimeout > 0 {
 			turnCtx, cancel = context.WithTimeout(ctx, turnTimeout)
 		}
+		allocBefore := inferenceBenchmarkAllocSnapshot()
 		turnStart := time.Now()
 		turn, err := session.Generate(turnCtx, prompt, generate)
 		turnWall := time.Since(turnStart)
+		allocBytes, allocs := inferenceBenchmarkAllocDelta(allocBefore, inferenceBenchmarkAllocSnapshot())
 		if err != nil {
 			cancel()
 			return inferenceBenchmarkBookRun{}, err
@@ -485,11 +492,14 @@ func inferenceBenchmarkRunBookRetained(ctx context.Context, model *hipLoadedMode
 			PromptTokens:      turn.PromptTokens,
 			GeneratedTokens:   turn.GeneratedTokens,
 			RetainedTokens:    session.position,
+			Wake:              turn.Wake,
 			Wall:              turnWall,
 			Prefill:           turn.Prefill,
 			Decode:            turn.Decode,
 			PeakMemoryBytes:   peakMemory,
 			ActiveMemoryBytes: activeMemory,
+			AllocBytes:        allocBytes,
+			Allocs:            allocs,
 			HitMaxTokens:      turn.GeneratedTokens >= generate.MaxTokens,
 		})
 		if chapter == 10 {
@@ -524,6 +534,7 @@ func inferenceBenchmarkRunBookReplay(ctx context.Context, model inference.TextMo
 		if turnTimeout > 0 {
 			turnCtx, cancel = context.WithTimeout(ctx, turnTimeout)
 		}
+		allocBefore := inferenceBenchmarkAllocSnapshot()
 		turnStart := time.Now()
 		generatedBefore := run.GeneratedTokens
 		for token := range model.Generate(turnCtx, prompt, inferenceBenchmarkBookGenerateOptions(generate)...) {
@@ -531,6 +542,7 @@ func inferenceBenchmarkRunBookReplay(ctx context.Context, model inference.TextMo
 			run.GeneratedTokens++
 		}
 		turnWall := time.Since(turnStart)
+		allocBytes, allocs := inferenceBenchmarkAllocDelta(allocBefore, inferenceBenchmarkAllocSnapshot())
 		if err := model.Err(); err != nil {
 			cancel()
 			return inferenceBenchmarkBookRun{}, err
@@ -550,11 +562,14 @@ func inferenceBenchmarkRunBookReplay(ctx context.Context, model inference.TextMo
 			PromptTokens:      metrics.PromptTokens,
 			GeneratedTokens:   turnGenerated,
 			RetainedTokens:    run.PromptTokens + run.GeneratedTokens,
+			Wake:              0,
 			Wall:              turnWall,
 			Prefill:           metrics.PrefillDuration,
 			Decode:            metrics.DecodeDuration,
 			PeakMemoryBytes:   metrics.PeakMemoryBytes,
 			ActiveMemoryBytes: metrics.ActiveMemoryBytes,
+			AllocBytes:        allocBytes,
+			Allocs:            allocs,
 			HitMaxTokens:      turnGenerated >= generate.MaxTokens,
 		})
 		if metrics.PeakMemoryBytes > run.PeakMemoryBytes {
@@ -577,6 +592,24 @@ func inferenceBenchmarkRunBookReplay(ctx context.Context, model inference.TextMo
 	run.Wall = time.Since(start)
 	run.ArcAnchorHits = inferenceBenchmarkBookArcAnchorHits(run.Chapter10)
 	return run, nil
+}
+
+func inferenceBenchmarkAllocSnapshot() runtime.MemStats {
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+	return stats
+}
+
+func inferenceBenchmarkAllocDelta(before, after runtime.MemStats) (uint64, uint64) {
+	var bytes uint64
+	if after.TotalAlloc >= before.TotalAlloc {
+		bytes = after.TotalAlloc - before.TotalAlloc
+	}
+	var allocs uint64
+	if after.Mallocs >= before.Mallocs {
+		allocs = after.Mallocs - before.Mallocs
+	}
+	return bytes, allocs
 }
 
 func inferenceBenchmarkRetainedBookMemory(model *hipLoadedModel, session *inferenceBenchmarkGemma4Q4RetainedBookSession) (uint64, uint64) {
@@ -804,6 +837,7 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 		Text:            text.String(),
 		PromptTokens:    len(promptTokens),
 		GeneratedTokens: generatedCount,
+		Wake:            0,
 		Prefill:         prefillDuration,
 		Decode:          time.Since(decodeStart),
 	}, nil
@@ -922,8 +956,8 @@ func inferenceBenchmarkMaybeWriteBookOutput(b *testing.B, run inferenceBenchmark
 	builder.WriteString(strconv.FormatFloat(run.Wall.Seconds(), 'f', 3, 64))
 	builder.WriteString("\n\n")
 	if len(run.TurnStats) > 0 {
-		builder.WriteString("| turn | prompt_tokens | generated_tokens | retained_tokens | prefill_s | decode_s | wall_s | decode_tok_s | active_mib | peak_mib | hit_max_tokens |\n")
-		builder.WriteString("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|\n")
+		builder.WriteString("| turn | prompt_tokens | generated_tokens | retained_tokens | wake_s | prefill_s | decode_s | wall_s | decode_tok_s | active_mib | peak_mib | alloc_bytes | allocs | hit_max_tokens |\n")
+		builder.WriteString("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|\n")
 		for _, stat := range run.TurnStats {
 			decodeTokS := 0.0
 			if stat.Decode > 0 {
@@ -938,6 +972,8 @@ func inferenceBenchmarkMaybeWriteBookOutput(b *testing.B, run inferenceBenchmark
 			builder.WriteString(" | ")
 			builder.WriteString(strconv.Itoa(stat.RetainedTokens))
 			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatFloat(stat.Wake.Seconds(), 'f', 3, 64))
+			builder.WriteString(" | ")
 			builder.WriteString(strconv.FormatFloat(stat.Prefill.Seconds(), 'f', 3, 64))
 			builder.WriteString(" | ")
 			builder.WriteString(strconv.FormatFloat(stat.Decode.Seconds(), 'f', 3, 64))
@@ -949,6 +985,10 @@ func inferenceBenchmarkMaybeWriteBookOutput(b *testing.B, run inferenceBenchmark
 			builder.WriteString(strconv.FormatFloat(float64(stat.ActiveMemoryBytes)/float64(1<<20), 'f', 1, 64))
 			builder.WriteString(" | ")
 			builder.WriteString(strconv.FormatFloat(float64(stat.PeakMemoryBytes)/float64(1<<20), 'f', 1, 64))
+			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatUint(stat.AllocBytes, 10))
+			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatUint(stat.Allocs, 10))
 			builder.WriteString(" | ")
 			if stat.HitMaxTokens {
 				builder.WriteString("yes")
@@ -1033,12 +1073,15 @@ func inferenceBenchmarkReportBookTurnStats(b *testing.B, run inferenceBenchmarkB
 		b.ReportMetric(float64(stat.PromptTokens), fmt.Sprintf("book_turn%02d_prompt_tokens/op", stat.Chapter))
 		b.ReportMetric(float64(stat.GeneratedTokens), fmt.Sprintf("book_turn%02d_generated_tokens/op", stat.Chapter))
 		b.ReportMetric(float64(stat.RetainedTokens), fmt.Sprintf("book_turn%02d_retained_tokens/op", stat.Chapter))
+		b.ReportMetric(float64(stat.Wake)/float64(time.Second), fmt.Sprintf("book_turn%02d_wake_s/op", stat.Chapter))
 		b.ReportMetric(float64(stat.Prefill)/float64(time.Second), fmt.Sprintf("book_turn%02d_prefill_s/op", stat.Chapter))
 		b.ReportMetric(float64(stat.Decode)/float64(time.Second), fmt.Sprintf("book_turn%02d_decode_s/op", stat.Chapter))
 		b.ReportMetric(float64(stat.Wall)/float64(time.Second), fmt.Sprintf("book_turn%02d_wall_s/op", stat.Chapter))
 		b.ReportMetric(decodeTokS, fmt.Sprintf("book_turn%02d_tok/s", stat.Chapter))
 		b.ReportMetric(float64(stat.ActiveMemoryBytes), fmt.Sprintf("book_turn%02d_active_memory_bytes", stat.Chapter))
 		b.ReportMetric(float64(stat.PeakMemoryBytes), fmt.Sprintf("book_turn%02d_peak_memory_bytes", stat.Chapter))
+		b.ReportMetric(float64(stat.AllocBytes), fmt.Sprintf("book_turn%02d_alloc_bytes/op", stat.Chapter))
+		b.ReportMetric(float64(stat.Allocs), fmt.Sprintf("book_turn%02d_allocs/op", stat.Chapter))
 	}
 	b.ReportMetric(float64(maxedTurns), "book_maxed_turns/op")
 	b.ReportMetric(float64(maxTurnGenerated), "book_max_turn_generated_tokens/op")

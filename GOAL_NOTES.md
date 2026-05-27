@@ -60,6 +60,26 @@ peak_memory_bytes 3495653376
 B/op 8017536
 allocs/op 16269
 ```
+- Extended that retained-book accounting pass to cover the rest of the
+  `GOAL.md` per-turn table: wake/restore seconds, allocation bytes, and
+  allocation count are now emitted as benchmark metrics and written to the
+  optional `book.md` output. The current retained path is in-memory, so
+  `book_turnXX_wake_s/op` is explicitly `0` until a disk wake is introduced.
+  A 2-turn/8-token greedy smoke completed with empty
+  `/tmp/go-rocm-book-2x8-accounting.err`:
+
+```text
+book_wall_s/op 0.6481
+book_decode_s/op 0.1263
+book_turn01_wake_s/op 0
+book_turn02_wake_s/op 0
+book_turn01_alloc_bytes/op 3615128
+book_turn01_allocs/op 6864
+book_turn02_alloc_bytes/op 4300912
+book_turn02_allocs/op 8525
+B/op 8026552
+allocs/op 16260
+```
 
 ## 2026-05-26 Public Q4 Direct Token Path
 
