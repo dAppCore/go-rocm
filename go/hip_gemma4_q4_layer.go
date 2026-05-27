@@ -19,23 +19,24 @@ const (
 )
 
 type hipGemma4Q4Layer0Config struct {
-	Layer             int
-	LayerType         string
-	Embedding         hipDeviceEmbeddingLookupConfig
-	HiddenSize        int
-	EmbeddingScale    float32
-	VocabSize         int
-	GroupSize         int
-	HeadDim           int
-	QueryHeads        int
-	IntermediateSize  int
-	RoPEBase          float32
-	RoPERotaryDim     int
-	SlidingWindow     int
-	AttentionKEqV     bool
-	FinalLogitSoftcap float32
-	LayerScalar       float32
-	PerLayerInput     hipGemma4Q4PerLayerInputConfig
+	Layer              int
+	LayerType          string
+	Embedding          hipDeviceEmbeddingLookupConfig
+	HiddenSize         int
+	EmbeddingScale     float32
+	VocabSize          int
+	GroupSize          int
+	HeadDim            int
+	QueryHeads         int
+	IntermediateSize   int
+	RoPEBase           float32
+	RoPERotaryDim      int
+	RoPEFrequencyScale float32
+	SlidingWindow      int
+	AttentionKEqV      bool
+	FinalLogitSoftcap  float32
+	LayerScalar        float32
+	PerLayerInput      hipGemma4Q4PerLayerInputConfig
 
 	InputNorm           hipRMSNormDeviceWeightConfig
 	QueryNorm           hipRMSNormDeviceWeightConfig
@@ -346,7 +347,7 @@ func (model *hipLoadedModel) loadedGemma4Q4LayerConfig(layer int) (hipGemma4Q4La
 	}
 	queryHeads := queryRows / headDim
 	intermediate := gateRows
-	ropeBase, ropeRotaryDim := model.loadedGemma4Q4LayerRoPE(layerType, headDim)
+	ropeBase, ropeRotaryDim, ropeFrequencyScale := model.loadedGemma4Q4LayerRoPE(layerType, headDim)
 	slidingWindow := model.loadedGemma4Q4EffectiveSlidingWindow(layerType, headDim)
 
 	inputNorm, err := model.loadedGemma4BF16NormConfig(layerPrefix+".input_layernorm.weight", "input_layernorm", hidden)
@@ -398,6 +399,7 @@ func (model *hipLoadedModel) loadedGemma4Q4LayerConfig(layer int) (hipGemma4Q4La
 		IntermediateSize:    intermediate,
 		RoPEBase:            ropeBase,
 		RoPERotaryDim:       ropeRotaryDim,
+		RoPEFrequencyScale:  ropeFrequencyScale,
 		SlidingWindow:       slidingWindow,
 		AttentionKEqV:       attentionKEqV,
 		FinalLogitSoftcap:   model.loadedGemma4Q4FinalLogitSoftcap(),
@@ -1247,16 +1249,17 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 	}
 	queryNormCfg := hipGemma4Q4RoPENormConfig(cfg.QueryNorm, req.Epsilon, cfg.HeadDim)
 	ropeFrequencyDim, ropeRotaryCount := hipGemma4Q4RoPEKernelDims(cfg)
+	ropeFrequencyScale := cfg.effectiveRoPEFrequencyScale()
 	if req.AttentionWorkspace != nil && req.OmitDebugTensors {
 		ropeQueryBuffer, err = req.AttentionWorkspace.EnsureRMSRoPEOutput(driver, queryBuffer.Count())
 		if err != nil {
 			return hipGemma4Q4DecoderLayerResult{}, err
 		}
-		if err := hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigOutput(ctx, driver, queryBuffer, queryNormCfg, cfg.QueryHeads, req.Position, ropeBase, ropeFrequencyDim, ropeRotaryCount, ropeQueryBuffer); err != nil {
+		if err := hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigOutputFrequencyScale(ctx, driver, queryBuffer, queryNormCfg, cfg.QueryHeads, req.Position, ropeBase, ropeFrequencyDim, ropeRotaryCount, ropeFrequencyScale, ropeQueryBuffer); err != nil {
 			return hipGemma4Q4DecoderLayerResult{}, err
 		}
 	} else {
-		ropeQueryBuffer, err = hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfig(ctx, driver, queryBuffer, queryNormCfg, cfg.QueryHeads, req.Position, ropeBase, ropeFrequencyDim, ropeRotaryCount)
+		ropeQueryBuffer, err = hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigFrequencyScale(ctx, driver, queryBuffer, queryNormCfg, cfg.QueryHeads, req.Position, ropeBase, ropeFrequencyDim, ropeRotaryCount, ropeFrequencyScale)
 		if err != nil {
 			return hipGemma4Q4DecoderLayerResult{}, err
 		}
@@ -1326,11 +1329,11 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 			if err != nil {
 				return hipGemma4Q4DecoderLayerResult{}, err
 			}
-			if err := hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigOutput(ctx, driver, keyBuffer, keyNormCfg, 1, req.Position, ropeBase, 0, 0, ropeKeyBuffer); err != nil {
+			if err := hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigOutputFrequencyScale(ctx, driver, keyBuffer, keyNormCfg, 1, req.Position, ropeBase, 0, 0, ropeFrequencyScale, ropeKeyBuffer); err != nil {
 				return hipGemma4Q4DecoderLayerResult{}, err
 			}
 		} else {
-			ropeKeyBuffer, err = hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfig(ctx, driver, keyBuffer, keyNormCfg, 1, req.Position, ropeBase, 0, 0)
+			ropeKeyBuffer, err = hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigFrequencyScale(ctx, driver, keyBuffer, keyNormCfg, 1, req.Position, ropeBase, 0, 0, ropeFrequencyScale)
 			if err != nil {
 				return hipGemma4Q4DecoderLayerResult{}, err
 			}
@@ -1396,11 +1399,11 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 			if err != nil {
 				return hipGemma4Q4DecoderLayerResult{}, err
 			}
-			if err := hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigOutput(ctx, driver, keyBuffer, keyNormCfg, 1, req.Position, ropeBase, cfg.HeadDim, cfg.RoPERotaryDim, ropeKeyBuffer); err != nil {
+			if err := hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigOutputFrequencyScale(ctx, driver, keyBuffer, keyNormCfg, 1, req.Position, ropeBase, cfg.HeadDim, cfg.RoPERotaryDim, ropeFrequencyScale, ropeKeyBuffer); err != nil {
 				return hipGemma4Q4DecoderLayerResult{}, err
 			}
 		} else {
-			ropeKeyBuffer, err = hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfig(ctx, driver, keyBuffer, keyNormCfg, 1, req.Position, ropeBase, cfg.HeadDim, cfg.RoPERotaryDim)
+			ropeKeyBuffer, err = hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigFrequencyScale(ctx, driver, keyBuffer, keyNormCfg, 1, req.Position, ropeBase, cfg.HeadDim, cfg.RoPERotaryDim, ropeFrequencyScale)
 			if err != nil {
 				return hipGemma4Q4DecoderLayerResult{}, err
 			}
@@ -2002,6 +2005,9 @@ func (cfg hipGemma4Q4Layer0Config) validate() error {
 	}
 	if cfg.RoPERotaryDim <= 0 || cfg.RoPERotaryDim > cfg.HeadDim || cfg.RoPERotaryDim%2 != 0 {
 		return core.E(hipGemma4Q4Layer0Operation, "layer RoPE rotary dimension must be positive, even, and no larger than head dimension", nil)
+	}
+	if cfg.effectiveRoPEFrequencyScale() <= 0 {
+		return core.E(hipGemma4Q4Layer0Operation, "layer RoPE frequency scale must be positive and finite", nil)
 	}
 	if cfg.SlidingWindow < 0 {
 		return core.E(hipGemma4Q4Layer0Operation, "sliding window must be non-negative", nil)
@@ -3505,7 +3511,7 @@ func (model *hipLoadedModel) loadedGemma4Q4LayerType(layer, headDim int) string 
 	return hipGemma4Q4LayerTypeFromHeadDim(headDim)
 }
 
-func (model *hipLoadedModel) loadedGemma4Q4LayerRoPE(layerType string, headDim int) (float32, int) {
+func (model *hipLoadedModel) loadedGemma4Q4LayerRoPE(layerType string, headDim int) (float32, int, float32) {
 	params := nativeGemma4RoPEParameters{}
 	if model != nil && model.gemma4TextConfig.RoPEParameters != nil {
 		params = model.gemma4TextConfig.RoPEParameters[layerType]
@@ -3528,7 +3534,11 @@ func (model *hipLoadedModel) loadedGemma4Q4LayerRoPE(layerType string, headDim i
 			factor = 1
 		}
 	}
-	return float32(base), hipGemma4Q4RoPERotaryDimFromFactor(headDim, factor)
+	frequencyScale := float32(1)
+	if params.RopeType == "proportional" && params.Factor > 0 && !math.IsNaN(params.Factor) && !math.IsInf(params.Factor, 0) {
+		frequencyScale = float32(1 / params.Factor)
+	}
+	return float32(base), hipGemma4Q4RoPERotaryDimFromFactor(headDim, factor), frequencyScale
 }
 
 func hipGemma4Q4RoPERotaryDimFromFactor(headDim int, factor float64) int {
@@ -3566,6 +3576,17 @@ func hipGemma4Q4RoPEKernelDims(cfg hipGemma4Q4Layer0Config) (frequencyDim, rotar
 		return cfg.HeadDim, cfg.RoPERotaryDim
 	}
 	return 0, 0
+}
+
+func (cfg hipGemma4Q4Layer0Config) effectiveRoPEFrequencyScale() float32 {
+	scale := cfg.RoPEFrequencyScale
+	if scale == 0 {
+		scale = 1
+	}
+	if scale <= 0 || math.IsNaN(float64(scale)) || math.IsInf(float64(scale), 0) {
+		return 0
+	}
+	return scale
 }
 
 func hipGemma4Q4LayerSlidingWindow(headDim int) int {

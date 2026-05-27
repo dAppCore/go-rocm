@@ -189,6 +189,10 @@ func hipReferenceRoPE(input []float32, position int, base float64) ([]float32, e
 }
 
 func hipReferenceRoPEWithFrequencyDim(input []float32, position int, base float64, frequencyDim int) ([]float32, error) {
+	return hipReferenceRoPEWithFrequencyDimScale(input, position, base, frequencyDim, 1)
+}
+
+func hipReferenceRoPEWithFrequencyDimScale(input []float32, position int, base float64, frequencyDim int, frequencyScale float64) ([]float32, error) {
 	if len(input) == 0 || len(input)%2 != 0 {
 		return nil, core.E("rocm.hip.ReferenceRoPE", "input length must be positive and even", nil)
 	}
@@ -197,6 +201,9 @@ func hipReferenceRoPEWithFrequencyDim(input []float32, position int, base float6
 	}
 	if base <= 0 || math.IsNaN(base) || math.IsInf(base, 0) {
 		return nil, core.E("rocm.hip.ReferenceRoPE", "base must be positive and finite", nil)
+	}
+	if frequencyScale <= 0 || math.IsNaN(frequencyScale) || math.IsInf(frequencyScale, 0) {
+		return nil, core.E("rocm.hip.ReferenceRoPE", "frequency scale must be positive and finite", nil)
 	}
 	if frequencyDim < 0 || (frequencyDim > 0 && frequencyDim < len(input)) {
 		return nil, core.E("rocm.hip.ReferenceRoPE", "frequency dimension must be zero or at least input length", nil)
@@ -208,7 +215,7 @@ func hipReferenceRoPEWithFrequencyDim(input []float32, position int, base float6
 	dim := float64(frequencyDim)
 	for i := 0; i < len(input); i += 2 {
 		frequency := 1 / math.Pow(base, float64(i)/dim)
-		angle := float64(position) * frequency
+		angle := float64(position) * frequency * frequencyScale
 		cosine := float32(math.Cos(angle))
 		sine := float32(math.Sin(angle))
 		x := input[i]
@@ -220,6 +227,10 @@ func hipReferenceRoPEWithFrequencyDim(input []float32, position int, base float6
 }
 
 func hipReferenceRoPENeoXWithFrequencyDim(input []float32, position int, base float64, frequencyDim, rotaryCount int) ([]float32, error) {
+	return hipReferenceRoPENeoXWithFrequencyDimScale(input, position, base, frequencyDim, rotaryCount, 1)
+}
+
+func hipReferenceRoPENeoXWithFrequencyDimScale(input []float32, position int, base float64, frequencyDim, rotaryCount int, frequencyScale float64) ([]float32, error) {
 	if len(input) == 0 || len(input)%2 != 0 {
 		return nil, core.E("rocm.hip.ReferenceRoPENeoX", "input length must be positive and even", nil)
 	}
@@ -228,6 +239,9 @@ func hipReferenceRoPENeoXWithFrequencyDim(input []float32, position int, base fl
 	}
 	if base <= 0 || math.IsNaN(base) || math.IsInf(base, 0) {
 		return nil, core.E("rocm.hip.ReferenceRoPENeoX", "base must be positive and finite", nil)
+	}
+	if frequencyScale <= 0 || math.IsNaN(frequencyScale) || math.IsInf(frequencyScale, 0) {
+		return nil, core.E("rocm.hip.ReferenceRoPENeoX", "frequency scale must be positive and finite", nil)
 	}
 	if frequencyDim < 0 || (frequencyDim > 0 && frequencyDim < len(input)) {
 		return nil, core.E("rocm.hip.ReferenceRoPENeoX", "frequency dimension must be zero or at least input length", nil)
@@ -254,7 +268,7 @@ func hipReferenceRoPENeoXWithFrequencyDim(input []float32, position int, base fl
 			continue
 		}
 		frequency := 1 / math.Pow(base, float64(pair*2)/dim)
-		angle := float64(position) * frequency
+		angle := float64(position) * frequency * frequencyScale
 		cosine := float32(math.Cos(angle))
 		sine := float32(math.Sin(angle))
 		x := input[first]

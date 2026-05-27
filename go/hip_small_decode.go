@@ -1439,6 +1439,10 @@ func hipRunRMSNormHeadsKernelWithDeviceInputWeightConfigOutput(ctx context.Conte
 }
 
 func hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfig(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipRMSNormDeviceWeightConfig, headCount int, position int, base float32, frequencyDim int, rotaryCount int) (*hipDeviceByteBuffer, error) {
+	return hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigFrequencyScale(ctx, driver, input, cfg, headCount, position, base, frequencyDim, rotaryCount, 1)
+}
+
+func hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigFrequencyScale(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipRMSNormDeviceWeightConfig, headCount int, position int, base float32, frequencyDim int, rotaryCount int, frequencyScale float32) (*hipDeviceByteBuffer, error) {
 	if err := hipContextErr(ctx); err != nil {
 		return nil, err
 	}
@@ -1464,7 +1468,7 @@ func hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfig(ctx context.Context
 			_ = output.Close()
 		}
 	}()
-	if err := hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigOutput(ctx, driver, input, cfg, headCount, position, base, frequencyDim, rotaryCount, output); err != nil {
+	if err := hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigOutputFrequencyScale(ctx, driver, input, cfg, headCount, position, base, frequencyDim, rotaryCount, frequencyScale, output); err != nil {
 		return nil, err
 	}
 	success = true
@@ -1472,6 +1476,10 @@ func hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfig(ctx context.Context
 }
 
 func hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigOutput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipRMSNormDeviceWeightConfig, headCount int, position int, base float32, frequencyDim int, rotaryCount int, output *hipDeviceByteBuffer) error {
+	return hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigOutputFrequencyScale(ctx, driver, input, cfg, headCount, position, base, frequencyDim, rotaryCount, 1, output)
+}
+
+func hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigOutputFrequencyScale(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipRMSNormDeviceWeightConfig, headCount int, position int, base float32, frequencyDim int, rotaryCount int, frequencyScale float32, output *hipDeviceByteBuffer) error {
 	if err := hipContextErr(ctx); err != nil {
 		return err
 	}
@@ -1506,6 +1514,7 @@ func hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigOutput(ctx context.C
 		Base:           base,
 		FrequencyDim:   frequencyDim,
 		RotaryCount:    rotaryCount,
+		FrequencyScale: frequencyScale,
 	}).Binary()
 	if err != nil {
 		return err
@@ -1530,6 +1539,10 @@ func hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigOutput(ctx context.C
 }
 
 func hipRunRMSNormRoPEHeadsBatchKernelWithDeviceInputWeightConfig(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipRMSNormDeviceWeightConfig, headCount int, batch int, startPosition int, base float32, frequencyDim int, rotaryCount int) (*hipDeviceByteBuffer, error) {
+	return hipRunRMSNormRoPEHeadsBatchKernelWithDeviceInputWeightConfigFrequencyScale(ctx, driver, input, cfg, headCount, batch, startPosition, base, frequencyDim, rotaryCount, 1)
+}
+
+func hipRunRMSNormRoPEHeadsBatchKernelWithDeviceInputWeightConfigFrequencyScale(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipRMSNormDeviceWeightConfig, headCount int, batch int, startPosition int, base float32, frequencyDim int, rotaryCount int, frequencyScale float32) (*hipDeviceByteBuffer, error) {
 	if err := hipContextErr(ctx); err != nil {
 		return nil, err
 	}
@@ -1572,6 +1585,7 @@ func hipRunRMSNormRoPEHeadsBatchKernelWithDeviceInputWeightConfig(ctx context.Co
 		Base:           base,
 		FrequencyDim:   frequencyDim,
 		RotaryCount:    rotaryCount,
+		FrequencyScale: frequencyScale,
 	}).Binary()
 	if err != nil {
 		return nil, err

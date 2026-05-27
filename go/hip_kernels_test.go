@@ -1948,6 +1948,24 @@ func TestHIPKernels_RMSNormRoPEHeadsLaunchArgs_Good(t *testing.T) {
 	core.AssertNoError(t, err)
 	assertFloat32SlicesNear(t, want, reusedValues, 0.0001)
 
+	scaledOutput, err := hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigFrequencyScale(context.Background(), driver, input, cfg, 2, 1, 1, 4, 2, 0.5)
+	core.AssertNoError(t, err)
+	defer scaledOutput.Close()
+	scaledValues, err := hipReadFloat32DeviceOutput(scaledOutput, "rocm.hip.RMSNormRoPEHeadsLaunch", "scaled rms norm rope heads output", len(inputValues))
+	core.AssertNoError(t, err)
+	want = want[:0]
+	for head := 0; head < 2; head++ {
+		start := head * 4
+		normalized, err := hipReferenceRMSNorm(inputValues[start:start+4], unitWeight, 0)
+		core.AssertNoError(t, err)
+		rotated, err := hipReferenceRoPEWithFrequencyDimScale(normalized[:2], 1, 1, 4, 0.5)
+		core.AssertNoError(t, err)
+		normalized[0] = rotated[0]
+		normalized[1] = rotated[1]
+		want = append(want, normalized...)
+	}
+	assertFloat32SlicesNear(t, want, scaledValues, 0.0001)
+
 	neoxCfg := cfg
 	neoxCfg.Flags = hipRMSNormLaunchFlagRoPENeoX
 	neoxOutput, err := hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfig(context.Background(), driver, input, neoxCfg, 2, 1, 1, 4, 2)
@@ -1979,6 +1997,7 @@ func TestHIPKernels_RMSNormRoPEHeadsLaunchArgs_Good(t *testing.T) {
 		Base:           1,
 		FrequencyDim:   4,
 		RotaryCount:    2,
+		FrequencyScale: 0.5,
 	}).Binary()
 	core.AssertNoError(t, err)
 	core.AssertEqual(t, hipRMSNormRoPEHeadsLaunchArgsBytes, len(launchBytes))
@@ -1988,6 +2007,7 @@ func TestHIPKernels_RMSNormRoPEHeadsLaunchArgs_Good(t *testing.T) {
 	core.AssertEqual(t, hipRMSNormLaunchFlagRoPENeoX, binary.LittleEndian.Uint32(launchBytes[60:]))
 	core.AssertEqual(t, uint32(4), binary.LittleEndian.Uint32(launchBytes[72:]))
 	core.AssertEqual(t, uint32(2), binary.LittleEndian.Uint32(launchBytes[76:]))
+	assertFloat32Near(t, 0.5, math.Float32frombits(binary.LittleEndian.Uint32(launchBytes[80:])))
 }
 
 func TestHIPKernels_RMSNormRoPEHeadsBatchLaunchArgs_Good(t *testing.T) {
@@ -2036,6 +2056,26 @@ func TestHIPKernels_RMSNormRoPEHeadsBatchLaunchArgs_Good(t *testing.T) {
 	core.AssertEqual(t, uint32(2), launches[0].GridX)
 	core.AssertEqual(t, uint32(2), launches[0].GridY)
 
+	scaledOutput, err := hipRunRMSNormRoPEHeadsBatchKernelWithDeviceInputWeightConfigFrequencyScale(context.Background(), driver, input, cfg, 2, 2, 3, 1, 4, 2, 0.25)
+	core.AssertNoError(t, err)
+	defer scaledOutput.Close()
+	scaledValues, err := hipReadFloat32DeviceOutput(scaledOutput, "rocm.hip.RMSNormRoPEHeadsBatchLaunch", "scaled rms norm rope heads batch output", len(inputValues))
+	core.AssertNoError(t, err)
+	want = want[:0]
+	for batch := 0; batch < 2; batch++ {
+		for head := 0; head < 2; head++ {
+			start := (batch*2 + head) * 4
+			normalized, err := hipReferenceRMSNorm(inputValues[start:start+4], unitWeight, 0)
+			core.AssertNoError(t, err)
+			rotated, err := hipReferenceRoPEWithFrequencyDimScale(normalized[:2], 3+batch, 1, 4, 0.25)
+			core.AssertNoError(t, err)
+			normalized[0] = rotated[0]
+			normalized[1] = rotated[1]
+			want = append(want, normalized...)
+		}
+	}
+	assertFloat32SlicesNear(t, want, scaledValues, 0.0001)
+
 	launchBytes, err := (hipRMSNormRoPEHeadsBatchLaunchArgs{
 		InputPointer:   input.Pointer(),
 		OutputPointer:  output.Pointer(),
@@ -2049,6 +2089,7 @@ func TestHIPKernels_RMSNormRoPEHeadsBatchLaunchArgs_Good(t *testing.T) {
 		Base:           1,
 		FrequencyDim:   4,
 		RotaryCount:    2,
+		FrequencyScale: 0.25,
 	}).Binary()
 	core.AssertNoError(t, err)
 	core.AssertEqual(t, hipRMSNormRoPEHeadsBatchLaunchArgsBytes, len(launchBytes))
@@ -2061,6 +2102,7 @@ func TestHIPKernels_RMSNormRoPEHeadsBatchLaunchArgs_Good(t *testing.T) {
 	core.AssertEqual(t, uint32(3), binary.LittleEndian.Uint32(launchBytes[68:]))
 	core.AssertEqual(t, uint32(4), binary.LittleEndian.Uint32(launchBytes[76:]))
 	core.AssertEqual(t, uint32(2), binary.LittleEndian.Uint32(launchBytes[80:]))
+	assertFloat32Near(t, 0.25, math.Float32frombits(binary.LittleEndian.Uint32(launchBytes[84:])))
 }
 
 func TestHIPKernels_RMSNormRoPEHeadsBatchLaunchArgs_Bad(t *testing.T) {

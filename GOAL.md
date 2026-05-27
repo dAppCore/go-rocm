@@ -1748,6 +1748,13 @@ endpoint.
   for E2B-style configs. `TestHIPGemma4Q4LMHeadProjectionPrefersUntiedHead_Good`
   covers both branches; this is behavior-neutral for the current E2B q4 model
   because its config ties embeddings.
+- [x] Carry the `go-mlx` Gemma4 proportional RoPE factor into ROCm RMSNorm+RoPE
+  kernels. The launch ABI now includes a frequency scale so `rope_type:
+  proportional` with a non-default `factor` rotates as `position / (freq *
+  factor)` for both decode and batched prefill. The current E2B q4 config has no
+  `factor`, so this is behavior-neutral there; the patched `gfx1100` HSACO
+  kept the 2048-token guard green at `108.0 tok/s`, `6666048 B/op`, and
+  `2610 allocs/op` with empty stderr.
 - [x] Add the first batched q4 MLP primitive for prefill. The new
   `rocm_mlx_q4_gelu_tanh_multiply_batch` kernel maps prompt rows onto `GridY`
   for fused gate/up projection plus GELU multiply, and the Gemma4 q4 prefill

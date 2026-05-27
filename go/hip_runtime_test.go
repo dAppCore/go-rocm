@@ -4745,6 +4745,7 @@ func (driver *fakeHIPDriver) launchRMSNormRoPEHeads(args []byte) error {
 	base := math.Float32frombits(binary.LittleEndian.Uint32(args[68:]))
 	frequencyDim := int(binary.LittleEndian.Uint32(args[72:]))
 	rotaryCount := int(binary.LittleEndian.Uint32(args[76:]))
+	frequencyScale := math.Float32frombits(binary.LittleEndian.Uint32(args[80:]))
 	totalCount := headDim * headCount
 	if headDim <= 0 || headDim%2 != 0 || headCount <= 0 || inputBytes != totalCount*4 || outputBytes != totalCount*4 {
 		return core.E("rocm.hip.FakeLaunch", "rms norm rope heads shape metadata mismatch", nil)
@@ -4757,6 +4758,9 @@ func (driver *fakeHIPDriver) launchRMSNormRoPEHeads(args []byte) error {
 	}
 	if rotaryCount == 0 {
 		rotaryCount = headDim
+	}
+	if frequencyScale <= 0 || math.IsNaN(float64(frequencyScale)) || math.IsInf(float64(frequencyScale), 0) {
+		return core.E("rocm.hip.FakeLaunch", "rms norm rope heads frequency scale mismatch", nil)
 	}
 	effectiveFrequencyDim := frequencyDim
 	if effectiveFrequencyDim == 0 {
@@ -4831,11 +4835,11 @@ func (driver *fakeHIPDriver) launchRMSNormRoPEHeads(args []byte) error {
 		}
 		var rotated []float32
 		if flags&hipRMSNormLaunchFlagRoPENeoX != 0 {
-			rotated, err = hipReferenceRoPENeoXWithFrequencyDim(normalized, position, float64(base), effectiveFrequencyDim, rotaryCount)
+			rotated, err = hipReferenceRoPENeoXWithFrequencyDimScale(normalized, position, float64(base), effectiveFrequencyDim, rotaryCount, float64(frequencyScale))
 		} else {
 			rotated = append([]float32(nil), normalized...)
 			var rotary []float32
-			rotary, err = hipReferenceRoPEWithFrequencyDim(normalized[:rotaryCount], position, float64(base), effectiveFrequencyDim)
+			rotary, err = hipReferenceRoPEWithFrequencyDimScale(normalized[:rotaryCount], position, float64(base), effectiveFrequencyDim, float64(frequencyScale))
 			if err == nil {
 				copy(rotated[:rotaryCount], rotary)
 			}
@@ -4877,6 +4881,7 @@ func (driver *fakeHIPDriver) launchRMSNormRoPEHeadsBatch(args []byte) error {
 	base := math.Float32frombits(binary.LittleEndian.Uint32(args[72:]))
 	frequencyDim := int(binary.LittleEndian.Uint32(args[76:]))
 	rotaryCount := int(binary.LittleEndian.Uint32(args[80:]))
+	frequencyScale := math.Float32frombits(binary.LittleEndian.Uint32(args[84:]))
 	totalCount := headDim * headCount * batch
 	if headDim <= 0 || headDim%2 != 0 || headCount <= 0 || batch <= 0 || inputBytes != totalCount*4 || outputBytes != totalCount*4 {
 		return core.E("rocm.hip.FakeLaunch", "rms norm rope heads batch shape metadata mismatch", nil)
@@ -4889,6 +4894,9 @@ func (driver *fakeHIPDriver) launchRMSNormRoPEHeadsBatch(args []byte) error {
 	}
 	if rotaryCount == 0 {
 		rotaryCount = headDim
+	}
+	if frequencyScale <= 0 || math.IsNaN(float64(frequencyScale)) || math.IsInf(float64(frequencyScale), 0) {
+		return core.E("rocm.hip.FakeLaunch", "rms norm rope heads batch frequency scale mismatch", nil)
 	}
 	effectiveFrequencyDim := frequencyDim
 	if effectiveFrequencyDim == 0 {
@@ -4964,11 +4972,11 @@ func (driver *fakeHIPDriver) launchRMSNormRoPEHeadsBatch(args []byte) error {
 			}
 			var rotated []float32
 			if flags&hipRMSNormLaunchFlagRoPENeoX != 0 {
-				rotated, err = hipReferenceRoPENeoXWithFrequencyDim(normalized, startPosition+batchIndex, float64(base), effectiveFrequencyDim, rotaryCount)
+				rotated, err = hipReferenceRoPENeoXWithFrequencyDimScale(normalized, startPosition+batchIndex, float64(base), effectiveFrequencyDim, rotaryCount, float64(frequencyScale))
 			} else {
 				rotated = append([]float32(nil), normalized...)
 				var rotary []float32
-				rotary, err = hipReferenceRoPEWithFrequencyDim(normalized[:rotaryCount], startPosition+batchIndex, float64(base), effectiveFrequencyDim)
+				rotary, err = hipReferenceRoPEWithFrequencyDimScale(normalized[:rotaryCount], startPosition+batchIndex, float64(base), effectiveFrequencyDim, float64(frequencyScale))
 				if err == nil {
 					copy(rotated[:rotaryCount], rotary)
 				}

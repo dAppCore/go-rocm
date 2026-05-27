@@ -20,9 +20,9 @@ const (
 	hipRMSNormResAddNormArgsBytes                         = 128
 	hipRMSNormHeadsLaunchArgsVersion               uint32 = 1
 	hipRMSNormHeadsLaunchArgsBytes                        = 64
-	hipRMSNormRoPEHeadsLaunchArgsVersion           uint32 = 1
-	hipRMSNormRoPEHeadsLaunchArgsBytes                    = 80
-	hipRMSNormRoPEHeadsBatchLaunchArgsVersion      uint32 = 1
+	hipRMSNormRoPEHeadsLaunchArgsVersion           uint32 = 2
+	hipRMSNormRoPEHeadsLaunchArgsBytes                    = 88
+	hipRMSNormRoPEHeadsBatchLaunchArgsVersion      uint32 = 2
 	hipRMSNormRoPEHeadsBatchLaunchArgsBytes               = 96
 	hipRoPELaunchArgsVersion                       uint32 = 1
 	hipRoPELaunchArgsBytes                                = 64
@@ -184,6 +184,7 @@ type hipRMSNormRoPEHeadsLaunchArgs struct {
 	Base           float32
 	FrequencyDim   int
 	RotaryCount    int
+	FrequencyScale float32
 }
 
 type hipRMSNormRoPEHeadsBatchLaunchArgs struct {
@@ -203,6 +204,7 @@ type hipRMSNormRoPEHeadsBatchLaunchArgs struct {
 	Base           float32
 	FrequencyDim   int
 	RotaryCount    int
+	FrequencyScale float32
 }
 
 type hipRoPERequest struct {
@@ -1092,6 +1094,13 @@ func (args hipRMSNormRoPEHeadsLaunchArgs) Binary() ([]byte, error) {
 	if args.Base <= 0 || math.IsNaN(float64(args.Base)) || math.IsInf(float64(args.Base), 0) {
 		return nil, core.E("rocm.hip."+operation, "base must be positive and finite", nil)
 	}
+	frequencyScale := args.FrequencyScale
+	if frequencyScale == 0 {
+		frequencyScale = 1
+	}
+	if frequencyScale <= 0 || math.IsNaN(float64(frequencyScale)) || math.IsInf(float64(frequencyScale), 0) {
+		return nil, core.E("rocm.hip."+operation, "frequency scale must be positive and finite", nil)
+	}
 	if args.FrequencyDim < 0 || (args.FrequencyDim > 0 && args.FrequencyDim < args.HeadDim) {
 		return nil, core.E("rocm.hip."+operation, "frequency dimension must be zero or at least head dim", nil)
 	}
@@ -1140,6 +1149,7 @@ func (args hipRMSNormRoPEHeadsLaunchArgs) Binary() ([]byte, error) {
 	binary.LittleEndian.PutUint32(payload[68:], math.Float32bits(args.Base))
 	binary.LittleEndian.PutUint32(payload[72:], frequencyDim)
 	binary.LittleEndian.PutUint32(payload[76:], rotaryCount)
+	binary.LittleEndian.PutUint32(payload[80:], math.Float32bits(frequencyScale))
 	return payload, nil
 }
 
@@ -1176,6 +1186,13 @@ func (args hipRMSNormRoPEHeadsBatchLaunchArgs) Binary() ([]byte, error) {
 	startPosition := uint32(args.StartPosition)
 	if args.Base <= 0 || math.IsNaN(float64(args.Base)) || math.IsInf(float64(args.Base), 0) {
 		return nil, core.E("rocm.hip."+operation, "base must be positive and finite", nil)
+	}
+	frequencyScale := args.FrequencyScale
+	if frequencyScale == 0 {
+		frequencyScale = 1
+	}
+	if frequencyScale <= 0 || math.IsNaN(float64(frequencyScale)) || math.IsInf(float64(frequencyScale), 0) {
+		return nil, core.E("rocm.hip."+operation, "frequency scale must be positive and finite", nil)
 	}
 	if args.FrequencyDim < 0 || (args.FrequencyDim > 0 && args.FrequencyDim < args.HeadDim) {
 		return nil, core.E("rocm.hip."+operation, "frequency dimension must be zero or at least head dim", nil)
@@ -1226,6 +1243,7 @@ func (args hipRMSNormRoPEHeadsBatchLaunchArgs) Binary() ([]byte, error) {
 	binary.LittleEndian.PutUint32(payload[72:], math.Float32bits(args.Base))
 	binary.LittleEndian.PutUint32(payload[76:], frequencyDim)
 	binary.LittleEndian.PutUint32(payload[80:], rotaryCount)
+	binary.LittleEndian.PutUint32(payload[84:], math.Float32bits(frequencyScale))
 	return payload, nil
 }
 

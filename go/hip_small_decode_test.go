@@ -855,6 +855,7 @@ func TestHIPGemma4Q4PrefillQKNormRoPEBatch_Good(t *testing.T) {
 	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
 	defer cleanup()
 	cfg.RoPERotaryDim = 2
+	cfg.RoPEFrequencyScale = 0.5
 
 	tokenCount := 2
 	queryValues := make([]float32, tokenCount*cfg.QueryHeads*cfg.HeadDim)
@@ -905,6 +906,7 @@ func TestHIPGemma4Q4PrefillQKNormRoPEBatch_Good(t *testing.T) {
 		core.AssertEqual(t, uint32(5), binary.LittleEndian.Uint32(launch.Args[68:]))
 		core.AssertEqual(t, uint32(cfg.HeadDim), binary.LittleEndian.Uint32(launch.Args[76:]))
 		core.AssertEqual(t, uint32(cfg.RoPERotaryDim), binary.LittleEndian.Uint32(launch.Args[80:]))
+		assertFloat32Near(t, cfg.RoPEFrequencyScale, math.Float32frombits(binary.LittleEndian.Uint32(launch.Args[84:])))
 	}
 }
 
@@ -1901,21 +1903,23 @@ func TestHIPGemma4Q4LoadedTextConfigOverridesHeadDimHeuristics_Good(t *testing.T
 			SlidingWindow:     1024,
 			RoPEParameters: map[string]nativeGemma4RoPEParameters{
 				"sliding_attention": {RopeTheta: 10000, RopeType: "default"},
-				"full_attention":    {PartialRotaryFactor: 0.25, RopeTheta: 1000000, RopeType: "proportional"},
+				"full_attention":    {PartialRotaryFactor: 0.25, RopeTheta: 1000000, RopeType: "proportional", Factor: 8},
 			},
 		},
 	}
 
 	core.AssertEqual(t, "sliding_attention", model.loadedGemma4Q4LayerType(0, 512))
-	slidingBase, slidingRotaryDim := model.loadedGemma4Q4LayerRoPE("sliding_attention", 512)
+	slidingBase, slidingRotaryDim, slidingFrequencyScale := model.loadedGemma4Q4LayerRoPE("sliding_attention", 512)
 	core.AssertEqual(t, float32(10000), slidingBase)
 	core.AssertEqual(t, 512, slidingRotaryDim)
+	core.AssertEqual(t, float32(1), slidingFrequencyScale)
 	core.AssertEqual(t, 1024, model.loadedGemma4Q4EffectiveSlidingWindow("sliding_attention", 512))
 
 	core.AssertEqual(t, "full_attention", model.loadedGemma4Q4LayerType(1, 1024))
-	fullBase, fullRotaryDim := model.loadedGemma4Q4LayerRoPE("full_attention", 1024)
+	fullBase, fullRotaryDim, fullFrequencyScale := model.loadedGemma4Q4LayerRoPE("full_attention", 1024)
 	core.AssertEqual(t, float32(1000000), fullBase)
 	core.AssertEqual(t, 256, fullRotaryDim)
+	core.AssertEqual(t, float32(0.125), fullFrequencyScale)
 	core.AssertEqual(t, 0, model.loadedGemma4Q4EffectiveSlidingWindow("full_attention", 1024))
 	core.AssertEqual(t, 18, model.loadedGemma4Q4KVSharedLayers(42))
 }

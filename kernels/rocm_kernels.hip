@@ -74,9 +74,9 @@ constexpr uint32_t ROCM_RMS_NORM_RESIDUAL_ADD_NORM_LAUNCH_ARGS_VERSION = 1;
 constexpr uint32_t ROCM_RMS_NORM_RESIDUAL_ADD_NORM_LAUNCH_ARGS_BYTES = 128;
 constexpr uint32_t ROCM_RMS_NORM_HEADS_LAUNCH_ARGS_VERSION = 1;
 constexpr uint32_t ROCM_RMS_NORM_HEADS_LAUNCH_ARGS_BYTES = 64;
-constexpr uint32_t ROCM_RMS_NORM_ROPE_HEADS_LAUNCH_ARGS_VERSION = 1;
-constexpr uint32_t ROCM_RMS_NORM_ROPE_HEADS_LAUNCH_ARGS_BYTES = 80;
-constexpr uint32_t ROCM_RMS_NORM_ROPE_HEADS_BATCH_LAUNCH_ARGS_VERSION = 1;
+constexpr uint32_t ROCM_RMS_NORM_ROPE_HEADS_LAUNCH_ARGS_VERSION = 2;
+constexpr uint32_t ROCM_RMS_NORM_ROPE_HEADS_LAUNCH_ARGS_BYTES = 88;
+constexpr uint32_t ROCM_RMS_NORM_ROPE_HEADS_BATCH_LAUNCH_ARGS_VERSION = 2;
 constexpr uint32_t ROCM_RMS_NORM_ROPE_HEADS_BATCH_LAUNCH_ARGS_BYTES = 96;
 constexpr uint32_t ROCM_RMS_NORM_WEIGHT_ENCODING_NONE = 0;
 constexpr uint32_t ROCM_RMS_NORM_WEIGHT_ENCODING_F32 = 1;
@@ -664,6 +664,8 @@ struct rocm_rms_norm_rope_heads_launch_args {
 	uint32_t base_bits;
 	uint32_t frequency_dim;
 	uint32_t rotary_count;
+	uint32_t frequency_scale_bits;
+	uint32_t reserved0;
 };
 
 struct rocm_rms_norm_rope_heads_batch_launch_args {
@@ -685,7 +687,7 @@ struct rocm_rms_norm_rope_heads_batch_launch_args {
 	uint32_t base_bits;
 	uint32_t frequency_dim;
 	uint32_t rotary_count;
-	uint32_t reserved0;
+	uint32_t frequency_scale_bits;
 	uint32_t reserved1;
 	uint32_t reserved2;
 };
@@ -1916,6 +1918,7 @@ __device__ bool rocm_valid_rms_norm_rope_heads_args(const rocm_rms_norm_rope_hea
 {
 	const float epsilon = rocm_float_from_bits(args.epsilon_bits);
 	const float base = rocm_float_from_bits(args.base_bits);
+	const float frequency_scale = rocm_float_from_bits(args.frequency_scale_bits);
 	const uint32_t rotary_count = args.rotary_count == 0u ? args.head_dim : args.rotary_count;
 	return args.version == ROCM_RMS_NORM_ROPE_HEADS_LAUNCH_ARGS_VERSION &&
 		args.total_bytes == ROCM_RMS_NORM_ROPE_HEADS_LAUNCH_ARGS_BYTES &&
@@ -1930,7 +1933,9 @@ __device__ bool rocm_valid_rms_norm_rope_heads_args(const rocm_rms_norm_rope_hea
 		isfinite(epsilon) &&
 		base > 0.0f &&
 		isfinite(base) &&
-			(args.flags & ~ROCM_RMS_NORM_LAUNCH_FLAG_MASK) == 0u &&
+		frequency_scale > 0.0f &&
+		isfinite(frequency_scale) &&
+		(args.flags & ~ROCM_RMS_NORM_LAUNCH_FLAG_MASK) == 0u &&
 		(args.frequency_dim == 0u || args.frequency_dim >= args.head_dim) &&
 		(rotary_count % 2u) == 0u &&
 		rotary_count <= args.head_dim &&
@@ -1941,6 +1946,7 @@ __device__ bool rocm_valid_rms_norm_rope_heads_batch_args(const rocm_rms_norm_ro
 {
 	const float epsilon = rocm_float_from_bits(args.epsilon_bits);
 	const float base = rocm_float_from_bits(args.base_bits);
+	const float frequency_scale = rocm_float_from_bits(args.frequency_scale_bits);
 	const uint32_t rotary_count = args.rotary_count == 0u ? args.head_dim : args.rotary_count;
 	const uint64_t total_count = static_cast<uint64_t>(args.head_dim) * static_cast<uint64_t>(args.head_count) * static_cast<uint64_t>(args.batch);
 	const uint64_t last_position = static_cast<uint64_t>(args.start_position) + static_cast<uint64_t>(args.batch == 0u ? 0u : args.batch - 1u);
@@ -1959,8 +1965,10 @@ __device__ bool rocm_valid_rms_norm_rope_heads_batch_args(const rocm_rms_norm_ro
 		isfinite(epsilon) &&
 		base > 0.0f &&
 		isfinite(base) &&
+		frequency_scale > 0.0f &&
+		isfinite(frequency_scale) &&
 		last_position <= 0xffffffffu &&
-			(args.flags & ~ROCM_RMS_NORM_LAUNCH_FLAG_MASK) == 0u &&
+		(args.flags & ~ROCM_RMS_NORM_LAUNCH_FLAG_MASK) == 0u &&
 		(args.frequency_dim == 0u || args.frequency_dim >= args.head_dim) &&
 		(rotary_count % 2u) == 0u &&
 		rotary_count <= args.head_dim &&
@@ -4543,6 +4551,7 @@ extern "C" __global__ void rocm_rms_norm_rope_heads(const unsigned char *packet)
 	const uint32_t frequency_dim = args.frequency_dim == 0u ? args.head_dim : args.frequency_dim;
 		const uint32_t rotary_count = args.rotary_count == 0u ? args.head_dim : args.rotary_count;
 		const float base = rocm_float_from_bits(args.base_bits);
+		const float frequency_scale = rocm_float_from_bits(args.frequency_scale_bits);
 		const float dim = static_cast<float>(frequency_dim);
 		const uint32_t half_head_dim = args.head_dim >> 1u;
 		const bool neox = (args.flags & ROCM_RMS_NORM_LAUNCH_FLAG_ROPE_NEOX) != 0u;
@@ -4557,7 +4566,7 @@ extern "C" __global__ void rocm_rms_norm_rope_heads(const unsigned char *packet)
 				const float y = input[j] / rms * weight_y;
 				if (pair < active_pairs) {
 					const float frequency = 1.0f / powf(base, static_cast<float>(pair << 1u) / dim);
-					const float angle = static_cast<float>(args.position) * frequency;
+					const float angle = static_cast<float>(args.position) * frequency * frequency_scale;
 					const float cosine = cosf(angle);
 					const float sine = sinf(angle);
 					output[i] = x * cosine - y * sine;
@@ -4577,7 +4586,7 @@ extern "C" __global__ void rocm_rms_norm_rope_heads(const unsigned char *packet)
 			const float y = input[i + 1u] / rms * weight_y;
 			if (i < rotary_count) {
 				const float frequency = 1.0f / powf(base, static_cast<float>(i) / dim);
-				const float angle = static_cast<float>(args.position) * frequency;
+				const float angle = static_cast<float>(args.position) * frequency * frequency_scale;
 				const float cosine = cosf(angle);
 				const float sine = sinf(angle);
 			output[i] = x * cosine - y * sine;
@@ -4616,6 +4625,7 @@ extern "C" __global__ void rocm_rms_norm_rope_heads_batch(const unsigned char *p
 	const uint32_t frequency_dim = args.frequency_dim == 0u ? args.head_dim : args.frequency_dim;
 		const uint32_t rotary_count = args.rotary_count == 0u ? args.head_dim : args.rotary_count;
 		const float base = rocm_float_from_bits(args.base_bits);
+		const float frequency_scale = rocm_float_from_bits(args.frequency_scale_bits);
 		const float dim = static_cast<float>(frequency_dim);
 		const uint32_t position = args.start_position + batch;
 		const uint32_t half_head_dim = args.head_dim >> 1u;
@@ -4631,7 +4641,7 @@ extern "C" __global__ void rocm_rms_norm_rope_heads_batch(const unsigned char *p
 				const float y = input[j] / rms * weight_y;
 				if (pair < active_pairs) {
 					const float frequency = 1.0f / powf(base, static_cast<float>(pair << 1u) / dim);
-					const float angle = static_cast<float>(position) * frequency;
+					const float angle = static_cast<float>(position) * frequency * frequency_scale;
 					const float cosine = cosf(angle);
 					const float sine = sinf(angle);
 					output[i] = x * cosine - y * sine;
@@ -4651,7 +4661,7 @@ extern "C" __global__ void rocm_rms_norm_rope_heads_batch(const unsigned char *p
 			const float y = input[i + 1u] / rms * weight_y;
 			if (i < rotary_count) {
 				const float frequency = 1.0f / powf(base, static_cast<float>(i) / dim);
-				const float angle = static_cast<float>(position) * frequency;
+				const float angle = static_cast<float>(position) * frequency * frequency_scale;
 				const float cosine = cosf(angle);
 				const float sine = sinf(angle);
 			output[i] = x * cosine - y * sine;

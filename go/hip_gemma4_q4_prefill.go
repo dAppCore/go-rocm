@@ -568,6 +568,9 @@ func hipRunGemma4Q4PrefillQKNormRoPEBatch(ctx context.Context, driver nativeHIPD
 	if cfg.RoPERotaryDim <= 0 || cfg.RoPERotaryDim > cfg.HeadDim || cfg.RoPERotaryDim%2 != 0 {
 		return nil, core.E(hipGemma4Q4Layer0Operation, "prefill Q/K RoPE rotary dimension mismatch", nil)
 	}
+	if cfg.effectiveRoPEFrequencyScale() <= 0 {
+		return nil, core.E(hipGemma4Q4Layer0Operation, "prefill Q/K RoPE frequency scale must be positive and finite", nil)
+	}
 	if qkv == nil || qkv.Query == nil || qkv.Query.Pointer() == 0 || qkv.Key == nil || qkv.Key.Pointer() == 0 {
 		return nil, core.E(hipGemma4Q4Layer0Operation, "prefill Q/K RoPE QKV buffers are required", nil)
 	}
@@ -588,6 +591,7 @@ func hipRunGemma4Q4PrefillQKNormRoPEBatch(ctx context.Context, driver nativeHIPD
 	queryNormCfg := hipGemma4Q4RoPENormConfig(cfg.QueryNorm, epsilon, cfg.HeadDim)
 	keyNormCfg := hipGemma4Q4RoPENormConfig(cfg.KeyNorm, epsilon, cfg.HeadDim)
 	ropeFrequencyDim, ropeRotaryCount := hipGemma4Q4RoPEKernelDims(cfg)
+	ropeFrequencyScale := cfg.effectiveRoPEFrequencyScale()
 	out := &hipGemma4Q4PrefillRoPEQKBatch{}
 	success := false
 	defer func() {
@@ -596,11 +600,11 @@ func hipRunGemma4Q4PrefillQKNormRoPEBatch(ctx context.Context, driver nativeHIPD
 		}
 	}()
 	var err error
-	out.Query, err = hipRunRMSNormRoPEHeadsBatchKernelWithDeviceInputWeightConfig(ctx, driver, qkv.Query, queryNormCfg, cfg.QueryHeads, tokenCount, startPosition, cfg.RoPEBase, ropeFrequencyDim, ropeRotaryCount)
+	out.Query, err = hipRunRMSNormRoPEHeadsBatchKernelWithDeviceInputWeightConfigFrequencyScale(ctx, driver, qkv.Query, queryNormCfg, cfg.QueryHeads, tokenCount, startPosition, cfg.RoPEBase, ropeFrequencyDim, ropeRotaryCount, ropeFrequencyScale)
 	if err != nil {
 		return nil, err
 	}
-	out.Key, err = hipRunRMSNormRoPEHeadsBatchKernelWithDeviceInputWeightConfig(ctx, driver, qkv.Key, keyNormCfg, 1, tokenCount, startPosition, cfg.RoPEBase, ropeFrequencyDim, ropeRotaryCount)
+	out.Key, err = hipRunRMSNormRoPEHeadsBatchKernelWithDeviceInputWeightConfigFrequencyScale(ctx, driver, qkv.Key, keyNormCfg, 1, tokenCount, startPosition, cfg.RoPEBase, ropeFrequencyDim, ropeRotaryCount, ropeFrequencyScale)
 	if err != nil {
 		return nil, err
 	}
@@ -801,7 +805,7 @@ func hipRunGemma4Q4PrefillLayerQueryBatchWithSharedKV(ctx context.Context, drive
 	out.QKV = &hipGemma4Q4PrefillQKVBatch{Query: query}
 	queryNormCfg := hipGemma4Q4RoPENormConfig(cfg.QueryNorm, epsilon, cfg.HeadDim)
 	ropeFrequencyDim, ropeRotaryCount := hipGemma4Q4RoPEKernelDims(cfg)
-	ropeQuery, err := hipRunRMSNormRoPEHeadsBatchKernelWithDeviceInputWeightConfig(ctx, driver, query, queryNormCfg, cfg.QueryHeads, tokenCount, startPosition, cfg.RoPEBase, ropeFrequencyDim, ropeRotaryCount)
+	ropeQuery, err := hipRunRMSNormRoPEHeadsBatchKernelWithDeviceInputWeightConfigFrequencyScale(ctx, driver, query, queryNormCfg, cfg.QueryHeads, tokenCount, startPosition, cfg.RoPEBase, ropeFrequencyDim, ropeRotaryCount, cfg.effectiveRoPEFrequencyScale())
 	if err != nil {
 		return nil, err
 	}

@@ -91,6 +91,10 @@ func TestHIPTransformerReferenceRoPE_Good(t *testing.T) {
 		float32(math.Sin(0.1)),
 	}, output, 0.0001)
 
+	output, err = hipReferenceRoPEWithFrequencyDimScale([]float32{1, 0}, 1, 1, 2, 0.5)
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{float32(math.Cos(0.5)), float32(math.Sin(0.5))}, output, 0.0001)
+
 	output, err = hipReferenceRoPENeoXWithFrequencyDim([]float32{1, 2, 3, 4}, 1, 1, 4, 2)
 	core.RequireNoError(t, err)
 	assertFloat32SlicesNear(t, []float32{
