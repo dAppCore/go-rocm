@@ -16569,3 +16569,44 @@ stderr: .bench-errors/2048_greedy_rows16_20260527.err (0 bytes)
 
 The final logits path is not helped by extra row parallelism on gfx1100. Keep
 the current 32 rows/block, 8 threads/row shape for greedy and score projection.
+
+## 2026-05-27 Rejected PLE Projection Output-Scale Fusion
+
+Pulled the Gemma4 notes from `../go-mlx/IDEAS.md` and rechecked ROCm against
+the production MLX shape:
+
+- Gemma4 hybrid attention is already modeled as local sliding layers plus full
+  layers; local device KV is windowed instead of globally retained.
+- shared KV source layers are already aliased through borrowed device caches and
+  descriptor entries.
+- full/global RoPE uses the Gemma4 global parameters, while sliding layers keep
+  the local rope shape.
+- retained book generation appends only new turn tokens into device state; it
+  does not rebuild the manuscript as prompt text.
+
+Tested folding the Gemma4 PLE model-projection scale into `rocm_projection`
+using the spare 32-bit projection launch slot. The PLE path wrote directly into
+the existing projected-scaled workspace buffer and skipped the separate
+`rocm_vector_scale` pass after the BF16 projection.
+
+Rejected result:
+
+```text
+Focused tests passed:
+go test ./go -run 'TestHIPKernels_Projection|TestHIPKernelSource_(ABIConstants|ExportsLaunchABI)_Good' -count=1
+go test ./go -count=1
+
+Compiled cleanly:
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-projection-output-scale.hsaco
+stderr: .bench-errors/hipcc_gfx1100_projection_output_scale_20260527.err (0 bytes)
+
+2048 live non-route guard:
+BenchmarkInferenceGemma4Q4Generate-32  1  18995535183 ns/op
+107.8 tok/s, 2048 tokens, 6673728 B/op, 2634 allocs/op
+stderr: .bench-errors/2048_projection_output_scale_noroute_20260527.err (0 bytes)
+```
+
+The scale fusion removed a kernel conceptually, but it moved work into the
+projection hot loop and did not reduce Go allocations or bytes transferred in
+the benchmark contract. Keep the separate projection and vector-scale path until
+a broader PLE fusion can combine projection, normalization, and add in one pass.
