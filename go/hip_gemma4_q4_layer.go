@@ -2492,11 +2492,10 @@ func hipGemma4Q4SoftcapLogits(logits []float32, softcap float32) ([]float32, err
 	if softcap == 0 {
 		return logits, nil
 	}
-	output := make([]float32, len(logits))
 	for index, value := range logits {
-		output[index] = float32(math.Tanh(float64(value/softcap))) * softcap
+		logits[index] = float32(math.Tanh(float64(value/softcap))) * softcap
 	}
-	return output, nil
+	return logits, nil
 }
 
 func hipRunGemma4Q4RoPEVector(ctx context.Context, driver nativeHIPDriver, input []float32, position int, base float32, rotaryDim int) ([]float32, error) {

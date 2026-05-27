@@ -43,6 +43,11 @@ const (
 )
 
 const (
+	rocmDeviceKVDescriptorPointerPoolMaxBytes   = 32 << 20
+	rocmDeviceKVDescriptorPointerPoolMaxPerSize = 4096
+)
+
+const (
 	rocmDeviceKVDescriptorEncodingFP16 uint32 = 1
 	rocmDeviceKVDescriptorEncodingQ8   uint32 = 2
 	rocmDeviceKVDescriptorEncodingQ4   uint32 = 3
@@ -115,6 +120,19 @@ var rocmDeviceKVDescriptorTablePool = struct {
 	entries []*rocmDeviceKVDescriptorTable
 }{}
 
+type rocmDeviceKVDescriptorPointerPoolEntry struct {
+	driver  nativeHIPDriver
+	pointer nativeDevicePointer
+}
+
+var rocmDeviceKVDescriptorPointerPool = struct {
+	sync.Mutex
+	entries map[uint64][]rocmDeviceKVDescriptorPointerPoolEntry
+	bytes   uint64
+}{
+	entries: make(map[uint64][]rocmDeviceKVDescriptorPointerPoolEntry),
+}
+
 type rocmDeviceKVLaunchDescriptor struct {
 	DescriptorPointer nativeDevicePointer
 	DescriptorBytes   uint64
@@ -167,6 +185,64 @@ func rocmReleaseDeviceKVDescriptorTable(table *rocmDeviceKVDescriptorTable) {
 		rocmDeviceKVDescriptorTablePool.entries = append(rocmDeviceKVDescriptorTablePool.entries, table)
 	}
 	rocmDeviceKVDescriptorTablePool.Unlock()
+}
+
+func rocmDeviceKVDescriptorHotTableBytes() uint64 {
+	return uint64(rocmDeviceKVDescriptorHeaderBytes + rocmDeviceKVHotPageCapacity*rocmDeviceKVDescriptorPageBytes)
+}
+
+func rocmDeviceKVDescriptorPointerPoolable(sizeBytes uint64) bool {
+	return sizeBytes == rocmDeviceKVDescriptorHotTableBytes()
+}
+
+func rocmDeviceKVDescriptorTableMalloc(driver nativeHIPDriver, sizeBytes uint64) (nativeDevicePointer, error) {
+	if driver == nil {
+		return 0, core.E("rocm.KVCache.DeviceDescriptor", "HIP driver is nil", nil)
+	}
+	if rocmDeviceKVDescriptorPointerPoolable(sizeBytes) {
+		rocmDeviceKVDescriptorPointerPool.Lock()
+		entries := rocmDeviceKVDescriptorPointerPool.entries[sizeBytes]
+		for index := len(entries) - 1; index >= 0; index-- {
+			entry := entries[index]
+			if entry.driver != driver {
+				continue
+			}
+			entries[index] = entries[len(entries)-1]
+			entries[len(entries)-1] = rocmDeviceKVDescriptorPointerPoolEntry{}
+			entries = entries[:len(entries)-1]
+			rocmDeviceKVDescriptorPointerPool.entries[sizeBytes] = entries
+			rocmDeviceKVDescriptorPointerPool.bytes -= sizeBytes
+			rocmDeviceKVDescriptorPointerPool.Unlock()
+			return entry.pointer, nil
+		}
+		rocmDeviceKVDescriptorPointerPool.Unlock()
+	}
+	return driver.Malloc(sizeBytes)
+}
+
+func rocmDeviceKVDescriptorTableFree(driver nativeHIPDriver, pointer nativeDevicePointer, sizeBytes uint64) error {
+	if pointer == 0 {
+		return nil
+	}
+	if driver == nil {
+		return core.E("rocm.KVCache.DeviceDescriptor", "HIP driver is nil", nil)
+	}
+	if rocmDeviceKVDescriptorPointerPoolable(sizeBytes) {
+		rocmDeviceKVDescriptorPointerPool.Lock()
+		entries := rocmDeviceKVDescriptorPointerPool.entries[sizeBytes]
+		if rocmDeviceKVDescriptorPointerPool.bytes+sizeBytes <= rocmDeviceKVDescriptorPointerPoolMaxBytes &&
+			len(entries) < rocmDeviceKVDescriptorPointerPoolMaxPerSize {
+			rocmDeviceKVDescriptorPointerPool.entries[sizeBytes] = append(entries, rocmDeviceKVDescriptorPointerPoolEntry{
+				driver:  driver,
+				pointer: pointer,
+			})
+			rocmDeviceKVDescriptorPointerPool.bytes += sizeBytes
+			rocmDeviceKVDescriptorPointerPool.Unlock()
+			return nil
+		}
+		rocmDeviceKVDescriptorPointerPool.Unlock()
+	}
+	return driver.Free(pointer)
 }
 
 type hipKVEncodeTokenLaunchArgs struct {
@@ -589,16 +665,13 @@ func (cache *rocmDeviceKVCache) withAppendedDeviceTokenWindow(ctx context.Contex
 	if err != nil {
 		return nil, err
 	}
-	next, err := cache.withAppendedEncodedToken(encodedKey, encodedValue, keyWidth, valueWidth)
+	next, err := cache.withAppendedEncodedTokenWindow(encodedKey, encodedValue, keyWidth, valueWidth, window)
 	if err != nil {
 		_ = rocmDeviceKVTensorFree(cache.driver, encodedKey.pointer, encodedKey.sizeBytes)
 		_ = rocmDeviceKVTensorFree(cache.driver, encodedValue.pointer, encodedValue.sizeBytes)
 		return nil, err
 	}
-	if window <= 0 || next.TokenCount() <= window {
-		return next, nil
-	}
-	return next.trimDeviceTokenWindow(window), nil
+	return next, nil
 }
 
 func (cache *rocmDeviceKVCache) withAppendedDeviceRowsWindow(ctx context.Context, key, value *hipDeviceByteBuffer, keyWidth, valueWidth, tokenCount, window int) (*rocmDeviceKVCache, error) {
@@ -740,42 +813,59 @@ func (cache *rocmDeviceKVCache) withAppendedEncodedToken(key, value rocmDeviceKV
 	return cache.withAppendedEncodedRows(key, value, keyWidth, valueWidth, 1)
 }
 
+func (cache *rocmDeviceKVCache) withAppendedEncodedTokenWindow(key, value rocmDeviceKVTensor, keyWidth, valueWidth, window int) (*rocmDeviceKVCache, error) {
+	if window <= 0 || cache == nil || cache.TokenCount()+1 <= window {
+		return cache.withAppendedEncodedToken(key, value, keyWidth, valueWidth)
+	}
+	next, ok, err := cache.withAppendedEncodedTokenTrimmed(key, value, keyWidth, valueWidth, window)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return next, nil
+	}
+	next, err = cache.withAppendedEncodedToken(key, value, keyWidth, valueWidth)
+	if err != nil {
+		return nil, err
+	}
+	return next.trimDeviceTokenWindow(window), nil
+}
+
+func (cache *rocmDeviceKVCache) withAppendedEncodedTokenTrimmed(key, value rocmDeviceKVTensor, keyWidth, valueWidth, window int) (*rocmDeviceKVCache, bool, error) {
+	if err := cache.validateAppendedEncodedRows(key, value, keyWidth, valueWidth, 1); err != nil {
+		return nil, false, err
+	}
+	trimStart := cache.TokenCount() + 1 - window
+	pages := rocmDeviceKVBorrowPageSlice(0, window)
+	for _, page := range cache.pages {
+		pageEnd := page.tokenStart + page.tokenCount
+		if pageEnd <= trimStart {
+			continue
+		}
+		if page.tokenStart < trimStart {
+			rocmDeviceKVReleasePageSlice(pages)
+			return nil, false, nil
+		}
+		page.tokenStart -= trimStart
+		page.owned = false
+		pages = append(pages, page)
+	}
+	tokenStart := cache.TokenCount() - trimStart
+	pages = append(pages, rocmDeviceKVPage{
+		tokenStart: tokenStart,
+		tokenCount: 1,
+		keyWidth:   keyWidth,
+		valueWidth: valueWidth,
+		key:        key,
+		value:      value,
+		owned:      true,
+	})
+	return rocmBorrowDeviceKVCache(cache.driver, cache.mode, cache.blockSize, window, pages, false), true, nil
+}
+
 func (cache *rocmDeviceKVCache) withAppendedEncodedRows(key, value rocmDeviceKVTensor, keyWidth, valueWidth, tokenCount int) (*rocmDeviceKVCache, error) {
-	if cache == nil {
-		return nil, core.E("rocm.KVCache.DeviceAppend", "device KV cache is nil", nil)
-	}
-	if cache.closed {
-		return nil, core.E("rocm.KVCache.DeviceAppend", "device KV cache is closed", nil)
-	}
-	if cache.driver == nil {
-		return nil, core.E("rocm.KVCache.DeviceAppend", "HIP driver is nil", nil)
-	}
-	if !cache.driver.Available() {
-		return nil, core.E("rocm.KVCache.DeviceAppend", "HIP driver is not available", nil)
-	}
-	if key.pointer == 0 || value.pointer == 0 || key.sizeBytes == 0 || value.sizeBytes == 0 {
-		return nil, core.E("rocm.KVCache.DeviceAppend", "encoded device KV row tensors are required", nil)
-	}
-	if keyWidth <= 0 || valueWidth <= 0 || tokenCount <= 0 {
-		return nil, core.E("rocm.KVCache.DeviceAppend", "KV row widths and token count must be positive", nil)
-	}
-	if priorKeyWidth, priorValueWidth, ok := cache.LastVectorWidths(); ok && (priorKeyWidth != keyWidth || priorValueWidth != valueWidth) {
-		return nil, core.E("rocm.KVCache.DeviceAppend", "KV row widths must match device cache shape", nil)
-	}
-	expectedKeyEncoding, expectedValueEncoding := rocmKVEncodingsForMode(cache.mode)
-	if key.encoding != expectedKeyEncoding || value.encoding != expectedValueEncoding {
-		return nil, core.E("rocm.KVCache.DeviceAppend", "encoded device KV row encodings do not match cache mode", nil)
-	}
-	expectedKeyBytes, err := rocmKVTensorDeviceByteCount(key.encoding, keyWidth*tokenCount)
-	if err != nil {
+	if err := cache.validateAppendedEncodedRows(key, value, keyWidth, valueWidth, tokenCount); err != nil {
 		return nil, err
-	}
-	expectedValueBytes, err := rocmKVTensorDeviceByteCount(value.encoding, valueWidth*tokenCount)
-	if err != nil {
-		return nil, err
-	}
-	if key.sizeBytes != expectedKeyBytes || value.sizeBytes != expectedValueBytes {
-		return nil, core.E("rocm.KVCache.DeviceAppend", "encoded device KV row byte count mismatch", nil)
 	}
 	tokenStart := cache.TokenCount()
 	next := rocmBorrowDeviceKVCache(cache.driver, cache.mode, cache.blockSize, tokenStart+tokenCount, rocmDeviceKVCopyPagesWithExtra(cache.pages, 1), false)
@@ -792,6 +882,46 @@ func (cache *rocmDeviceKVCache) withAppendedEncodedRows(key, value rocmDeviceKVT
 		owned:      true,
 	})
 	return next, nil
+}
+
+func (cache *rocmDeviceKVCache) validateAppendedEncodedRows(key, value rocmDeviceKVTensor, keyWidth, valueWidth, tokenCount int) error {
+	if cache == nil {
+		return core.E("rocm.KVCache.DeviceAppend", "device KV cache is nil", nil)
+	}
+	if cache.closed {
+		return core.E("rocm.KVCache.DeviceAppend", "device KV cache is closed", nil)
+	}
+	if cache.driver == nil {
+		return core.E("rocm.KVCache.DeviceAppend", "HIP driver is nil", nil)
+	}
+	if !cache.driver.Available() {
+		return core.E("rocm.KVCache.DeviceAppend", "HIP driver is not available", nil)
+	}
+	if key.pointer == 0 || value.pointer == 0 || key.sizeBytes == 0 || value.sizeBytes == 0 {
+		return core.E("rocm.KVCache.DeviceAppend", "encoded device KV row tensors are required", nil)
+	}
+	if keyWidth <= 0 || valueWidth <= 0 || tokenCount <= 0 {
+		return core.E("rocm.KVCache.DeviceAppend", "KV row widths and token count must be positive", nil)
+	}
+	if priorKeyWidth, priorValueWidth, ok := cache.LastVectorWidths(); ok && (priorKeyWidth != keyWidth || priorValueWidth != valueWidth) {
+		return core.E("rocm.KVCache.DeviceAppend", "KV row widths must match device cache shape", nil)
+	}
+	expectedKeyEncoding, expectedValueEncoding := rocmKVEncodingsForMode(cache.mode)
+	if key.encoding != expectedKeyEncoding || value.encoding != expectedValueEncoding {
+		return core.E("rocm.KVCache.DeviceAppend", "encoded device KV row encodings do not match cache mode", nil)
+	}
+	expectedKeyBytes, err := rocmKVTensorDeviceByteCount(key.encoding, keyWidth*tokenCount)
+	if err != nil {
+		return err
+	}
+	expectedValueBytes, err := rocmKVTensorDeviceByteCount(value.encoding, valueWidth*tokenCount)
+	if err != nil {
+		return err
+	}
+	if key.sizeBytes != expectedKeyBytes || value.sizeBytes != expectedValueBytes {
+		return core.E("rocm.KVCache.DeviceAppend", "encoded device KV row byte count mismatch", nil)
+	}
+	return nil
 }
 
 func (cache *rocmDeviceKVCache) trimDeviceTokenWindow(window int) *rocmDeviceKVCache {
@@ -1460,7 +1590,7 @@ func (cache *rocmDeviceKVCache) KernelDescriptorTableFromAppendedToken(ctx conte
 		return nil, err
 	}
 	outputBytes := uint64(rocmDeviceKVDescriptorHeaderBytes + cache.PageCount()*rocmDeviceKVDescriptorPageBytes)
-	pointer, err := cache.driver.Malloc(outputBytes)
+	pointer, err := rocmDeviceKVDescriptorTableMalloc(cache.driver, outputBytes)
 	if err != nil {
 		return nil, core.E("rocm.KVCache.DeviceDescriptor", "allocate appended descriptor table", err)
 	}
@@ -1484,7 +1614,7 @@ func (cache *rocmDeviceKVCache) KernelDescriptorTableFromAppendedToken(ctx conte
 		TrimStart:                 trimStart,
 	}).Binary()
 	if err != nil {
-		_ = cache.driver.Free(pointer)
+		_ = rocmDeviceKVDescriptorTableFree(cache.driver, pointer, outputBytes)
 		return nil, err
 	}
 	config := hipKernelLaunchConfig{
@@ -1498,7 +1628,7 @@ func (cache *rocmDeviceKVCache) KernelDescriptorTableFromAppendedToken(ctx conte
 		BlockZ: 1,
 	}
 	if err := hipLaunchKernel(cache.driver, config); err != nil {
-		_ = cache.driver.Free(pointer)
+		_ = rocmDeviceKVDescriptorTableFree(cache.driver, pointer, outputBytes)
 		return nil, err
 	}
 	return rocmBorrowDeviceKVDescriptorTable(cache.driver, pointer, outputBytes, rocmDeviceKVDescriptorVersion, cache.PageCount(), false, true), nil
@@ -1697,7 +1827,7 @@ func (table *rocmDeviceKVDescriptorTable) Close() error {
 		return nil
 	}
 	if table.pointer != 0 {
-		if err := table.driver.Free(table.pointer); err != nil {
+		if err := rocmDeviceKVDescriptorTableFree(table.driver, table.pointer, table.sizeBytes); err != nil {
 			return core.E("rocm.KVCache.DeviceDescriptor", "free descriptor table", err)
 		}
 		table.pointer = 0

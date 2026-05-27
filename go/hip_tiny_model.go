@@ -1162,7 +1162,7 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 				current.Greedy = greedyOut.Greedy
 				if hipTokenIsSuppressed(int32(current.Greedy.TokenID), suppressTokens) {
 					last := cfg.Layers[len(cfg.Layers)-1]
-					current.Greedy, err = hipRunGemma4Q4PrefillFinalGreedyForRowSuppress(ctx, model.driver, last, forward.FinalHidden, len(ubatch.Tokens), greedyOut.Row, req.Epsilon, finalGreedyBuffer, suppressTokens)
+					current.Greedy, err = hipRunGemma4Q4PrefillFinalGreedyForRowSuppressWorkspace(ctx, model.driver, last, forward.FinalHidden, len(ubatch.Tokens), greedyOut.Row, req.Epsilon, finalGreedyBuffer, suppressTokens, attentionWorkspace)
 					if err != nil {
 						_ = forward.Close()
 						runErr = err

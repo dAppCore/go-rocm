@@ -14132,3 +14132,60 @@ from `230620784` to `230528032 B/op`; average decode stayed noise-flat around
 `80 tok/s`, and turn 10 stayed around `69 tok/s`. The next material target is
 still the q4 projection/GELU/long-context attention hot path, not vector helper
 fusion.
+
+## 2026-05-27: 2048 Fast-Iteration KV Metadata Cleanup
+
+This pass used the chapter-shaped 2048-token guard as the acceptance loop and
+kept numerical kernel geometry unchanged:
+
+```text
+- Softcap host fallback logits in place instead of allocating a second full
+  vocab-sized logits slice.
+- Pass the existing generation workspace into the prefill suppress-token retry,
+  keeping the retry on the device when the first prefill greedy result is a
+  suppressed token.
+- Pool device descriptor table pointers for the hot 512-page local-window size.
+- Append already-windowed 512-page local KV metadata directly instead of
+  building a 513-page slice and immediately trimming it back to 512.
+```
+
+AX-11 microbenchmarks:
+
+```text
+BenchmarkROCmDeviceKVDescriptorPointerPool_HotWindow-32      23.96 ns/op  0 B/op  0 allocs/op
+BenchmarkROCmDeviceKVAppendEncodedTokenWindow_Hot-32          2606 ns/op  0 B/op  0 allocs/op
+```
+
+2048-token fast guards:
+
+```text
+2048 text:Hi:
+  18868635246 ns/op, 108.5 tok/s, 7138848 B/op, 4712 allocs/op
+
+2048 generated tokens, context_len=4096, chapter-1 lighthouse prompt:
+  20427504236 ns/op, 100.3 tok/s, 10041992 B/op, 6065 allocs/op
+```
+
+Retained-book acceptance:
+
+```text
+book_wall_s/op             37.77
+book_decode_s/op           33.55
+book_generated_tokens/op    3021
+book_tok/s                 79.99
+book_turn01_tok/s         109.6
+book_turn10_tok/s          69.88
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+stderr_bytes                   0
+B/op                    230625576
+allocs/op                  100447
+output: /tmp/go-rocm-book-10turn-fullcap-direct-trim.md
+stderr: /tmp/go-rocm-book-10turn-fullcap-direct-trim.err
+```
+
+This is a 2048 allocation cleanup, not a retained decode breakthrough. The
+chapter guard moved from `15750440 B/op` and `6163 allocs/op` at the baseline
+to `10041992 B/op` and `6065 allocs/op`; retained-book wall and decode speed
+stayed noise-flat and quality-clean. The remaining speed target is still the
+q4 projection/GELU/long-context attention hot path.

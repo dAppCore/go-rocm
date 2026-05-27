@@ -1579,6 +1579,16 @@ Remaining blocker:
   chapter-shaped 2048 run. Retained-book acceptance stayed quality-clean at
   `37.76s` wall, `80.01 tok/s` average, turn 10 `69.24 tok/s`,
   `230620784 B/op`, `100506 allocs/op`, `chapter10_arc_anchor_hits=3`.
+- The latest 2048-token fast-iteration batch keeps prompt tokenization reused,
+  softcaps host fallback logits in place, passes the generation workspace into
+  prefill suppress retry, pools hot 512-page device descriptor pointers, and
+  appends already-windowed 512-page local KV metadata directly instead of
+  building then trimming a 513-page slice. Fast guards now measure
+  `108.5 tok/s`, `7138848 B/op`, `4712 allocs/op` on `text:Hi` and
+  `100.3 tok/s`, `10041992 B/op`, `6065 allocs/op` on the chapter-shaped
+  2048 run. Retained-book acceptance stayed quality-clean at `37.77s` wall,
+  `79.99 tok/s` average, turn 10 `69.88 tok/s`, `230625576 B/op`,
+  `100447 allocs/op`, `chapter10_arc_anchor_hits=3`.
 
 - [ ] Phase 0: Snapshot the tree and establish the baseline.
   - Run `git status --short`.

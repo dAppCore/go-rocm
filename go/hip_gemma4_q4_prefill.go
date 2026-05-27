@@ -1347,6 +1347,10 @@ func hipRunGemma4Q4PrefillFinalGreedyForRow(ctx context.Context, driver nativeHI
 }
 
 func hipRunGemma4Q4PrefillFinalGreedyForRowSuppress(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4Layer0Config, hidden *hipDeviceByteBuffer, tokenCount int, row int, epsilon float32, best *hipDeviceByteBuffer, suppressTokens []int32) (hipGreedySampleResult, error) {
+	return hipRunGemma4Q4PrefillFinalGreedyForRowSuppressWorkspace(ctx, driver, cfg, hidden, tokenCount, row, epsilon, best, suppressTokens, nil)
+}
+
+func hipRunGemma4Q4PrefillFinalGreedyForRowSuppressWorkspace(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4Layer0Config, hidden *hipDeviceByteBuffer, tokenCount int, row int, epsilon float32, best *hipDeviceByteBuffer, suppressTokens []int32, workspace *hipAttentionHeadsChunkedWorkspace) (hipGreedySampleResult, error) {
 	if err := hipContextErr(ctx); err != nil {
 		return hipGreedySampleResult{}, err
 	}
@@ -1387,5 +1391,5 @@ func hipRunGemma4Q4PrefillFinalGreedyForRowSuppress(ctx context.Context, driver 
 		return hipGreedySampleResult{}, err
 	}
 	defer finalNorm.Close()
-	return hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppress(ctx, driver, finalNorm, cfg.LMHeadProjection, cfg.FinalLogitSoftcap, best, suppressTokens, nil)
+	return hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppress(ctx, driver, finalNorm, cfg.LMHeadProjection, cfg.FinalLogitSoftcap, best, suppressTokens, workspace)
 }
