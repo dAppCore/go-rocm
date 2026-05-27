@@ -1,5 +1,90 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Rejected Chunk-Aligned Descriptor Page Shortcut
+
+- Tested a guarded HIP-only optimization for
+  `rocm_attention_heads_chunked_stage1`: when a retained full/global
+  128-token chunk exactly matched one KQ8/VQ4 descriptor page, the kernel used
+  that page directly instead of resolving the descriptor for each token.
+- The guard required `header.block_size == chunk_size`, page `token_start`
+  equal to the chunk start, enough `token_count` to cover the chunk, matching
+  key/value widths, non-zero pointers, and q8/q4 encodings. Mixed suffix pages
+  fell back to the existing lookup. This was intended to avoid the earlier
+  invalid direct-page shortcut that broke retained page layouts.
+- Source and compile checks passed, but the retained route regressed. The HIP
+  source edit was reverted.
+
+Verification while the candidate was applied:
+
+```text
+go test ./go -run 'TestHIPAttentionHeads(ChunkedSharedMemBytes|ChunkedEligible)_Good|TestHIPAttentionHeadsChunkedEligible_Gemma4HeadDim512_Good|TestHIPKernelSource' -count=1 -v
+PASS
+
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-attn-chunk-page.hsaco
+stderr: .bench-errors/hipcc_gfx1100_attn_chunk_page_20260527.err (0 bytes)
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.139s
+```
+
+Short 2048 guard stayed effectively neutral:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 18704454678 ns/op
+tok/s=109.5
+tokens=2048
+B/op=5471376
+allocs/op=4713
+stderr: .bench-errors/2048_attn_chunk_page_20260527.err (0 bytes)
+```
+
+2-turn retained smoke was also neutral/slightly slower:
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 12635115919 ns/op
+book_wall_s=12.61
+book_generated_tokens=1253
+book_tok/s=99.39
+book_turn02_tok/s=101.9
+stderr: .bench-errors/book2_attn_chunk_page_20260527.err (0 bytes)
+```
+
+Strict 10-turn retained gate passed correctness but regressed performance:
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 65989347856 ns/op
+book_wall_s=65.92
+book_decode_s=54.45
+book_generated_tokens=4687
+book_tok/s=71.10
+book_turn10_tok/s=69.78
+chapter10_arc_anchor_hits=5
+book_repeated_turns=0
+book_maxed_turns=0
+B/op=22251016
+allocs/op=43023
+stderr: .bench-errors/book10_attn_chunk_page_20260527.err (0 bytes)
+artifact: /tmp/go-rocm-book10-attn-chunk-page-20260527.md
+```
+
+Current-source comparison immediately before the candidate:
+
+```text
+book_wall_s=57.03
+book_decode_s=46.59
+book_generated_tokens=4143
+book_tok/s=72.64
+book_turn10_tok/s=72.60
+chapter10_arc_anchor_hits=5
+stderr: .bench-errors/book10_current_rope_attention_shapes_20260527.err (0 bytes)
+artifact: /tmp/go-rocm-book10-current-rope-attention-shapes-20260527.md
+```
+
+Rejected reason: reducing descriptor lookup inside chunked stage1 did not reduce
+the measured retained wall/decode path on the RX 7800 XT. Keep the existing
+per-token descriptor lookup until a larger attention redesign changes the
+memory access pattern or measured kernel time.
+
 ## 2026-05-27 Accepted Retained RoPE Shape Table
 
 - Added a retained-book decode-only RoPE shape table alongside the existing
