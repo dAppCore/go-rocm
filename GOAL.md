@@ -491,6 +491,16 @@ workspace-backed scratch variant as well:
 XT completed with empty stderr at `0.706s` wall, `0.1279s` decode,
 `120.3 tok/s` on the last turn, `9777088 B/op`, and `18496 allocs/op`. This is
 allocation-shape prep for the sampled path, not a new best retained-book route.
+A fresh full 10-turn retained sampled book run after this cleanup, using the
+current source HSACO and `GO_ROCM_BOOK_CONTEXT_LEN=48000`, passed the production
+wall and arc gates with empty stderr at `51.58s` wall, `45.73s` decode,
+`3750` generated tokens, `72.70 tok/s` average, `60.99 tok/s` on turn 10,
+`292265176 B/op`, `125865 allocs/op`, `0` repeated turns, `0` max-token hits,
+and `3` chapter-10 arc anchors. The per-turn prompt-token counts stayed small
+after turn 1 (`161-180`) while retained tokens grew to `5403`, confirming the
+benchmark is appending only the new Gemma4 chat turn to retained `.kv` state
+instead of replaying prior chapter text. This is accepted wall-time evidence,
+but it reinforces that late-turn decode remains the next target.
 
 Rejected prompt-shortening follow-up: replacing the anchored wording with a
 shorter "advance the arc / keep continuity words alive" instruction reduced
