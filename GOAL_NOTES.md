@@ -17122,3 +17122,79 @@ optimization target should treat PLE projection, sliding attention output, and
 MLP down projection separately; the already-rejected generic small-column
 projection route should not be revived without a more specific design and a
 retained-book proof.
+
+## 2026-05-27 Accepted Q4 PLE Cols256 Projection Route
+
+Added a narrow q4 projection specialization for the Gemma4 PLE-sized route:
+`rows=1536 cols=256 group=64`. This avoids reviving the previously rejected
+generic small-column projection path; the launch selector only switches the
+full-output q4 projection kernel when `cols == 256 && group_size == 64`.
+
+Accepted 2048-token route check on the RX 7800 XT:
+
+```text
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85
+GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100-cols256-ple.hsaco
+GO_ROCM_BENCH_KERNEL_ROUTE_METRICS=1
+GO_ROCM_BENCH_TOKENS=2048
+BenchmarkInferenceGemma4Q4Generate-32 1 18836195444 ns/op
+tok/s=108.7
+tokens=2048
+B/op=5460088
+allocs/op=4696
+kernel_total_launches/op=999352
+kernel_total_blocks/op=165483379
+rocm_mlx_q4_projection_cols256=3,438,960 blocks/op, 71,645 launches/op
+stderr: .bench-errors/2048_cols256_ple_20260527.err (0 bytes)
+```
+
+The same shape previously used the generic `rocm_mlx_q4_projection` route at
+`13,755,840 blocks/op, 71,645 launches/op`, so the specialization removes about
+10.3M launched blocks from the 2048-token acceptance loop while preserving the
+same launch count.
+
+Strict retained 10-turn book proof also passed:
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 62953383076 ns/op
+book_wall_s=62.89
+book_decode_s=51.75
+book_generated_tokens=4507
+book_tok/s=71.67
+book_turn10_tok/s=71.61
+book_turn10_retained_tokens=6660
+chapter10_arc_anchor_hits=5
+chapter10_repeated_ngram_count=0
+chapter10_max_adjacent_repeat_ratio=0.01435
+peak_memory_bytes=6017097728
+B/op=19316504
+allocs/op=40600
+kernel_total_launches/generated_token=499.0
+kernel_total_blocks/generated_token=90137
+stderr: .bench-errors/book10_cols256_ple_20260527.err (0 bytes)
+```
+
+This is not a retained-book wall-time win against the prior accepted run
+(`55.81s`) because this generation produced more output tokens (`4507` vs
+`3974`). It is still accepted because the strict no-replay book proof stayed
+within the 90s/110s gates, turn-10 decode moved from roughly `69.78 tok/s` to
+`71.61 tok/s`, and the q4 short-route block count dropped.
+
+Verification:
+
+```text
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-cols256-ple.hsaco
+stderr: .bench-errors/hipcc_gfx1100_cols256_ple_20260527.err (0 bytes)
+
+go test ./go -run 'TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good|TestInferenceBenchmarkHIPKernelCountingDriver_Good' -count=1 -v
+PASS
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.195s
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.156s
+
+go test ./... -count=1
+ok dappco.re/go/rocm/workspace 0.696s
+```

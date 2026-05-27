@@ -2284,6 +2284,8 @@ func (driver *fakeHIPDriver) LaunchKernel(config hipKernelLaunchConfig) error {
 		return driver.launchProjectionBatch(config.Args)
 	case hipKernelNameMLXQ4Proj:
 		return driver.launchMLXQ4Projection(config.Args)
+	case hipKernelNameMLXQ4ProjCols256:
+		return driver.launchMLXQ4Projection(config.Args)
 	case hipKernelNameMLXQ4ProjBatch:
 		return driver.launchMLXQ4ProjectionBatch(config.Args)
 	case hipKernelNameMLXQ4ProjGreedy:

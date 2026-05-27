@@ -18,6 +18,7 @@ const (
 	hipKernelNameProjection                       = "rocm_projection"
 	hipKernelNameProjectionBatch                  = "rocm_projection_batch"
 	hipKernelNameMLXQ4Proj                        = "rocm_mlx_q4_projection"
+	hipKernelNameMLXQ4ProjCols256                 = "rocm_mlx_q4_projection_cols256"
 	hipKernelNameMLXQ4ProjBatch                   = "rocm_mlx_q4_projection_batch"
 	hipKernelNameMLXQ4ProjGreedy                  = "rocm_mlx_q4_projection_greedy"
 	hipKernelNameMLXQ4ProjScores                  = "rocm_mlx_q4_projection_scores"

@@ -38,6 +38,7 @@ const (
 	hipMLXQ4ProjectionBits                            = 4
 	hipMLXQ4ProjectionBlockSize                uint32 = 256
 	hipMLXQ4ProjectionRowsPerBlock                    = 8
+	hipMLXQ4ProjectionCols256RowsPerBlock             = 32
 	hipMLXQ4ProjectionBatchTokensPerBlock             = 8
 	hipMLXQ4ProjectionGreedyRowsPerBlock              = 32
 	hipMLXQ4ProjectionBestBytes                       = 8
@@ -1615,7 +1616,7 @@ func hipRunMLXQ4ProjectionKernel(ctx context.Context, driver nativeHIPDriver, re
 	if err != nil {
 		return nil, err
 	}
-	config, err := hipMLXQ4ProjectionLaunchConfig(launchBytes, req.Rows)
+	config, err := hipMLXQ4ProjectionLaunchConfigForShape(launchBytes, req.Rows, req.Cols, req.GroupSize)
 	if err != nil {
 		return nil, err
 	}
@@ -1739,7 +1740,7 @@ func hipRunMLXQ4ProjectionKernelWithDeviceInputOutput(ctx context.Context, drive
 	if err != nil {
 		return err
 	}
-	config, err := hipMLXQ4ProjectionLaunchConfig(launchBytes, cfg.Rows)
+	config, err := hipMLXQ4ProjectionLaunchConfigForShape(launchBytes, cfg.Rows, cfg.Cols, cfg.GroupSize)
 	if err != nil {
 		return err
 	}
@@ -2819,6 +2820,27 @@ func hipMLXQ4ProjectionLaunchConfig(args []byte, rows int) (hipKernelLaunchConfi
 		BlockZ: 1,
 	}
 	return config, config.Validate()
+}
+
+func hipMLXQ4ProjectionLaunchConfigForShape(args []byte, rows, cols, groupSize int) (hipKernelLaunchConfig, error) {
+	if cols == 256 && groupSize == 64 {
+		gridX, err := rocmDeviceKVPositiveUint32("MLX q4 cols256 projection row blocks", (rows+hipMLXQ4ProjectionCols256RowsPerBlock-1)/hipMLXQ4ProjectionCols256RowsPerBlock)
+		if err != nil {
+			return hipKernelLaunchConfig{}, err
+		}
+		config := hipKernelLaunchConfig{
+			Name:   hipKernelNameMLXQ4ProjCols256,
+			Args:   args,
+			GridX:  gridX,
+			GridY:  1,
+			GridZ:  1,
+			BlockX: hipMLXQ4ProjectionBlockSize,
+			BlockY: 1,
+			BlockZ: 1,
+		}
+		return config, config.Validate()
+	}
+	return hipMLXQ4ProjectionLaunchConfig(args, rows)
 }
 
 func hipMLXQ4ProjectionScoresLaunchConfig(args []byte, rows int) (hipKernelLaunchConfig, error) {

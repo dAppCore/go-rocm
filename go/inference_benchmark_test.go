@@ -188,6 +188,7 @@ func inferenceBenchmarkReportHIPKernelRouteMetrics(b *testing.B, driver *inferen
 	report(hipKernelNameAttentionHeadsChunkedStage1, "kernel_attention_decode_chunked_stage1")
 	report(hipKernelNameAttentionHeadsChunkedStage2, "kernel_attention_decode_chunked_stage2")
 	report(hipKernelNameMLXQ4Proj, "kernel_mlx_q4_projection")
+	report(hipKernelNameMLXQ4ProjCols256, "kernel_mlx_q4_projection_cols256")
 	report(hipKernelNameMLXQ4TripleProj, "kernel_mlx_q4_triple_projection")
 	report(hipKernelNameMLXQ4PairProj, "kernel_mlx_q4_pair_projection")
 	report(hipKernelNameMLXQ4GELUTanhMul, "kernel_mlx_q4_gelu_tanh_multiply")
@@ -353,7 +354,7 @@ func inferenceBenchmarkHIPKernelShapeLabel(entry inferenceBenchmarkHIPKernelShap
 func inferenceBenchmarkHIPKernelTensorShape(config hipKernelLaunchConfig) (rows, cols, group, batch uint32) {
 	args := config.Args
 	switch config.Name {
-	case hipKernelNameMLXQ4Proj, hipKernelNameMLXQ4ProjGreedy, hipKernelNameMLXQ4ProjScores:
+	case hipKernelNameMLXQ4Proj, hipKernelNameMLXQ4ProjCols256, hipKernelNameMLXQ4ProjGreedy, hipKernelNameMLXQ4ProjScores:
 		return inferenceBenchmarkU32At(args, 48), inferenceBenchmarkU32At(args, 52), inferenceBenchmarkU32At(args, 56), 0
 	case hipKernelNameMLXQ4ProjBatch:
 		return inferenceBenchmarkU32At(args, 48), inferenceBenchmarkU32At(args, 52), inferenceBenchmarkU32At(args, 60), inferenceBenchmarkU32At(args, 56)
@@ -1731,6 +1732,7 @@ func inferenceBenchmarkSelectedHIPKernelEntries(driver *inferenceBenchmarkHIPKer
 	}
 	names := []string{
 		hipKernelNameMLXQ4Proj,
+		hipKernelNameMLXQ4ProjCols256,
 		hipKernelNameMLXQ4TripleProj,
 		hipKernelNameMLXQ4PairProj,
 		hipKernelNameMLXQ4GELUTanhMul,

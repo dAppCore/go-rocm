@@ -57,6 +57,8 @@ constexpr uint32_t ROCM_MLX_Q4_PROJECTION_BITS = 4;
 constexpr uint32_t ROCM_MLX_Q4_PROJECTION_BLOCK_SIZE = 256;
 constexpr uint32_t ROCM_MLX_Q4_PROJECTION_ROWS_PER_BLOCK = 8;
 constexpr uint32_t ROCM_MLX_Q4_PROJECTION_THREADS_PER_ROW = ROCM_MLX_Q4_PROJECTION_BLOCK_SIZE / ROCM_MLX_Q4_PROJECTION_ROWS_PER_BLOCK;
+constexpr uint32_t ROCM_MLX_Q4_PROJECTION_COLS256_ROWS_PER_BLOCK = 32;
+constexpr uint32_t ROCM_MLX_Q4_PROJECTION_COLS256_THREADS_PER_ROW = ROCM_MLX_Q4_PROJECTION_BLOCK_SIZE / ROCM_MLX_Q4_PROJECTION_COLS256_ROWS_PER_BLOCK;
 constexpr uint32_t ROCM_MLX_Q4_PROJECTION_BATCH_TOKENS_PER_BLOCK = 8;
 constexpr uint32_t ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK = 32;
 constexpr uint32_t ROCM_MLX_Q4_PROJECTION_GREEDY_THREADS_PER_ROW = ROCM_MLX_Q4_PROJECTION_BLOCK_SIZE / ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK;
@@ -3439,6 +3441,14 @@ __device__ float rocm_mlx_q4_projection_row_sum(
 	return rocm_mlx_q4_projection_row_sum(input, weights, scales, biases, row, cols, group_size, col_lane, ROCM_MLX_Q4_PROJECTION_THREADS_PER_ROW);
 }
 
+__device__ float rocm_mlx_q4_cols256_row_reduce(float value)
+{
+	for (uint32_t stride = ROCM_MLX_Q4_PROJECTION_COLS256_THREADS_PER_ROW / 2u; stride > 0u; stride >>= 1u) {
+		value += rocm_shfl_down(value, stride, ROCM_MLX_Q4_PROJECTION_COLS256_THREADS_PER_ROW);
+	}
+	return value;
+}
+
 __device__ float rocm_mlx_q4_greedy_row_reduce(float value)
 {
 	for (uint32_t stride = ROCM_MLX_Q4_PROJECTION_GREEDY_THREADS_PER_ROW / 2u; stride > 0u; stride >>= 1u) {
@@ -3474,6 +3484,38 @@ extern "C" __global__ void rocm_mlx_q4_projection(const unsigned char *packet)
 		sum = rocm_mlx_q4_projection_row_sum(input, weights, scales, biases, row, args.cols, args.group_size, col_lane);
 	}
 	sum = rocm_mlx_q4_row_reduce(sum);
+	if (col_lane == 0 && row < args.rows) {
+		output[row] = sum;
+	}
+}
+
+extern "C" __global__ void rocm_mlx_q4_projection_cols256(const unsigned char *packet)
+{
+	if (packet == nullptr) {
+		return;
+	}
+	const rocm_mlx_q4_projection_launch_args &args = *reinterpret_cast<const rocm_mlx_q4_projection_launch_args *>(packet);
+	if (!rocm_valid_mlx_q4_projection_args(args) || args.cols != 256u || args.group_size != 64u) {
+		return;
+	}
+
+	if (blockDim.x != ROCM_MLX_Q4_PROJECTION_BLOCK_SIZE) {
+		return;
+	}
+	const uint32_t row_lane = threadIdx.x / ROCM_MLX_Q4_PROJECTION_COLS256_THREADS_PER_ROW;
+	const uint32_t col_lane = threadIdx.x - row_lane * ROCM_MLX_Q4_PROJECTION_COLS256_THREADS_PER_ROW;
+	const uint32_t row = blockIdx.x * ROCM_MLX_Q4_PROJECTION_COLS256_ROWS_PER_BLOCK + row_lane;
+
+	const float *input = reinterpret_cast<const float *>(static_cast<uintptr_t>(args.input_pointer));
+	const uint32_t *weights = reinterpret_cast<const uint32_t *>(static_cast<uintptr_t>(args.weight_pointer));
+	const uint16_t *scales = reinterpret_cast<const uint16_t *>(static_cast<uintptr_t>(args.scale_pointer));
+	const uint16_t *biases = reinterpret_cast<const uint16_t *>(static_cast<uintptr_t>(args.bias_pointer));
+	float *output = reinterpret_cast<float *>(static_cast<uintptr_t>(args.output_pointer));
+	float sum = 0.0f;
+	if (row < args.rows) {
+		sum = rocm_mlx_q4_projection_row_sum(input, weights, scales, biases, row, args.cols, args.group_size, col_lane, ROCM_MLX_Q4_PROJECTION_COLS256_THREADS_PER_ROW);
+	}
+	sum = rocm_mlx_q4_cols256_row_reduce(sum);
 	if (col_lane == 0 && row < args.rows) {
 		output[row] = sum;
 	}

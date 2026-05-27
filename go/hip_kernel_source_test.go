@@ -242,6 +242,11 @@ func TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good(t *test
 	core.AssertTrue(t, !strings.Contains(projection, `ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK`), "projection must not use greedy row blocks")
 	core.AssertTrue(t, !strings.Contains(projection, `ROCM_MLX_Q4_PROJECTION_GREEDY_THREADS_PER_ROW`), "projection must not use greedy row threads")
 
+	cols256 := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_projection_cols256`)
+	core.AssertTrue(t, strings.Contains(cols256, `args.cols != 256u || args.group_size != 64u`), "cols256 projection must guard its specialized tensor shape")
+	core.AssertTrue(t, strings.Contains(cols256, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_COLS256_THREADS_PER_ROW`), "cols256 projection rows use narrow row geometry")
+	core.AssertTrue(t, strings.Contains(cols256, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_COLS256_ROWS_PER_BLOCK + row_lane`), "cols256 projection grid uses narrow row blocks")
+
 	batch := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_projection_batch`)
 	core.AssertTrue(t, strings.Contains(batch, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_THREADS_PER_ROW`), "batch projection rows use normal row geometry")
 	core.AssertTrue(t, strings.Contains(batch, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_ROWS_PER_BLOCK + row_lane`), "batch projection grid uses normal row blocks")
