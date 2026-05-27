@@ -17328,3 +17328,66 @@ Conclusion: the fixed q4 hot path is now flat per generated token in retained
 decode, while chunked attention stage1 still grows as retained context grows.
 That growth is the next scaling target; the q4 route is still the largest fixed
 cost, but it is not the reason later turns bend downward.
+
+## 2026-05-27 Rejected Dim512-Only Chunk256 Attention
+
+The decode-only attention shape table showed local/SWA attention is bounded:
+once the 512-token window is full, the sliding route sits at
+`grid=32, shared_mem=3072`, `28` launches/generated token, and `896`
+blocks/generated token. The growing part is the full/global `dim=512` route
+(`shared_mem=4096`) as retained context grows.
+
+Tested a narrower version of the earlier rejected chunk-size knob: keep
+sliding `dim=256` attention at 128-token chunks, but launch `dim=512`
+full/global chunked attention with 256-token chunks. No HIP source change was
+needed; only the Go launch packet chunk size changed. The experiment was
+reverted after measurement.
+
+Focused tests passed:
+
+```text
+go test ./go -run 'TestHIPAttentionHeads(ChunkedSharedMemBytes|ChunkedEligible)_Good|TestHIPAttentionHeadsChunkedEligible_Gemma4HeadDim512_Good|TestHIPKernels_AttentionHeadsBatchChunked' -count=1 -v
+PASS
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.142s
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.107s
+```
+
+2048-token route guard:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 19883656672 ns/op
+tok/s=103.0
+tokens=2048
+B/op=5507984
+allocs/op=4668
+kernel_attention_decode_chunked_stage1_launches=66374
+kernel_attention_decode_chunked_stage1_blocks=932848
+kernel_total_launches=998456
+kernel_total_blocks=165017011
+stderr: .bench-errors/2048_dim512_chunk256_20260527.err (0 bytes)
+```
+
+2-turn retained book check:
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 12548130154 ns/op
+book_wall_s=12.52
+book_generated_tokens=1221
+book_tok/s=97.51
+book_turn01_tok/s=105.0
+book_turn02_tok/s=99.96
+book_turn01_decode_kernel_blocks=66007424
+book_turn02_decode_kernel_blocks=33628980
+stderr: .bench-errors/book2_dim512_chunk256_20260527.err (0 bytes)
+```
+
+Rejected reason: the 2048 guard stayed above the hard `100 tok/s` endpoint but
+regressed materially from the accepted `109.4 tok/s`/`18.71s` route, and the
+2-turn retained check was slower than the current 128-token attention route
+(`10.83s` wall, `98.93 tok/s`, turn 2 `102.5 tok/s`). The reduced launch/block
+count still does not translate to throughput on the RX 7800 XT. Keep both
+sliding and full/global chunked attention at the 128-token grain.
