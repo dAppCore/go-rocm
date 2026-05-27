@@ -330,7 +330,7 @@ func (model *hipLoadedModel) loadedGemma4Q4LayerConfig(layer int) (hipGemma4Q4La
 	if err != nil {
 		return hipGemma4Q4Layer0Config{}, err
 	}
-	lmHead, lmRows, lmCols, err := model.loadedGemma4Q4ProjectionConfig("language_model.model.embed_tokens", "embed_tokens_lm_head", groupSize)
+	lmHead, lmRows, lmCols, err := model.loadedGemma4Q4LMHeadProjectionConfig(groupSize)
 	if err != nil {
 		return hipGemma4Q4Layer0Config{}, err
 	}
@@ -3372,6 +3372,19 @@ func (model *hipLoadedModel) loadedGemma4Q4ProjectionConfig(baseName, label stri
 		return hipMLXQ4DeviceWeightConfig{}, 0, 0, core.E(hipGemma4Q4Layer0Operation, label+" q4 config", err)
 	}
 	return cfg, rows, cols, nil
+}
+
+func (model *hipLoadedModel) loadedGemma4Q4LMHeadProjectionConfig(groupSize int) (hipMLXQ4DeviceWeightConfig, int, int, error) {
+	for _, baseName := range []string{
+		"language_model.lm_head",
+		"language_model.model.lm_head",
+		"lm_head",
+	} {
+		if model.hasHIPTensor(baseName + ".weight") {
+			return model.loadedGemma4Q4ProjectionConfig(baseName, "lm_head", groupSize)
+		}
+	}
+	return model.loadedGemma4Q4ProjectionConfig("language_model.model.embed_tokens", "embed_tokens_lm_head", groupSize)
 }
 
 func (model *hipLoadedModel) loadedGemma4BF16NormConfig(name, label string, count int) (hipRMSNormDeviceWeightConfig, error) {

@@ -1742,6 +1742,12 @@ endpoint.
   contract tests assert propagation into the native runtime config and labels;
   the pinned 2048-token guard stayed green at `108.6 tok/s`, `6625608 B/op`,
   and `2610 allocs/op` with empty stderr.
+- [x] Match the `go-mlx` Gemma4 LM-head selection rule. The q4 runtime now
+  prefers an explicit `language_model.lm_head`/`language_model.model.lm_head`
+  tensor when present and falls back to tied `language_model.model.embed_tokens`
+  for E2B-style configs. `TestHIPGemma4Q4LMHeadProjectionPrefersUntiedHead_Good`
+  covers both branches; this is behavior-neutral for the current E2B q4 model
+  because its config ties embeddings.
 - [x] Add the first batched q4 MLP primitive for prefill. The new
   `rocm_mlx_q4_gelu_tanh_multiply_batch` kernel maps prompt rows onto `GridY`
   for fused gate/up projection plus GELU multiply, and the Gemma4 q4 prefill

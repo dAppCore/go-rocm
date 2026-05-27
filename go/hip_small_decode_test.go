@@ -1947,6 +1947,40 @@ func TestHIPGemma4Q4LoadedTextConfigFinalLogitSoftcap_Good(t *testing.T) {
 	core.AssertEqual(t, float32(30), model.loadedGemma4Q4FinalLogitSoftcap())
 }
 
+func TestHIPGemma4Q4LMHeadProjectionPrefersUntiedHead_Good(t *testing.T) {
+	const groupSize = 64
+	model := &hipLoadedModel{tensors: map[string]hipTensor{}}
+	addQ4ProjectionTensors := func(baseName string, pointer nativeDevicePointer) {
+		model.tensors[baseName+".weight"] = hipTensor{
+			info:    nativeTensorInfo{TypeName: "U32", Dimensions: []uint64{8, 8}, ByteSize: 256},
+			pointer: pointer,
+		}
+		model.tensors[baseName+".scales"] = hipTensor{
+			info:    nativeTensorInfo{TypeName: "BF16", Dimensions: []uint64{8, 1}, ByteSize: 16},
+			pointer: pointer + 1,
+		}
+		model.tensors[baseName+".biases"] = hipTensor{
+			info:    nativeTensorInfo{TypeName: "BF16", Dimensions: []uint64{8, 1}, ByteSize: 16},
+			pointer: pointer + 2,
+		}
+	}
+	addQ4ProjectionTensors("language_model.model.embed_tokens", 100)
+	addQ4ProjectionTensors("language_model.lm_head", 200)
+
+	cfg, rows, cols, err := model.loadedGemma4Q4LMHeadProjectionConfig(groupSize)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, nativeDevicePointer(200), cfg.WeightPointer)
+	core.AssertEqual(t, 8, rows)
+	core.AssertEqual(t, 64, cols)
+
+	delete(model.tensors, "language_model.lm_head.weight")
+	delete(model.tensors, "language_model.lm_head.scales")
+	delete(model.tensors, "language_model.lm_head.biases")
+	cfg, _, _, err = model.loadedGemma4Q4LMHeadProjectionConfig(groupSize)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, nativeDevicePointer(100), cfg.WeightPointer)
+}
+
 func TestHIPGemma4Q4E4BSharedKVLayoutUsesLayerTypes_Good(t *testing.T) {
 	const layerCount = 42
 	layers := make([]hipGemma4Q4Layer0Config, layerCount)
