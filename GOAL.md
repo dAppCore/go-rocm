@@ -1667,6 +1667,10 @@ go test ./go -run TestNativeDecodeSmokeKernelStatus_Good -count=1 -v
 - Use local `go.work` during Core development. Do not force `GOWORK=off` while
   unpublished local `go-inference` contracts are linked.
 - Hardware tests must be opt-in and skip cleanly without ROCm hardware.
+- Retained state is a URI-first `.kv` vector stream stored through the
+  go-inference/state path, currently using the repurposed MP4-style state
+  container. Wake/restore failures must return an error. They must never rebuild
+  a session by replaying prior prompt or chapter text.
 
 ## Current Baseline
 
@@ -1812,47 +1816,78 @@ Remaining blocker:
     `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./... -count=1`, and
     `go test -tags rocm_legacy_server ./... -count=1`.
 
-- [ ] Phase 1: Synchronise shared contracts.
+- [x] Phase 1: Synchronise shared contracts.
   - Ensure local `external/go-inference/go` contains the contract primitives
     required by `go-mlx`: capability IDs, optional interfaces, OpenAI service
     helpers, parser interfaces, cache interfaces, benchmark/eval structs, and
     the `state` package.
   - Add only backend-neutral contracts to `go-inference`.
   - Add focused `go-inference` tests before touching `go-rocm`.
+  - 2026-05-27 audit: `external/go-inference/go/capability.go` exposes the
+    shared capability IDs/report helpers and `contracts.go` exposes scheduler,
+    cancellation, cache, embedding/rerank, parser, model-pack, and state
+    wake/sleep/fork contracts. The local `state` package is present and wired
+    through URI-first refs.
 
-- [ ] Phase 2: Make ROCm capability reports honest and complete.
+- [x] Phase 2: Make ROCm capability reports honest and complete.
   - Update `go/native_contract_test.go` first.
   - Ensure `rocmBackend.Capabilities()` and `rocmModel.Capabilities()` report
     all shared feature IDs with correct status.
   - Supported means usable today. Experimental means callable with known limits.
     Planned means visible to planners but not callable.
+  - 2026-05-27 audit: `go/native.go` builds a full capability report and
+    `go/native_contract_test.go` asserts every ID in
+    `nativeContractSharedCapabilityIDs()` is present with supported,
+    experimental, or planned status as appropriate.
 
-- [ ] Phase 3: Model-pack inspection parity.
+- [x] Phase 3: Model-pack inspection parity.
   - Harden `go/model_pack.go` for GGUF, safetensors headers, `config.json`,
     tokenizer metadata, `jang_config.json`, `codebook_config.json`, architecture
     aliases, quantization aliases, context limits, and memory-fit labels.
   - Add fixtures for MiniMax/JANGTQ, Qwen3, Gemma, Mistral/Mixtral, Phi,
     DeepSeek, GPT-OSS, and BERT metadata.
+  - 2026-05-27 audit: `go/model_pack.go` and
+    `go/native_contract_test.go` cover GGUF/safetensors metadata, tokenizer
+    sidecars, JANGTQ/codebook metadata, memory-fit labels, sharded safetensors,
+    malformed inputs, and architecture fixtures for Qwen3, Gemma/Gemma4,
+    Mistral/Mixtral, Phi, DeepSeek/R1, GPT-OSS, Kimi, MiniMax, Llama, GLM,
+    Hermes, Granite, and BERT embedding/rerank/classifier packs.
 
-- [ ] Phase 4: Scheduler and cancellation.
+- [x] Phase 4: Scheduler and cancellation.
   - Add a ROCm scheduler wrapper implementing `inference.SchedulerModel` and
     `inference.CancellableModel`.
   - Include bounded queueing, request IDs, cancellation before prefill,
     cancellation during decode, queue latency, first-token latency, and probe
     events.
+  - 2026-05-27 audit: `go/scheduler.go` implements `ScheduledModel` with
+    bounded queueing, generated request IDs, cancellation, queue/first-token
+    labels, and probe events; `go/scheduler_test.go` covers queueing, clones,
+    Generate/Chat wrappers, cancellation, close/error paths, and probe labels.
 
-- [ ] Phase 5: Parser registry.
+- [x] Phase 5: Parser registry.
   - Add ROCm reasoning/tool parser support for Qwen, Gemma, MiniMax, DeepSeek
     R1, GPT-OSS, Mistral, Kimi, GLM, Hermes, Granite, and generic XML/JSON.
   - Wire parser capabilities to loaded model metadata and stream output.
+  - 2026-05-27 audit: `go/parser_registry.go` delegates through the shared
+    output parser by architecture, and `go/parser_registry_test.go` covers Qwen,
+    Gemma/Gemma4, MiniMax, DeepSeek R1, GPT-OSS, Kimi, GLM, Mistral, Hermes,
+    Granite, generic XML/JSON, and `rocmModel` parser contracts.
 
-- [ ] Phase 6: Cache and state groundwork.
+- [x] Phase 6: Cache and state groundwork.
   - Add a ROCm `inference.CacheService` implementation with cache stats,
     warm, clear, block identity, adapter compatibility, tokenizer compatibility,
     and memory/disk accounting.
   - Wire `go-inference/state` wake/sleep/fork primitives without coupling to
     `go-mlx` or `go-ai`.
   - Keep memvid-compatible references URI-first and runtime-owned.
+  - 2026-05-27 audit: `go/cache.go` implements block cache warm/stats/clear,
+    compatibility, disk refs, and package-local/HIP device KV accounting.
+    `go/state_session.go` implements wake/sleep/fork over
+    go-inference/state refs, including block-stream KV bundles and direct HIP
+    device restore. `WakeState` refuses prompt-text restore with
+    `KV state is required; refusing to rebuild retained state from prompt text`,
+    and the retained book benchmark test asserts turn 2 appends only the new
+    Gemma4 user turn, not `Book so far`.
 
 - [ ] Phase 7: HIP runtime stepping stones.
   - Keep allocation/copy tests green.
