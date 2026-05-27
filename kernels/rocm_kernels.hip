@@ -3204,11 +3204,13 @@ __device__ float rocm_mlx_q4_projection_row_sum(
 	uint32_t threads_per_row)
 {
 	const uint32_t packed_per_row = cols / 8u;
+	const uint32_t row_packed_base = row * packed_per_row;
 	float sum = 0.0f;
 	if (group_size == 64u) {
 		const uint32_t groups_per_row = cols >> 6u;
+		const uint32_t row_group_base = row * groups_per_row;
 		for (uint32_t group_col = col_lane; group_col < groups_per_row; group_col += threads_per_row) {
-			const uint32_t group = row * groups_per_row + group_col;
+			const uint32_t group = row_group_base + group_col;
 			const float scale = rocm_bfloat16_to_float(scales[group]);
 			const float bias = rocm_bfloat16_to_float(biases[group]);
 			const uint32_t first_packed = group_col << 3u;
@@ -3216,7 +3218,7 @@ __device__ float rocm_mlx_q4_projection_row_sum(
 			float input_sum = 0.0f;
 			for (uint32_t group_packed = 0; group_packed < 8u; ++group_packed) {
 				const uint32_t packed = first_packed + group_packed;
-				const uint32_t word = weights[row * packed_per_row + packed];
+				const uint32_t word = weights[row_packed_base + packed];
 				const uint32_t col = packed << 3;
 				const float in0 = input[col];
 				const float in1 = input[col + 1u];
@@ -3242,10 +3244,11 @@ __device__ float rocm_mlx_q4_projection_row_sum(
 		return sum;
 	}
 	const uint32_t groups_per_row = cols / group_size;
+	const uint32_t row_group_base = row * groups_per_row;
 	if ((group_size & 7u) == 0u) {
 		const uint32_t packed_per_group = group_size >> 3u;
 		for (uint32_t group_col = col_lane; group_col < groups_per_row; group_col += threads_per_row) {
-			const uint32_t group = row * groups_per_row + group_col;
+			const uint32_t group = row_group_base + group_col;
 			const float scale = rocm_bfloat16_to_float(scales[group]);
 			const float bias = rocm_bfloat16_to_float(biases[group]);
 			const uint32_t first_packed = group_col * packed_per_group;
@@ -3253,7 +3256,7 @@ __device__ float rocm_mlx_q4_projection_row_sum(
 			float input_sum = 0.0f;
 			for (uint32_t group_packed = 0; group_packed < packed_per_group; ++group_packed) {
 				const uint32_t packed = first_packed + group_packed;
-				const uint32_t word = weights[row * packed_per_row + packed];
+				const uint32_t word = weights[row_packed_base + packed];
 				const uint32_t col = packed << 3;
 				const float in0 = input[col];
 				const float in1 = input[col + 1u];
@@ -3279,9 +3282,9 @@ __device__ float rocm_mlx_q4_projection_row_sum(
 		return sum;
 	}
 	for (uint32_t col = col_lane; col < cols; col += threads_per_row) {
-		const uint32_t word = weights[row * packed_per_row + col / 8u];
+		const uint32_t word = weights[row_packed_base + col / 8u];
 		const uint32_t q = (word >> ((col & 7u) * 4u)) & 0x0fu;
-		const uint32_t group = row * groups_per_row + col / group_size;
+		const uint32_t group = row_group_base + col / group_size;
 		const float scale = rocm_bfloat16_to_float(scales[group]);
 		const float bias = rocm_bfloat16_to_float(biases[group]);
 		sum += input[col] * (static_cast<float>(q) * scale + bias);
@@ -3656,12 +3659,14 @@ extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply(const unsigned char *p
 	float *output = reinterpret_cast<float *>(static_cast<uintptr_t>(args.output_pointer));
 	const uint32_t packed_per_row = args.cols / 8;
 	const uint32_t groups_per_row = args.cols / args.group_size;
+	const uint32_t row_packed_base = row * packed_per_row;
+	const uint32_t row_group_base = row * groups_per_row;
 	float gate_sum = 0.0f;
 	float up_sum = 0.0f;
 	if (row < args.rows && args.group_size == 64u) {
 		for (uint32_t packed = col_lane; packed < packed_per_row; packed += ROCM_MLX_Q4_PROJECTION_THREADS_PER_ROW) {
-			const uint32_t gate_word = gate_weights[row * packed_per_row + packed];
-			const uint32_t up_word = up_weights[row * packed_per_row + packed];
+			const uint32_t gate_word = gate_weights[row_packed_base + packed];
+			const uint32_t up_word = up_weights[row_packed_base + packed];
 			const uint32_t col = packed << 3;
 			const uint32_t group = row * groups_per_row + (packed >> 3u);
 			const float gate_scale = rocm_bfloat16_to_float(gate_scales[group]);
@@ -3700,10 +3705,10 @@ extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply(const unsigned char *p
 		}
 	} else if (row < args.rows && (args.group_size & 7u) == 0u) {
 		for (uint32_t packed = col_lane; packed < packed_per_row; packed += ROCM_MLX_Q4_PROJECTION_THREADS_PER_ROW) {
-			const uint32_t gate_word = gate_weights[row * packed_per_row + packed];
-			const uint32_t up_word = up_weights[row * packed_per_row + packed];
+			const uint32_t gate_word = gate_weights[row_packed_base + packed];
+			const uint32_t up_word = up_weights[row_packed_base + packed];
 			const uint32_t col = packed << 3;
-			const uint32_t group = row * groups_per_row + col / args.group_size;
+			const uint32_t group = row_group_base + col / args.group_size;
 			const float gate_scale = rocm_bfloat16_to_float(gate_scales[group]);
 			const float gate_bias = rocm_bfloat16_to_float(gate_biases[group]);
 			const float up_scale = rocm_bfloat16_to_float(up_scales[group]);
@@ -3740,12 +3745,12 @@ extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply(const unsigned char *p
 		}
 	} else if (row < args.rows) {
 		for (uint32_t col = col_lane; col < args.cols; col += ROCM_MLX_Q4_PROJECTION_THREADS_PER_ROW) {
-			const uint32_t gate_word = gate_weights[row * packed_per_row + col / 8];
-			const uint32_t up_word = up_weights[row * packed_per_row + col / 8];
+			const uint32_t gate_word = gate_weights[row_packed_base + col / 8];
+			const uint32_t up_word = up_weights[row_packed_base + col / 8];
 			const uint32_t shift = (col & 7u) * 4u;
 			const uint32_t gate_q = (gate_word >> shift) & 0x0fu;
 			const uint32_t up_q = (up_word >> shift) & 0x0fu;
-			const uint32_t group = row * groups_per_row + col / args.group_size;
+			const uint32_t group = row_group_base + col / args.group_size;
 			const float gate_scale = rocm_bfloat16_to_float(gate_scales[group]);
 			const float gate_bias = rocm_bfloat16_to_float(gate_biases[group]);
 			const float up_scale = rocm_bfloat16_to_float(up_scales[group]);

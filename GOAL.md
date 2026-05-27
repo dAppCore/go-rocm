@@ -608,6 +608,16 @@ turn 2. This is only slightly above the host-sampling run, so final sampling is
 not the next high-ROI target. Keep focusing on q4 projection/GELU kernels and
 long-context attention.
 
+Accepted q4 row-base arithmetic cleanup: the projection row-sum helper and q4
+GELU multiply now hoist repeated row packed/group base arithmetic out of the
+inner loops while keeping the exact group-64 fast-path shape guarded by source
+tests. The `gfx1100` HSACO rebuilt with empty compiler stderr, package/source
+tests passed, and a serialized 2-turn `2k` retained sampled book guard with
+`block_size=16` stayed above the floor at `16.04s` wall, `15.52s` decode,
+`1536` generated tokens, `95.78 tok/s` average, and `93.95 tok/s` on turn 2.
+Both debug turns hit the 768-token cap, so this is accepted as neutral hot-loop
+codegen cleanup rather than book-quality evidence.
+
 Rejected prompt-shortening follow-up: replacing the anchored wording with a
 shorter "advance the arc / keep continuity words alive" instruction reduced
 prompt tokens to `1581` and still passed the arc gate with `3` anchors, but it
