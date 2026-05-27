@@ -1,5 +1,53 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Current Route Shape After IDEAS Refresh
+
+- Took a fresh selected-kernel route sample after reading the Gemma4 notes in
+  `go-mlx/IDEAS.md` and refreshing `go-inference`.
+
+```text
+BenchmarkInferenceGemma4Q4Generate, 512 tokens:
+  4550398241 ns/op
+  112.5 tok/s
+  3212416 B/op
+  3012 allocs/op
+  kernel_total_launches/op 246715
+  rocm_mlx_q4_projection launches/op 63875
+  rocm_mlx_q4_triple_projection launches/op 7665
+  rocm_mlx_q4_pair_projection launches/op 0
+  rocm_mlx_q4_gelu_tanh_multiply launches/op 17885
+  rocm_mlx_q4_gelu_tanh_projection launches/op 17885
+  rocm_attention_heads_chunked_stage1 launches/op 13510
+  rocm_attention_heads_chunked_stage2 launches/op 13510
+  stderr: .bench-errors/512_route_after_inference_fb49548_20260527.err (empty)
+```
+
+- The E2B q4 pack reports `attention_k_eq_v=false`, so the pair-projection
+  route correctly stays at zero launches on this model. The q4 projection count
+  is also structurally explainable: 20 shared-layer query projections plus 35
+  attention output projections, 35 MLP down projections, and 35 PLE projections
+  per generated token. That makes simple launch-count removal unlikely without
+  deeper fusion; the next useful work is per-kernel math/memory behavior or
+  long-context attention, not another routing shortcut.
+- A 2048-token memprofile run stayed green:
+
+```text
+BenchmarkInferenceGemma4Q4Generate:
+  18922537475 ns/op
+  108.2 tok/s
+  2048 tokens
+  6673488 B/op
+  2633 allocs/op
+  stderr: .bench-errors/2048_memprofile_after_inference_fb49548_20260527.err (empty)
+```
+
+- The raw `go test -memprofile` allocation profile is dominated by model-load
+  work (`copyTensorToDevice`, tokenizer JSON, safetensors inspection), not the
+  post-load generation loop measured by `B/op`. For generation tuning, keep
+  using benchmark `B/op`/`allocs/op`, route counters, and retained-book turn
+  deltas rather than treating whole-process pprof load allocations as the decode
+  bottleneck.
+
 ## 2026-05-27 go-inference Parser/Probe Refresh
 
 - Fast-forwarded `external/go-inference` `858cd0d` -> `fb49548` after the
