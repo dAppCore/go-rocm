@@ -474,16 +474,20 @@ adding counters to the normal hot path. A 4096-token `prefill_ubatch=16` check
 proved the route is active: `rocm_attention_heads_batch_causal` launched `8064`
 times, while `rocm_attention_heads_batch_chunked_stage1` and `_stage2` launched
 `896` times each with `2809856` stage-1 blocks and `114688` stage-2 blocks. The
-next target is therefore not route selection; it is reducing the remaining
-batch-causal launch count and making the batch-chunked stage cheaper.
-Rejected threshold tuning: moving the batch-chunked route below the 2048-token
-shared-weight cutoff is not a good default yet. A `512` threshold improved the
-2k prompt to `417.1 prompt_tok/s` but dropped the 4k prompt to
-`290.2 prompt_tok/s` by launching `7840` batch-chunked stages. A `1024`
-threshold was flat at 4k and worse at 2k (`374.0 prompt_tok/s`). A `1536`
-threshold reached `403.4 prompt_tok/s` at 2k but reduced 4k to
-`330.9 prompt_tok/s`. Keep the 2048 cutoff until the stage cost is lower or
-local-window attention has its own specialized kernel.
+next target is therefore reducing the remaining batch-causal launch count and
+making the batch-chunked stage cheaper.
+
+Accepted route tuning: full-attention layers (`head_dim == 512`) now switch to
+the batch-chunked route after 512 tokens while sliding-window layers keep the
+2048-token shared-weight cutoff. This avoids sending the 528-token local-window
+layers through the two-stage path. Clean no-route-metric checks measured
+`374.4 prompt_tok/s` at 2k, `339.7 prompt_tok/s` on the accepted 4k rerun, and
+`236.4 prompt_tok/s` at 8k, with all runtime `.err` files empty. Rejected
+all-layer threshold tuning: a `512` threshold improved the 2k prompt to
+`417.1 prompt_tok/s` but dropped the 4k prompt to `290.2 prompt_tok/s` by
+launching `7840` batch-chunked stages; `1024` was flat at 4k and worse at 2k;
+`1536` reached `403.4 prompt_tok/s` at 2k but reduced 4k to
+`330.9 prompt_tok/s`.
 
 For comparison, upstream llama.cpp built locally with HIP for `gfx1100` and run
 against the Hugging Face Gemma4 GGUF

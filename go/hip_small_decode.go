@@ -2123,7 +2123,14 @@ func hipAttentionHeadsBatchChunkedEligible(req hipAttentionHeadsBatchCausalDevic
 	if workspace == nil || req.DeviceKV == nil || req.DescriptorTable == nil {
 		return false
 	}
-	if req.Dim <= 0 || req.Dim > hipAttentionHeadsChunkedBlockSize || req.TokenCount <= hipAttentionHeadsSharedMaxTokens {
+	if req.Dim <= 0 || req.Dim > hipAttentionHeadsChunkedBlockSize {
+		return false
+	}
+	minTokenCount := hipAttentionHeadsSharedMaxTokens
+	if req.Dim == hipAttentionHeadsChunkedBlockSize {
+		minTokenCount = 512
+	}
+	if req.TokenCount <= minTokenCount {
 		return false
 	}
 	if req.DeviceKV.mode != rocmKVCacheModeKQ8VQ4 {
