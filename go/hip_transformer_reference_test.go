@@ -391,6 +391,8 @@ func TestHIPTransformerReferenceSamplerBadInputsAndTies_Bad(t *testing.T) {
 	core.AssertEqual(t, 2, candidatePenalized.TokenID)
 	core.AssertTrue(t, hipGemma4Q4DeviceCandidateSamplingRequested(inference.GenerateConfig{Temperature: 1, TopK: 2, TopP: 1, RepeatPenalty: 1}), "top-k sampling can use device candidates without repeat penalty")
 	core.AssertTrue(t, !hipGemma4Q4DeviceCandidateSamplingRequested(inference.GenerateConfig{Temperature: 1, TopK: 2, TopP: 1, RepeatPenalty: 2}), "repeat penalty changes the top-k set and must use full logits")
+	core.AssertTrue(t, !hipGemma4Q4RepeatHistoryRequired(inference.GenerateConfig{Temperature: 1, TopK: 2, TopP: 1, RepeatPenalty: 1}), "repeat history is unused when repeat penalty is neutral")
+	core.AssertTrue(t, hipGemma4Q4RepeatHistoryRequired(inference.GenerateConfig{RepeatPenalty: 2}), "repeat history is required when repeat penalty is active")
 	packed := []uint64{
 		hipPackGreedyBest(1, 0),
 		hipPackGreedyBest(3, 1),
@@ -585,6 +587,16 @@ func BenchmarkHIPGemma4Q4HostSampleCandidateResultScratch_TopK64(b *testing.B) {
 		scratchCandidates = nextCandidates
 		scratchWeights = nextWeights
 		benchmarkHIPCandidateSampleResultSink = result
+	}
+}
+
+func BenchmarkHIPGemma4Q4RepeatHistoryRequired_Hot(b *testing.B) {
+	generate := inference.GenerateConfig{Temperature: 1, TopK: 64, TopP: 0.95, RepeatPenalty: 1}
+	b.ReportAllocs()
+	for b.Loop() {
+		if hipGemma4Q4RepeatHistoryRequired(generate) {
+			b.Fatal("neutral repeat penalty should not require history")
+		}
 	}
 }
 

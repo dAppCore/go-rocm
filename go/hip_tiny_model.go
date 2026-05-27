@@ -1086,7 +1086,8 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 		var current hipGemma4Q4ForwardResult
 		haveCurrent := false
 		var history []int32
-		if hostSampling {
+		trackHistory := hipGemma4Q4RepeatHistoryRequired(generate)
+		if trackHistory {
 			history = make([]int32, 0, generate.MaxTokens)
 		}
 		deviceCandidateSampling := hipGemma4Q4DeviceCandidateSamplingRequested(generate)
@@ -1218,7 +1219,7 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 			if !yield(token) {
 				return
 			}
-			if hostSampling {
+			if trackHistory {
 				history = append(history, tokenID)
 			}
 			if generated == generate.MaxTokens-1 {
@@ -1748,6 +1749,10 @@ func hipGemma4Q4HostSamplingRequested(generate inference.GenerateConfig) bool {
 
 func hipGemma4Q4DeviceCandidateSamplingRequested(generate inference.GenerateConfig) bool {
 	return hipGemma4Q4HostSamplingRequested(generate) && generate.TopK > 0 && generate.RepeatPenalty <= 1
+}
+
+func hipGemma4Q4RepeatHistoryRequired(generate inference.GenerateConfig) bool {
+	return generate.RepeatPenalty > 1
 }
 
 func hipGemma4Q4HostSampleResult(logits []float32, generate inference.GenerateConfig, suppressTokens []int32, history []int32, draw float64) (hipGreedySampleResult, error) {

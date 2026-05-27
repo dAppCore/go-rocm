@@ -14720,3 +14720,53 @@ attention speedups unless the 48k retained story gate also passes.
 failed output: /tmp/go-rocm-book-retained-block16-48k-global64-route.md
 failed stderr: /tmp/go-rocm-book-retained-block16-48k-global64-route.err
 ```
+
+## 2026-05-27: Neutral Repeat Sampling History Cleanup
+
+Accepted a small exactness-preserving host-sampling cleanup:
+
+```text
+- Added `hipGemma4Q4RepeatHistoryRequired`.
+- Public Gemma4 q4 Generate and the retained book harness now allocate and
+  append generated-token history only when `RepeatPenalty > 1`.
+- The default sampled book route uses `RepeatPenalty == 1`, and both host
+  samplers already ignore `history` unless the penalty is active, so this does
+  not change token scoring or `.kv`/MP4 retained-state semantics.
+```
+
+AX-11 microbenchmarks:
+
+```text
+BenchmarkHIPGemma4Q4HostSampleCandidateResultScratch_TopK64-32  554.8 ns/op  0 B/op  0 allocs/op
+BenchmarkHIPGemma4Q4RepeatHistoryRequired_Hot-32               0.8238 ns/op  0 B/op  0 allocs/op
+```
+
+Verification:
+
+```text
+go test ./go -run '^TestHIPTransformerReferenceSamplerBadInputsAndTies_Bad$' -count=1
+go test ./go -count=1
+go test ./... -count=1
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./... -count=1
+go test -tags rocm_legacy_server ./... -count=1
+git diff --check
+```
+
+Serialized retained hardware guard:
+
+```text
+book_wall_s/op              9.375
+book_decode_s/op            8.879
+book_generated_tokens/op      885
+book_tok/s                  94.40
+book_turn02_tok/s           91.45
+B/op                      5886848
+allocs/op                   7239
+stderr_bytes                   0
+output: /tmp/go-rocm-book-retained-block16-2turn-nohistory.md
+stderr: /tmp/go-rocm-book-retained-block16-2turn-nohistory.err
+```
+
+This is cleanup only; retained long-context decode still needs q4
+projection/GELU and attention work to move turn 10 from the mid-60s toward the
+`90-100+ tok/s` target.

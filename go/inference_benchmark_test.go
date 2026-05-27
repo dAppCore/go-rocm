@@ -1074,6 +1074,7 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 	}
 	current := finalForward.Greedy
 	var history []int32
+	trackHistory := hipGemma4Q4RepeatHistoryRequired(generate)
 	if hostSampling {
 		if len(finalForward.Candidates) > 0 {
 			current, err = hipGemma4Q4HostSampleCandidateResultWorkspace(finalForward.Candidates, generate, history, rand.Float64(), session.attentionWorkspace)
@@ -1095,7 +1096,7 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 	decodeStart := time.Now()
 	var text strings.Builder
 	generatedCount := 0
-	if hostSampling {
+	if trackHistory {
 		history = make([]int32, 0, generate.MaxTokens)
 	}
 	for generated := 0; generated < generate.MaxTokens; generated++ {
@@ -1107,7 +1108,7 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 			break
 		}
 		text.WriteString(hipGeneratedTokenText(session.model, tokenID))
-		if hostSampling {
+		if trackHistory {
 			history = append(history, tokenID)
 		}
 		generatedCount++
