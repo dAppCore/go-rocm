@@ -577,6 +577,17 @@ deterministic equivalence test against the descriptor walk. The accepted
 block16 route remains the generic descriptor lookup plus row-scaled block
 payloads.
 
+Rejected chunk-local page preloader: a safer variant resolved descriptor pages
+once per 128-token chunk into shared memory, preserving the generic descriptor
+walk semantics instead of assuming flat block order. The live block-row chunked
+attention primitive passed on the RX 7800 XT with empty stderr, but the 2-turn
+`2k` retained sampled book probe with `block_size=16` regressed to `12.01s`
+wall, `11.47s` decode, `1032` generated tokens, `86.10 tok/s` average, and
+`84.81 tok/s` on turn 2. Stderr remained empty, so this was a performance
+rejection rather than a crash/correctness rejection. Do not restore a serial
+thread-0 page preloader; a future token-to-page index must be device-resident
+and append/trim-aware, or it will cost more than the current per-token lookup.
+
 Rejected prompt-shortening follow-up: replacing the anchored wording with a
 shorter "advance the arc / keep continuity words alive" instruction reduced
 prompt tokens to `1581` and still passed the arc gate with `3` anchors, but it
