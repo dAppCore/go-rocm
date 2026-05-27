@@ -40,6 +40,13 @@ output: /tmp/go-rocm-book-10turn-fullcap-repeatmetric.md
   `0.55`. Optional hard gates are now available as
   `GO_ROCM_BOOK_MAX_REPEATED_TURNS` and
   `GO_ROCM_BOOK_MAX_ADJACENT_REPEAT`.
+- Rejected an opt-in device no-repeat n-gram experiment that reused the greedy
+  suppress-token path. A full-cap `NO_REPEAT_NGRAM=8` retained run removed
+  adjacent repetition (`book_repeated_turns=0`, `max_adjacent_repeat=0.010`)
+  and stayed fast (`14.90s` wall), but collapsed chapters 4-10 into short
+  headings, generated only `1173` tokens, and failed the chapter-10 arc gate
+  with `0` anchor hits. The code was not kept; the next quality fix should not
+  blindly suppress repeated token n-grams across the whole book state.
 
 ## 2026-05-27 Q4 Generation Ladder Gate
 
