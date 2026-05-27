@@ -1750,6 +1750,50 @@ func TestHIPGemma4Q4PerLayerInputPrecompute_Good(t *testing.T) {
 	core.AssertEqual(t, 1, projectionLaunches)
 }
 
+func TestHIPGemma4Q4PerLayerInputConfigScalesCached_Good(t *testing.T) {
+	cases := []struct {
+		inputSize int
+		hidden    int
+	}{
+		{inputSize: 2, hidden: 2},
+		{inputSize: 256, hidden: 2048},
+		{inputSize: 384, hidden: 3072},
+	}
+	for _, tc := range cases {
+		cfg := hipGemma4Q4PerLayerInputConfig{
+			InputSize: tc.inputSize,
+			ModelProjection: hipBF16DeviceWeightConfig{
+				Cols: tc.hidden,
+			},
+		}
+		cfg.finalizeScales()
+		wantEmbedding := float32(math.Sqrt(float64(tc.inputSize)))
+		if cfg.EmbeddingScale != wantEmbedding || cfg.embeddingScale() != wantEmbedding {
+			t.Fatalf("embedding scale input=%d cached=%v helper=%v want=%v", tc.inputSize, cfg.EmbeddingScale, cfg.embeddingScale(), wantEmbedding)
+		}
+		wantProjection := float32(math.Pow(float64(tc.hidden), -0.5))
+		if cfg.ModelProjectionScale != wantProjection || cfg.modelProjectionScale() != wantProjection {
+			t.Fatalf("projection scale hidden=%d cached=%v helper=%v want=%v", tc.hidden, cfg.ModelProjectionScale, cfg.modelProjectionScale(), wantProjection)
+		}
+	}
+	wantCombine := float32(math.Pow(2, -0.5))
+	if hipGemma4Q4PerLayerCombineScale != wantCombine {
+		t.Fatalf("per-layer combine scale = %v, want %v", hipGemma4Q4PerLayerCombineScale, wantCombine)
+	}
+	cfg := hipGemma4Q4PerLayerInputConfig{
+		InputSize: 128,
+		ModelProjection: hipBF16DeviceWeightConfig{
+			Cols: 1024,
+		},
+	}
+	cfg.finalizeScales()
+	cfg.InputSize = 0
+	cfg.ModelProjection.Cols = 0
+	cfg.finalizeScales()
+	core.AssertEqual(t, float32(0), cfg.EmbeddingScale)
+	core.AssertEqual(t, float32(0), cfg.ModelProjectionScale)
+}
+
 func TestHIPGemma4Q4SharedKV_Good(t *testing.T) {
 	driver := &fakeHIPDriver{available: true}
 	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 8, 1, 8)
@@ -2855,6 +2899,26 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_PerLayerInputDeviceSetReused(b *
 		if layer == nil || layer.Pointer() == 0 || layer.Count() != inputSize {
 			b.Fatalf("layer view = %#v", layer)
 		}
+	}
+}
+
+func BenchmarkHIPGemma4Q4PerLayerInputConfigScales_Cached(b *testing.B) {
+	cfg := hipGemma4Q4PerLayerInputConfig{
+		InputSize: 256,
+		ModelProjection: hipBF16DeviceWeightConfig{
+			Cols: 2048,
+		},
+	}
+	cfg.finalizeScales()
+	var sink float32
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		sink += cfg.embeddingScale()
+		sink += cfg.modelProjectionScale()
+		sink += hipGemma4Q4PerLayerCombineScale
+	}
+	if sink == 0 {
+		b.Fatal("unexpected zero scale sum")
 	}
 }
 
@@ -4120,6 +4184,7 @@ func hipGemma4Q4GlobalPerLayerInputFixture(t *testing.T, driver nativeHIPDriver,
 			Cols:          hidden,
 		}
 		perLayer.ProjectionNorm = projectionNorm
+		perLayer.finalizeScales()
 		output[index].PerLayerInput = perLayer
 	}
 	cleanup := func() {
@@ -4191,7 +4256,7 @@ func hipGemma4Q4FixtureConfig(t *testing.T, driver nativeHIPDriver, layer, headD
 			_ = buffers[index].Close()
 		}
 	}
-	return hipGemma4Q4Layer0Config{
+	cfg := hipGemma4Q4Layer0Config{
 		Layer:     layer,
 		LayerType: hipGemma4Q4LayerTypeFromHeadDim(headDim),
 		Embedding: hipDeviceEmbeddingLookupConfig{
@@ -4238,5 +4303,7 @@ func hipGemma4Q4FixtureConfig(t *testing.T, driver nativeHIPDriver, layer, headD
 		UpProjection:        q4Projection("mlp.up_proj", intermediate, hidden),
 		DownProjection:      q4Projection("mlp.down_proj", hidden, intermediate),
 		LMHeadProjection:    q4Projection("embed_tokens_lm_head", vocab, hidden),
-	}, cleanup
+	}
+	cfg.PerLayerInput.finalizeScales()
+	return cfg, cleanup
 }

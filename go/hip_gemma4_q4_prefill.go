@@ -416,7 +416,7 @@ func hipRunGemma4Q4PrefillPerLayerInputDeviceSetBatch(ctx context.Context, drive
 		return nil, err
 	}
 	defer perLayerEmbedding.Close()
-	perLayerEmbeddingScaled, err := hipRunVectorScaleDeviceKernel(ctx, driver, perLayerEmbedding, float32(math.Sqrt(float64(perLayer.InputSize))))
+	perLayerEmbeddingScaled, err := hipRunVectorScaleDeviceKernel(ctx, driver, perLayerEmbedding, perLayer.embeddingScale())
 	if err != nil {
 		return nil, err
 	}
@@ -436,7 +436,7 @@ func hipRunGemma4Q4PrefillPerLayerInputDeviceSetBatch(ctx context.Context, drive
 		return nil, err
 	}
 	defer projected.Close()
-	projectedScaled, err := hipRunVectorScaleDeviceKernel(ctx, driver, projected, float32(math.Pow(float64(perLayer.ModelProjection.Cols), -0.5)))
+	projectedScaled, err := hipRunVectorScaleDeviceKernel(ctx, driver, projected, perLayer.modelProjectionScale())
 	if err != nil {
 		return nil, err
 	}
@@ -454,7 +454,7 @@ func hipRunGemma4Q4PrefillPerLayerInputDeviceSetBatch(ctx context.Context, drive
 		return nil, err
 	}
 	defer combined.Close()
-	scaled, err := hipRunVectorScaleDeviceKernel(ctx, driver, combined, float32(math.Sqrt(0.5)))
+	scaled, err := hipRunVectorScaleDeviceKernel(ctx, driver, combined, hipGemma4Q4PerLayerCombineScale)
 	if err != nil {
 		return nil, err
 	}

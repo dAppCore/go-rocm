@@ -14,6 +14,8 @@ import (
 
 const (
 	hipGemma4Q4Layer0Operation = "rocm.hip.Gemma4Q4Layer0"
+
+	hipGemma4Q4PerLayerCombineScale float32 = 0.70710678118654752440
 )
 
 type hipGemma4Q4Layer0Config struct {
@@ -60,13 +62,15 @@ type hipBF16DeviceWeightConfig struct {
 }
 
 type hipGemma4Q4PerLayerInputConfig struct {
-	InputSize       int
-	Embedding       hipDeviceEmbeddingLookupConfig
-	ModelProjection hipBF16DeviceWeightConfig
-	ProjectionNorm  hipRMSNormDeviceWeightConfig
-	InputGate       hipMLXQ4DeviceWeightConfig
-	Projection      hipMLXQ4DeviceWeightConfig
-	PostInputNorm   hipRMSNormDeviceWeightConfig
+	InputSize            int
+	EmbeddingScale       float32
+	ModelProjectionScale float32
+	Embedding            hipDeviceEmbeddingLookupConfig
+	ModelProjection      hipBF16DeviceWeightConfig
+	ProjectionNorm       hipRMSNormDeviceWeightConfig
+	InputGate            hipMLXQ4DeviceWeightConfig
+	Projection           hipMLXQ4DeviceWeightConfig
+	PostInputNorm        hipRMSNormDeviceWeightConfig
 }
 
 type hipGemma4Q4Layer0Request struct {
@@ -2172,6 +2176,42 @@ func (cfg hipGemma4Q4PerLayerInputConfig) hasGlobalPrecompute() bool {
 		cfg.ProjectionNorm.WeightPointer != 0
 }
 
+func (cfg *hipGemma4Q4PerLayerInputConfig) finalizeScales() {
+	if cfg == nil {
+		return
+	}
+	if cfg.InputSize > 0 {
+		cfg.EmbeddingScale = float32(math.Sqrt(float64(cfg.InputSize)))
+	} else {
+		cfg.EmbeddingScale = 0
+	}
+	if cfg.ModelProjection.Cols > 0 {
+		cfg.ModelProjectionScale = float32(math.Pow(float64(cfg.ModelProjection.Cols), -0.5))
+	} else {
+		cfg.ModelProjectionScale = 0
+	}
+}
+
+func (cfg hipGemma4Q4PerLayerInputConfig) embeddingScale() float32 {
+	if cfg.EmbeddingScale != 0 {
+		return cfg.EmbeddingScale
+	}
+	if cfg.InputSize <= 0 {
+		return 0
+	}
+	return float32(math.Sqrt(float64(cfg.InputSize)))
+}
+
+func (cfg hipGemma4Q4PerLayerInputConfig) modelProjectionScale() float32 {
+	if cfg.ModelProjectionScale != 0 {
+		return cfg.ModelProjectionScale
+	}
+	if cfg.ModelProjection.Cols <= 0 {
+		return 0
+	}
+	return float32(math.Pow(float64(cfg.ModelProjection.Cols), -0.5))
+}
+
 func (cfg hipBF16DeviceWeightConfig) validate(encoding uint32) error {
 	if cfg.WeightPointer == 0 {
 		return core.E("rocm.hip.ProjectionLaunch", "projection weight pointer is required", nil)
@@ -2686,7 +2726,7 @@ func hipRunGemma4Q4PerLayerInputSet(ctx context.Context, driver nativeHIPDriver,
 	}
 	perLayerEmbedding, err = hipRunVectorScaleKernel(ctx, driver, hipVectorScaleRequest{
 		Input: perLayerEmbedding,
-		Scale: float32(math.Sqrt(float64(cfg.InputSize))),
+		Scale: cfg.embeddingScale(),
 	})
 	if err != nil {
 		return nil, err
@@ -2706,7 +2746,7 @@ func hipRunGemma4Q4PerLayerInputSet(ctx context.Context, driver nativeHIPDriver,
 	}
 	projected, err = hipRunVectorScaleKernel(ctx, driver, hipVectorScaleRequest{
 		Input: projected,
-		Scale: float32(math.Pow(float64(cfg.ModelProjection.Cols), -0.5)),
+		Scale: cfg.modelProjectionScale(),
 	})
 	if err != nil {
 		return nil, err
@@ -2730,7 +2770,7 @@ func hipRunGemma4Q4PerLayerInputSet(ctx context.Context, driver nativeHIPDriver,
 		}
 		combined, err = hipRunVectorScaleKernel(ctx, driver, hipVectorScaleRequest{
 			Input: combined,
-			Scale: float32(math.Sqrt(0.5)),
+			Scale: hipGemma4Q4PerLayerCombineScale,
 		})
 		if err != nil {
 			return nil, err
@@ -2805,10 +2845,10 @@ func hipRunGemma4Q4PerLayerInputConfigDeviceSet(ctx context.Context, driver nati
 	if workspace != nil {
 		perLayerEmbeddingScaled, err = workspace.EnsurePerLayerScaled(driver, cfg.ModelProjection.Rows)
 		if err == nil {
-			err = hipRunVectorScaleDeviceKernelOutput(ctx, driver, perLayerEmbedding, float32(math.Sqrt(float64(cfg.InputSize))), perLayerEmbeddingScaled)
+			err = hipRunVectorScaleDeviceKernelOutput(ctx, driver, perLayerEmbedding, cfg.embeddingScale(), perLayerEmbeddingScaled)
 		}
 	} else {
-		perLayerEmbeddingScaled, err = hipRunVectorScaleDeviceKernel(ctx, driver, perLayerEmbedding, float32(math.Sqrt(float64(cfg.InputSize))))
+		perLayerEmbeddingScaled, err = hipRunVectorScaleDeviceKernel(ctx, driver, perLayerEmbedding, cfg.embeddingScale())
 	}
 	if err != nil {
 		return nil, err
@@ -2854,10 +2894,10 @@ func hipRunGemma4Q4PerLayerInputConfigDeviceSet(ctx context.Context, driver nati
 	if workspace != nil {
 		projectedScaled, err = workspace.EnsurePerLayerProjectedScaled(driver, cfg.ModelProjection.Rows)
 		if err == nil {
-			err = hipRunVectorScaleDeviceKernelOutput(ctx, driver, projected, float32(math.Pow(float64(cfg.ModelProjection.Cols), -0.5)), projectedScaled)
+			err = hipRunVectorScaleDeviceKernelOutput(ctx, driver, projected, cfg.modelProjectionScale(), projectedScaled)
 		}
 	} else {
-		projectedScaled, err = hipRunVectorScaleDeviceKernel(ctx, driver, projected, float32(math.Pow(float64(cfg.ModelProjection.Cols), -0.5)))
+		projectedScaled, err = hipRunVectorScaleDeviceKernel(ctx, driver, projected, cfg.modelProjectionScale())
 	}
 	if err != nil {
 		return nil, err
@@ -2884,7 +2924,7 @@ func hipRunGemma4Q4PerLayerInputConfigDeviceSet(ctx context.Context, driver nati
 	if workspace == nil {
 		defer projectedNorm.Close()
 	}
-	addScale := float32(math.Sqrt(0.5))
+	addScale := hipGemma4Q4PerLayerCombineScale
 	var scaled *hipDeviceByteBuffer
 	if workspace != nil {
 		scaled, err = workspace.EnsurePerLayerOutput(driver, cfg.ModelProjection.Rows)
@@ -3167,6 +3207,7 @@ func (model *hipLoadedModel) loadedGemma4Q4PerLayerInputConfig(layerPrefix strin
 		Projection:      projection,
 		PostInputNorm:   postNorm,
 	}
+	cfg.finalizeScales()
 	if err := (hipGemma4Q4Layer0Config{
 		Layer:         layer,
 		HiddenSize:    hidden,

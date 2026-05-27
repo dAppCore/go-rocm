@@ -1,5 +1,47 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Gemma4 PLE Scale Cache Parity
+
+- Read `/home/claude/Code/core/go-mlx/IDEAS.md` and mirrored the cheap
+  Gemma4 per-layer-input scale cache already used by the MLX path. ROCm now
+  caches `sqrt(hidden_size_per_layer_input)`, `1/sqrt(hidden_size)`, and the
+  constant `1/sqrt(2)` on the q4 per-layer input config instead of recomputing
+  those scalars in the per-token PLE precompute path.
+- Added AX-11 coverage for the touched hot path:
+
+```text
+BenchmarkHIPGemma4Q4PerLayerInputConfigScales_Cached:
+  6.222 ns/op, 0 B/op, 0 allocs/op
+```
+
+- Verification:
+
+```text
+go test ./go -run 'TestHIPGemma4Q4PerLayerInputConfigScalesCached_Good|TestHIPGemma4Q4PerLayerInputPrecompute_Good|TestHIPGemma4Q4PrefillForwardBatchWithGeneratedPerLayerInput_Good' -count=1
+go test ./go -run '^$' -bench '^BenchmarkHIPGemma4Q4PerLayerInputConfigScales_Cached$' -benchmem -count=1
+go test ./go -count=1
+go test ./... -count=1
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+go test -tags rocm_legacy_server ./... -count=1
+git diff --check
+```
+
+- Fresh RX 7800 XT 2048-token q4 guard stayed green on the accepted SWA-window
+  HSACO:
+
+```text
+BenchmarkInferenceGemma4Q4Generate:
+  18927231084 ns/op
+  108.2 tok/s
+  6666552 B/op
+  2608 allocs/op
+  stderr: /tmp/go-rocm-2048-ple-scale-cache.err (empty)
+```
+
+- This closes one small `go-mlx` parity gap but does not materially change the
+  remaining blocker. The retained-book path is still dominated by q4
+  projection/GELU launches and long-context global attention cost.
+
 ## 2026-05-27 go-cgo CString Tracker Refresh and Chunk Threshold Probe
 
 - Rechecked the active dependency remotes only. `external/go-inference` remains
