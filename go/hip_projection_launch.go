@@ -2560,7 +2560,8 @@ func hipRunMLXQ4ProjectionSoftcapScoreKernelWithDeviceInputBufferSuppress(ctx co
 		if err := driver.CopyDeviceToHost(partial.Pointer(), payload); err != nil {
 			return nil, core.E("rocm.hip.PackedTopKLaunch", "copy packed top-k partial scores", err)
 		}
-		top = hipTopPackedScoresBytes(payload, topK)
+		top = hipTopPackedScoresBytesInto(payload, topK, workspace.ProjectionTopPacked)
+		workspace.ProjectionTopPacked = top
 	} else {
 		packed, err := hipReadUint64DeviceOutput(scores, "rocm.hip.MLXQ4ProjectionScoresLaunch", "MLX q4 projection packed scores", cfg.Rows)
 		if err != nil {
@@ -2568,7 +2569,15 @@ func hipRunMLXQ4ProjectionSoftcapScoreKernelWithDeviceInputBufferSuppress(ctx co
 		}
 		top = hipTopPackedScores(packed, topK)
 	}
-	candidates := make([]hipGreedySampleResult, 0, len(top))
+	var candidates []hipGreedySampleResult
+	if workspace != nil {
+		candidates = workspace.ProjectionCandidates[:0]
+		if cap(candidates) < len(top) {
+			candidates = make([]hipGreedySampleResult, 0, len(top))
+		}
+	} else {
+		candidates = make([]hipGreedySampleResult, 0, len(top))
+	}
 	for _, value := range top {
 		candidate, err := hipUnpackGreedyBest(value, softcap, cfg.Rows)
 		if err != nil {
@@ -2578,6 +2587,9 @@ func hipRunMLXQ4ProjectionSoftcapScoreKernelWithDeviceInputBufferSuppress(ctx co
 	}
 	if len(candidates) == 0 {
 		return nil, core.E("rocm.hip.MLXQ4ProjectionScoresLaunch", "score projection did not produce candidates", nil)
+	}
+	if workspace != nil {
+		workspace.ProjectionCandidates = candidates
 	}
 	return candidates, nil
 }
@@ -2598,21 +2610,29 @@ func hipTopPackedScores(values []uint64, topK int) []uint64 {
 		if insert >= topK {
 			continue
 		}
-		top = append(top, 0)
-		copy(top[insert+1:], top[insert:])
-		top[insert] = value
-		if len(top) > topK {
-			top = top[:topK]
+		if len(top) < topK {
+			top = append(top, 0)
+			copy(top[insert+1:], top[insert:])
+		} else {
+			copy(top[insert+1:], top[insert:len(top)-1])
 		}
+		top[insert] = value
 	}
 	return top
 }
 
 func hipTopPackedScoresBytes(payload []byte, topK int) []uint64 {
+	return hipTopPackedScoresBytesInto(payload, topK, nil)
+}
+
+func hipTopPackedScoresBytesInto(payload []byte, topK int, top []uint64) []uint64 {
 	if topK <= 0 || len(payload) == 0 {
 		return nil
 	}
-	top := make([]uint64, 0, min(topK, len(payload)/hipMLXQ4ProjectionBestBytes))
+	top = top[:0]
+	if cap(top) < min(topK, len(payload)/hipMLXQ4ProjectionBestBytes) {
+		top = make([]uint64, 0, min(topK, len(payload)/hipMLXQ4ProjectionBestBytes))
+	}
 	for offset := 0; offset+hipMLXQ4ProjectionBestBytes <= len(payload); offset += hipMLXQ4ProjectionBestBytes {
 		value := binary.LittleEndian.Uint64(payload[offset:])
 		if value == 0 {
@@ -2625,12 +2645,13 @@ func hipTopPackedScoresBytes(payload []byte, topK int) []uint64 {
 		if insert >= topK {
 			continue
 		}
-		top = append(top, 0)
-		copy(top[insert+1:], top[insert:])
-		top[insert] = value
-		if len(top) > topK {
-			top = top[:topK]
+		if len(top) < topK {
+			top = append(top, 0)
+			copy(top[insert+1:], top[insert:])
+		} else {
+			copy(top[insert+1:], top[insert:len(top)-1])
 		}
+		top[insert] = value
 	}
 	return top
 }

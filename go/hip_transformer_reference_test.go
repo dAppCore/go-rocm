@@ -15,6 +15,7 @@ import (
 
 var (
 	benchmarkHIPTopPackedScoresSink       []uint64
+	benchmarkHIPTopPackedScoreSink        uint64
 	benchmarkHIPCandidateSampleResultSink hipGreedySampleResult
 )
 
@@ -387,7 +388,15 @@ func TestHIPTransformerReferenceSamplerBadInputsAndTies_Bad(t *testing.T) {
 	for index, value := range packed {
 		binary.LittleEndian.PutUint64(payload[index*hipMLXQ4ProjectionBestBytes:], value)
 	}
-	core.AssertEqual(t, hipTopPackedScores(packed, 2), hipTopPackedScoresBytes(payload, 2))
+	expectedPackedTop := hipTopPackedScores(packed, 2)
+	core.AssertEqual(t, expectedPackedTop, hipTopPackedScoresBytes(payload, 2))
+	scratchPackedTop := make([]uint64, 0, 2)
+	scratchBacking := scratchPackedTop[:cap(scratchPackedTop)]
+	intoPackedTop := hipTopPackedScoresBytesInto(payload, 2, scratchPackedTop)
+	core.AssertEqual(t, expectedPackedTop, intoPackedTop)
+	if len(intoPackedTop) > 0 && &intoPackedTop[0] != &scratchBacking[0] {
+		t.Fatalf("hipTopPackedScoresBytesInto did not reuse caller-provided capacity")
+	}
 
 	probs, err := hipReferenceTopKProbabilities([]float32{1, 2, 2}, 1, 1)
 	core.RequireNoError(t, err)
@@ -506,6 +515,26 @@ func BenchmarkHIPTopPackedScoresBytes_VocabTopK64(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		benchmarkHIPTopPackedScoresSink = hipTopPackedScoresBytes(payload, 64)
+	}
+}
+
+func BenchmarkHIPTopPackedScoresBytesInto_VocabTopK64(b *testing.B) {
+	const vocabSize = 256000
+	payload := make([]byte, vocabSize*hipMLXQ4ProjectionBestBytes)
+	for index := 0; index < vocabSize; index++ {
+		score := float32((index*1103515245+12345)&0xffff) / 4096
+		if index%257 == 0 {
+			score += 100
+		}
+		binary.LittleEndian.PutUint64(payload[index*hipMLXQ4ProjectionBestBytes:], hipPackGreedyBest(score, index))
+	}
+	top := make([]uint64, 0, 64)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		top = hipTopPackedScoresBytesInto(payload, 64, top)
+		benchmarkHIPTopPackedScoreSink ^= top[0]
 	}
 }
 

@@ -479,6 +479,16 @@ book passed at `37.63s` wall, `33.51s` decode, `3021` generated tokens,
 `99123 allocs/op`, empty stderr, no chapter cap hits, and `3` chapter-10 arc
 anchors.
 
+Follow-up sampled host-scratch cleanup: the workspace-backed packed top-k
+selector now reuses caller-provided host scratch and never grows beyond `topK`
+while inserting, so `BenchmarkHIPTopPackedScoresBytesInto_VocabTopK64` reports
+`0 B/op` and `0 allocs/op`. The normal byte helper also drops from two
+allocations to one (`512 B/op`). A single 2-turn, 8-token retained sampled
+smoke on the RX 7800 XT completed with empty stderr at `0.728s` wall,
+`0.1278s` decode, `120.2 tok/s` on the last turn, `9811768 B/op`, and
+`18546 allocs/op`. This is allocation-shape prep for the sampled path, not a
+new best retained-book route.
+
 Rejected prompt-shortening follow-up: replacing the anchored wording with a
 shorter "advance the arc / keep continuity words alive" instruction reduced
 prompt tokens to `1581` and still passed the arc gate with `3` anchors, but it
