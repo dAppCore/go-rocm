@@ -55,14 +55,16 @@ type nativeLoadConfig struct {
 }
 
 type nativeGemma4TextConfig struct {
-	LayerTypes        []string
-	KVSharedLayers    int
-	KVSharedLayersSet bool
-	SlidingWindow     int
-	HeadDim           int
-	GlobalHeadDim     int
-	AttentionKEqV     bool
-	RoPEParameters    map[string]nativeGemma4RoPEParameters
+	LayerTypes              []string
+	KVSharedLayers          int
+	KVSharedLayersSet       bool
+	SlidingWindow           int
+	HeadDim                 int
+	GlobalHeadDim           int
+	HiddenSizePerLayerInput int
+	VocabSizePerLayerInput  int
+	AttentionKEqV           bool
+	RoPEParameters          map[string]nativeGemma4RoPEParameters
 }
 
 type nativeGemma4RoPEParameters struct {
@@ -2797,6 +2799,8 @@ func rocmMemoryPlanLabels(memoryBytes uint64, contextLength, layers, hidden int,
 		"attention_kv_width",
 		"attention_global_kv_width",
 		"attention_gqa",
+		"gemma4_hidden_size_per_layer_input",
+		"gemma4_vocab_size_per_layer_input",
 		"rms_norm_eps",
 		"final_logit_softcapping",
 	} {

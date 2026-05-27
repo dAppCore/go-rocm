@@ -3266,6 +3266,12 @@ func (model *hipLoadedModel) loadedGemma4Q4PerLayerEmbeddingConfig(groupSize, nu
 		return hipDeviceEmbeddingLookupConfig{}, 0, core.E(hipGemma4Q4Layer0Operation, "embed_tokens_per_layer dimensions must align with layer count", nil)
 	}
 	inputSize := hiddenTotal / numLayers
+	if model.gemma4TextConfig.HiddenSizePerLayerInput > 0 && inputSize != model.gemma4TextConfig.HiddenSizePerLayerInput {
+		return hipDeviceEmbeddingLookupConfig{}, 0, core.E(hipGemma4Q4Layer0Operation, "embed_tokens_per_layer hidden size does not match Gemma4 config", nil)
+	}
+	if model.gemma4TextConfig.VocabSizePerLayerInput > 0 && vocab != model.gemma4TextConfig.VocabSizePerLayerInput {
+		return hipDeviceEmbeddingLookupConfig{}, 0, core.E(hipGemma4Q4Layer0Operation, "embed_tokens_per_layer vocab size does not match Gemma4 config", nil)
+	}
 	if hiddenTotal%groupSize != 0 {
 		return hipDeviceEmbeddingLookupConfig{}, 0, core.E(hipGemma4Q4Layer0Operation, "embed_tokens_per_layer hidden size must align with q4 group size", nil)
 	}

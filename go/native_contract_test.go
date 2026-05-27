@@ -864,6 +864,8 @@ func TestNativeContract_LoadModelSafetensorsGemma4PropagatesTextRuntimeConfig_Go
 			"global_head_dim":1024,
 			"attention_k_eq_v":true,
 			"num_kv_shared_layers":2,
+			"hidden_size_per_layer_input":4,
+			"vocab_size_per_layer_input":8,
 			"max_position_embeddings":131072,
 			"sliding_window":1024,
 			"layer_types":["sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention","sliding_attention"],
@@ -894,16 +896,42 @@ func TestNativeContract_LoadModelSafetensorsGemma4PropagatesTextRuntimeConfig_Go
 	core.AssertEqual(t, 1024, cfg.SlidingWindow)
 	core.AssertEqual(t, 512, cfg.HeadDim)
 	core.AssertEqual(t, 1024, cfg.GlobalHeadDim)
+	core.AssertEqual(t, 4, cfg.HiddenSizePerLayerInput)
+	core.AssertEqual(t, 8, cfg.VocabSizePerLayerInput)
 	core.AssertEqual(t, true, cfg.AttentionKEqV)
 	core.AssertEqual(t, float64(10000), cfg.RoPEParameters["sliding_attention"].RopeTheta)
 	core.AssertEqual(t, float64(1000000), cfg.RoPEParameters["full_attention"].RopeTheta)
 	core.AssertEqual(t, float64(0.25), cfg.RoPEParameters["full_attention"].PartialRotaryFactor)
 	if runtime.loadConfig.ModelLabels["attention_layer_types"] == "" ||
 		runtime.loadConfig.ModelLabels["attention_kv_shared_layers"] != "2" ||
+		runtime.loadConfig.ModelLabels["gemma4_hidden_size_per_layer_input"] != "4" ||
+		runtime.loadConfig.ModelLabels["gemma4_vocab_size_per_layer_input"] != "8" ||
 		runtime.loadConfig.ModelLabels["attention_k_eq_v"] != "true" ||
 		runtime.loadConfig.ModelLabels["attention_rope_full_theta"] != "1e+06" {
 		t.Fatalf("model labels = %+v, want Gemma4 attention metadata propagated", runtime.loadConfig.ModelLabels)
 	}
+}
+
+func TestNativeContract_Gemma4GlobalPartialRotaryFallback_Good(t *testing.T) {
+	cfg := rocmModelPackConfigProbe{
+		ModelType: "gemma4",
+		TextConfig: rocmModelPackTextConfigProbe{
+			ModelType:           "gemma4_text",
+			NumHiddenLayers:     2,
+			GlobalPartialRotary: 0.125,
+		},
+	}
+
+	runtime := rocmNativeGemma4TextConfigFromProbe(cfg)
+	full := runtime.RoPEParameters["full_attention"]
+	core.AssertEqual(t, float64(0.125), full.PartialRotaryFactor)
+	core.AssertEqual(t, float64(1000000), full.RopeTheta)
+	core.AssertEqual(t, "proportional", full.RopeType)
+
+	labels := rocmAttentionConfigLabels(cfg)
+	core.AssertEqual(t, "0.125", labels["attention_rope_full_partial_rotary_factor"])
+	core.AssertEqual(t, "1e+06", labels["attention_rope_full_theta"])
+	core.AssertEqual(t, "proportional", labels["attention_rope_full_type"])
 }
 
 func TestNativeContract_Gemma4LayerTypesDefaultPatternForcesFinalFull_Good(t *testing.T) {
@@ -3172,6 +3200,8 @@ func TestNativeContract_ModelPackInspectorGemma4NestedTextConfig_Good(t *testing
 			"num_global_key_value_heads":1,
 			"head_dim":256,
 			"global_head_dim":512,
+			"hidden_size_per_layer_input":256,
+			"vocab_size_per_layer_input":262144,
 			"max_position_embeddings":131072,
 			"sliding_window":512,
 			"layer_types":["full_attention","sliding_attention"],
@@ -3221,6 +3251,8 @@ func TestNativeContract_ModelPackInspectorGemma4NestedTextConfig_Good(t *testing
 		inspection.Labels["attention_global_kv_heads"] != "1" ||
 		inspection.Labels["attention_head_dim"] != "256" ||
 		inspection.Labels["attention_global_head_dim"] != "512" ||
+		inspection.Labels["gemma4_hidden_size_per_layer_input"] != "256" ||
+		inspection.Labels["gemma4_vocab_size_per_layer_input"] != "262144" ||
 		inspection.Labels["attention_query_width"] != "2048" ||
 		inspection.Labels["attention_kv_width"] != "256" ||
 		inspection.Labels["attention_global_kv_width"] != "512" ||

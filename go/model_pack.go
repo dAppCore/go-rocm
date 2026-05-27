@@ -34,13 +34,16 @@ type rocmModelPackConfigProbe struct {
 	NumGlobalKVHeads      int                          `json:"num_global_key_value_heads"`
 	HeadDim               int                          `json:"head_dim"`
 	GlobalHeadDim         int                          `json:"global_head_dim"`
+	GlobalPartialRotary   float64                      `json:"global_partial_rotary_factor"`
 	VocabSize             int                          `json:"vocab_size"`
+	VocabSizePerLayer     int                          `json:"vocab_size_per_layer_input"`
 	MaxPositionEmbeddings int                          `json:"max_position_embeddings"`
 	MaxSequenceLength     int                          `json:"max_sequence_length"`
 	SeqLength             int                          `json:"seq_length"`
 	SlidingWindow         int                          `json:"sliding_window"`
 	SlidingWindowPattern  int                          `json:"sliding_window_pattern"`
 	NumKVSharedLayers     *int                         `json:"num_kv_shared_layers"`
+	HiddenSizePerLayer    int                          `json:"hidden_size_per_layer_input"`
 	LayerTypes            []string                     `json:"layer_types"`
 	AttentionKEqV         bool                         `json:"attention_k_eq_v"`
 	RoPEParameters        map[string]rocmRoPEProbe     `json:"rope_parameters"`
@@ -68,13 +71,16 @@ type rocmModelPackTextConfigProbe struct {
 	NumGlobalKVHeads      int                      `json:"num_global_key_value_heads"`
 	HeadDim               int                      `json:"head_dim"`
 	GlobalHeadDim         int                      `json:"global_head_dim"`
+	GlobalPartialRotary   float64                  `json:"global_partial_rotary_factor"`
 	VocabSize             int                      `json:"vocab_size"`
+	VocabSizePerLayer     int                      `json:"vocab_size_per_layer_input"`
 	MaxPositionEmbeddings int                      `json:"max_position_embeddings"`
 	MaxSequenceLength     int                      `json:"max_sequence_length"`
 	SeqLength             int                      `json:"seq_length"`
 	SlidingWindow         int                      `json:"sliding_window"`
 	SlidingWindowPattern  int                      `json:"sliding_window_pattern"`
 	NumKVSharedLayers     *int                     `json:"num_kv_shared_layers"`
+	HiddenSizePerLayer    int                      `json:"hidden_size_per_layer_input"`
 	LayerTypes            []string                 `json:"layer_types"`
 	AttentionKEqV         bool                     `json:"attention_k_eq_v"`
 	RoPEParameters        map[string]rocmRoPEProbe `json:"rope_parameters"`
@@ -529,6 +535,12 @@ func rocmAttentionConfigLabels(cfg rocmModelPackConfigProbe) map[string]string {
 	if globalHeadDim > 0 {
 		out["attention_global_head_dim"] = core.Sprintf("%d", globalHeadDim)
 	}
+	if hiddenPerLayer := firstPositiveInt(cfg.HiddenSizePerLayer, cfg.TextConfig.HiddenSizePerLayer); hiddenPerLayer > 0 && isROCmGemma4Architecture(rocmConfigArchitecture(cfg)) {
+		out["gemma4_hidden_size_per_layer_input"] = core.Sprintf("%d", hiddenPerLayer)
+	}
+	if vocabPerLayer := firstPositiveInt(cfg.VocabSizePerLayer, cfg.TextConfig.VocabSizePerLayer); vocabPerLayer > 0 && isROCmGemma4Architecture(rocmConfigArchitecture(cfg)) {
+		out["gemma4_vocab_size_per_layer_input"] = core.Sprintf("%d", vocabPerLayer)
+	}
 	if attentionHeads > 0 && headDim > 0 {
 		out["attention_query_width"] = core.Sprintf("%d", attentionHeads*headDim)
 	}
@@ -779,14 +791,16 @@ func rocmNativeGemma4TextConfigFromProbe(cfg rocmModelPackConfigProbe) nativeGem
 	}
 	kvShared, kvSharedSet := rocmConfigKVSharedLayers(cfg)
 	return nativeGemma4TextConfig{
-		LayerTypes:        layerTypes,
-		KVSharedLayers:    kvShared,
-		KVSharedLayersSet: kvSharedSet,
-		SlidingWindow:     firstPositiveInt(cfg.SlidingWindow, cfg.TextConfig.SlidingWindow),
-		HeadDim:           firstPositiveInt(cfg.HeadDim, cfg.TextConfig.HeadDim),
-		GlobalHeadDim:     firstPositiveInt(cfg.GlobalHeadDim, cfg.TextConfig.GlobalHeadDim),
-		AttentionKEqV:     cfg.AttentionKEqV || cfg.TextConfig.AttentionKEqV,
-		RoPEParameters:    rocmNativeGemma4RoPEParameters(cfg),
+		LayerTypes:              layerTypes,
+		KVSharedLayers:          kvShared,
+		KVSharedLayersSet:       kvSharedSet,
+		SlidingWindow:           firstPositiveInt(cfg.SlidingWindow, cfg.TextConfig.SlidingWindow),
+		HeadDim:                 firstPositiveInt(cfg.HeadDim, cfg.TextConfig.HeadDim),
+		GlobalHeadDim:           firstPositiveInt(cfg.GlobalHeadDim, cfg.TextConfig.GlobalHeadDim),
+		HiddenSizePerLayerInput: firstPositiveInt(cfg.HiddenSizePerLayer, cfg.TextConfig.HiddenSizePerLayer),
+		VocabSizePerLayerInput:  firstPositiveInt(cfg.VocabSizePerLayer, cfg.TextConfig.VocabSizePerLayer),
+		AttentionKEqV:           cfg.AttentionKEqV || cfg.TextConfig.AttentionKEqV,
+		RoPEParameters:          rocmNativeGemma4RoPEParameters(cfg),
 	}
 }
 
@@ -825,6 +839,21 @@ func rocmNativeGemma4RoPEParameters(cfg rocmModelPackConfigProbe) map[string]nat
 				RopeType:            params.RopeType,
 				Factor:              params.Factor,
 			}
+		}
+	}
+	if isROCmGemma4Architecture(rocmConfigArchitecture(cfg)) {
+		if factor := firstPositiveFloat(cfg.GlobalPartialRotary, cfg.TextConfig.GlobalPartialRotary); factor > 0 {
+			params := out["full_attention"]
+			if params.PartialRotaryFactor <= 0 {
+				params.PartialRotaryFactor = factor
+			}
+			if params.RopeTheta <= 0 {
+				params.RopeTheta = 1000000
+			}
+			if params.RopeType == "" {
+				params.RopeType = "proportional"
+			}
+			out["full_attention"] = params
 		}
 	}
 	if len(out) == 0 {

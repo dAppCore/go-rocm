@@ -15692,3 +15692,68 @@ context_len=128 max_tokens=2048 prefill_ubatch_tokens=512
 108.1 tok/s, 2048 tokens, 6677024 B/op, 2615 allocs/op
 stderr: /tmp/go-rocm-2048-keqv-parity.err (0 bytes)
 ```
+
+## 2026-05-27 go-mlx Gemma4 Config Data Pass
+
+Pulled the remaining concrete Gemma4 config data called out by `go-mlx/IDEAS.md`
+and the current go-mlx loader into ROCm's native safetensors path:
+
+- `hidden_size_per_layer_input` and `vocab_size_per_layer_input` now parse from
+  root or nested `text_config`, propagate into `nativeGemma4TextConfig`, and
+  appear in model-pack/memory-plan labels.
+- The q4 PLE loader validates `embed_tokens_per_layer` tensor shape against
+  those config values when present, so a bad pack fails at load instead of
+  silently deriving a different PLE shape from weights.
+- Legacy `global_partial_rotary_factor` now seeds full-attention RoPE metadata
+  when `rope_parameters.full_attention` is absent, preserving go-mlx's
+  p-RoPE fallback shape.
+
+Dependency refresh in the same pass:
+
+```text
+external/go-inference: e583c2e perf(bench): assign Quality.Checks instead of append-into-nil -- -1 alloc per Run
+external/go-cgo:       51d16e8 perf(errno): inline WithErrno by forwarding to Errno
+go test ./external/go-inference/go/... -count=1
+go test ./external/go-cgo/go/... -count=1
+```
+
+Focused and non-live gates:
+
+```text
+go test ./go -run 'TestNativeContract_(LoadModelSafetensorsGemma4PropagatesTextRuntimeConfig_Good|Gemma4GlobalPartialRotaryFallback_Good|ModelPackInspectorGemma4NestedTextConfig_Good)|TestHIPGemma4Q4LoadedTextConfigOverridesHeadDimHeuristics_Good' -count=1
+go test ./go -count=1
+go test ./... -count=1
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+go test -tags rocm_legacy_server ./... -count=1
+git diff --check
+```
+
+Serialized RX 7800 XT guards, real Gemma4-E2B q4:
+
+```text
+2048 text:Hi:
+BenchmarkInferenceGemma4Q4Generate-32  1  18922648089 ns/op
+context_len=128 max_tokens=2048 prefill_ubatch_tokens=512
+108.2 tok/s, 2048 tokens, 6667208 B/op, 2609 allocs/op
+stderr: /tmp/go-rocm-2048-gemma4-data.err (0 bytes)
+
+Strict 48k retained book:
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32  1  51330029528 ns/op
+book_wall_s/op 51.26
+book_decode_s/op 41.63
+book_generated_tokens/op 3437
+book_tok/s 67.05
+book_turn10_tok/s 61.95
+book_turn10_retained_tokens/op 5108
+book_peak_memory_bytes/op 5983502336
+B/op 43660272
+allocs/op 33736
+chapter10_arc_anchor_hits 4
+stderr: /tmp/go-rocm-book-retained-gemma4-data.err (0 bytes)
+output: /tmp/go-rocm-book-retained-gemma4-data.md
+```
+
+The book wall-time/quality endpoint remains green, but this is still not final
+driver completion: late-turn retained decode is `61.95 tok/s`, so the remaining
+work is still dim512 long-context attention and q4 projection/GELU block
+volume, not prompt replay or loader metadata.
