@@ -952,6 +952,24 @@ func TestNativeContract_Gemma4GlobalPartialRotaryFallback_Good(t *testing.T) {
 	core.AssertEqual(t, "proportional", labels["attention_rope_full_type"])
 }
 
+func TestNativeContract_Gemma4TieWordEmbeddingsDefaultsTrue_Good(t *testing.T) {
+	cfg := rocmModelPackConfigProbe{
+		ModelType: "gemma4",
+		TextConfig: rocmModelPackTextConfigProbe{
+			ModelType: "gemma4_text",
+		},
+	}
+	core.AssertEqual(t, true, rocmConfigTiedWordEmbeddings(cfg))
+
+	explicitFalse := false
+	cfg.TextConfig.TieWordEmbeddings = &explicitFalse
+	core.AssertEqual(t, false, rocmConfigTiedWordEmbeddings(cfg))
+
+	explicitTrue := true
+	cfg.TieWordEmbeddings = &explicitTrue
+	core.AssertEqual(t, true, rocmConfigTiedWordEmbeddings(cfg))
+}
+
 func TestNativeContract_Gemma4LayerTypesDefaultPatternForcesFinalFull_Good(t *testing.T) {
 	cfg := rocmNativeGemma4TextConfigFromProbe(rocmModelPackConfigProbe{
 		TextConfig: rocmModelPackTextConfigProbe{

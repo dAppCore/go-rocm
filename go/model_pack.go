@@ -61,7 +61,7 @@ type rocmModelPackConfigProbe struct {
 	Quantization           rocmQuantizationConfigProbe  `json:"quantization"`
 	TaskSpecificParams     map[string]any               `json:"task_specific_params"`
 	TextConfig             rocmModelPackTextConfigProbe `json:"text_config"`
-	TieWordEmbeddings      bool                         `json:"tie_word_embeddings"`
+	TieWordEmbeddings      *bool                        `json:"tie_word_embeddings"`
 }
 
 type rocmModelPackTextConfigProbe struct {
@@ -98,7 +98,7 @@ type rocmModelPackTextConfigProbe struct {
 	ExpertIntermediateSize int                      `json:"expert_intermediate_size"`
 	UseDoubleWideMLP       bool                     `json:"use_double_wide_mlp"`
 	EnableMoEBlock         bool                     `json:"enable_moe_block"`
-	TieWordEmbeddings      bool                     `json:"tie_word_embeddings"`
+	TieWordEmbeddings      *bool                    `json:"tie_word_embeddings"`
 }
 
 type rocmRoPEProbe struct {
@@ -451,7 +451,13 @@ func rocmConfigArchitecture(cfg rocmModelPackConfigProbe) string {
 }
 
 func rocmConfigTiedWordEmbeddings(cfg rocmModelPackConfigProbe) bool {
-	return cfg.TieWordEmbeddings || cfg.TextConfig.TieWordEmbeddings
+	if cfg.TieWordEmbeddings != nil {
+		return *cfg.TieWordEmbeddings
+	}
+	if cfg.TextConfig.TieWordEmbeddings != nil {
+		return *cfg.TextConfig.TieWordEmbeddings
+	}
+	return isROCmGemma4Architecture(rocmConfigArchitecture(cfg))
 }
 
 func rocmConfigLayerTypes(cfg rocmModelPackConfigProbe) []string {

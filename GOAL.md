@@ -1748,6 +1748,10 @@ endpoint.
   for E2B-style configs. `TestHIPGemma4Q4LMHeadProjectionPrefersUntiedHead_Good`
   covers both branches; this is behavior-neutral for the current E2B q4 model
   because its config ties embeddings.
+- [x] Match the `go-mlx` Gemma4 tied-output default. Gemma4 model-pack metadata
+  now treats absent `tie_word_embeddings` as tied unless the top-level or
+  nested text config explicitly sets it false, preventing tied Gemma4 packs from
+  requiring a nonexistent `lm_head`.
 - [x] Carry the `go-mlx` Gemma4 proportional RoPE factor into ROCm RMSNorm+RoPE
   kernels. The launch ABI now includes a frequency scale so `rope_type:
   proportional` with a non-default `factor` rotates as `position / (freq *
