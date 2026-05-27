@@ -70,6 +70,10 @@ CUDA runtime smoke is also available behind `GO_ROCM_RUN_ZLUDA_CUDA_TESTS=1`;
 on this ROCm 7.2 host it uses side-by-side ROCm 6.4.4 rpath runtime libraries
 from `/opt/rocm-6.4.4/lib` so ZLUDA's `libamdhip64.so.6` dependency is
 satisfied without downgrading the real ROCm 7.2 development stack.
+2026-05-27 recheck: the NVIDIA HIP compile gate passed with CUDA 12.8,
+`std=c++20`, `arch=sm_75`, and a `1488896` byte object; the ZLUDA v5 CUDA
+runtime smoke passed on the discrete RX 7800 XT with
+`zluda_cuda_smoke_ok count=1 values=7,8,9,10`. Both stderr captures were empty.
 
 AX-11 benchmark rule applies here: any per-token, per-page, per-request, or
 cross-product hot path touched for this driver needs a `Benchmark*` with
