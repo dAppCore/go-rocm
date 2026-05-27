@@ -16540,3 +16540,32 @@ git diff --check
 This does not change driver performance. It makes future failed acceptance runs
 actionable: a timeout should now leave the completed turn table and kernel route
 shape in the output file instead of requiring a blind rerun.
+
+## 2026-05-27 Rejected Greedy Rows16 Final Projection
+
+Tested lowering `ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK` and
+`hipMLXQ4ProjectionGreedyRowsPerBlock` from 32 to 16 rows per 256-thread block.
+This doubled final-logit q4 projection blocks and increased per-vocab-row
+parallelism from 8 to 16 threads.
+
+Rejected result:
+
+```text
+Focused tests passed:
+go test ./go -run 'TestHIPKernelSource_ABIConstants_Good|TestHIPKernelSource_MLXQ4Projection|TestHIPKernels_MLXQ4ProjectionSoftcap' -count=1
+
+Compiled cleanly:
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-greedy-rows16.hsaco
+stderr: .bench-errors/hipcc_gfx1100_greedy_rows16_20260527.err (0 bytes)
+
+2048 live route guard:
+BenchmarkInferenceGemma4Q4Generate-32  1  19191204574 ns/op
+106.7 tok/s, 2048 tokens, 6691768 B/op, 4689 allocs/op
+kernel_mlx_q4_projection_greedy_blocks/op=33603584
+kernel_mlx_q4_projection_greedy_launches/op=2051
+kernel_total_blocks/op=192602057
+stderr: .bench-errors/2048_greedy_rows16_20260527.err (0 bytes)
+```
+
+The final logits path is not helped by extra row parallelism on gfx1100. Keep
+the current 32 rows/block, 8 threads/row shape for greedy and score projection.
