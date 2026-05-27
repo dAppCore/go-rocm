@@ -1,5 +1,56 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Accepted p-RoPE Route Instrumentation
+
+- Pulled the Gemma4 p-RoPE details from `../go-mlx/IDEAS.md` and cross-checked
+  against the production `go-mlx` loader. For proportional RoPE, absent
+  `factor` means `1.0`; ROCm now normalizes that metadata the same way so model
+  labels expose `attention_rope_full_factor=1` instead of leaving the factor
+  implicit.
+- Extended the benchmark route-shape parser to record RMSNorm+RoPE head shapes:
+  `rows=head_count`, `cols=head_dim`, `qg=rotary_count`, and
+  `bt=batch`. This does not change the HIP math path; it makes the p-RoPE
+  compute phase visible in the same AX-11 route tables as q4 projection/GELU
+  and attention.
+- Verification:
+
+```text
+go test ./go -run 'TestInferenceBenchmarkHIPKernelCountingDriver|TestNativeContract_(LoadModelSafetensorsGemma4PropagatesTextRuntimeConfig|Gemma4GlobalPartialRotaryFallback)_Good' -count=1 -v
+PASS
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.143s
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.108s
+
+go test ./... -count=1
+ok dappco.re/go/rocm/workspace 0.711s
+```
+
+- Live RX 7800 XT 2048-token route guard stayed on the accepted performance
+  line:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 18714813909 ns/op
+tok/s=109.4
+tokens=2048
+B/op=5459944
+allocs/op=4694
+kernel_total_launches/op=999352
+kernel_total_blocks/op=165483379
+kernel_rocm_rms_norm_rope_heads_launches/op=102350
+kernel_rocm_rms_norm_rope_heads_blocks/op=603865
+kernel_shape_rocm_rms_norm_rope_heads_g8_1_1_b256_1_1_sm0_r8_c256_qg0_bt0_launches/op=57316
+kernel_shape_rocm_rms_norm_rope_heads_g8_1_1_b256_1_1_sm0_r8_c256_qg0_bt0_blocks/op=458528
+stderr: .bench-errors/2048_rope_route_metrics_20260527.err (0 bytes)
+```
+
+- The p-RoPE path is now accounted for, but not the next speed blocker: the
+  route table still points at q4 GELU/projection block volume and retained
+  full/global attention growth as the material gap to the 90-100 tok/s
+  late-turn target.
+
 ## 2026-05-27 Rejected Local-Window Shared Attention Decode Route
 
 - Tested the `go-mlx/IDEAS.md` SWA-window hint as a decode-route change:

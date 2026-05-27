@@ -895,6 +895,12 @@ func rocmNativeGemma4RoPEParameters(cfg rocmModelPackConfigProbe) map[string]nat
 			out["full_attention"] = params
 		}
 	}
+	for layerType, params := range out {
+		if params.RopeType == "proportional" && params.Factor <= 0 {
+			params.Factor = 1
+			out[layerType] = params
+		}
+	}
 	if len(out) == 0 {
 		return nil
 	}

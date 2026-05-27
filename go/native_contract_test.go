@@ -914,6 +914,7 @@ func TestNativeContract_LoadModelSafetensorsGemma4PropagatesTextRuntimeConfig_Go
 	core.AssertEqual(t, float64(10000), cfg.RoPEParameters["sliding_attention"].RopeTheta)
 	core.AssertEqual(t, float64(1000000), cfg.RoPEParameters["full_attention"].RopeTheta)
 	core.AssertEqual(t, float64(0.25), cfg.RoPEParameters["full_attention"].PartialRotaryFactor)
+	core.AssertEqual(t, float64(1), cfg.RoPEParameters["full_attention"].Factor)
 	if runtime.loadConfig.ModelLabels["attention_layer_types"] == "" ||
 		runtime.loadConfig.ModelLabels["attention_kv_shared_layers"] != "2" ||
 		runtime.loadConfig.ModelLabels["gemma4_hidden_size_per_layer_input"] != "4" ||
@@ -925,7 +926,8 @@ func TestNativeContract_LoadModelSafetensorsGemma4PropagatesTextRuntimeConfig_Go
 		runtime.loadConfig.ModelLabels["gemma4_moe_intermediate_size"] != "32" ||
 		runtime.loadConfig.ModelLabels["final_logit_softcapping"] != "42" ||
 		runtime.loadConfig.ModelLabels["attention_k_eq_v"] != "true" ||
-		runtime.loadConfig.ModelLabels["attention_rope_full_theta"] != "1e+06" {
+		runtime.loadConfig.ModelLabels["attention_rope_full_theta"] != "1e+06" ||
+		runtime.loadConfig.ModelLabels["attention_rope_full_factor"] != "1" {
 		t.Fatalf("model labels = %+v, want Gemma4 attention metadata propagated", runtime.loadConfig.ModelLabels)
 	}
 }
@@ -945,11 +947,13 @@ func TestNativeContract_Gemma4GlobalPartialRotaryFallback_Good(t *testing.T) {
 	core.AssertEqual(t, float64(0.125), full.PartialRotaryFactor)
 	core.AssertEqual(t, float64(1000000), full.RopeTheta)
 	core.AssertEqual(t, "proportional", full.RopeType)
+	core.AssertEqual(t, float64(1), full.Factor)
 
 	labels := rocmAttentionConfigLabels(cfg)
 	core.AssertEqual(t, "0.125", labels["attention_rope_full_partial_rotary_factor"])
 	core.AssertEqual(t, "1e+06", labels["attention_rope_full_theta"])
 	core.AssertEqual(t, "proportional", labels["attention_rope_full_type"])
+	core.AssertEqual(t, "1", labels["attention_rope_full_factor"])
 }
 
 func TestNativeContract_Gemma4TieWordEmbeddingsDefaultsTrue_Good(t *testing.T) {

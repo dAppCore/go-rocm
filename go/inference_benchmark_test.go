@@ -451,6 +451,10 @@ func inferenceBenchmarkHIPKernelTensorShape(config hipKernelLaunchConfig) (rows,
 		return inferenceBenchmarkU32At(args, 56), inferenceBenchmarkU32At(args, 60), inferenceBenchmarkU32At(args, 64), 0
 	case hipKernelNameMLXQ4GELUTanhProjBatch:
 		return inferenceBenchmarkU32At(args, 56), inferenceBenchmarkU32At(args, 60), inferenceBenchmarkU32At(args, 68), inferenceBenchmarkU32At(args, 64)
+	case hipKernelNameRMSNormRoPEHeads:
+		return inferenceBenchmarkU32At(args, 36), inferenceBenchmarkU32At(args, 32), inferenceBenchmarkU32At(args, 76), 0
+	case hipKernelNameRMSNormRoPEHeadsBatch:
+		return inferenceBenchmarkU32At(args, 36), inferenceBenchmarkU32At(args, 32), inferenceBenchmarkU32At(args, 80), inferenceBenchmarkU32At(args, 40)
 	default:
 		return 0, 0, 0, 0
 	}
@@ -625,6 +629,50 @@ func TestInferenceBenchmarkHIPKernelCountingDriver_Good(t *testing.T) {
 		shapeEntries[0].tensorCols != 256 ||
 		shapeEntries[0].tensorGroup != 64 {
 		t.Fatalf("top q4 shape = %+v, want q4 1536x256 qg64", shapeEntries)
+	}
+	ropeArgs, err := (hipRMSNormRoPEHeadsBatchLaunchArgs{
+		InputPointer:   1,
+		OutputPointer:  2,
+		HeadDim:        512,
+		HeadCount:      8,
+		Batch:          3,
+		InputBytes:     512 * 8 * 3 * 4,
+		OutputBytes:    512 * 8 * 3 * 4,
+		Epsilon:        1e-6,
+		WeightEncoding: hipRMSNormWeightEncodingNone,
+		Base:           1000000,
+		FrequencyDim:   512,
+		RotaryCount:    128,
+		FrequencyScale: 1,
+	}).Binary()
+	if err != nil {
+		t.Fatalf("RMSNorm RoPE batch args: %v", err)
+	}
+	err = driver.LaunchKernel(hipKernelLaunchConfig{
+		Name:   hipKernelNameRMSNormRoPEHeadsBatch,
+		Args:   ropeArgs,
+		GridX:  8,
+		GridY:  3,
+		GridZ:  1,
+		BlockX: 256,
+		BlockY: 1,
+		BlockZ: 1,
+	})
+	if err != nil {
+		t.Fatalf("LaunchKernel RMSNorm RoPE batch: %v", err)
+	}
+	shapeEntries = inferenceBenchmarkTopHIPKernelShapeEntries(driver, 3, inferenceBenchmarkHIPKernelSortByBlocks)
+	var sawRoPE bool
+	for _, entry := range shapeEntries {
+		if entry.name == hipKernelNameRMSNormRoPEHeadsBatch {
+			sawRoPE = true
+			if entry.tensorRows != 8 || entry.tensorCols != 512 || entry.tensorGroup != 128 || entry.tensorBatch != 3 {
+				t.Fatalf("top RoPE shape = %+v, want heads=8 dim=512 rotary=128 batch=3", entry)
+			}
+		}
+	}
+	if !sawRoPE {
+		t.Fatalf("top shapes = %+v, want RMSNorm RoPE batch shape", shapeEntries)
 	}
 	driver.ResetKernelStats()
 	if got := driver.TotalKernelStats(); got != (inferenceBenchmarkHIPKernelStats{}) {
@@ -2186,6 +2234,8 @@ func inferenceBenchmarkSelectedHIPKernelNames() []string {
 		hipKernelNameAttentionHeadsBatchCausal,
 		hipKernelNameAttentionHeadsBatchChunkedStage1,
 		hipKernelNameAttentionHeadsBatchChunkedStage2,
+		hipKernelNameRMSNormRoPEHeads,
+		hipKernelNameRMSNormRoPEHeadsBatch,
 	}
 }
 
