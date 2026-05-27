@@ -136,6 +136,11 @@ func inferenceBenchmarkReportHIPKernelRouteMetrics(b *testing.B, driver *inferen
 	report(hipKernelNameAttentionHeadsBatchChunkedStage2, "kernel_attention_batch_chunked_stage2")
 	report(hipKernelNameAttentionHeadsChunkedStage1, "kernel_attention_decode_chunked_stage1")
 	report(hipKernelNameAttentionHeadsChunkedStage2, "kernel_attention_decode_chunked_stage2")
+	report(hipKernelNameMLXQ4Proj, "kernel_mlx_q4_projection")
+	report(hipKernelNameMLXQ4TripleProj, "kernel_mlx_q4_triple_projection")
+	report(hipKernelNameMLXQ4PairProj, "kernel_mlx_q4_pair_projection")
+	report(hipKernelNameMLXQ4GELUTanhMul, "kernel_mlx_q4_gelu_tanh_multiply")
+	report(hipKernelNameMLXQ4GELUTanhProj, "kernel_mlx_q4_gelu_tanh_projection")
 	inferenceBenchmarkReportTopHIPKernels(b, driver, 12)
 	inferenceBenchmarkReportTopHIPKernelBlocks(b, driver, 12)
 }

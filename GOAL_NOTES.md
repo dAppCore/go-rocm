@@ -15812,3 +15812,47 @@ This does not move decode speed directly. It fixes the production planner so
 128k Gemma4 cache sizing follows the same mixed-width shape as the real q4
 driver and go-mlx, instead of rejecting viable long-context loads from a
 hidden-size-only estimate.
+
+## 2026-05-27 Gemma4 K=V Pair Projection Kernel
+
+Carried the `go-mlx/IDEAS.md` Gemma4 shared-K/V note into the ROCm q4 decoder
+route. Full-attention `attention_k_eq_v` owner layers no longer launch separate
+query and key q4 projections when local KV is projected in the layer. ROCm now
+has a dedicated `rocm_mlx_q4_pair_projection` HIP kernel that reuses the
+existing triple-projection packet layout with `third_rows=0`, returns borrowed
+Q/K output views, and aliases V to K before the existing value RMS/key RoPE
+path.
+
+Rejected shape:
+
+```text
+Reusing rocm_mlx_q4_triple_projection directly with third_rows=0 passed tests
+and rebuilt gfx1100 cleanly, but the 2048 live guard measured only 107.9 tok/s
+with 6666192 B/op and 2639 allocs/op. It was kept only as an ABI stepping stone,
+not as the hot route.
+stderr: .bench-errors/2048_pair_projection_20260527.err (0 bytes)
+```
+
+Accepted shape:
+
+```text
+Dedicated rocm_mlx_q4_pair_projection kernel:
+BenchmarkInferenceGemma4Q4Generate-32  1  18928825287 ns/op
+context_len=128 max_tokens=2048 prefill_ubatch_tokens=512
+108.2 tok/s, 2048 tokens, 6673344 B/op, 2632 allocs/op
+stderr: .bench-errors/2048_pair_kernel_20260527.err (0 bytes)
+
+512-token route sample:
+BenchmarkInferenceGemma4Q4Generate-32  1  4563549918 ns/op
+112.2 tok/s, 512 tokens, 3208040 B/op, 3013 allocs/op
+kernel_total_launches/op=246715
+kernel_total_blocks/op=43777321
+stderr: .bench-errors/512_pair_kernel_metrics_20260527.err (0 bytes)
+```
+
+This is a correctness and launch-count cleanup, not a throughput win. The pair
+kernel is too small to change the headline while q4 projection remains about
+125 launches/token and GELU-tanh multiply/projection remain about 35
+launches/token each. Route metrics now report q4 projection, triple projection,
+pair projection, and GELU projection/multiply explicitly so future samples do
+not hide the pair route when it falls below the top-k table.

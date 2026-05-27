@@ -2444,7 +2444,12 @@ reported `108.2 tok/s`, `6673344 B/op`, `2632 allocs/op`, and empty
 `.bench-errors/2048_pair_kernel_20260527.err`. Keep this as a correctness and
 launch-count cleanup, not as final performance proof. The next high-impact
 target remains the much larger per-token q4 projection/GELU launch volume from
-output/down/MLP routes.
+output/down/MLP routes. A 512-token route-metrics sample after this change
+reported `112.2 tok/s`, `3208040 B/op`, `3013 allocs/op`, empty
+`.bench-errors/512_pair_kernel_metrics_20260527.err`, and about
+`482` total launches/token; q4 projection remained about `125` launches/token,
+while GELU-tanh multiply and GELU-tanh projection remained about `35`
+launches/token each.
 
 Run these before handoff:
 
