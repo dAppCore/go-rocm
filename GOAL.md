@@ -476,6 +476,16 @@ lands, the production acceptance route remains device-greedy: with
 on turn 10, `205163552 B/op`, `99123 allocs/op`, empty stderr, no chapter cap
 hits, and `3` chapter-10 arc anchors.
 
+Rejected device-side packed top-k reduction attempt: a second-stage
+`rocm_packed_topk` kernel that scanned 512-score chunks on device compiled with
+`--std=c++23` and passed the fake/source tests, but the 2-turn sampled retained
+smoke regressed to `0.746s` wall, `0.2208s` decode, `16` generated tokens, and
+only `71.0 tok/s` on the last turn. Allocation improved slightly to
+`8368784 B/op` with empty stderr, but the serial per-chunk reduction cost more
+than the saved device-to-host copy. Do not reintroduce that shape; the next
+top-k reduction needs a parallel/warp-level reduction or fusion into the q4
+score kernel that keeps sampled decode above the 90 tok/s guard.
+
 The replay-style book benchmark is deliberately double-gated with
 `GO_ROCM_RUN_UNSAFE_REPLAY_BOOK_BENCHMARKS=1` and has a per-turn timeout because
 it can monopolize a display GPU. Use it only as a baseline/debug aid. The route
