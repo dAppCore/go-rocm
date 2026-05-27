@@ -1,5 +1,46 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Fresh Retained-Book Gate and Repetition Metric
+
+- Fresh single-job RX 7800 XT guards after the local `dev` commit stack:
+
+```text
+2048 text:Hi:
+  18859249789 ns/op, 108.6 tok/s, 6605248 B/op, 2513 allocs/op
+  stderr: /tmp/go-rocm-2048-fresh.err (empty)
+
+2048 generated tokens, context_len=4096, chapter-1 lighthouse prompt:
+  20388470017 ns/op, 100.4 tok/s, 8108536 B/op, 3242 allocs/op
+  stderr: /tmp/go-rocm-2048-chapter-fresh.err (empty)
+```
+
+- Full-cap retained 10-turn greedy book acceptance passed with mechanical
+  thresholds enabled (`max_wall=90s`, `min_last_tok/s=65`,
+  `min_arc_anchor_hits=3`, `max_maxed_turns=0`) and empty
+  `/tmp/go-rocm-book-10turn-fullcap-repeatmetric.err`:
+
+```text
+book_wall_s/op             37.72
+book_decode_s/op           33.61
+book_generated_tokens/op    3021
+book_tok/s                 80.08
+book_turn01_tok/s         109.8
+book_turn10_tok/s          69.06
+chapter10_arc_anchor_hits      3
+maxed_turns                    0
+B/op                    205147408
+allocs/op                   99115
+output: /tmp/go-rocm-book-10turn-fullcap-repeatmetric.md
+```
+
+- Added an adjacent-chapter repetition metric because the arc-anchor gate alone
+  still lets visibly repetitive late chapters pass. The same full-cap retained
+  run reports `book_repeated_turns/op=2`,
+  `book_max_adjacent_repeat=0.9214`, with a fixed reporting threshold of
+  `0.55`. Optional hard gates are now available as
+  `GO_ROCM_BOOK_MAX_REPEATED_TURNS` and
+  `GO_ROCM_BOOK_MAX_ADJACENT_REPEAT`.
+
 ## 2026-05-27 Q4 Generation Ladder Gate
 
 - Added `BenchmarkInferenceGemma4Q4Generate_Ladder` as the AX-11 regression

@@ -379,6 +379,8 @@ type inferenceBenchmarkBookRun struct {
 	PeakMemoryBytes   uint64
 	ActiveMemoryBytes uint64
 	ArcAnchorHits     int
+	RepeatedTurns     int
+	MaxAdjacentRepeat float64
 	Chapter10         string
 	Chapters          []string
 	TurnStats         []inferenceBenchmarkBookTurnStat
@@ -512,6 +514,7 @@ func inferenceBenchmarkRunBookRetained(ctx context.Context, model *hipLoadedMode
 	}
 	run.Wall = time.Since(start)
 	run.ArcAnchorHits = inferenceBenchmarkBookArcAnchorHits(run.Chapter10)
+	run.RepeatedTurns, run.MaxAdjacentRepeat = inferenceBenchmarkBookRepetitionStats(run.Chapters)
 	return run, nil
 }
 
@@ -593,6 +596,7 @@ func inferenceBenchmarkRunBookReplay(ctx context.Context, model inference.TextMo
 	}
 	run.Wall = time.Since(start)
 	run.ArcAnchorHits = inferenceBenchmarkBookArcAnchorHits(run.Chapter10)
+	run.RepeatedTurns, run.MaxAdjacentRepeat = inferenceBenchmarkBookRepetitionStats(run.Chapters)
 	return run, nil
 }
 
@@ -956,6 +960,12 @@ func inferenceBenchmarkMaybeWriteBookOutput(b *testing.B, run inferenceBenchmark
 	builder.WriteString(strconv.Itoa(run.PromptTokens))
 	builder.WriteString("\n- wall_seconds: ")
 	builder.WriteString(strconv.FormatFloat(run.Wall.Seconds(), 'f', 3, 64))
+	builder.WriteString("\n- repeated_turns: ")
+	builder.WriteString(strconv.Itoa(run.RepeatedTurns))
+	builder.WriteString("\n- max_adjacent_repeat: ")
+	builder.WriteString(strconv.FormatFloat(run.MaxAdjacentRepeat, 'f', 3, 64))
+	builder.WriteString("\n- repeat_similarity_threshold: ")
+	builder.WriteString(strconv.FormatFloat(inferenceBenchmarkBookRepeatSimilarityThreshold, 'f', 3, 64))
 	builder.WriteString("\n\n")
 	if len(run.TurnStats) > 0 {
 		builder.WriteString("| turn | prompt_tokens | generated_tokens | retained_tokens | wake_s | prefill_s | decode_s | wall_s | decode_tok_s | active_mib | peak_mib | alloc_bytes | allocs | hit_max_tokens |\n")
@@ -1030,6 +1040,9 @@ func inferenceBenchmarkReportBookRun(b *testing.B, run inferenceBenchmarkBookRun
 	b.ReportMetric(float64(run.PeakMemoryBytes), "peak_memory_bytes")
 	b.ReportMetric(float64(run.ActiveMemoryBytes), "active_memory_bytes")
 	b.ReportMetric(float64(run.ArcAnchorHits), "chapter10_arc_anchor_hits")
+	b.ReportMetric(float64(run.RepeatedTurns), "book_repeated_turns/op")
+	b.ReportMetric(run.MaxAdjacentRepeat, "book_max_adjacent_repeat")
+	b.ReportMetric(inferenceBenchmarkBookRepeatSimilarityThreshold, "book_repeat_similarity_threshold")
 	inferenceBenchmarkReportBookTurnStats(b, run)
 	if run.Turns >= 10 && run.Wall <= 90*time.Second && run.ArcAnchorHits >= 3 {
 		b.ReportMetric(1, "book_90s_success")
@@ -1114,6 +1127,85 @@ func inferenceBenchmarkRequireBookThresholds(b *testing.B, run inferenceBenchmar
 	} else if ok && inferenceBenchmarkBookMaxedTurns(run) > maxed {
 		b.Fatalf("book maxed turns = %d exceeds GO_ROCM_BOOK_MAX_MAXED_TURNS=%d", inferenceBenchmarkBookMaxedTurns(run), maxed)
 	}
+	if repeats, ok, err := inferenceBenchmarkOptionalNonNegativeEnv("GO_ROCM_BOOK_MAX_REPEATED_TURNS"); err != nil {
+		b.Fatal(err)
+	} else if ok && run.RepeatedTurns > repeats {
+		b.Fatalf("book repeated turns = %d exceeds GO_ROCM_BOOK_MAX_REPEATED_TURNS=%d", run.RepeatedTurns, repeats)
+	}
+	if similarity, ok, err := inferenceBenchmarkOptionalPositiveFloatEnv("GO_ROCM_BOOK_MAX_ADJACENT_REPEAT"); err != nil {
+		b.Fatal(err)
+	} else if ok && run.MaxAdjacentRepeat > similarity {
+		b.Fatalf("book max adjacent repeat %.3f exceeds GO_ROCM_BOOK_MAX_ADJACENT_REPEAT=%.3f", run.MaxAdjacentRepeat, similarity)
+	}
+}
+
+const inferenceBenchmarkBookRepeatSimilarityThreshold = 0.55
+
+func inferenceBenchmarkBookRepetitionStats(chapters []string) (int, float64) {
+	repeated := 0
+	maxSimilarity := 0.0
+	for index := 1; index < len(chapters); index++ {
+		similarity := inferenceBenchmarkBookShingleSimilarity(chapters[index-1], chapters[index])
+		if similarity > maxSimilarity {
+			maxSimilarity = similarity
+		}
+		if similarity >= inferenceBenchmarkBookRepeatSimilarityThreshold {
+			repeated++
+		}
+	}
+	return repeated, maxSimilarity
+}
+
+func inferenceBenchmarkBookShingleSimilarity(left, right string) float64 {
+	leftShingles := inferenceBenchmarkBookWordShingles(left, 4)
+	rightShingles := inferenceBenchmarkBookWordShingles(right, 4)
+	if len(leftShingles) == 0 || len(rightShingles) == 0 {
+		return 0
+	}
+	if len(leftShingles) > len(rightShingles) {
+		leftShingles, rightShingles = rightShingles, leftShingles
+	}
+	intersection := 0
+	for shingle := range leftShingles {
+		if _, ok := rightShingles[shingle]; ok {
+			intersection++
+		}
+	}
+	union := len(leftShingles) + len(rightShingles) - intersection
+	if union <= 0 {
+		return 0
+	}
+	return float64(intersection) / float64(union)
+}
+
+func inferenceBenchmarkBookWordShingles(text string, size int) map[string]struct{} {
+	words := inferenceBenchmarkBookNormalizedWords(text)
+	if len(words) == 0 {
+		return nil
+	}
+	if size <= 0 {
+		size = 1
+	}
+	if len(words) < size {
+		return map[string]struct{}{strings.Join(words, " "): {}}
+	}
+	shingles := make(map[string]struct{}, len(words)-size+1)
+	for index := 0; index+size <= len(words); index++ {
+		shingles[strings.Join(words[index:index+size], " ")] = struct{}{}
+	}
+	return shingles
+}
+
+func inferenceBenchmarkBookNormalizedWords(text string) []string {
+	fields := strings.Fields(strings.ToLower(text))
+	words := make([]string, 0, len(fields))
+	for _, field := range fields {
+		word := strings.Trim(field, " \t\r\n.,;:!?\"'`*_()[]{}<>|/\\")
+		if word != "" {
+			words = append(words, word)
+		}
+	}
+	return words
 }
 
 func inferenceBenchmarkBookMaxedTurns(run inferenceBenchmarkBookRun) int {
@@ -1884,6 +1976,33 @@ func TestInferenceBenchmarkBookThresholdHelpers_Good(t *testing.T) {
 	}
 	if got := inferenceBenchmarkBookLastTurnTokS(run); got != 2 {
 		t.Fatalf("last turn tok/s = %f, want 2", got)
+	}
+}
+
+func TestInferenceBenchmarkBookRepetitionStats_Good(t *testing.T) {
+	repeatedChapter := "The light kept the keeper at the black reef. The deep ocean answered with a slow signal."
+	repeated, similarity := inferenceBenchmarkBookRepetitionStats([]string{
+		"Silas climbs the tower and hears the first signal beneath the storm.",
+		repeatedChapter,
+		repeatedChapter,
+	})
+	if repeated != 1 {
+		t.Fatalf("repeated turns = %d, want 1", repeated)
+	}
+	if similarity < inferenceBenchmarkBookRepeatSimilarityThreshold {
+		t.Fatalf("max adjacent repeat = %f, want at least threshold %f", similarity, inferenceBenchmarkBookRepeatSimilarityThreshold)
+	}
+
+	repeated, similarity = inferenceBenchmarkBookRepetitionStats([]string{
+		"The keeper repairs the lens while gulls vanish into a red dawn.",
+		"The light remembers a century of storms and counts every lost ship.",
+		"The ocean below answers in pressure, salt, and patient geometry.",
+	})
+	if repeated != 0 {
+		t.Fatalf("distinct repeated turns = %d, want 0", repeated)
+	}
+	if similarity >= inferenceBenchmarkBookRepeatSimilarityThreshold {
+		t.Fatalf("distinct max adjacent repeat = %f, want below threshold %f", similarity, inferenceBenchmarkBookRepeatSimilarityThreshold)
 	}
 }
 
