@@ -2064,6 +2064,16 @@ Remaining blocker:
   checked to include only its current distractor. This locks the benchmark to
   the intended `.kv`/MP4 retained-state path: append the new user turn, restore
   state, and never rebuild prior chapters as prompt text.
+- Rejected normal q4 projection shared-input tiling: a prototype cached each
+  64-float input group in block shared memory so the eight output rows in a
+  projection block could reuse it. It compiled with empty stderr and preserved
+  source/package checks, but the live 512-token guard regressed to `86.34 tok/s`
+  (`5929926749 ns/op`, `3186864 B/op`, `2464 allocs/op`) with empty runtime
+  stderr. The sync/shared-memory pressure is worse than repeated cached input
+  loads on the RX 7800 XT for the current row geometry, so the code was
+  reverted. Rebuilding the accepted-source HSACO restored the 512-token guard to
+  `112.5 tok/s` with empty stderr. Do not reintroduce this shape without a
+  different tiling strategy.
 
 - [x] Phase 0: Snapshot the tree and establish the baseline.
   - Run `git status --short`.
