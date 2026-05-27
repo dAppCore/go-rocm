@@ -530,6 +530,27 @@ but it regressed the retained book route to `38.65s` wall, `34.52s` decode,
 fresh descriptor-wrapper churn and peak-memory growth outweighed the launch
 count reduction.
 
+A fresh accepted-route `rocprof --stats` pass on the 2048-token short guard
+measured `19032238405 ns/op`, `107.6 tok/s`, `6622368 B/op`, and
+`2518 allocs/op` with an empty `.err` file. The profile says the next speed
+target is q4 compute, not KV state plumbing: `rocm_mlx_q4_projection` consumed
+`28.97%` of GPU time, `rocm_mlx_q4_gelu_tanh_multiply` `16.57%`,
+decode chunked stage 1 `13.90%`, `rocm_rms_norm_residual_add_norm` `11.04%`,
+and final `rocm_mlx_q4_projection_greedy` `5.30%`. The current
+`rocm_kv_encode_token` plus `rocm_kv_descriptor_append` pair is only about
+`3.06%` combined, which reinforces the fused-KV rejection. Prioritize larger
+tiled q4 projection/GELU work, per-layer decode fusion, or residual/norm fusion
+before revisiting KV descriptor launch count.
+
+A direct shared-input staging experiment for the normal
+`rocm_mlx_q4_projection` kernel was also rejected on this profile. The kernel
+compiled with `--std=c++23` and the fake/source tests passed, but staging
+projection inputs up to `4096` columns in dynamic shared memory reduced the
+2048-token guard to `19539193817 ns/op`, `104.8 tok/s`, `6620992 B/op`, and
+`2511 allocs/op` with an empty `.err` file. That confirms the current input
+loads are not the limiting q4 projection problem; do not reintroduce block-local
+input copies without a different tiling plan.
+
 For comparison, upstream llama.cpp built locally with HIP for `gfx1100` and run
 against the Hugging Face Gemma4 GGUF
 `/home/claude/models/hf/unsloth-gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf`
