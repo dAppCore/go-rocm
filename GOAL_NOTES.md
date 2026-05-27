@@ -1,5 +1,99 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Rejected Launch-Argument Event/Ring Retunes
+
+- Retested the cgo HIP launch-argument path because the short q4 guard issues
+  hundreds of thousands of tiny kernel launches. The accepted default remains
+  the async mapped-host ring with synchronization only on ring wrap.
+- `GO_ROCM_ENABLE_LAUNCH_ARG_EVENTS=1` was rejected. It avoids wrap
+  synchronization but records a HIP event for every launch packet, which
+  regressed the same 512-token guard hard:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 5004237380 ns/op
+tok/s=102.3
+tokens=512
+B/op=3473368
+allocs/op=2538
+stderr: .bench-errors/512_launch_arg_events_20260527.err (0 bytes)
+```
+
+- Increasing `cgoHIPLaunchArgRingSize` from `8192` to `32768` was also
+  rejected and reverted. It stayed neutral on the 512-token guard but did not
+  improve the 2048 fast-loop shape:
+
+```text
+512 text:Hi context_len=48000:
+BenchmarkInferenceGemma4Q4Generate-32 1 4489642987 ns/op
+tok/s=114.0
+B/op=3473720
+allocs/op=2542
+stderr: .bench-errors/512_launch_arg_ring32768_20260527.err (0 bytes)
+
+2048 chapter prompt context_len=4096:
+BenchmarkInferenceGemma4Q4Generate-32 1 19938265450 ns/op
+tok/s=102.7
+B/op=5416440
+allocs/op=2818
+stderr: .bench-errors/2048_chapter_ring32768_20260527.err (0 bytes)
+```
+
+Rejected reason: the launch-argument path is already low enough overhead that
+ring/event retuning does not move decode in the right direction. Keep the
+existing 8192-slot async mapped ring and continue targeting attention/q4 math.
+
+## 2026-05-27 Rejected Chunked KQ8/VQ4 Fast Page Validation
+
+- Tested a HIP-only shortcut in `rocm_attention_heads_chunked_stage1` and the
+  batch stage1 variant that replaced the full per-token
+  `rocm_attention_kq8vq4_page_valid` byte-size recomputation with a cheaper
+  KQ8/VQ4 shape/pointer check. The host already validates descriptor-table
+  compatibility before launch, so this looked like a safe way to reduce full
+  global attention overhead without changing retained KV layout.
+- Source/shape guards and `gfx1100` compile passed, but the live short guard
+  was slower with the same launch/block shape. The HIP edit was reverted.
+
+Verification while the candidate was applied:
+
+```text
+go test ./go -run 'TestHIPKernelSource_AttentionChunkedStage1ScoreLaneReduction_Good|TestHIPAttentionHeads(ChunkedSharedMemBytes|ChunkedEligible)_Good|TestHIPAttentionHeadsChunkedEligible_Gemma4HeadDim512_Good|TestHIPKernels_AttentionHeadsBatchChunked' -count=1 -v
+PASS
+
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-fast-page-valid-20260527.hsaco
+stderr: .bench-errors/hipcc_gfx1100_fast_page_valid_20260527.err (0 bytes)
+```
+
+Live RX 7800 XT 512-token route guard:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 4541590785 ns/op
+tok/s=112.7
+tokens=512
+B/op=3524872
+allocs/op=3076
+kernel_attention_decode_chunked_stage1_blocks=324016
+kernel_attention_decode_chunked_stage1_launches=13510
+kernel_total_blocks=41374579
+kernel_total_launches=246712
+stderr: .bench-errors/512_fast_page_valid_20260527.err (0 bytes)
+```
+
+Accepted comparison immediately before the candidate:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 4488831104 ns/op
+tok/s=114.1
+B/op=3525704
+allocs/op=3081
+kernel_attention_decode_chunked_stage1_blocks=324016
+kernel_attention_decode_chunked_stage1_launches=13510
+```
+
+Rejected reason: the compiler/runtime did not turn the reduced validation work
+into faster attention on the RX 7800 XT. Keep the full page-byte validation in
+chunked stage1 until a broader attention layout change alters the measured
+memory path.
+
 ## 2026-05-27 Rejected Contiguous Score-Lane Q8 Dot
 
 - Tested a HIP-only q8 key dot specialization inside
