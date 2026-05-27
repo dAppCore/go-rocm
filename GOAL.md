@@ -691,6 +691,14 @@ and decoded at only `62.22 tok/s`, down from `103.56 tok/s` on turn 1. Keep
 targeting the retained decode scaling curve until later turns stay near the
 `90-100+ tok/s` goal.
 
+Rejected post-cleanup 256-token decode chunks: retesting
+`ROCM_ATTENTION_HEADS_CHUNK_SIZE=256` after descriptor-lane and lookup cleanup
+still regressed the fast retained route. The build and focused hardware
+attention test passed with empty stderr, but the serialized 2-turn `2k`
+retained sampled book guard dropped to `90.54 tok/s` average and only
+`87.34 tok/s` on turn 2. Keep the 128-token chunk default; reducing chunk count
+is not enough to offset the worse per-block parallelism.
+
 Rejected prompt-shortening follow-up: replacing the anchored wording with a
 shorter "advance the arc / keep continuity words alive" instruction reduced
 prompt tokens to `1581` and still passed the arc gate with `3` anchors, but it
