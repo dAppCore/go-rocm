@@ -2078,6 +2078,17 @@ Remaining blocker:
   reverted. Rebuilding the accepted-source HSACO restored the 512-token guard to
   `112.5 tok/s` with empty stderr. Do not reintroduce this shape without a
   different tiling strategy.
+- Accepted async cgo launch-argument copy cleanup: the mapped launch-argument
+  ring no longer clears the unused tail between the fixed packet size and the
+  256-byte slot minimum. Kernels validate and consume only their fixed packet
+  body, and the synchronous mapped path already copied without clearing. The
+  focused `BenchmarkCGOHIPLaunchArgCopy_96B` reports `0 B/op` and `0 allocs/op`;
+  package/workspace/no-cgo gates passed. Live guards stayed green with empty
+  stderr: `text:Hi` 512 measured `112.8 tok/s`, `3185712 B/op`, `2463 allocs/op`;
+  `text:Hi` 2048 measured `108.1 tok/s`, `6659376 B/op`, `2612 allocs/op`; and
+  the serialized `block_size=16` 2-turn retained book guard measured `9.35s`
+  wall, `8.84s` decode, `878` generated tokens, `93.91 tok/s` average, turn 2
+  `90.73 tok/s`, `1133` retained tokens, `5886808 B/op`, and `7199 allocs/op`.
 
 - [x] Phase 0: Snapshot the tree and establish the baseline.
   - Run `git status --short`.

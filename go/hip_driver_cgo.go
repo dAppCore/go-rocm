@@ -1034,7 +1034,6 @@ func (driver cgoHIPDriver) launchArgPointerAsync(args []byte) (cgoHIPLaunchArgLe
 	}
 	hostBytes := unsafe.Slice((*byte)(slot.host), int(slot.bytes))
 	copy(hostBytes, args)
-	clear(hostBytes[len(args):want])
 	if !slot.mapped {
 		if rc := C.core_rocm_hip_memcpy_htod_async(C.uintptr_t(slot.pointer), slot.host, C.size_t(len(args))); rc != 0 {
 			cgoHIPLaunchArgRing.Unlock()

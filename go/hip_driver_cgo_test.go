@@ -7,6 +7,7 @@ package rocm
 import "testing"
 
 var benchmarkCGOHIPLaunchArgModeSink cgoHIPLaunchArgMode
+var benchmarkCGOHIPLaunchArgCopySink byte
 
 func BenchmarkCGOHIPLaunchArgModeConfig_Hot(b *testing.B) {
 	_ = cgoHIPLaunchArgModeConfig()
@@ -14,4 +15,17 @@ func BenchmarkCGOHIPLaunchArgModeConfig_Hot(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		benchmarkCGOHIPLaunchArgModeSink = cgoHIPLaunchArgModeConfig()
 	}
+}
+
+func BenchmarkCGOHIPLaunchArgCopy_96B(b *testing.B) {
+	host := make([]byte, 256)
+	args := make([]byte, 96)
+	for index := range args {
+		args[index] = byte(index)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		copy(host, args)
+	}
+	benchmarkCGOHIPLaunchArgCopySink = host[len(args)-1]
 }
