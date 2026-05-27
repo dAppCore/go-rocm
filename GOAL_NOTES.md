@@ -16363,3 +16363,46 @@ launches/token each. Route metrics now report q4 projection, triple projection,
 pair projection, and GELU projection/multiply explicitly through both
 `b.ReportMetric` and a retained-book "Selected Hot Kernels" artifact table, so
 future samples do not hide the pair route when it falls below the top-k table.
+
+## 2026-05-27 Rejected PLE Right-Scale Fusion
+
+Tested folding the Gemma4 per-layer embedding scale into the existing
+`rocm_vector_add_scaled` launch by using the launch packet's reserved field as a
+right-hand multiplier. This removed the separate PLE `vector_scale` step in the
+layer-input combine path while preserving the 56-byte ABI packet size.
+
+Rejected result:
+
+```text
+Focused tests passed:
+go test ./go -run 'TestHIPKernels_VectorAddScaledLaunchArgs|TestHIPKernelSource_ABIConstants_Good|TestHIPKernelSource_ExportsLaunchABI_Good|TestHIPGemma4Q4PrefillPerLayerInput|TestHIPGemma4Q4PerLayerInput' -count=1
+
+Compiled cleanly:
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-ple-rightscale.hsaco
+stderr: .bench-errors/hipcc_gfx1100_ple_rightscale_20260527.err (0 bytes)
+
+2048 live guard:
+BenchmarkInferenceGemma4Q4Generate-32  1  18990737467 ns/op
+107.8 tok/s, 2048 tokens, 6684344 B/op, 2647 allocs/op
+stderr: .bench-errors/2048_ple_rightscale_noroute_20260527.err (0 bytes)
+
+Strict 48k retained book:
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32  1  74674290199 ns/op
+book_wall_s/op 74.60
+book_decode_s/op 63.13
+book_generated_tokens/op 4653
+book_tok/s 62.38
+book_turn10_tok/s 50.15
+book_prefill_s/op 11.39
+B/op 18897248
+allocs/op 36319
+chapter10_arc_anchor_hits 5
+stderr: .bench-errors/book_retained_ple_rightscale_20260527.err (0 bytes)
+output: /tmp/go-rocm-book-retained-ple-rightscale-20260527.md
+```
+
+The route was functionally correct and still met the 90s retained-book wall
+guard, but it moved the actual endpoint backward: 2048 tok/s stayed flat, book
+decode dropped below the accepted retained-state samples, and allocations rose.
+Keep the separate PLE scale for now; chase larger projection/GELU/attention
+traffic reductions before revisiting this micro-fusion.
