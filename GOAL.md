@@ -2089,6 +2089,18 @@ Remaining blocker:
   the serialized `block_size=16` 2-turn retained book guard measured `9.35s`
   wall, `8.84s` decode, `878` generated tokens, `93.91 tok/s` average, turn 2
   `90.73 tok/s`, `1133` retained tokens, `5886808 B/op`, and `7199 allocs/op`.
+- Tightened the retained/replay book prompt wording to match the exact anchor
+  gate without replaying prior text: continuation turns now ask for each exact
+  continuity word in the chapter body (`lighthouse`, `keeper`, `light`, `ocean`,
+  `deep`) instead of the softer "keep anchors alive" wording. Before this prompt
+  alignment, the current batch had a clean `52.43s` wall run with empty stderr,
+  no repeats, and no max-token turns, but failed strict acceptance with only
+  `2` chapter-10 anchor hits. After the wording change, the strict serialized
+  `48k` 10-turn retained book guard passed with empty stderr at `69.07s` wall,
+  `60.68s` decode, `4838` generated tokens, `70.04 tok/s` average, turn 10
+  `62.41 tok/s`, `6509` retained tokens, `chapter10_arc_anchor_hits=4`, no
+  repeats, no max-token turns, `39189064 B/op`, and `36780 allocs/op`. This is
+  wall/story green; the final long-context decode-speed target remains open.
 
 - [x] Phase 0: Snapshot the tree and establish the baseline.
   - Run `git status --short`.

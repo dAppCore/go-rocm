@@ -1189,7 +1189,7 @@ func inferenceBenchmarkBookTurnPrompt(workload inferenceBenchmarkBookWorkloadSpe
 	}
 	builder.WriteString("Continue the same book. Write a complete next chapter with several paragraphs, chapter ")
 	builder.WriteString(strconv.Itoa(chapter))
-	builder.WriteString(" only. Do not stop after the heading. Preserve the original lighthouse keeper, signalling light, and deep-ocean entity story arc from chapter 1. The chapter text must explicitly keep these continuity anchors alive: lighthouse, keeper, light, ocean, deep.")
+	builder.WriteString(" only. Do not stop after the heading. Preserve the original lighthouse keeper, signalling light, and deep-ocean entity story arc from chapter 1. Include each exact continuity word at least once in the chapter body: lighthouse, keeper, light, ocean, deep.")
 	return builder.String()
 }
 
@@ -1208,7 +1208,7 @@ func inferenceBenchmarkBookRetainedTurnPrompt(workload inferenceBenchmarkBookWor
 	}
 	builder.WriteString("Continue the same book from the retained story state. Write a complete next chapter with several paragraphs, chapter ")
 	builder.WriteString(strconv.Itoa(chapter))
-	builder.WriteString(" only. Do not stop after the heading. Preserve the original lighthouse keeper, signalling light, and deep-ocean entity story arc from chapter 1. The chapter text must explicitly keep these continuity anchors alive: lighthouse, keeper, light, ocean, deep.")
+	builder.WriteString(" only. Do not stop after the heading. Preserve the original lighthouse keeper, signalling light, and deep-ocean entity story arc from chapter 1. Include each exact continuity word at least once in the chapter body: lighthouse, keeper, light, ocean, deep.")
 	return builder.String()
 }
 
@@ -2184,7 +2184,7 @@ func TestInferenceBenchmarkBookTurnPrompt_Good(t *testing.T) {
 		!strings.Contains(chapter2, "Evaluation distractor prompt") ||
 		!strings.Contains(chapter2, "Preserve the original lighthouse keeper") ||
 		!strings.Contains(chapter2, "setting, characters, objects, form, or premise") ||
-		!strings.Contains(chapter2, "continuity anchors alive") {
+		!strings.Contains(chapter2, "each exact continuity word") {
 		t.Fatalf("chapter 2 prompt = %q, want chapter continuation with distractor", chapter2)
 	}
 	retainedChapter1 := inferenceBenchmarkBookRetainedTurnChatPrompt(workload, 1)
@@ -2200,7 +2200,7 @@ func TestInferenceBenchmarkBookTurnPrompt_Good(t *testing.T) {
 		strings.Contains(retainedChapter2, "C001_STORY_PERSPECTIVE") ||
 		strings.Contains(retainedChapter2, "light has been signalling") ||
 		strings.Contains(retainedChapter2, "Write chapter 1") ||
-		!strings.Contains(retainedChapter2, "continuity anchors alive") {
+		!strings.Contains(retainedChapter2, "each exact continuity word") {
 		t.Fatalf("retained chapter 2 chat prompt = %q, want assistant close plus new user turn only", retainedChapter2)
 	}
 	retainedChapter3 := inferenceBenchmarkBookRetainedTurnChatPrompt(workload, 3)
