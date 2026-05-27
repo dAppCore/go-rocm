@@ -518,6 +518,18 @@ clearer: collapse per-layer decode orchestration and fuse state-adjacent work,
 especially q4 projections, residual/norm pairs, RoPE norm, MLP activation, and
 KV encode/descriptor append.
 
+Rejected state-adjacent shortcuts: enabling the existing
+`GO_ROCM_ENABLE_KV_TENSOR_POOL=1` path on the 2048-token guard kept stderr empty
+and measured `108.8 tok/s`, but regressed allocations to `10279192 B/op` and
+`21753 allocs/op`, so it should remain opt-in. A fused
+`rocm_kv_encode_token_descriptor_append` experiment compiled and passed the
+fake-driver/source gates, and route metrics proved the fused kernel was used,
+but it regressed the retained book route to `38.65s` wall, `34.52s` decode,
+`78.17 tok/s` average, `62.65 tok/s` on turn 10, `7.00GB` peak memory, and
+`210451000 B/op` with `144851 allocs/op`. Do not restore that shape as-is; the
+fresh descriptor-wrapper churn and peak-memory growth outweighed the launch
+count reduction.
+
 For comparison, upstream llama.cpp built locally with HIP for `gfx1100` and run
 against the Hugging Face Gemma4 GGUF
 `/home/claude/models/hf/unsloth-gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf`
