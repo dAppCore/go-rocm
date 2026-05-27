@@ -334,6 +334,9 @@ func TestHIPKernelSource_AttentionChunkedStage1ScoreLaneReduction_Good(t *testin
 
 	stage1 := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_attention_heads_chunked_stage1`)
 	core.AssertTrue(t, strings.Contains(stage1, `(score_lanes & (score_lanes - 1u)) == 0u`), "stage1 score lanes must stay shuffle-width safe")
+	core.AssertTrue(t, strings.Contains(stage1, `local < local_count && lane == 0u`), "stage1 score lanes must resolve KV pages once per token")
+	core.AssertTrue(t, strings.Contains(stage1, `key_pointer = rocm_shfl_u64(key_pointer, 0, static_cast<int>(score_lanes))`), "stage1 score lanes must broadcast key pointers from lane zero")
+	core.AssertTrue(t, strings.Contains(stage1, `key_scale = rocm_shfl_float(key_scale, 0, static_cast<int>(score_lanes))`), "stage1 score lanes must broadcast key scales from lane zero")
 	core.AssertTrue(t, strings.Contains(stage1, `rocm_shfl_down(partial_dot, score_lane, static_cast<int>(score_lanes))`), "stage1 score lane reduction must use ordered lane shuffles")
 	core.AssertTrue(t, !strings.Contains(stage1, `scratch[tid] = partial_dot`), "stage1 score lane reduction must not reintroduce shared-memory score scratch")
 	core.AssertTrue(t, strings.Contains(stage1, `__shared__ float value_scratch1[ROCM_ATTENTION_HEADS_CHUNKED_BLOCK_SIZE]`), "stage1 value reduction must keep a second value scratch buffer")

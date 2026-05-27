@@ -631,6 +631,21 @@ runtime and promising wall-time datapoint, not full book acceptance. The
 retained benchmark path still appends only the new turn prompt to the `.kv`/MP4
 state; do not "fix" this by rebuilding prior chapters as prompt text.
 
+Accepted chunked-attention descriptor-lane cleanup: decode chunked stage 1 now
+resolves KQ8/VQ4 descriptor pages once on lane 0 for each score-lane token and
+broadcasts the key pointer/scale across the lane group, instead of walking the
+same `.kv`/MP4 page descriptor four times for the same token. It deliberately
+does not assume `token / block_size` maps to a page after prompt blocks and
+generated suffix pages interleave. The `gfx1100` HSACO rebuilt with empty
+compiler stderr; package/source tests and the focused hardware chunked-attention
+subtest passed. A serialized 2-turn `2k` retained sampled book guard with
+`block_size=16` completed with empty stderr at `9.67s` wall, `9.16s` decode,
+`908` generated tokens, `93.90 tok/s` average, and `93.04 tok/s` on turn 2.
+The canonical `text:Hi` 2048-token guard stayed green at `108.0 tok/s`,
+`5378040 B/op`, and `2602 allocs/op`. Treat this as descriptor-traffic and
+allocation-shape cleanup; full `48k` acceptance still requires the strict arc
+gate and later-turn decode target.
+
 Rejected prompt-shortening follow-up: replacing the anchored wording with a
 shorter "advance the arc / keep continuity words alive" instruction reduced
 prompt tokens to `1581` and still passed the arc gate with `3` anchors, but it
