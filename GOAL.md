@@ -680,6 +680,17 @@ wall, `9.75s` decode, `972` generated tokens, `94.73 tok/s` average, and
 `93.80 tok/s` on turn 2. The canonical `text:Hi` 2048-token guard stayed green
 at `108.3 tok/s`, `5379448 B/op`, and `2606 allocs/op`.
 
+Full `48k` acceptance after the state/lookup cleanup batch: a serialized
+10-turn retained sampled book run with `block_size=16`, `prefill_ubatch=512`,
+and strict wall/repeat/max-token/arc gates passed with empty runtime stderr at
+`68.66s` wall, `60.35s` decode, `4789` generated tokens, `69.75 tok/s`
+average, `0` repeated turns, `0` max-token hits, and
+`chapter10_arc_anchor_hits=3`. This is production-acceptable on the wall/story
+gates, but it is not the final driver endpoint: turn 10 retained `6442` tokens
+and decoded at only `62.22 tok/s`, down from `103.56 tok/s` on turn 1. Keep
+targeting the retained decode scaling curve until later turns stay near the
+`90-100+ tok/s` goal.
+
 Rejected prompt-shortening follow-up: replacing the anchored wording with a
 shorter "advance the arc / keep continuity words alive" instruction reduced
 prompt tokens to `1581` and still passed the arc gate with `3` anchors, but it
