@@ -17974,3 +17974,151 @@ the current strict retained book profile from the previous `57.03s` wall,
 `21.58MB/op`, `41801 allocs/op` baseline to `53.31s` wall, `15.64MB/op`, and
 `41008 allocs/op`. Continue targeting full/global chunked stage1 and q4
 projection for the 90-100+ tok/s late-turn goal.
+
+## 2026-05-27 Accepted HIP Traffic Counters and Encoded K/V Pair Allocation
+
+The next allocation pass made device traffic visible in the hot benchmark
+instead of inferring it from Go heap counters. `GO_ROCM_BENCH_KERNEL_ROUTE_METRICS=1`
+now reports HIP driver allocation/copy/memset totals:
+
+- `device_mallocs/op`, `device_malloc_bytes/op`, and `device_frees/op`
+- `h2d_copies/op`, `h2d_bytes/op`, `h2d_async_copies/op`, and
+  `h2d_async_bytes/op`
+- `d2h_copies/op`, `d2h_bytes/op`
+- `device_memsets/op`, `device_memset_bytes/op`
+
+The counting driver also preserves the optimized `CopyDeviceToHostUint64`
+readback path so route metrics do not accidentally force the old generic copy
+path during sampled generation.
+
+The 512-token traffic guard before changing allocation shape showed that host
+traffic was already tiny, but per-token encoded K/V allocation was still noisy:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 4498479122 ns/op
+tok/s=113.8
+B/op=4629752
+allocs/op=2690
+device_mallocs/op=15911
+device_malloc_bytes/op=11079216
+device_frees/op=15402
+h2d_async_bytes/op=2320
+d2h_bytes/op=4120
+device_memset_bytes/op=4120
+kernel_total_launches=246712
+kernel_total_blocks=41374579
+stderr: .bench-errors/512_traffic_metrics_fresh_hsaco_20260527.err (0 bytes)
+```
+
+The existing `GO_ROCM_ENABLE_KV_TENSOR_POOL=1` toggle did not address the first
+pass allocation count because generated K/V pages remain live until the state
+is closed:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 4480910513 ns/op
+tok/s=114.3
+B/op=5429688
+allocs/op=2722
+device_mallocs/op=15911
+device_frees/op=5671
+stderr: .bench-errors/512_kv_tensor_pool_traffic_20260527.err (0 bytes)
+```
+
+Rejected reason for making the pool a default optimization: it only defers
+frees in this workload, keeps the same malloc count, and increases Go heap
+bytes/op. Keep it as a lifecycle-specific knob unless a future workload reuses
+the same pages within one live state.
+
+Accepted implementation: encoded K and V tensors produced by
+`hipRunKVEncodeRowsKernel` now come from one contiguous HIP allocation. The K
+tensor owns the allocation, the V tensor points at the second slice, and all
+KV-close/rollback paths free the shared allocation exactly once. The descriptor
+ABI stays unchanged.
+
+Verification:
+
+```text
+go test ./go -run 'TestKVCache|TestStateSession|TestInferenceBenchmark(HIPKernelCountingDriver|BookTurnKernelDeltas)_Good|TestHIPGemma4Q4SharedDeviceKV_Good|TestHIPGemma4Q4DecoderLayerAttentionKEqVUsesPairProjection_Good' -count=1 -v
+PASS
+
+go test ./go -count=1
+ok dappco.re/go/rocm 0.143s
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+ok dappco.re/go/rocm 0.109s
+```
+
+512-token traffic guard after contiguous encoded K/V allocation:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 4450437609 ns/op
+tok/s=115.0
+B/op=3930224
+allocs/op=2551
+device_mallocs/op=8219
+device_malloc_bytes/op=11079216
+device_frees/op=7710
+h2d_async_bytes/op=2320
+d2h_bytes/op=4120
+device_memset_bytes/op=4120
+kernel_total_launches=246712
+kernel_total_blocks=41374579
+stderr: .bench-errors/512_kv_pair_alloc_traffic_20260527.err (0 bytes)
+```
+
+2048-token guard:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 19604135098 ns/op
+tok/s=104.5
+tokens=2048
+B/op=6026080
+allocs/op=2569
+stderr: .bench-errors/2048_kv_pair_alloc_nometrics_20260527.err (0 bytes)
+```
+
+2048-token route-metric companion:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 19596449648 ns/op
+tok/s=104.5
+tokens=2048
+B/op=6590368
+allocs/op=2646
+device_mallocs/op=31288
+device_malloc_bytes/op=24641904
+device_frees/op=30750
+h2d_async_bytes/op=2320
+d2h_bytes/op=16408
+device_memset_bytes/op=16408
+kernel_total_launches=999352
+kernel_total_blocks=166688275
+stderr: .bench-errors/2048_kv_pair_alloc_traffic_20260527.err (0 bytes)
+```
+
+Strict 48k retained-book gate:
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 46624844358 ns/op
+book_wall_s=46.60
+book_decode_s=37.37
+book_generated_tokens=3479
+book_tok/s=74.66
+book_turn10_tok/s=79.23
+book_maxed_turns=0
+book_repeated_turns=0
+chapter10_arc_anchor_hits=5
+B/op=14170944
+allocs/op=37892
+peak_memory_bytes=5874438144
+stderr: .bench-errors/book10_retained_kv_pair_alloc_20260527.err (0 bytes)
+output: /tmp/go-rocm-book-kv-pair-alloc-20260527.md
+```
+
+Conclusion: accepted. The 2048 short guard remains above the hard `100 tok/s`
+endpoint but does not beat the previous best `109.4 tok/s` short-decode line.
+The retained book route is materially better than the previous strict sampled
+gate (`53.31s` wall, `42.40s` decode, `72.88 tok/s` turn 10, `15.64MB/op`,
+`41008 allocs/op`) and the HIP traffic counters confirm the next zero-copy work
+should focus on reducing device allocation byte volume and full/global attention
+traffic, not host H2D/D2H transfer size.

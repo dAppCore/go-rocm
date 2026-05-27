@@ -964,13 +964,11 @@ func wakeDeviceKVCacheBlockBundleFromChunk(ctx context.Context, store state.Stor
 			return nil, true, err
 		}
 		if page.tokenStart != blockRef.TokenStart || page.tokenCount != blockRef.TokenCount || page.keyWidth != blockRef.KeyWidth || page.valueWidth != blockRef.ValueWidth {
-			_ = rocmDeviceKVTensorFree(driver, page.key.pointer, page.key.sizeBytes)
-			_ = rocmDeviceKVTensorFree(driver, page.value.pointer, page.value.sizeBytes)
+			_ = rocmDeviceKVTensorFreePair(driver, page.key, page.value)
 			return nil, true, core.E("rocm.WakeState", "KV device block metadata mismatch", nil)
 		}
 		if page.tokenStart != nextStart || page.tokenCount <= 0 {
-			_ = rocmDeviceKVTensorFree(driver, page.key.pointer, page.key.sizeBytes)
-			_ = rocmDeviceKVTensorFree(driver, page.value.pointer, page.value.sizeBytes)
+			_ = rocmDeviceKVTensorFreePair(driver, page.key, page.value)
 			return nil, true, core.E("rocm.WakeState", "KV device block token range mismatch", nil)
 		}
 		nextStart += page.tokenCount

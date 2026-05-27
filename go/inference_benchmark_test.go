@@ -65,12 +65,28 @@ type inferenceBenchmarkHIPKernelStatsSnapshot struct {
 	Total  inferenceBenchmarkHIPKernelStats
 }
 
+type inferenceBenchmarkHIPDriverTrafficStats struct {
+	Mallocs                uint64
+	MallocBytes            uint64
+	Frees                  uint64
+	HostToDeviceCopies     uint64
+	HostToDeviceBytes      uint64
+	HostToDeviceAsync      uint64
+	HostToDeviceAsyncBytes uint64
+	DeviceToHostCopies     uint64
+	DeviceToHostBytes      uint64
+	Memsets                uint64
+	MemsetBytes            uint64
+}
+
 type inferenceBenchmarkHIPKernelCountingDriver struct {
 	nativeHIPDriver
-	mu     sync.Mutex
-	kernel map[string]inferenceBenchmarkHIPKernelStats
-	shape  map[inferenceBenchmarkHIPKernelShapeKey]inferenceBenchmarkHIPKernelStats
-	total  inferenceBenchmarkHIPKernelStats
+	mu          sync.Mutex
+	kernel      map[string]inferenceBenchmarkHIPKernelStats
+	shape       map[inferenceBenchmarkHIPKernelShapeKey]inferenceBenchmarkHIPKernelStats
+	total       inferenceBenchmarkHIPKernelStats
+	traffic     inferenceBenchmarkHIPDriverTrafficStats
+	allocations map[nativeDevicePointer]uint64
 }
 
 func newInferenceBenchmarkHIPKernelCountingDriver(driver nativeHIPDriver) *inferenceBenchmarkHIPKernelCountingDriver {
@@ -78,21 +94,109 @@ func newInferenceBenchmarkHIPKernelCountingDriver(driver nativeHIPDriver) *infer
 		nativeHIPDriver: driver,
 		kernel:          make(map[string]inferenceBenchmarkHIPKernelStats),
 		shape:           make(map[inferenceBenchmarkHIPKernelShapeKey]inferenceBenchmarkHIPKernelStats),
+		allocations:     make(map[nativeDevicePointer]uint64),
 	}
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) Malloc(size uint64) (nativeDevicePointer, error) {
+	pointer, err := driver.nativeHIPDriver.Malloc(size)
+	if err != nil {
+		return 0, err
+	}
+	driver.mu.Lock()
+	driver.traffic.Mallocs++
+	driver.traffic.MallocBytes += size
+	driver.allocations[pointer] = size
+	driver.mu.Unlock()
+	return pointer, nil
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) Free(pointer nativeDevicePointer) error {
+	if err := driver.nativeHIPDriver.Free(pointer); err != nil {
+		return err
+	}
+	driver.mu.Lock()
+	driver.traffic.Frees++
+	delete(driver.allocations, pointer)
+	driver.mu.Unlock()
+	return nil
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) CopyHostToDevice(pointer nativeDevicePointer, data []byte) error {
+	if err := driver.nativeHIPDriver.CopyHostToDevice(pointer, data); err != nil {
+		return err
+	}
+	driver.mu.Lock()
+	driver.traffic.HostToDeviceCopies++
+	driver.traffic.HostToDeviceBytes += uint64(len(data))
+	driver.mu.Unlock()
+	return nil
 }
 
 func (driver *inferenceBenchmarkHIPKernelCountingDriver) CopyHostToDeviceAsync(pointer nativeDevicePointer, data []byte) error {
 	if async, ok := driver.nativeHIPDriver.(nativeHIPAsyncHostToDevice); ok {
-		return async.CopyHostToDeviceAsync(pointer, data)
+		if err := async.CopyHostToDeviceAsync(pointer, data); err != nil {
+			return err
+		}
+		driver.mu.Lock()
+		driver.traffic.HostToDeviceAsync++
+		driver.traffic.HostToDeviceAsyncBytes += uint64(len(data))
+		driver.mu.Unlock()
+		return nil
 	}
-	return driver.nativeHIPDriver.CopyHostToDevice(pointer, data)
+	return driver.CopyHostToDevice(pointer, data)
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) CopyDeviceToHost(pointer nativeDevicePointer, data []byte) error {
+	if err := driver.nativeHIPDriver.CopyDeviceToHost(pointer, data); err != nil {
+		return err
+	}
+	driver.mu.Lock()
+	driver.traffic.DeviceToHostCopies++
+	driver.traffic.DeviceToHostBytes += uint64(len(data))
+	driver.mu.Unlock()
+	return nil
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) CopyDeviceToHostUint64(pointer nativeDevicePointer) (uint64, error) {
+	if reader, ok := driver.nativeHIPDriver.(nativeHIPDeviceUint64Reader); ok {
+		value, err := reader.CopyDeviceToHostUint64(pointer)
+		if err != nil {
+			return 0, err
+		}
+		driver.mu.Lock()
+		driver.traffic.DeviceToHostCopies++
+		driver.traffic.DeviceToHostBytes += 8
+		driver.mu.Unlock()
+		return value, nil
+	}
+	var payload [8]byte
+	if err := driver.CopyDeviceToHost(pointer, payload[:]); err != nil {
+		return 0, err
+	}
+	return uint64(payload[0]) |
+		uint64(payload[1])<<8 |
+		uint64(payload[2])<<16 |
+		uint64(payload[3])<<24 |
+		uint64(payload[4])<<32 |
+		uint64(payload[5])<<40 |
+		uint64(payload[6])<<48 |
+		uint64(payload[7])<<56, nil
 }
 
 func (driver *inferenceBenchmarkHIPKernelCountingDriver) MemsetAsync(pointer nativeDevicePointer, value byte, size uint64) error {
 	if memset, ok := driver.nativeHIPDriver.(nativeHIPDeviceMemset); ok {
-		return memset.MemsetAsync(pointer, value, size)
+		if err := memset.MemsetAsync(pointer, value, size); err != nil {
+			return err
+		}
+	} else if err := hipMemsetDevice(driver.nativeHIPDriver, pointer, value, size); err != nil {
+		return err
 	}
-	return hipMemsetDevice(driver.nativeHIPDriver, pointer, value, size)
+	driver.mu.Lock()
+	driver.traffic.Memsets++
+	driver.traffic.MemsetBytes += size
+	driver.mu.Unlock()
+	return nil
 }
 
 func (driver *inferenceBenchmarkHIPKernelCountingDriver) LaunchKernel(config hipKernelLaunchConfig) error {
@@ -137,6 +241,8 @@ func (driver *inferenceBenchmarkHIPKernelCountingDriver) ResetKernelStats() {
 	clear(driver.kernel)
 	clear(driver.shape)
 	driver.total = inferenceBenchmarkHIPKernelStats{}
+	driver.traffic = inferenceBenchmarkHIPDriverTrafficStats{}
+	clear(driver.allocations)
 	driver.mu.Unlock()
 }
 
@@ -183,6 +289,12 @@ func (driver *inferenceBenchmarkHIPKernelCountingDriver) TotalKernelStats() infe
 	driver.mu.Lock()
 	defer driver.mu.Unlock()
 	return driver.total
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) TrafficStats() inferenceBenchmarkHIPDriverTrafficStats {
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	return driver.traffic
 }
 
 func inferenceBenchmarkBookKernelSnapshot(driver *inferenceBenchmarkHIPKernelCountingDriver) inferenceBenchmarkHIPKernelStatsSnapshot {
@@ -253,10 +365,33 @@ func inferenceBenchmarkReportHIPKernelRouteMetrics(b *testing.B, driver *inferen
 	report(hipKernelNameMLXQ4PairProj, "kernel_mlx_q4_pair_projection")
 	report(hipKernelNameMLXQ4GELUTanhMul, "kernel_mlx_q4_gelu_tanh_multiply")
 	report(hipKernelNameMLXQ4GELUTanhProj, "kernel_mlx_q4_gelu_tanh_projection")
+	inferenceBenchmarkReportHIPDriverTrafficMetrics(b, driver)
 	inferenceBenchmarkReportTopHIPKernels(b, driver, 12)
 	inferenceBenchmarkReportTopHIPKernelBlocks(b, driver, 12)
 	inferenceBenchmarkReportTopHIPKernelShapes(b, driver, 8, inferenceBenchmarkHIPKernelSortByLaunches)
 	inferenceBenchmarkReportTopHIPKernelShapes(b, driver, 8, inferenceBenchmarkHIPKernelSortByBlocks)
+}
+
+func inferenceBenchmarkReportHIPDriverTrafficMetrics(b *testing.B, driver *inferenceBenchmarkHIPKernelCountingDriver) {
+	b.Helper()
+	if driver == nil || b.N <= 0 {
+		return
+	}
+	traffic := driver.TrafficStats()
+	report := func(value uint64, label string) {
+		b.ReportMetric(float64(value)/float64(b.N), label+"/op")
+	}
+	report(traffic.Mallocs, "device_mallocs")
+	report(traffic.MallocBytes, "device_malloc_bytes")
+	report(traffic.Frees, "device_frees")
+	report(traffic.HostToDeviceCopies, "h2d_copies")
+	report(traffic.HostToDeviceBytes, "h2d_bytes")
+	report(traffic.HostToDeviceAsync, "h2d_async_copies")
+	report(traffic.HostToDeviceAsyncBytes, "h2d_async_bytes")
+	report(traffic.DeviceToHostCopies, "d2h_copies")
+	report(traffic.DeviceToHostBytes, "d2h_bytes")
+	report(traffic.Memsets, "device_memsets")
+	report(traffic.MemsetBytes, "device_memset_bytes")
 }
 
 func inferenceBenchmarkReportHIPKernelGeneratedTokenMetrics(b *testing.B, driver *inferenceBenchmarkHIPKernelCountingDriver, generatedTokens int) {
@@ -272,6 +407,15 @@ func inferenceBenchmarkReportHIPKernelGeneratedTokenMetrics(b *testing.B, driver
 		b.ReportMetric(float64(entry.stats.Launches)/float64(generatedTokens), label+"_launches/generated_token")
 		b.ReportMetric(float64(entry.stats.Blocks)/float64(generatedTokens), label+"_blocks/generated_token")
 	}
+	traffic := driver.TrafficStats()
+	reportTraffic := func(value uint64, label string) {
+		b.ReportMetric(float64(value)/float64(generatedTokens), label+"/generated_token")
+	}
+	reportTraffic(traffic.Mallocs, "device_mallocs")
+	reportTraffic(traffic.MallocBytes, "device_malloc_bytes")
+	reportTraffic(traffic.HostToDeviceBytes+traffic.HostToDeviceAsyncBytes, "h2d_total_bytes")
+	reportTraffic(traffic.DeviceToHostBytes, "d2h_bytes")
+	reportTraffic(traffic.MemsetBytes, "device_memset_bytes")
 }
 
 func inferenceBenchmarkReportTopHIPKernels(b *testing.B, driver *inferenceBenchmarkHIPKernelCountingDriver, limit int) {
@@ -575,6 +719,40 @@ func TestInferenceBenchmarkHIPKernelCountingDriver_Good(t *testing.T) {
 	if got := inferenceBenchmarkSanitizeMetricName("rocm/foo-bar"); got != "rocm_foo_bar" {
 		t.Fatalf("sanitize metric name = %q, want rocm_foo_bar", got)
 	}
+	pointer, err := driver.Malloc(16)
+	if err != nil {
+		t.Fatalf("Malloc: %v", err)
+	}
+	if err := driver.CopyHostToDevice(pointer, []byte{1, 2, 3, 4}); err != nil {
+		t.Fatalf("CopyHostToDevice: %v", err)
+	}
+	if err := driver.CopyHostToDeviceAsync(pointer, []byte{5, 6}); err != nil {
+		t.Fatalf("CopyHostToDeviceAsync: %v", err)
+	}
+	if err := driver.CopyDeviceToHost(pointer, make([]byte, 3)); err != nil {
+		t.Fatalf("CopyDeviceToHost: %v", err)
+	}
+	if _, err := driver.CopyDeviceToHostUint64(pointer); err != nil {
+		t.Fatalf("CopyDeviceToHostUint64: %v", err)
+	}
+	if err := driver.MemsetAsync(pointer, 0, 8); err != nil {
+		t.Fatalf("MemsetAsync: %v", err)
+	}
+	if err := driver.Free(pointer); err != nil {
+		t.Fatalf("Free: %v", err)
+	}
+	traffic := driver.TrafficStats()
+	if traffic.Mallocs != 1 ||
+		traffic.MallocBytes != 16 ||
+		traffic.Frees != 1 ||
+		traffic.HostToDeviceCopies != 2 ||
+		traffic.HostToDeviceBytes != 6 ||
+		traffic.DeviceToHostCopies != 2 ||
+		traffic.DeviceToHostBytes != 11 ||
+		traffic.Memsets != 1 ||
+		traffic.MemsetBytes != 8 {
+		t.Fatalf("traffic stats = %+v, want counted allocation/copy/memset traffic", traffic)
+	}
 	entries := inferenceBenchmarkTopHIPKernelEntries(driver, 1, inferenceBenchmarkHIPKernelSortByBlocks)
 	if len(entries) != 1 || entries[0].name != hipKernelNameAttentionHeadsBatchChunkedStage1 {
 		t.Fatalf("top kernel entries = %+v, want %s", entries, hipKernelNameAttentionHeadsBatchChunkedStage1)
@@ -587,6 +765,8 @@ func TestInferenceBenchmarkHIPKernelCountingDriver_Good(t *testing.T) {
 		!strings.Contains(got, hipKernelNameMLXQ4PairProj) ||
 		!strings.Contains(got, hipKernelNameAttentionHeadsBatchChunkedStage1) ||
 		!strings.Contains(got, "2x3x4") ||
+		!strings.Contains(got, "h2d_bytes") ||
+		!strings.Contains(got, "d2h_bytes") ||
 		!strings.Contains(got, "launches/generated_token") {
 		t.Fatalf("kernel output summary = %q, want route metrics with kernel name", got)
 	}
@@ -2320,6 +2500,29 @@ func inferenceBenchmarkWriteHIPKernelRouteMetrics(builder *strings.Builder, driv
 		builder.WriteString("\n- total_blocks_per_generated_token: ")
 		builder.WriteString(strconv.FormatFloat(float64(total.Blocks)/float64(generatedTokens), 'f', 2, 64))
 	}
+	traffic := driver.TrafficStats()
+	builder.WriteString("\n- device_mallocs: ")
+	builder.WriteString(strconv.FormatUint(traffic.Mallocs, 10))
+	builder.WriteString("\n- device_malloc_bytes: ")
+	builder.WriteString(strconv.FormatUint(traffic.MallocBytes, 10))
+	builder.WriteString("\n- device_frees: ")
+	builder.WriteString(strconv.FormatUint(traffic.Frees, 10))
+	builder.WriteString("\n- h2d_copies: ")
+	builder.WriteString(strconv.FormatUint(traffic.HostToDeviceCopies, 10))
+	builder.WriteString("\n- h2d_bytes: ")
+	builder.WriteString(strconv.FormatUint(traffic.HostToDeviceBytes, 10))
+	builder.WriteString("\n- h2d_async_copies: ")
+	builder.WriteString(strconv.FormatUint(traffic.HostToDeviceAsync, 10))
+	builder.WriteString("\n- h2d_async_bytes: ")
+	builder.WriteString(strconv.FormatUint(traffic.HostToDeviceAsyncBytes, 10))
+	builder.WriteString("\n- d2h_copies: ")
+	builder.WriteString(strconv.FormatUint(traffic.DeviceToHostCopies, 10))
+	builder.WriteString("\n- d2h_bytes: ")
+	builder.WriteString(strconv.FormatUint(traffic.DeviceToHostBytes, 10))
+	builder.WriteString("\n- device_memsets: ")
+	builder.WriteString(strconv.FormatUint(traffic.Memsets, 10))
+	builder.WriteString("\n- device_memset_bytes: ")
+	builder.WriteString(strconv.FormatUint(traffic.MemsetBytes, 10))
 	builder.WriteString("\n\n")
 	inferenceBenchmarkWriteHIPKernelRouteTable(builder, "Selected Hot Kernels", inferenceBenchmarkSelectedHIPKernelEntries(driver), generatedTokens)
 	inferenceBenchmarkWriteHIPKernelRouteTable(builder, "Top By Launches", inferenceBenchmarkTopHIPKernelEntries(driver, limit, inferenceBenchmarkHIPKernelSortByLaunches), generatedTokens)

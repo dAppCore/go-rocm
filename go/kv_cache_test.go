@@ -395,8 +395,7 @@ func TestKVCache_Good_KVEncodeTokenKernelEncodesDeviceToken(t *testing.T) {
 
 	key, value, err := hipRunKVEncodeTokenKernel(context.Background(), driver, keyInput, valueInput, rocmKVCacheModeKQ8VQ4)
 	core.RequireNoError(t, err)
-	defer driver.Free(key.pointer)
-	defer driver.Free(value.pointer)
+	defer rocmDeviceKVTensorFreePair(driver, key, value)
 
 	core.AssertEqual(t, rocmKVEncodingQ8, key.encoding)
 	core.AssertEqual(t, rocmKVEncodingQ4, value.encoding)

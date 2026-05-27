@@ -102,9 +102,11 @@ type rocmDeviceKVPage struct {
 }
 
 type rocmDeviceKVTensor struct {
-	pointer   nativeDevicePointer
-	sizeBytes uint64
-	encoding  string
+	pointer           nativeDevicePointer
+	sizeBytes         uint64
+	encoding          string
+	allocationPointer nativeDevicePointer
+	allocationBytes   uint64
 }
 
 type rocmDeviceKVDescriptorTable struct {
@@ -575,6 +577,76 @@ func rocmDeviceKVTensorFree(driver nativeHIPDriver, pointer nativeDevicePointer,
 	return driver.Free(pointer)
 }
 
+func rocmDeviceKVAllocateEncodedTensorPair(driver nativeHIPDriver, keyBytes, valueBytes uint64, keyEncoding, valueEncoding string) (rocmDeviceKVTensor, rocmDeviceKVTensor, error) {
+	if driver == nil {
+		return rocmDeviceKVTensor{}, rocmDeviceKVTensor{}, core.E("rocm.KVCache.DeviceAppend", "HIP driver is nil", nil)
+	}
+	if keyBytes == 0 || valueBytes == 0 {
+		return rocmDeviceKVTensor{}, rocmDeviceKVTensor{}, core.E("rocm.KVCache.DeviceAppend", "encoded KV tensor sizes must be positive", nil)
+	}
+	if valueBytes > ^uint64(0)-keyBytes {
+		return rocmDeviceKVTensor{}, rocmDeviceKVTensor{}, core.E("rocm.KVCache.DeviceAppend", "encoded KV tensor allocation size overflow", nil)
+	}
+	allocationBytes := keyBytes + valueBytes
+	pointer, err := rocmDeviceKVTensorMalloc(driver, allocationBytes)
+	if err != nil {
+		return rocmDeviceKVTensor{}, rocmDeviceKVTensor{}, core.E("rocm.KVCache.DeviceAppend", "allocate encoded KV token pair", err)
+	}
+	key := rocmDeviceKVTensor{
+		pointer:           pointer,
+		sizeBytes:         keyBytes,
+		encoding:          keyEncoding,
+		allocationPointer: pointer,
+		allocationBytes:   allocationBytes,
+	}
+	value := rocmDeviceKVTensor{
+		pointer:           pointer + nativeDevicePointer(keyBytes),
+		sizeBytes:         valueBytes,
+		encoding:          valueEncoding,
+		allocationPointer: pointer,
+		allocationBytes:   allocationBytes,
+	}
+	return key, value, nil
+}
+
+func rocmDeviceKVTensorAllocation(tensor rocmDeviceKVTensor) (nativeDevicePointer, uint64) {
+	if tensor.allocationPointer != 0 && tensor.allocationBytes > 0 {
+		return tensor.allocationPointer, tensor.allocationBytes
+	}
+	return tensor.pointer, tensor.sizeBytes
+}
+
+func rocmDeviceKVTensorsShareAllocation(key, value rocmDeviceKVTensor) bool {
+	keyPointer, keyBytes := rocmDeviceKVTensorAllocation(key)
+	valuePointer, valueBytes := rocmDeviceKVTensorAllocation(value)
+	return key.allocationPointer != 0 &&
+		value.allocationPointer != 0 &&
+		keyPointer == valuePointer &&
+		keyBytes == valueBytes
+}
+
+func rocmDeviceKVTensorFreeTensor(driver nativeHIPDriver, tensor rocmDeviceKVTensor) error {
+	pointer, sizeBytes := rocmDeviceKVTensorAllocation(tensor)
+	if pointer == 0 || sizeBytes == 0 {
+		return nil
+	}
+	return rocmDeviceKVTensorFree(driver, pointer, sizeBytes)
+}
+
+func rocmDeviceKVTensorFreePair(driver nativeHIPDriver, key, value rocmDeviceKVTensor) error {
+	if rocmDeviceKVTensorsShareAllocation(key, value) {
+		return rocmDeviceKVTensorFreeTensor(driver, key)
+	}
+	var lastErr error
+	if err := rocmDeviceKVTensorFreeTensor(driver, key); err != nil {
+		lastErr = err
+	}
+	if err := rocmDeviceKVTensorFreeTensor(driver, value); err != nil {
+		lastErr = err
+	}
+	return lastErr
+}
+
 func (cache *rocmKVCache) MirrorToDevice(driver nativeHIPDriver) (*rocmDeviceKVCache, error) {
 	if cache == nil {
 		return nil, core.E("rocm.KVCache.DeviceMirror", "cache is nil", nil)
@@ -795,8 +867,7 @@ func (cache *rocmDeviceKVCache) withAppendedDeviceTokenWindow(ctx context.Contex
 	}
 	next, err := cache.withAppendedEncodedTokenWindow(encodedKey, encodedValue, keyWidth, valueWidth, window)
 	if err != nil {
-		_ = rocmDeviceKVTensorFree(cache.driver, encodedKey.pointer, encodedKey.sizeBytes)
-		_ = rocmDeviceKVTensorFree(cache.driver, encodedValue.pointer, encodedValue.sizeBytes)
+		_ = rocmDeviceKVTensorFreePair(cache.driver, encodedKey, encodedValue)
 		return nil, err
 	}
 	return next, nil
@@ -907,8 +978,7 @@ func newROCmDeviceKVCacheFromDeviceToken(ctx context.Context, driver nativeHIPDr
 	next, err := cache.withAppendedEncodedToken(encodedKey, encodedValue, key.Count(), value.Count())
 	rocmReleaseDeviceKVCache(cache)
 	if err != nil {
-		_ = rocmDeviceKVTensorFree(driver, encodedKey.pointer, encodedKey.sizeBytes)
-		_ = rocmDeviceKVTensorFree(driver, encodedValue.pointer, encodedValue.sizeBytes)
+		_ = rocmDeviceKVTensorFreePair(driver, encodedKey, encodedValue)
 		return nil, err
 	}
 	if window > 0 && next.TokenCount() > window {
@@ -1163,20 +1233,15 @@ func hipRunKVEncodeRowsKernel(ctx context.Context, driver nativeHIPDriver, key, 
 	if err != nil {
 		return rocmDeviceKVTensor{}, rocmDeviceKVTensor{}, err
 	}
-	keyPointer, err := rocmDeviceKVTensorMalloc(driver, keyBytes)
+	encodedKey, encodedValue, err := rocmDeviceKVAllocateEncodedTensorPair(driver, keyBytes, valueBytes, keyEncoding, valueEncoding)
 	if err != nil {
-		return rocmDeviceKVTensor{}, rocmDeviceKVTensor{}, core.E("rocm.KVCache.DeviceAppend", "allocate encoded KV key token", err)
-	}
-	valuePointer, err := rocmDeviceKVTensorMalloc(driver, valueBytes)
-	if err != nil {
-		_ = rocmDeviceKVTensorFree(driver, keyPointer, keyBytes)
-		return rocmDeviceKVTensor{}, rocmDeviceKVTensor{}, core.E("rocm.KVCache.DeviceAppend", "allocate encoded KV value token", err)
+		return rocmDeviceKVTensor{}, rocmDeviceKVTensor{}, err
 	}
 	args, err := (hipKVEncodeTokenLaunchArgs{
 		KeyInputPointer:    key.Pointer(),
 		ValueInputPointer:  value.Pointer(),
-		KeyOutputPointer:   keyPointer,
-		ValueOutputPointer: valuePointer,
+		KeyOutputPointer:   encodedKey.pointer,
+		ValueOutputPointer: encodedValue.pointer,
 		KeyCount:           key.Count(),
 		ValueCount:         value.Count(),
 		KeyInputBytes:      key.SizeBytes(),
@@ -1190,8 +1255,7 @@ func hipRunKVEncodeRowsKernel(ctx context.Context, driver nativeHIPDriver, key, 
 		TokenCount:         tokenCount,
 	}).Binary()
 	if err != nil {
-		_ = rocmDeviceKVTensorFree(driver, keyPointer, keyBytes)
-		_ = rocmDeviceKVTensorFree(driver, valuePointer, valueBytes)
+		_ = rocmDeviceKVTensorFreePair(driver, encodedKey, encodedValue)
 		return rocmDeviceKVTensor{}, rocmDeviceKVTensor{}, err
 	}
 	config := hipKernelLaunchConfig{
@@ -1205,12 +1269,10 @@ func hipRunKVEncodeRowsKernel(ctx context.Context, driver nativeHIPDriver, key, 
 		BlockZ: 1,
 	}
 	if err := hipLaunchKernel(driver, config); err != nil {
-		_ = rocmDeviceKVTensorFree(driver, keyPointer, keyBytes)
-		_ = rocmDeviceKVTensorFree(driver, valuePointer, valueBytes)
+		_ = rocmDeviceKVTensorFreePair(driver, encodedKey, encodedValue)
 		return rocmDeviceKVTensor{}, rocmDeviceKVTensor{}, err
 	}
-	return rocmDeviceKVTensor{pointer: keyPointer, sizeBytes: keyBytes, encoding: keyEncoding},
-		rocmDeviceKVTensor{pointer: valuePointer, sizeBytes: valueBytes, encoding: valueEncoding}, nil
+	return encodedKey, encodedValue, nil
 }
 
 func (cache *rocmDeviceKVCache) borrowedAlias() (*rocmDeviceKVCache, error) {
@@ -1260,18 +1322,11 @@ func (cache *rocmDeviceKVCache) closePagesFrom(index int) error {
 		if !page.owned {
 			continue
 		}
-		if page.key.pointer != 0 {
-			if err := rocmDeviceKVTensorFree(cache.driver, page.key.pointer, page.key.sizeBytes); err != nil {
-				lastErr = core.E("rocm.KVCache.DeviceAppend", "free appended KV key page", err)
-			}
-			page.key.pointer = 0
+		if err := rocmDeviceKVTensorFreePair(cache.driver, page.key, page.value); err != nil {
+			lastErr = core.E("rocm.KVCache.DeviceAppend", "free appended KV page", err)
 		}
-		if page.value.pointer != 0 {
-			if err := rocmDeviceKVTensorFree(cache.driver, page.value.pointer, page.value.sizeBytes); err != nil {
-				lastErr = core.E("rocm.KVCache.DeviceAppend", "free appended KV value page", err)
-			}
-			page.value.pointer = 0
-		}
+		page.key = rocmDeviceKVTensor{}
+		page.value = rocmDeviceKVTensor{}
 		page.owned = false
 	}
 	cache.pages = nil
@@ -1384,8 +1439,8 @@ func rocmDeviceKVPagePointersEqual(source, target *rocmDeviceKVPage) bool {
 func rocmDeviceKVTransferPageOwnership(source, target *rocmDeviceKVPage) {
 	if source.owned {
 		target.owned = true
-		source.key.pointer = 0
-		source.value.pointer = 0
+		source.key = rocmDeviceKVTensor{}
+		source.value = rocmDeviceKVTensor{}
 	}
 	source.owned = false
 }
@@ -1394,18 +1449,11 @@ func rocmDeviceKVFreeOwnedPage(driver nativeHIPDriver, page *rocmDeviceKVPage, l
 	if page == nil || !page.owned {
 		return
 	}
-	if page.key.pointer != 0 {
-		if err := rocmDeviceKVTensorFree(driver, page.key.pointer, page.key.sizeBytes); err != nil && lastErr != nil {
-			*lastErr = core.E("rocm.KVCache.DeviceAppend", "free trimmed KV key page", err)
-		}
-		page.key.pointer = 0
+	if err := rocmDeviceKVTensorFreePair(driver, page.key, page.value); err != nil && lastErr != nil {
+		*lastErr = core.E("rocm.KVCache.DeviceAppend", "free trimmed KV page", err)
 	}
-	if page.value.pointer != 0 {
-		if err := rocmDeviceKVTensorFree(driver, page.value.pointer, page.value.sizeBytes); err != nil && lastErr != nil {
-			*lastErr = core.E("rocm.KVCache.DeviceAppend", "free trimmed KV value page", err)
-		}
-		page.value.pointer = 0
-	}
+	page.key = rocmDeviceKVTensor{}
+	page.value = rocmDeviceKVTensor{}
 	page.owned = false
 }
 
@@ -1475,18 +1523,11 @@ func (cache *rocmDeviceKVCache) Close() error {
 		if !page.owned {
 			continue
 		}
-		if page.key.pointer != 0 {
-			if err := rocmDeviceKVTensorFree(cache.driver, page.key.pointer, page.key.sizeBytes); err != nil {
-				lastErr = core.E("rocm.KVCache.DeviceMirror", "free KV key page", err)
-			}
-			page.key.pointer = 0
+		if err := rocmDeviceKVTensorFreePair(cache.driver, page.key, page.value); err != nil {
+			lastErr = core.E("rocm.KVCache.DeviceMirror", "free KV page", err)
 		}
-		if page.value.pointer != 0 {
-			if err := rocmDeviceKVTensorFree(cache.driver, page.value.pointer, page.value.sizeBytes); err != nil {
-				lastErr = core.E("rocm.KVCache.DeviceMirror", "free KV value page", err)
-			}
-			page.value.pointer = 0
-		}
+		page.key = rocmDeviceKVTensor{}
+		page.value = rocmDeviceKVTensor{}
 		page.owned = false
 	}
 	cache.pages = nil
