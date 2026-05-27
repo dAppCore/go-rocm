@@ -2366,6 +2366,16 @@ building the q4 forward config. This matches the go-mlx pattern and avoids using
 models. The 2048-token E2B live guard after this parity fix remains stable at
 `108.1 tok/s`, `6667160 B/op`, `2608 allocs/op`, empty stderr.
 
+2026-05-27 audit against `go-mlx/IDEAS.md`: keep treating the Gemma4 facts as
+hard runtime constraints, not heuristics. Local/SWA layers must remain bounded
+to the configured `512`/`1024` token window, full-attention owner layers are the
+only layers allowed to grow unbounded, shared-KV layers must borrow the owner
+cache/descriptor instead of materializing fresh K/V, and retained `.kv`/MP4
+state must restore from borrowed block refs rather than prompt text replay.
+The ROCm HIP pinned-copy path now uses `core.PinnedView` for the Go-owned byte
+slice passed to HIP, matching the `mdspan + PinnedView` zero-copy direction
+until the host toolchain can compile the `go-cgo` C++23 mdspan companion header.
+
 Run these before handoff:
 
 ```sh

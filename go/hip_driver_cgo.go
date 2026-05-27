@@ -804,7 +804,10 @@ func hipCopyPinnedHostToDevice(driver nativeHIPDriver, pointer nativeDevicePoint
 	if !ok {
 		return hipCopyHostToDevice(driver, pointer, data)
 	}
-	if err := pinned.CopyPinnedHostToDevice(pointer, unsafe.Pointer(&data[0]), len(data)); err != nil {
+	var view core.PinnedView
+	core.PinSlice(data, &view)
+	defer view.Release()
+	if err := pinned.CopyPinnedHostToDevice(pointer, view.Ptr(), view.Bytes()); err != nil {
 		return err
 	}
 	runtime.KeepAlive(data)
