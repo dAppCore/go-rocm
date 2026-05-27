@@ -14810,3 +14810,47 @@ stderr: /tmp/go-rocm-book-retained-block16-2turn-sorted-candidates.err
 This keeps the short retained route in the same decode band while trimming
 host-side allocation/accounting cost. The long-context goal remains open until
 the 48k retained turn-10 decode path is back above `90 tok/s`.
+
+## 2026-05-27: Kernel Route Block-Volume Metrics
+
+Accepted a benchmark instrumentation update for the HIP tuning loop:
+
+```text
+- `GO_ROCM_BENCH_KERNEL_ROUTE_METRICS=1` now reports the top kernels by block
+  volume in addition to the existing launch-count sorted view.
+- This exposes kernels that are cheap in launch count but expensive in total
+  grid work, such as final vocab scoring/top-k, and keeps the benchmark useful
+  for HIP source changes instead of only Go allocation cleanup.
+```
+
+Serialized retained hardware guard with block-sorted route metrics:
+
+```text
+book_wall_s/op              14.75
+book_decode_s/op            14.23
+book_generated_tokens/op     1420
+book_tok/s                  96.27
+book_turn02_tok/s           93.82
+B/op                      8906024
+allocs/op                   8237
+stderr_bytes                   0
+kernel_total_launches        698595
+kernel_total_blocks       127397110
+kernel_by_blocks_rocm_mlx_q4_gelu_tanh_multiply_blocks        60065280
+kernel_by_blocks_rocm_mlx_q4_projection_blocks                37404288
+kernel_by_blocks_rocm_mlx_q4_projection_scores_blocks         11640832
+kernel_by_blocks_rocm_mlx_q4_triple_projection_blocks          8190720
+kernel_by_blocks_rocm_attention_heads_chunked_stage1_blocks    1794968
+output: /tmp/go-rocm-book-retained-block16-2turn-kernelblocks.md
+stderr: /tmp/go-rocm-book-retained-block16-2turn-kernelblocks.err
+```
+
+Rejected HIP experiment from the block-volume pass:
+
+```text
+Adding `#pragma unroll 8` to the fixed eight-iteration group64 loop in
+`rocm_mlx_q4_gelu_tanh_multiply` compiled cleanly and passed
+`TestHIPHardwareTransformerKernelSource_Good` with empty stderr, but regressed
+the `text:Hi` 512-token guard to `110.9 tok/s` versus the kept ~`112.7 tok/s`
+band. The unroll was reverted.
+```

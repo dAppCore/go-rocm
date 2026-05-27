@@ -125,6 +125,7 @@ func inferenceBenchmarkReportHIPKernelRouteMetrics(b *testing.B, driver *inferen
 	report(hipKernelNameAttentionHeadsChunkedStage1, "kernel_attention_decode_chunked_stage1")
 	report(hipKernelNameAttentionHeadsChunkedStage2, "kernel_attention_decode_chunked_stage2")
 	inferenceBenchmarkReportTopHIPKernels(b, driver, 12)
+	inferenceBenchmarkReportTopHIPKernelBlocks(b, driver, 12)
 }
 
 func inferenceBenchmarkReportTopHIPKernels(b *testing.B, driver *inferenceBenchmarkHIPKernelCountingDriver, limit int) {
@@ -158,6 +159,42 @@ func inferenceBenchmarkReportTopHIPKernels(b *testing.B, driver *inferenceBenchm
 	}
 	for _, entry := range entries {
 		label := "kernel_" + inferenceBenchmarkSanitizeMetricName(entry.name)
+		b.ReportMetric(float64(entry.stats.Launches)/float64(b.N), label+"_launches/op")
+		b.ReportMetric(float64(entry.stats.Blocks)/float64(b.N), label+"_blocks/op")
+	}
+}
+
+func inferenceBenchmarkReportTopHIPKernelBlocks(b *testing.B, driver *inferenceBenchmarkHIPKernelCountingDriver, limit int) {
+	b.Helper()
+	if driver == nil || b.N <= 0 || limit <= 0 {
+		return
+	}
+	type kernelEntry struct {
+		name  string
+		stats inferenceBenchmarkHIPKernelStats
+	}
+	snapshot := driver.KernelStatsSnapshot()
+	entries := make([]kernelEntry, 0, len(snapshot))
+	for name, stats := range snapshot {
+		if stats.Launches == 0 && stats.Blocks == 0 {
+			continue
+		}
+		entries = append(entries, kernelEntry{name: name, stats: stats})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].stats.Blocks != entries[j].stats.Blocks {
+			return entries[i].stats.Blocks > entries[j].stats.Blocks
+		}
+		if entries[i].stats.Launches != entries[j].stats.Launches {
+			return entries[i].stats.Launches > entries[j].stats.Launches
+		}
+		return entries[i].name < entries[j].name
+	})
+	if len(entries) > limit {
+		entries = entries[:limit]
+	}
+	for _, entry := range entries {
+		label := "kernel_by_blocks_" + inferenceBenchmarkSanitizeMetricName(entry.name)
 		b.ReportMetric(float64(entry.stats.Launches)/float64(b.N), label+"_launches/op")
 		b.ReportMetric(float64(entry.stats.Blocks)/float64(b.N), label+"_blocks/op")
 	}
