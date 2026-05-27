@@ -2125,7 +2125,9 @@ Remaining blocker:
   `6285 ns/op`, `44 B/op`, and `0 allocs/op`. The live serialized `text:Hi`
   2048-token guard on `gfx1100` completed with empty stderr at
   `17964551296 ns/op`, `114.0 tok/s`, `6624528 B/op`, and `2635 allocs/op`.
-  Treat this as accepted allocation/plumbing progress under the
+  The chapter-shaped 2048-token guard at `context_len=4096` also completed with
+  empty stderr at `19536530899 ns/op`, `104.8 tok/s`, `8017064 B/op`, and
+  `3438 allocs/op`. Treat this as accepted allocation/plumbing progress under the
   go-mlx/IDEAS retained-state rule; it does not change `.kv`/MP4 semantics.
 - 2026-05-27 rechecked the current source with a fresh `gfx1100 -O2` HSACO:
   `512` tokens measured `4531496458 ns/op`, `113.0 tok/s`,
