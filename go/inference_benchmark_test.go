@@ -2197,8 +2197,18 @@ func TestInferenceBenchmarkBookTurnPrompt_Good(t *testing.T) {
 	if !strings.HasPrefix(retainedChapter2, "<turn|>\n<|turn>user\n") ||
 		!strings.HasSuffix(retainedChapter2, "<turn|>\n<|turn>model\n") ||
 		strings.Contains(retainedChapter2, "Book so far") ||
+		strings.Contains(retainedChapter2, "C001_STORY_PERSPECTIVE") ||
+		strings.Contains(retainedChapter2, "light has been signalling") ||
+		strings.Contains(retainedChapter2, "Write chapter 1") ||
 		!strings.Contains(retainedChapter2, "continuity anchors alive") {
 		t.Fatalf("retained chapter 2 chat prompt = %q, want assistant close plus new user turn only", retainedChapter2)
+	}
+	retainedChapter3 := inferenceBenchmarkBookRetainedTurnChatPrompt(workload, 3)
+	if strings.Contains(retainedChapter3, "Book so far") ||
+		strings.Contains(retainedChapter3, "C001_STORY_PERSPECTIVE") ||
+		strings.Contains(retainedChapter3, "C002_POETRY_TIME") ||
+		!strings.Contains(retainedChapter3, "C003_FICTION_MEMORY") {
+		t.Fatalf("retained chapter 3 chat prompt = %q, want only current turn prompt plus current distractor", retainedChapter3)
 	}
 	if hits := inferenceBenchmarkBookArcAnchorHits("The lighthouse keeper saw the light answer the deep ocean."); hits < 5 {
 		t.Fatalf("arc anchor hits = %d, want lighthouse arc anchors", hits)

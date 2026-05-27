@@ -2058,6 +2058,12 @@ Remaining blocker:
   turn 2 `91.64 tok/s`, `1112` retained tokens, `5887264 B/op`, and
   `7174 allocs/op`. Keep treating this as a tiny accepted hot-path simplifier;
   the final `48k` later-turn decode target remains open.
+- Strengthened the retained-book no-replay regression guard: retained chapter
+  turns must start a new Gemma4 user turn and must not include `Book so far`,
+  the chapter-1 seed ID/premise text, or the previous distractor. Chapter 3 is
+  checked to include only its current distractor. This locks the benchmark to
+  the intended `.kv`/MP4 retained-state path: append the new user turn, restore
+  state, and never rebuild prior chapters as prompt text.
 
 - [x] Phase 0: Snapshot the tree and establish the baseline.
   - Run `git status --short`.
