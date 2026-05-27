@@ -2416,11 +2416,13 @@ func TestHIPGemma4Q4SharedDeviceKV_Good(t *testing.T) {
 	if first.DeviceState == nil {
 		t.Fatal("first forward device state is nil")
 	}
+	firstLaunches := driver.launches[launchStart:]
 	core.AssertEqual(t, []int{1, 1, 1, 1}, first.DeviceState.LayerTokenCounts())
 	core.AssertEqual(t, "0", first.Labels["attention_kv_remirror_layers"])
 	core.AssertEqual(t, "2", first.Labels["attention_kv_shared_device_layers"])
 	core.AssertEqual(t, "2", first.Labels["gemma4_q4_device_kv_shared_layers"])
-	core.AssertEqual(t, 2, countKVEncodeTokenLaunches(driver.launches[launchStart:]))
+	core.AssertEqual(t, 2, countKVEncodeTokenLaunches(firstLaunches))
+	core.AssertEqual(t, 2, countLaunchName(firstLaunches, hipKernelNameMLXQ4TripleProj))
 	for index, layer := range firstState.Layers {
 		if len(layer.Keys) != 0 || len(layer.Values) != 0 {
 			t.Fatalf("first host state layer %d retained host KV in device-only generation path", index)
@@ -2429,6 +2431,7 @@ func TestHIPGemma4Q4SharedDeviceKV_Good(t *testing.T) {
 
 	priorDeviceState := first.DeviceState
 	first.DeviceState = nil
+	secondLaunchStart := len(driver.launches)
 	second, secondState, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(context.Background(), driver, cfg, firstState, hipGemma4Q4ForwardRequest{
 		TokenID:           int32(first.Greedy.TokenID),
 		Position:          1,
@@ -2451,6 +2454,8 @@ func TestHIPGemma4Q4SharedDeviceKV_Good(t *testing.T) {
 	core.AssertEqual(t, "0", second.Labels["attention_kv_remirror_layers"])
 	core.AssertEqual(t, "2", second.Labels["attention_kv_shared_device_layers"])
 	core.AssertEqual(t, "2", second.Labels["gemma4_q4_device_kv_shared_layers"])
+	secondLaunches := driver.launches[secondLaunchStart:]
+	core.AssertEqual(t, 2, countLaunchName(secondLaunches, hipKernelNameMLXQ4TripleProj))
 	for index, layer := range secondState.Layers {
 		if len(layer.Keys) != 0 || len(layer.Values) != 0 {
 			t.Fatalf("second host state layer %d retained host KV in device-only generation path", index)
