@@ -15757,3 +15757,58 @@ The book wall-time/quality endpoint remains green, but this is still not final
 driver completion: late-turn retained decode is `61.95 tok/s`, so the remaining
 work is still dim512 long-context attention and q4 projection/GELU block
 volume, not prompt replay or loader metadata.
+
+## 2026-05-27 Gemma4 Mixed-Width KV Memory Plan
+
+Carried the go-mlx Gemma4 mixed-head-size data into ROCm's memory estimator.
+The previous planner applied `hidden_size` to every retained KV layer even when
+Gemma4 metadata exposed narrower KV widths. For E2B that over-counts the local
+and global KV cache because sliding layers use `attention_kv_width=256`, full
+layers use `attention_global_kv_width=512`, and only 7 of 35 layers grow with
+full context.
+
+Accepted change:
+
+```text
+- estimateKVCacheElementSpan now uses attention_global_kv_width for full
+  layers, attention_kv_width for sliding layers, and hidden_size only for
+  unknown/remaining layers.
+- rocmMemoryPlanLabels now reports kv_key_width/kv_value_width from the same
+  mixed-width layer sum instead of layers * hidden_size when attention metadata
+  is available.
+```
+
+Focused test shape for Gemma4-E2B BF16 on the RX 7800 XT memory class:
+
+```text
+context_len=131072
+full_layers=7, full_kv_width=512
+sliding_layers=28, sliding_window=512, sliding_kv_width=256
+cache_mode=k-q8-v-q4
+kv_cache_bytes=710148096
+kv_key_width=10752
+kv_value_width=10752
+```
+
+Verification:
+
+```text
+go test ./go -run 'TestNativeContract_PlanModelFit_(Gemma4SlidingAttentionWeightBytes_Good|MemoryClassesAndCacheModes_Good|UsesKnownWeightBytes_Bad)|TestNativeContract_ModelPackInspectorGemma4NestedTextConfig_Good' -count=1
+go test ./go -count=1
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+git diff --check
+```
+
+Serialized live guard stayed neutral:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32  1  18956064998 ns/op
+context_len=128 max_tokens=2048 prefill_ubatch_tokens=512
+108.0 tok/s, 2048 tokens, 6666632 B/op, 2606 allocs/op
+stderr: /tmp/go-rocm-2048-mixed-kv-width.err (0 bytes)
+```
+
+This does not move decode speed directly. It fixes the production planner so
+128k Gemma4 cache sizing follows the same mixed-width shape as the real q4
+driver and go-mlx, instead of rejecting viable long-context loads from a
+hidden-size-only estimate.

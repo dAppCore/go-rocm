@@ -1104,10 +1104,12 @@ func TestNativeContract_PlanModelFit_Gemma4SlidingAttentionWeightBytes_Good(t *t
 		NumLayers:     35,
 		HiddenSize:    1536,
 		Labels: map[string]string{
-			"weight_bytes":             "9294899782",
-			"attention_full_layers":    "7",
-			"attention_sliding_layers": "28",
-			"sliding_window":           "512",
+			"weight_bytes":              "9294899782",
+			"attention_full_layers":     "7",
+			"attention_sliding_layers":  "28",
+			"sliding_window":            "512",
+			"attention_kv_width":        "256",
+			"attention_global_kv_width": "512",
 		},
 	}, 17163091968)
 	if err != nil {
@@ -1118,8 +1120,13 @@ func TestNativeContract_PlanModelFit_Gemma4SlidingAttentionWeightBytes_Good(t *t
 	}
 	if report.MemoryPlan.Labels["weight_bytes"] != "9294899782" ||
 		report.MemoryPlan.Labels["estimated_runtime_bytes"] == "" ||
+		report.MemoryPlan.Labels["kv_cache_bytes"] != "710148096" ||
+		report.MemoryPlan.Labels["kv_key_width"] != "10752" ||
+		report.MemoryPlan.Labels["kv_value_width"] != "10752" ||
 		report.MemoryPlan.Labels["attention_full_layers"] != "7" ||
 		report.MemoryPlan.Labels["attention_sliding_layers"] != "28" ||
+		report.MemoryPlan.Labels["attention_kv_width"] != "256" ||
+		report.MemoryPlan.Labels["attention_global_kv_width"] != "512" ||
 		report.MemoryPlan.Labels["sliding_window"] != "512" {
 		t.Fatalf("memory plan labels = %+v, want known weights and sliding-attention metadata", report.MemoryPlan.Labels)
 	}

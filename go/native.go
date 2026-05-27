@@ -2709,8 +2709,17 @@ func estimateKVCacheElementSpan(layers, contextLength, hidden int, model inferen
 		remainingLayers = 0
 	}
 	slidingContext := min(contextLength, slidingWindow)
-	effectiveLayerTokens := uint64(fullLayers+remainingLayers)*uint64(contextLength) + uint64(slidingLayers)*uint64(slidingContext)
-	return effectiveLayerTokens * uint64(hidden)
+	fullWidth := rocmModelLabelInt(model.Labels, "attention_global_kv_width")
+	if fullWidth <= 0 {
+		fullWidth = hidden
+	}
+	slidingWidth := rocmModelLabelInt(model.Labels, "attention_kv_width")
+	if slidingWidth <= 0 {
+		slidingWidth = hidden
+	}
+	return uint64(fullLayers)*uint64(contextLength)*uint64(fullWidth) +
+		uint64(slidingLayers)*uint64(slidingContext)*uint64(slidingWidth) +
+		uint64(remainingLayers)*uint64(contextLength)*uint64(hidden)
 }
 
 func rocmEstimatedRuntimeBytes(kvBytes, weightBytes uint64) uint64 {
@@ -2753,7 +2762,7 @@ func rocmMemoryPlanLabels(memoryBytes uint64, contextLength, layers, hidden int,
 	}
 	allocatorLimit := memoryBytes * 85 / 100
 	cacheLimit := memoryBytes * 30 / 100
-	kvWidth := layers * hidden
+	kvWidth := rocmKVCacheLayerWidth(layers, hidden, model)
 	labels := map[string]string{
 		"allocator_limit_bytes":    core.Sprintf("%d", allocatorLimit),
 		"cache_limit_bytes":        core.Sprintf("%d", cacheLimit),
@@ -2809,6 +2818,42 @@ func rocmMemoryPlanLabels(memoryBytes uint64, contextLength, layers, hidden int,
 		}
 	}
 	return labels
+}
+
+func rocmKVCacheLayerWidth(layers, hidden int, model inference.ModelIdentity) int {
+	if layers <= 0 || hidden <= 0 {
+		return 0
+	}
+	fullLayers := rocmModelLabelInt(model.Labels, "attention_full_layers")
+	slidingLayers := rocmModelLabelInt(model.Labels, "attention_sliding_layers")
+	if fullLayers <= 0 && slidingLayers <= 0 {
+		return layers * hidden
+	}
+	if fullLayers < 0 {
+		fullLayers = 0
+	}
+	if fullLayers+slidingLayers > layers {
+		overflow := fullLayers + slidingLayers - layers
+		if slidingLayers >= overflow {
+			slidingLayers -= overflow
+		} else {
+			fullLayers -= overflow - slidingLayers
+			slidingLayers = 0
+		}
+	}
+	remainingLayers := layers - fullLayers - slidingLayers
+	if remainingLayers < 0 {
+		remainingLayers = 0
+	}
+	fullWidth := rocmModelLabelInt(model.Labels, "attention_global_kv_width")
+	if fullWidth <= 0 {
+		fullWidth = hidden
+	}
+	slidingWidth := rocmModelLabelInt(model.Labels, "attention_kv_width")
+	if slidingWidth <= 0 {
+		slidingWidth = hidden
+	}
+	return fullLayers*fullWidth + slidingLayers*slidingWidth + remainingLayers*hidden
 }
 
 func rocmMachineClass(memoryBytes uint64) string {
