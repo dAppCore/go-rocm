@@ -36,6 +36,18 @@ ubatch=8     196.2 prompt_tok/s 3286707584 B/op   966474 allocs/op
   work is a non-materializing/chunked batch prefill attention kernel so prompt
   throughput can approach the `100 prompt_tok/s` line without enormous
   allocation volume.
+- Added `BenchmarkInferenceGemma4Q4PromptPrefillUBatchLadder` behind
+  `GO_ROCM_RUN_PREFILL_UBATCH_LADDER=1` so future prefill kernel work can rerun
+  the ubatch sweep mechanically. It defaults to an 8k synthetic token prompt
+  and the `1024,512,256,128,64,32,16,8` ladder, with overrides through
+  `GO_ROCM_BENCH_PROMPT_TOKEN_COUNT` and
+  `GO_ROCM_BENCH_PREFILL_UBATCH_LADDER`. A small RX 7800 XT wiring smoke passed
+  with empty `/tmp/go-rocm-prefill-ubatch-ladder-smoke.err`:
+
+```text
+ubatch_16  302790978 ns/op  422.7 prompt_tok/s  4401384 B/op   8629 allocs/op
+ubatch_8   329858740 ns/op  388.0 prompt_tok/s  3817840 B/op  15048 allocs/op
+```
 
 - Added an AX-11 reuse benchmark for the batch-causal attention weight scratch
   path. Under the workspace cap it reports:

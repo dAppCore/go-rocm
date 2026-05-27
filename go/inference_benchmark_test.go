@@ -65,6 +65,55 @@ func BenchmarkInferenceGemma4Q4Generate_Ladder(b *testing.B) {
 	}
 }
 
+func BenchmarkInferenceGemma4Q4PromptPrefillUBatchLadder(b *testing.B) {
+	if os.Getenv("GO_ROCM_RUN_BENCHMARKS") != "1" {
+		b.Skip("set GO_ROCM_RUN_BENCHMARKS=1 to run ROCm inference benchmarks")
+	}
+	if os.Getenv("GO_ROCM_RUN_PREFILL_UBATCH_LADDER") != "1" {
+		b.Skip("set GO_ROCM_RUN_PREFILL_UBATCH_LADDER=1 to run the q4 prompt prefill ubatch ladder")
+	}
+	modelPath := os.Getenv("GO_ROCM_MODEL_PATH")
+	if modelPath == "" {
+		b.Skip("set GO_ROCM_MODEL_PATH to a local Gemma4 q4 model pack")
+	}
+	if os.Getenv("GO_ROCM_BENCH_PROMPT") == "" &&
+		os.Getenv("GO_ROCM_BENCH_PROMPT_FILE") == "" &&
+		os.Getenv("GO_ROCM_BENCH_PROMPT_TOKEN_COUNT") == "" {
+		b.Setenv("GO_ROCM_BENCH_PROMPT_TOKEN_COUNT", "8192")
+	}
+	contextLen, err := inferenceBenchmarkPositiveEnv("GO_ROCM_BENCH_CONTEXT_LEN", 48000)
+	if err != nil {
+		b.Fatal(err)
+	}
+	maxTokens, err := inferenceBenchmarkPositiveEnv("GO_ROCM_BENCH_TOKENS", 1)
+	if err != nil {
+		b.Fatal(err)
+	}
+	benchPrompt, err := inferenceBenchmarkPromptFromEnv()
+	if err != nil {
+		b.Fatal(err)
+	}
+	ubatchSizes, err := inferenceBenchmarkPrefillUBatchLadderEnv()
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Setenv("GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE", "1")
+
+	model, err := newROCmBackendWithRuntime(newSystemNativeRuntime()).LoadModel(modelPath, inference.WithContextLen(contextLen))
+	if err != nil {
+		b.Fatalf("LoadModel(%q): %v", modelPath, err)
+	}
+	defer inferenceBenchmarkCloseModel(b, model)
+
+	for _, ubatchTokens := range ubatchSizes {
+		ubatchTokens := ubatchTokens
+		b.Run(fmt.Sprintf("ubatch_%d", ubatchTokens), func(b *testing.B) {
+			b.Setenv(hipGemma4Q4PrefillUBatchEnv, strconv.Itoa(ubatchTokens))
+			inferenceBenchmarkRunGemma4Q4GenerateLoaded(b, model, benchPrompt, maxTokens, contextLen, ubatchTokens, "")
+		})
+	}
+}
+
 func BenchmarkInferenceGemma4Q4Generate_OpencodeSessionStart29K(b *testing.B) {
 	if os.Getenv("GO_ROCM_RUN_29K_BENCHMARKS") != "1" {
 		b.Skip("set GO_ROCM_RUN_29K_BENCHMARKS=1 to run the 29k opencode session-start benchmark")
@@ -1566,6 +1615,27 @@ func inferenceBenchmarkLadderTokensEnv() ([]int, error) {
 	return tokens, nil
 }
 
+func inferenceBenchmarkPrefillUBatchLadderEnv() ([]int, error) {
+	value := strings.TrimSpace(os.Getenv("GO_ROCM_BENCH_PREFILL_UBATCH_LADDER"))
+	if value == "" {
+		return []int{1024, 512, 256, 128, 64, 32, 16, 8}, nil
+	}
+	parts := strings.Split(value, ",")
+	sizes := make([]int, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, fmt.Errorf("GO_ROCM_BENCH_PREFILL_UBATCH_LADDER contains an empty ubatch size")
+		}
+		size, err := strconv.Atoi(part)
+		if err != nil || size <= 0 {
+			return nil, fmt.Errorf("GO_ROCM_BENCH_PREFILL_UBATCH_LADDER ubatch size %q, want positive integer", part)
+		}
+		sizes = append(sizes, size)
+	}
+	return sizes, nil
+}
+
 func inferenceBenchmarkFailBelowMetric(b *testing.B, envName, metricName string, got float64) {
 	b.Helper()
 	minimum, ok, err := inferenceBenchmarkOptionalPositiveFloatEnv(envName)
@@ -1923,6 +1993,25 @@ func TestInferenceBenchmarkLadderTokensEnv_Good(t *testing.T) {
 	t.Setenv("GO_ROCM_BENCH_LADDER_TOKENS", "1,,8")
 	if _, err = inferenceBenchmarkLadderTokensEnv(); err == nil {
 		t.Fatal("empty ladder token count error = nil")
+	}
+}
+
+func TestInferenceBenchmarkPrefillUBatchLadderEnv_Good(t *testing.T) {
+	t.Setenv("GO_ROCM_BENCH_PREFILL_UBATCH_LADDER", "")
+	got, err := inferenceBenchmarkPrefillUBatchLadderEnv()
+	if err != nil || fmt.Sprint(got) != "[1024 512 256 128 64 32 16 8]" {
+		t.Fatalf("default prefill ubatch ladder = %v, %v; want 1024..8", got, err)
+	}
+
+	t.Setenv("GO_ROCM_BENCH_PREFILL_UBATCH_LADDER", "64, 16")
+	got, err = inferenceBenchmarkPrefillUBatchLadderEnv()
+	if err != nil || fmt.Sprint(got) != "[64 16]" {
+		t.Fatalf("custom prefill ubatch ladder = %v, %v; want [64 16]", got, err)
+	}
+
+	t.Setenv("GO_ROCM_BENCH_PREFILL_UBATCH_LADDER", "64,,16")
+	if _, err = inferenceBenchmarkPrefillUBatchLadderEnv(); err == nil {
+		t.Fatal("empty prefill ubatch size error = nil")
 	}
 }
 
