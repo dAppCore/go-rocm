@@ -2119,6 +2119,14 @@ Remaining blocker:
   Retained-book acceptance stayed quality-clean at `37.54s` wall,
   `80.48 tok/s` average, turn 10 `70.22 tok/s`, `204416384 B/op`,
   `93969 allocs/op`, `chapter10_arc_anchor_hits=3`.
+- The descriptor-table host scratch pass keeps the same kernel-visible
+  descriptor layout but reuses the hot 512-page host payload and hot descriptor
+  backing pointer. The focused fake-driver table benchmark moved to
+  `6285 ns/op`, `44 B/op`, and `0 allocs/op`. The live serialized `text:Hi`
+  2048-token guard on `gfx1100` completed with empty stderr at
+  `17964551296 ns/op`, `114.0 tok/s`, `6624528 B/op`, and `2635 allocs/op`.
+  Treat this as accepted allocation/plumbing progress under the
+  go-mlx/IDEAS retained-state rule; it does not change `.kv`/MP4 semantics.
 - 2026-05-27 rechecked the current source with a fresh `gfx1100 -O2` HSACO:
   `512` tokens measured `4531496458 ns/op`, `113.0 tok/s`,
   `3157648 B/op`, and `2367 allocs/op` with empty stderr. Rebuilding with
