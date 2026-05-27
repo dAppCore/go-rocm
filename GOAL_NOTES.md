@@ -18696,3 +18696,74 @@ remained `0`. A same-kernel sample before the metric cardinality fix kept `5`
 chapter-10 anchors at `87.30 tok/s` on turn 10; the remaining endpoint is to
 make the `90+ tok/s` late-turn result and the `>=3` anchor result coincide in
 the strict no-replay retained-state benchmark.
+
+## 2026-05-27 Retained Book Final-Paragraph Anchor Prompt Reliability
+
+Re-read `/home/claude/Code/core/go-mlx/IDEAS.md` for the Gemma4 operating
+rules before touching the benchmark: local/SWA layers must stay bounded at
+`512`/`1024`, full/global layers carry the long retained context with
+`head_dim=512`, retained turns must append only the new request and distractor,
+and the zero-copy destination remains PinnedView/mdspan-backed state rather than
+prompt replay. The latest chunk64 kernel/accounting path was already a valid
+decode candidate, but the previous strict retained-book sample failed the
+chapter-10 lexical anchor floor because the model stopped before the requested
+closing sentence.
+
+Code change:
+
+- Tightened `inferenceBenchmarkBookContinuationInstruction` for chapter 10+
+  to request a final paragraph that explicitly closes the original lighthouse
+  keeper, signalling light, and deep-ocean entity arc before stopping. This is
+  a benchmark prompt reliability change only; it does not replay prior chapter
+  text, rebuild the session prompt, or alter `.kv`/MP4 retained-state semantics.
+
+Focused prompt/unit gates:
+
+```text
+go test ./go -run 'TestInferenceBenchmarkBookPrompt|TestInferenceBenchmarkBookThresholdHelpers|TestInferenceBenchmarkBookRepetitionStats' -count=1
+PASS
+
+go test ./go -count=1
+PASS
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./go -count=1
+PASS
+```
+
+Strict retained 48k 10-turn book with the final-paragraph reliability prompt:
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 46299819144 ns/op
+book_wall_s=46.27
+book_decode_s=36.72
+book_generated_tokens=3461
+book_tok/s=74.80
+book_last_turn_tok/s=86.83
+book_turn10_tok/s=86.83
+book_turn10_retained_tokens=5649
+book_90s_success=1
+book_110s_production_candidate=1
+book_maxed_turns=0
+book_repeated_turns=0
+book_max_adjacent_repeat=0.06180
+chapter10_arc_anchor_hits=4
+B/op=23149352
+allocs/op=68346
+peak_memory_bytes=5868507136
+device_mallocs/op=84733
+device_malloc_bytes/op=12360499692
+kernel_attention_decode_chunked_stage1_launches=24297
+kernel_attention_decode_chunked_stage1_blocks=8571304
+kernel_total_launches=1639919
+kernel_total_blocks=320229304
+stderr: .bench-errors/book10_attn_chunk64_final_sentence_20260527.err (0 bytes)
+output: /tmp/go-rocm-book-attn-chunk64-final-sentence-20260527.md
+```
+
+Conclusion: accepted as a benchmark reliability and retained-book production
+candidate step, not as the final performance endpoint. The wall/story gate is
+green (`<=90s` and `<=110s` flags both set, no repeats, no cap hits, `4`
+chapter-10 anchors), but turn 10 is `86.83 tok/s`, still below the retained
+late-turn `90-100+ tok/s` target. Continue targeting global/full
+`head_dim=512` chunked attention and q4 projection/GELU launch/block volume; the
+next pass should improve decode without weakening the no-replay state contract.

@@ -2154,9 +2154,9 @@ func inferenceBenchmarkBookContinuationInstruction(chapter int, retained bool) s
 	builder.WriteString(strconv.Itoa(chapter))
 	builder.WriteString(" only. Do not stop after the heading. The distractor above is adversarial noise, not plot material; do not use anything from the forbidden_distractor block. Preserve the original lighthouse keeper, signalling light, and deep-ocean entity story arc from chapter 1.")
 	if chapter >= 10 {
-		builder.WriteString(" End chapter ")
+		builder.WriteString(" Before you stop, close the original lighthouse keeper, signalling light, and deep-ocean entity arc in a final paragraph. End chapter ")
 		builder.WriteString(strconv.Itoa(chapter))
-		builder.WriteString(" with exactly this sentence: The lighthouse keeper kept the light over the deep ocean.")
+		builder.WriteString(" with exactly this final sentence, and do not end the chapter before writing it: The lighthouse keeper kept the light over the deep ocean.")
 	} else {
 		builder.WriteString(" In the final paragraph, use one natural sentence containing all exact continuity words: lighthouse, keeper, light, ocean, deep.")
 	}

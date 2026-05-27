@@ -51,25 +51,23 @@ chunked stage1/stage2 launches at `13902` each. This is the best current
 The chapter-shaped 2048-token fast guard at `context_len=4096` reports
 `19536530899 ns/op`, `104.8 tok/s`, `8017064 B/op`, and `3438 allocs/op`.
 Full-attention/global Gemma4 device KV pages now use 128-token blocks while
-sliding-window layers keep exact one-token pages for 512/1024 SWA trimming. A
-fresh strict retained 10-turn book gate with device-reduced sampled top-k
+sliding-window layers keep exact one-token pages for 512/1024 SWA trimming. The
+latest strict retained 10-turn book gate with device-reduced sampled top-k
 partials, contiguous encoded K/V pair allocation, fused embedding-output
 scaling, SWA-window-aware decode routing, chunked stage2 per-chunk weight
-caching, and the 64-token chunked-attention grain produced a fast but not
-production-green sample: `24.58s` wall, `17.35s` decode, `1707` generated
-tokens, `91.81 tok/s` on turn 10, no repeated or maxed turns, `18619792 B/op`,
-and `58815` allocs/op, but only `1` chapter-10 arc anchor. The artifact
-`/tmp/go-rocm-book-attn-chunk64-chunkcount-metrics-20260528.md` confirms the
-story stayed abstractly on the same arc but did not pass the lexical
-`lighthouse`/`keeper`/`light`/`ocean`/`deep` anchor floor, so
-`book_90s_success` and `book_110s_production_candidate` correctly remained `0`.
-A same-kernel strict sample before the route-metric shape-key fix kept `5`
-chapter-10 anchors and measured `87.30 tok/s` on turn 10, so chunk64 is a valid
-decode candidate, not a final production gate.
-Local/SWA attention remains bounded, q4/RoPE work stays flat per generated
-token, and full/global chunked stage1 remains the late-turn scaling blocker.
-Long-context decode now has one sampled turn-10 result above `90 tok/s`, but the
-combined wall/story production gate is still not complete.
+caching, the 64-token chunked-attention grain, and a stronger chapter-10 final
+paragraph instruction reports `46.27s` wall, `36.72s` decode, `3461` generated
+tokens, `74.80 tok/s` average, `86.83 tok/s` on turn 10, no repeated or maxed
+turns, `23149352 B/op`, and `68346` allocs/op. It kept `4` chapter-10 arc
+anchors with empty stderr and produced
+`/tmp/go-rocm-book-attn-chunk64-final-sentence-20260527.md`, so
+`book_90s_success=1` and `book_110s_production_candidate=1`. This makes the
+wall/story production-candidate gate green, but it is not the final driver
+endpoint because late-turn decode remains below the `90-100+ tok/s` target.
+Local/SWA attention remains bounded according to the `go-mlx/IDEAS.md` Gemma4
+rule, q4/RoPE work stays flat per generated token, and full/global
+`head_dim=512` chunked attention plus q4 projection/GELU block volume remain the
+late-turn scaling blockers.
 These numbers use the
 benchmark's
 `inference.WithContextLen` load setting, now correctly applied to Gemma4 q4
@@ -433,10 +431,15 @@ of `3`, with `230986816 B/op` and `106647 allocs/op`. A same-batch attempt to
 avoid the second local-window page-slice copy was rejected: it reduced the
 chapter-shaped 2048-token allocation count but slowed the retained book to
 `38.24s` wall and `79.01 tok/s`.
-This is still not the final driver endpoint: the latest sampled retained-book
-run improved turn-10 decode to `77.00 tok/s`, but that remains below the
-`90-100+ tok/s` target. Keep tuning retained long-context attention and state
-quality until the later turns stay near the target.
+The current chunk64 retained-book reliability pass then made the strict 48k
+book gate production-green again with `46.27s` wall, `36.72s` decode, `3461`
+generated tokens, `74.80 tok/s` average, `86.83 tok/s` on turn 10, no cap hits,
+no repeats, `4` chapter-10 arc anchors, `23149352 B/op`, and `68346 allocs/op`.
+It still appends only the new turn prompt plus Gemma4 chat-control tokens; prior
+chapters are carried by retained KV state and are never rebuilt as prompt text.
+This is still not the final driver endpoint because the latest production-green
+sample remains below the `90-100+ tok/s` late-turn target. Keep tuning retained
+long-context attention and state quality until later turns stay near the target.
 
 Current decode-scaling status as of 2026-05-26: Gemma4 E2B/E4B context is
 `128k` tokens, not `128` tokens; the context-128 short decode numbers remain a
