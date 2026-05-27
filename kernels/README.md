@@ -12,6 +12,20 @@ hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o
 GO_ROCM_RUN_HIP_TESTS=1 GO_ROCM_KERNEL_HSACO=$PWD/build/rocm_kernels_gfx1100.hsaco go test ./go -run 'TestHIPHardware.*KernelSource' -count=1 -v
 ```
 
+The source portability matrix is covered by opt-in tests:
+
+```bash
+GO_ROCM_RUN_AMD_HIP_COMPILE_TESTS=1 go test ./go -run '^TestHIPKernelSource_AMDHIPCompile_Good$' -count=1 -v
+CUDA_PATH=/usr/local/cuda-12.8 GO_ROCM_RUN_NVIDIA_HIP_COMPILE_TESTS=1 go test ./go -run '^TestHIPKernelSource_NVIDIAHIPCompile_Good$' -count=1 -v
+GO_ROCM_RUN_HIP_CPU_COMPILE_TESTS=1 go test ./go -run '^TestHIPKernelSource_HIPCPUCompile_Good$' -count=1 -v
+GO_ROCM_RUN_HIP_CPU_RUNTIME_TESTS=1 go test ./go -run '^TestHIPKernelSource_HIPCPURuntimeSmoke_Good$' -count=1 -v
+CUDA_PATH=/usr/local/cuda-12.8 GO_ROCM_RUN_ZLUDA_CUDA_TESTS=1 ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 go test ./go -run '^TestHIPKernelSource_ZLUDACUDARuntimeSmoke_Good$' -count=1 -v
+```
+
+HIP-CPU is discovered through `GO_ROCM_HIP_CPU_INCLUDE`,
+`GO_ROCM_HIP_CPU_ROOT`, or `/opt/hip-cpu/include`. The CPU compile test defaults
+to `x86_64,aarch64`; set `GO_ROCM_HIP_CPU_TARGETS=x86_64` for host-only checks.
+
 The HIP source is built as C++23. The Go cgo bridge uses `dappco.re/go/cgo`
 and `core.PinnedView` for retained Go-owned buffers; direct HIP use of the
 `go-cgo` `cgo_pinned_view.hpp` mdspan companion requires a ROCm host toolchain

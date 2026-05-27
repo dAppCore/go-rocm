@@ -15026,3 +15026,87 @@ The multi-round device top-k implementation was reverted. Extra tiny top-k
 launches outweighed the reduced host copy on the 48k retained route, so the
 next sampled-path attempt should reduce readback without increasing per-token
 kernel launch count.
+
+## 2026-05-27: HIP Target Matrix and Per-Token Kernel Route Metrics
+
+Added first-class compile/runtime gates for the three useful HIP targets:
+
+```text
+AMD GPU:
+  GO_ROCM_RUN_AMD_HIP_COMPILE_TESTS=1 go test ./go -run '^TestHIPKernelSource_AMDHIPCompile_Good$' -count=1 -v
+  result: std=c++23, arch=gfx1100, hsaco_bytes=379912
+  stderr: /tmp/go-rocm-amd-hip-compile.err (0 bytes)
+  rebuilt HSACO: /tmp/go-rocm-kernels-gfx1100-target-matrix.hsaco
+  build stderr: /tmp/go-rocm-target-matrix-build.err (0 bytes)
+  transformer smoke: TestHIPHardwareTransformerKernelSource_Good PASS
+  transformer stderr: /tmp/go-rocm-target-matrix-transformer.err (0 bytes)
+
+NVIDIA/CUDA compile proof:
+  CUDA_PATH=/usr/local/cuda-12.8 GO_ROCM_RUN_NVIDIA_HIP_COMPILE_TESTS=1 go test ./go -run '^TestHIPKernelSource_NVIDIAHIPCompile_Good$' -count=1 -v
+  result: std=c++20, arch=sm_75, object_bytes=1494496
+  stderr: /tmp/go-rocm-nvidia-hip-compile.err (0 bytes)
+
+HIP-CPU compile proof:
+  GO_ROCM_RUN_HIP_CPU_COMPILE_TESTS=1 go test ./go -run '^TestHIPKernelSource_HIPCPUCompile_Good$' -count=1 -v
+  result x86_64: compiler=/usr/bin/g++, object_bytes=9084984
+  result aarch64: compiler=/usr/bin/aarch64-linux-gnu-g++, object_bytes=3344752
+  stderr: /tmp/go-rocm-hipcpu-compile.err (0 bytes)
+
+HIP-CPU runtime smoke:
+  GO_ROCM_RUN_HIP_CPU_RUNTIME_TESTS=1 go test ./go -run '^TestHIPKernelSource_HIPCPURuntimeSmoke_Good$' -count=1 -v
+  result: hip_cpu_smoke_ok device=AMD Ryzen 9 9950X 16-Core Processor values=1.0,3.0,5.0,7.0
+  stderr: /tmp/go-rocm-hipcpu-runtime.err (0 bytes)
+
+ZLUDA CUDA runtime proof:
+  CUDA_PATH=/usr/local/cuda-12.8 GO_ROCM_RUN_ZLUDA_CUDA_TESTS=1 ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 go test ./go -run '^TestHIPKernelSource_ZLUDACUDARuntimeSmoke_Good$' -count=1 -v
+  result: zluda_cuda_smoke_ok count=1 values=7,8,9,10
+  stderr: /tmp/go-rocm-zluda-cuda-runtime.err (0 bytes)
+```
+
+HIP-CPU was installed as the header-only runtime at `/opt/hip-cpu`
+(`ROCm/HIP-CPU` commit `e112c93`), and the ARM64 cross compiler was installed
+with `g++-aarch64-linux-gnu`. The aarch64 HIP-CPU/libco headers currently need
+`-DVALGRIND_STACK_REGISTER(a,b)=((void)0)` for object compilation because their
+aarch64 fiber backend calls that macro unguarded when the cross environment
+does not provide Valgrind headers. This is compile-proof only; x86_64 is the
+runtime CPU profile on this Ryzen 9 machine.
+
+Kernel route metrics now normalize by generated tokens so short smoke runs and
+long retained-book runs can be compared without hiding launch inflation behind
+different output lengths. With `GO_ROCM_BENCH_KERNEL_ROUTE_METRICS=1`, the
+benchmark stdout and optional `GO_ROCM_BOOK_OUTPUT_FILE` now include:
+
+```text
+kernel_total_launches/generated_token
+kernel_total_blocks/generated_token
+kernel_by_blocks_<name>_launches/generated_token
+kernel_by_blocks_<name>_blocks/generated_token
+```
+
+Tiny retained-book artifact smoke with the current HSACO:
+
+```text
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 \
+GO_ROCM_RUN_BENCHMARKS=1 \
+GO_ROCM_RUN_BOOK_BENCHMARKS=1 \
+GO_ROCM_RUN_RETAINED_BOOK_BENCHMARKS=1 \
+GO_ROCM_BENCH_KERNEL_ROUTE_METRICS=1 \
+GO_ROCM_MODEL_PATH=/data/lem/models/gemma4/LEM-Gemma4-E2B-4bit \
+GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100-current.hsaco \
+GO_ROCM_BOOK_TURNS=2 \
+GO_ROCM_BOOK_CHAPTER_TOKENS=8 \
+GO_ROCM_BOOK_TURN_TIMEOUT_SECONDS=20 \
+GO_ROCM_BOOK_OUTPUT_FILE=/tmp/go-rocm-book-kernel-per-token-artifact.md \
+go test ./go -run '^$' -bench '^BenchmarkInferenceGemma4Q4Book10Turn_RetainedState$' -benchtime=1x -count=1 -timeout=90s
+
+book_wall_s/op 0.5948
+book_generated_tokens/op 16
+book_turn02_tok/s 121.2
+kernel_total_launches/generated_token 854.6
+kernel_total_blocks/generated_token 334546
+stderr: /tmp/go-rocm-book-kernel-per-token-artifact.err (0 bytes)
+output: /tmp/go-rocm-book-kernel-per-token-artifact.md
+```
+
+This is instrumentation only. It does not change the accepted 48k retained-book
+baseline or make the goal complete.

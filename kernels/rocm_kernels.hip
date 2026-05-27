@@ -3203,6 +3203,15 @@ __device__ float rocm_fast_expf(float value)
 	return __expf(value);
 }
 
+__device__ float rocm_rsqrtf(float value)
+{
+#if defined(__HIP_CPU_RT__)
+	return 1.0f / sqrtf(value);
+#else
+	return rsqrtf(value);
+#endif
+}
+
 __device__ float rocm_shfl_down(float value, uint32_t delta, int width)
 {
 #if defined(__HIP_PLATFORM_NVIDIA__) || defined(__HIP_PLATFORM_NVCC__) || defined(__CUDACC__)
@@ -4233,7 +4242,7 @@ extern "C" __global__ void rocm_embedding_mean_pool(const unsigned char *packet)
 			norm += output[dim] * output[dim];
 		}
 		if (norm > 0.0f) {
-			const float scale = rsqrtf(norm);
+			const float scale = rocm_rsqrtf(norm);
 			for (uint32_t dim = 0; dim < args.dim; ++dim) {
 				output[dim] *= scale;
 			}
@@ -4272,7 +4281,7 @@ extern "C" __global__ void rocm_rerank_cosine(const unsigned char *packet)
 		output[doc] = 0.0f;
 		return;
 	}
-	output[doc] = dot * rsqrtf(query_norm) * rsqrtf(doc_norm);
+	output[doc] = dot * rocm_rsqrtf(query_norm) * rocm_rsqrtf(doc_norm);
 }
 
 __device__ float rocm_block_reduce_sum(float value, float *scratch)

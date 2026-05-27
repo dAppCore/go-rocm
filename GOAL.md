@@ -62,18 +62,27 @@ device runtime without the older host-cache remirror step. Keep this layer
 HIP-generic: the same code path should remain usable for a future NVIDIA HIP
 backend profile if the local toolchain targets CUDA through HIP.
 
-NVIDIA portability proof is now part of the acceptance surface. The ROCm 7.2
-HIP source compiles through CUDA/NVCC with
-`GO_ROCM_RUN_NVIDIA_HIP_COMPILE_TESTS=1`; CUDA 12.8 accepts `--std=c++20` for
-that backend while the AMD `gfx1100` build remains `--std=c++23`. A ZLUDA v5
-CUDA runtime smoke is also available behind `GO_ROCM_RUN_ZLUDA_CUDA_TESTS=1`;
-on this ROCm 7.2 host it uses side-by-side ROCm 6.4.4 rpath runtime libraries
-from `/opt/rocm-6.4.4/lib` so ZLUDA's `libamdhip64.so.6` dependency is
-satisfied without downgrading the real ROCm 7.2 development stack.
-2026-05-27 recheck: the NVIDIA HIP compile gate passed with CUDA 12.8,
-`std=c++20`, `arch=sm_75`, and a `1488896` byte object; the ZLUDA v5 CUDA
-runtime smoke passed on the discrete RX 7800 XT with
-`zluda_cuda_smoke_ok count=1 values=7,8,9,10`. Both stderr captures were empty.
+Cross-target HIP proof is now part of the acceptance surface. The ROCm 7.2 HIP
+source must compile through three routes when the local toolchain is available:
+AMD `gfx1100` HSACO with `GO_ROCM_RUN_AMD_HIP_COMPILE_TESTS=1`, NVIDIA/CUDA
+object code with `GO_ROCM_RUN_NVIDIA_HIP_COMPILE_TESTS=1`, and HIP-CPU host
+objects with `GO_ROCM_RUN_HIP_CPU_COMPILE_TESTS=1`. CUDA 12.8 accepts
+`--std=c++20` for the NVIDIA backend while the AMD `gfx1100` build remains
+`--std=c++23`. A ZLUDA v5 CUDA runtime smoke is also available behind
+`GO_ROCM_RUN_ZLUDA_CUDA_TESTS=1`; on this ROCm 7.2 host it uses side-by-side
+ROCm 6.4.4 rpath runtime libraries from `/opt/rocm-6.4.4/lib` so ZLUDA's
+`libamdhip64.so.6` dependency is satisfied without downgrading the real ROCm
+7.2 development stack. HIP-CPU uses the header-only runtime from
+`/opt/hip-cpu/include`; `GO_ROCM_RUN_HIP_CPU_RUNTIME_TESTS=1` runs the x86 host
+runtime smoke on the Ryzen CPU, and the compile gate includes an ARM64
+cross-compile object when `aarch64-linux-gnu-g++` is present.
+2026-05-27 recheck: AMD HIP compile passed with `std=c++23`, `arch=gfx1100`,
+and a `379912` byte HSACO; NVIDIA HIP compile passed with CUDA 12.8,
+`std=c++20`, `arch=sm_75`, and a `1494496` byte object; HIP-CPU compile passed
+for x86_64 (`9084984` byte object) and aarch64 (`3344752` byte object); HIP-CPU
+runtime smoke passed on `AMD Ryzen 9 9950X 16-Core Processor`; and the ZLUDA v5
+CUDA runtime smoke passed on the discrete RX 7800 XT with
+`zluda_cuda_smoke_ok count=1 values=7,8,9,10`. All stderr captures were empty.
 
 AX-11 benchmark rule applies here: any per-token, per-page, per-request, or
 cross-product hot path touched for this driver needs a `Benchmark*` with
@@ -103,9 +112,12 @@ The kernel loop is:
 - For any math-order, launch-geometry, attention, sampler, or retained-KV
   change, run the strict 48k retained-book gate. Empty stderr and good short
   tok/s are not sufficient; chapter-10 arc retention must also pass.
-- Keep NVIDIA portability in the loop when the local toolchain is available:
-  `GO_ROCM_RUN_NVIDIA_HIP_COMPILE_TESTS=1` proves the HIP source compiles
-  through CUDA/NVCC, and `GO_ROCM_RUN_ZLUDA_CUDA_TESTS=1` proves the CUDA
+- Keep the cross-target HIP matrix in the loop when the local toolchain is
+  available: `GO_ROCM_RUN_AMD_HIP_COMPILE_TESTS=1` proves the AMD HSACO,
+  `GO_ROCM_RUN_NVIDIA_HIP_COMPILE_TESTS=1` proves CUDA/NVCC compilation,
+  `GO_ROCM_RUN_HIP_CPU_COMPILE_TESTS=1` proves HIP-CPU x86/ARM64 object
+  compilation, `GO_ROCM_RUN_HIP_CPU_RUNTIME_TESTS=1` proves the x86 CPU runtime
+  path on the Ryzen, and `GO_ROCM_RUN_ZLUDA_CUDA_TESTS=1` proves the CUDA
   runtime smoke can execute through ZLUDA on the AMD card.
 - Document rejected kernel shapes in `GOAL_NOTES.md` with their stdout metrics,
   `.err` path, and reason for rejection. Do not reintroduce a rejected shape

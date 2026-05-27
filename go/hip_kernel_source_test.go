@@ -410,6 +410,115 @@ func TestHIPKernelSource_NVIDIAHIPCompile_Good(t *testing.T) {
 	t.Logf("compiled HIP kernels for NVIDIA backend std=%s arch=%s object_bytes=%d", std, arch, info.Size())
 }
 
+func TestHIPKernelSource_AMDHIPCompile_Good(t *testing.T) {
+	if os.Getenv("GO_ROCM_RUN_AMD_HIP_COMPILE_TESTS") != "1" {
+		t.Skip("set GO_ROCM_RUN_AMD_HIP_COMPILE_TESTS=1 to compile HIP source through the AMD backend")
+	}
+
+	hipcc := rocmNVIDIATestLookPath(t, "hipcc")
+	arch := rocmNVIDIATestEnvDefault("GO_ROCM_AMD_HIP_ARCH", "gfx1100")
+	std := rocmNVIDIATestEnvDefault("GO_ROCM_AMD_HIP_STD", "c++23")
+	outputPath := filepath.Join(t.TempDir(), "rocm_kernels_"+arch+".hsaco")
+	cmd := exec.Command(
+		hipcc,
+		"--std="+std,
+		"--genco",
+		"--offload-arch="+arch,
+		"-O2",
+		"../kernels/rocm_kernels.hip",
+		"-o",
+		outputPath,
+	)
+	cmd.Env = rocmNVIDIATestEnv("", "HIP_PLATFORM=amd")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("compile HIP kernels through AMD backend: %v\n%s", err, rocmNVIDIATestOutputTail(output))
+	}
+	info, err := os.Stat(outputPath)
+	if err != nil {
+		t.Fatalf("stat AMD HIP code object: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Fatalf("AMD HIP code object is empty: %s", outputPath)
+	}
+	t.Logf("compiled HIP kernels for AMD backend std=%s arch=%s hsaco_bytes=%d", std, arch, info.Size())
+}
+
+func TestHIPKernelSource_HIPCPUCompile_Good(t *testing.T) {
+	if os.Getenv("GO_ROCM_RUN_HIP_CPU_COMPILE_TESTS") != "1" {
+		t.Skip("set GO_ROCM_RUN_HIP_CPU_COMPILE_TESTS=1 to compile HIP source through HIP-CPU")
+	}
+
+	includeDir := rocmHIPCPUTestIncludeDir(t)
+	for _, target := range rocmHIPCPUTestTargets() {
+		target := target
+		t.Run(target.name, func(t *testing.T) {
+			compiler := rocmHIPCPUTestCompiler(t, target)
+			outputPath := filepath.Join(t.TempDir(), "rocm_kernels_hip_cpu_"+target.name+".o")
+			args := []string{
+				"-std=c++20",
+				"-O2",
+				"-x",
+				"c++",
+				"-I" + includeDir,
+			}
+			args = append(args, target.extraCompileFlags...)
+			args = append(args, "-c", "../kernels/rocm_kernels.hip", "-o", outputPath)
+			cmd := exec.Command(compiler, args...)
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("compile HIP kernels through HIP-CPU target=%s compiler=%s: %v\n%s", target.name, compiler, err, rocmNVIDIATestOutputTail(output))
+			}
+			info, err := os.Stat(outputPath)
+			if err != nil {
+				t.Fatalf("stat HIP-CPU object: %v", err)
+			}
+			if info.Size() == 0 {
+				t.Fatalf("HIP-CPU object is empty: %s", outputPath)
+			}
+			t.Logf("compiled HIP kernels for HIP-CPU target=%s compiler=%s object_bytes=%d include=%s", target.name, compiler, info.Size(), includeDir)
+		})
+	}
+}
+
+func TestHIPKernelSource_HIPCPURuntimeSmoke_Good(t *testing.T) {
+	if os.Getenv("GO_ROCM_RUN_HIP_CPU_RUNTIME_TESTS") != "1" {
+		t.Skip("set GO_ROCM_RUN_HIP_CPU_RUNTIME_TESTS=1 to compile and run a HIP-CPU runtime smoke")
+	}
+
+	includeDir := rocmHIPCPUTestIncludeDir(t)
+	compiler := rocmHIPCPUTestCompiler(t, rocmHIPCPUTestTarget{name: "x86_64", compilerEnv: "GO_ROCM_HIP_CPU_CXX", compilerFallback: "g++"})
+	tempDir := t.TempDir()
+	sourcePath := filepath.Join(tempDir, "hip_cpu_smoke.cpp")
+	binaryPath := filepath.Join(tempDir, "hip_cpu_smoke")
+	core.RequireNoError(t, os.WriteFile(sourcePath, []byte(rocmHIPCPUSmokeSource), 0o644))
+
+	compile := exec.Command(
+		compiler,
+		"-std=c++20",
+		"-O2",
+		"-I"+includeDir,
+		sourcePath,
+		"-ltbb",
+		"-o",
+		binaryPath,
+	)
+	output, err := compile.CombinedOutput()
+	if err != nil {
+		t.Fatalf("compile HIP-CPU smoke compiler=%s: %v\n%s", compiler, err, rocmNVIDIATestOutputTail(output))
+	}
+
+	run := exec.Command(binaryPath)
+	output, err = run.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run HIP-CPU smoke: %v\n%s", err, rocmNVIDIATestOutputTail(output))
+	}
+	if !strings.Contains(string(output), "hip_cpu_smoke_ok") {
+		t.Fatalf("HIP-CPU smoke did not report success:\n%s", rocmNVIDIATestOutputTail(output))
+	}
+	t.Log(strings.TrimSpace(string(output)))
+}
+
 func TestHIPKernelSource_ZLUDACUDARuntimeSmoke_Good(t *testing.T) {
 	if os.Getenv("GO_ROCM_RUN_ZLUDA_CUDA_TESTS") != "1" {
 		t.Skip("set GO_ROCM_RUN_ZLUDA_CUDA_TESTS=1 to compile CUDA with nvcc and run it through ZLUDA")
@@ -538,6 +647,75 @@ int main() {
 }
 `
 
+const rocmHIPCPUSmokeSource = `
+#include <hip/hip_runtime.h>
+#include <cstdio>
+
+__global__ void rocm_hip_cpu_smoke_kernel(float *out, const float *in, int count) {
+	const int index = blockIdx.x * blockDim.x + threadIdx.x;
+	if (index < count) {
+		out[index] = in[index] * 2.0f + 1.0f;
+	}
+}
+
+int main() {
+	hipDeviceProp_t props{};
+	hipError_t err = hipGetDeviceProperties(&props, 0);
+	if (err != hipSuccess) {
+		std::printf("props_error=%s\n", hipGetErrorString(err));
+		return 10;
+	}
+
+	const int count = 8;
+	float host_in[count] = {0, 1, 2, 3, 4, 5, 6, 7};
+	float host_out[count] = {};
+	float *device_in = nullptr;
+	float *device_out = nullptr;
+	err = hipMalloc(reinterpret_cast<void **>(&device_in), sizeof(host_in));
+	if (err != hipSuccess) {
+		std::printf("malloc_in_error=%s\n", hipGetErrorString(err));
+		return 11;
+	}
+	err = hipMalloc(reinterpret_cast<void **>(&device_out), sizeof(host_out));
+	if (err != hipSuccess) {
+		std::printf("malloc_out_error=%s\n", hipGetErrorString(err));
+		hipFree(device_in);
+		return 12;
+	}
+	err = hipMemcpy(device_in, host_in, sizeof(host_in), hipMemcpyHostToDevice);
+	if (err != hipSuccess) {
+		std::printf("copy_in_error=%s\n", hipGetErrorString(err));
+		hipFree(device_in);
+		hipFree(device_out);
+		return 13;
+	}
+	hipLaunchKernelGGL(rocm_hip_cpu_smoke_kernel, dim3(1), dim3(count), 0, nullptr, device_out, device_in, count);
+	err = hipDeviceSynchronize();
+	if (err != hipSuccess) {
+		std::printf("sync_error=%s\n", hipGetErrorString(err));
+		hipFree(device_in);
+		hipFree(device_out);
+		return 14;
+	}
+	err = hipMemcpy(host_out, device_out, sizeof(host_out), hipMemcpyDeviceToHost);
+	hipFree(device_in);
+	hipFree(device_out);
+	if (err != hipSuccess) {
+		std::printf("copy_out_error=%s\n", hipGetErrorString(err));
+		return 15;
+	}
+	for (int i = 0; i < count; ++i) {
+		const float want = host_in[i] * 2.0f + 1.0f;
+		if (host_out[i] != want) {
+			std::printf("value_error index=%d got=%.1f want=%.1f\n", i, host_out[i], want);
+			return 16;
+		}
+	}
+	std::printf("hip_cpu_smoke_ok device=%s values=%.1f,%.1f,%.1f,%.1f\n", props.name, host_out[0], host_out[1], host_out[2], host_out[3]);
+	return 0;
+}
+`
+
 func rocmNVIDIATestCUDAPath(t *testing.T) string {
 	t.Helper()
 	if cudaPath := os.Getenv("CUDA_PATH"); cudaPath != "" {
@@ -566,7 +744,9 @@ func rocmNVIDIATestLookPath(t *testing.T, name string) string {
 
 func rocmNVIDIATestEnv(cudaPath string, extra ...string) []string {
 	env := append([]string{}, os.Environ()...)
-	env = append(env, "CUDA_PATH="+cudaPath, "CUDA_HOME="+cudaPath)
+	if cudaPath != "" {
+		env = append(env, "CUDA_PATH="+cudaPath, "CUDA_HOME="+cudaPath)
+	}
 	env = append(env, extra...)
 	return env
 }
@@ -650,4 +830,81 @@ func rocmZLUDAHIPCompatDir(t *testing.T) string {
 	core.RequireNoError(t, os.Symlink(target, filepath.Join(compatDir, "libamdhip64.so.6")))
 	t.Logf("using local ZLUDA HIP ABI symlink libamdhip64.so.6 -> %s", target)
 	return compatDir
+}
+
+type rocmHIPCPUTestTarget struct {
+	name              string
+	compilerEnv       string
+	compilerFallback  string
+	extraCompileFlags []string
+}
+
+func rocmHIPCPUTestTargets() []rocmHIPCPUTestTarget {
+	targets := []rocmHIPCPUTestTarget{}
+	names := "x86_64,aarch64"
+	if configured := os.Getenv("GO_ROCM_HIP_CPU_TARGETS"); configured != "" {
+		names = configured
+	}
+	for _, raw := range strings.Split(names, ",") {
+		name := strings.TrimSpace(raw)
+		switch name {
+		case "":
+			continue
+		case "x86_64", "amd64":
+			targets = append(targets, rocmHIPCPUTestTarget{
+				name:             "x86_64",
+				compilerEnv:      "GO_ROCM_HIP_CPU_CXX",
+				compilerFallback: "g++",
+			})
+		case "aarch64", "arm64":
+			targets = append(targets, rocmHIPCPUTestTarget{
+				name:             "aarch64",
+				compilerEnv:      "GO_ROCM_HIP_CPU_AARCH64_CXX",
+				compilerFallback: "aarch64-linux-gnu-g++",
+				extraCompileFlags: []string{
+					"-DVALGRIND_STACK_REGISTER(a,b)=((void)0)",
+				},
+			})
+		default:
+			targets = append(targets, rocmHIPCPUTestTarget{
+				name:             name,
+				compilerEnv:      "GO_ROCM_HIP_CPU_CXX",
+				compilerFallback: name + "-g++",
+			})
+		}
+	}
+	return targets
+}
+
+func rocmHIPCPUTestCompiler(t *testing.T, target rocmHIPCPUTestTarget) string {
+	t.Helper()
+	if configured := os.Getenv(target.compilerEnv); configured != "" {
+		return configured
+	}
+	path, err := exec.LookPath(target.compilerFallback)
+	if err != nil {
+		t.Skipf("HIP-CPU compiler %s for target %s not found; set %s", target.compilerFallback, target.name, target.compilerEnv)
+	}
+	return path
+}
+
+func rocmHIPCPUTestIncludeDir(t *testing.T) string {
+	t.Helper()
+	candidates := []string{}
+	if include := os.Getenv("GO_ROCM_HIP_CPU_INCLUDE"); include != "" {
+		candidates = append(candidates, include)
+	}
+	if root := os.Getenv("GO_ROCM_HIP_CPU_ROOT"); root != "" {
+		candidates = append(candidates, filepath.Join(root, "include"))
+	}
+	candidates = append(candidates, "/opt/hip-cpu/include", "/usr/local/include")
+	for _, candidate := range candidates {
+		header := filepath.Join(candidate, "hip", "hip_defines.h")
+		bytes, err := os.ReadFile(header)
+		if err == nil && strings.Contains(string(bytes), "__HIP_CPU_RT__") {
+			return candidate
+		}
+	}
+	t.Fatalf("HIP-CPU include directory not found; clone https://github.com/ROCm/HIP-CPU to /opt/hip-cpu or set GO_ROCM_HIP_CPU_INCLUDE")
+	return ""
 }

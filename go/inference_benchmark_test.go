@@ -140,6 +140,21 @@ func inferenceBenchmarkReportHIPKernelRouteMetrics(b *testing.B, driver *inferen
 	inferenceBenchmarkReportTopHIPKernelBlocks(b, driver, 12)
 }
 
+func inferenceBenchmarkReportHIPKernelGeneratedTokenMetrics(b *testing.B, driver *inferenceBenchmarkHIPKernelCountingDriver, generatedTokens int) {
+	b.Helper()
+	if driver == nil || generatedTokens <= 0 {
+		return
+	}
+	total := driver.TotalKernelStats()
+	b.ReportMetric(float64(total.Launches)/float64(generatedTokens), "kernel_total_launches/generated_token")
+	b.ReportMetric(float64(total.Blocks)/float64(generatedTokens), "kernel_total_blocks/generated_token")
+	for _, entry := range inferenceBenchmarkTopHIPKernelEntries(driver, 8, inferenceBenchmarkHIPKernelSortByBlocks) {
+		label := "kernel_by_blocks_" + inferenceBenchmarkSanitizeMetricName(entry.name)
+		b.ReportMetric(float64(entry.stats.Launches)/float64(generatedTokens), label+"_launches/generated_token")
+		b.ReportMetric(float64(entry.stats.Blocks)/float64(generatedTokens), label+"_blocks/generated_token")
+	}
+}
+
 func inferenceBenchmarkReportTopHIPKernels(b *testing.B, driver *inferenceBenchmarkHIPKernelCountingDriver, limit int) {
 	b.Helper()
 	entries := inferenceBenchmarkTopHIPKernelEntries(driver, limit, inferenceBenchmarkHIPKernelSortByLaunches)
@@ -293,9 +308,10 @@ func TestInferenceBenchmarkHIPKernelCountingDriver_Good(t *testing.T) {
 		t.Fatalf("top kernel entries = %+v, want %s", entries, hipKernelNameAttentionHeadsBatchChunkedStage1)
 	}
 	var builder strings.Builder
-	inferenceBenchmarkWriteHIPKernelRouteMetrics(&builder, driver, 1)
+	inferenceBenchmarkWriteHIPKernelRouteMetrics(&builder, driver, 1, 2)
 	if got := builder.String(); !strings.Contains(got, "HIP Kernel Route Metrics") ||
-		!strings.Contains(got, hipKernelNameAttentionHeadsBatchChunkedStage1) {
+		!strings.Contains(got, hipKernelNameAttentionHeadsBatchChunkedStage1) ||
+		!strings.Contains(got, "launches/generated_token") {
 		t.Fatalf("kernel output summary = %q, want route metrics with kernel name", got)
 	}
 	driver.ResetKernelStats()
@@ -537,6 +553,7 @@ func BenchmarkInferenceGemma4Q4Book10Turn_RetainedState(b *testing.B) {
 	inferenceBenchmarkMaybeWriteBookOutput(b, last, "retained", kernelCounter)
 	inferenceBenchmarkReportBookRun(b, last, contextLen, generate.MaxTokens, turnTimeout, "retained")
 	inferenceBenchmarkReportHIPKernelRouteMetrics(b, kernelCounter)
+	inferenceBenchmarkReportHIPKernelGeneratedTokenMetrics(b, kernelCounter, last.GeneratedTokens)
 	b.ReportMetric(float64(generate.Temperature), "book_temperature")
 	b.ReportMetric(float64(generate.TopP), "book_top_p")
 	b.ReportMetric(float64(generate.TopK), "book_top_k")
@@ -1374,7 +1391,7 @@ func inferenceBenchmarkMaybeWriteBookOutput(b *testing.B, run inferenceBenchmark
 		}
 		builder.WriteString("\n")
 	}
-	inferenceBenchmarkWriteHIPKernelRouteMetrics(&builder, kernelCounter, 12)
+	inferenceBenchmarkWriteHIPKernelRouteMetrics(&builder, kernelCounter, 12, run.GeneratedTokens)
 	for index, chapter := range run.Chapters {
 		builder.WriteString("## Chapter ")
 		builder.WriteString(strconv.Itoa(index + 1))
@@ -1387,7 +1404,7 @@ func inferenceBenchmarkMaybeWriteBookOutput(b *testing.B, run inferenceBenchmark
 	}
 }
 
-func inferenceBenchmarkWriteHIPKernelRouteMetrics(builder *strings.Builder, driver *inferenceBenchmarkHIPKernelCountingDriver, limit int) {
+func inferenceBenchmarkWriteHIPKernelRouteMetrics(builder *strings.Builder, driver *inferenceBenchmarkHIPKernelCountingDriver, limit, generatedTokens int) {
 	if builder == nil || driver == nil || limit <= 0 {
 		return
 	}
@@ -1400,20 +1417,31 @@ func inferenceBenchmarkWriteHIPKernelRouteMetrics(builder *strings.Builder, driv
 	builder.WriteString(strconv.FormatUint(total.Launches, 10))
 	builder.WriteString("\n- total_blocks: ")
 	builder.WriteString(strconv.FormatUint(total.Blocks, 10))
+	if generatedTokens > 0 {
+		builder.WriteString("\n- total_launches_per_generated_token: ")
+		builder.WriteString(strconv.FormatFloat(float64(total.Launches)/float64(generatedTokens), 'f', 2, 64))
+		builder.WriteString("\n- total_blocks_per_generated_token: ")
+		builder.WriteString(strconv.FormatFloat(float64(total.Blocks)/float64(generatedTokens), 'f', 2, 64))
+	}
 	builder.WriteString("\n\n")
-	inferenceBenchmarkWriteHIPKernelRouteTable(builder, "Top By Launches", inferenceBenchmarkTopHIPKernelEntries(driver, limit, inferenceBenchmarkHIPKernelSortByLaunches))
-	inferenceBenchmarkWriteHIPKernelRouteTable(builder, "Top By Blocks", inferenceBenchmarkTopHIPKernelEntries(driver, limit, inferenceBenchmarkHIPKernelSortByBlocks))
+	inferenceBenchmarkWriteHIPKernelRouteTable(builder, "Top By Launches", inferenceBenchmarkTopHIPKernelEntries(driver, limit, inferenceBenchmarkHIPKernelSortByLaunches), generatedTokens)
+	inferenceBenchmarkWriteHIPKernelRouteTable(builder, "Top By Blocks", inferenceBenchmarkTopHIPKernelEntries(driver, limit, inferenceBenchmarkHIPKernelSortByBlocks), generatedTokens)
 }
 
-func inferenceBenchmarkWriteHIPKernelRouteTable(builder *strings.Builder, title string, entries []inferenceBenchmarkHIPKernelEntry) {
+func inferenceBenchmarkWriteHIPKernelRouteTable(builder *strings.Builder, title string, entries []inferenceBenchmarkHIPKernelEntry, generatedTokens int) {
 	if len(entries) == 0 {
 		return
 	}
 	builder.WriteString("### ")
 	builder.WriteString(title)
 	builder.WriteString("\n\n")
-	builder.WriteString("| kernel | launches | blocks |\n")
-	builder.WriteString("|---|---:|---:|\n")
+	if generatedTokens > 0 {
+		builder.WriteString("| kernel | launches | blocks | launches/generated_token | blocks/generated_token |\n")
+		builder.WriteString("|---|---:|---:|---:|---:|\n")
+	} else {
+		builder.WriteString("| kernel | launches | blocks |\n")
+		builder.WriteString("|---|---:|---:|\n")
+	}
 	for _, entry := range entries {
 		builder.WriteString("| `")
 		builder.WriteString(entry.name)
@@ -1421,6 +1449,12 @@ func inferenceBenchmarkWriteHIPKernelRouteTable(builder *strings.Builder, title 
 		builder.WriteString(strconv.FormatUint(entry.stats.Launches, 10))
 		builder.WriteString(" | ")
 		builder.WriteString(strconv.FormatUint(entry.stats.Blocks, 10))
+		if generatedTokens > 0 {
+			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatFloat(float64(entry.stats.Launches)/float64(generatedTokens), 'f', 2, 64))
+			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatFloat(float64(entry.stats.Blocks)/float64(generatedTokens), 'f', 2, 64))
+		}
 		builder.WriteString(" |\n")
 	}
 	builder.WriteString("\n")
