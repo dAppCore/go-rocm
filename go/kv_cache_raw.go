@@ -70,11 +70,11 @@ func rocmKVCacheBlockFromRawPayload(payload []byte) (rocmKVCacheBlock, error) {
 	if err != nil {
 		return rocmKVCacheBlock{}, err
 	}
-	key, err := rocmKVTensorFromDeviceBytes(meta.keyEncoding, meta.keyLength, keyPayload)
+	key, err := rocmKVTensorFromDeviceBytesRows(meta.keyEncoding, meta.keyLength, meta.tokenCount, keyPayload)
 	if err != nil {
 		return rocmKVCacheBlock{}, core.E("rocm.KVCache.RawBlock", "decode key tensor", err)
 	}
-	value, err := rocmKVTensorFromDeviceBytes(meta.valueEncoding, meta.valueLength, valuePayload)
+	value, err := rocmKVTensorFromDeviceBytesRows(meta.valueEncoding, meta.valueLength, meta.tokenCount, valuePayload)
 	if err != nil {
 		return rocmKVCacheBlock{}, core.E("rocm.KVCache.RawBlock", "decode value tensor", err)
 	}
@@ -155,8 +155,8 @@ func rocmKVBlockRawPayloadParts(payload []byte) (rocmKVBlockRawMeta, []byte, []b
 	if keyLength != tokenCount*keyWidth || valueLength != tokenCount*valueWidth {
 		return rocmKVBlockRawMeta{}, nil, nil, core.E("rocm.KVCache.RawBlock", "raw block tensor length mismatch", nil)
 	}
-	expectedKeyBytes := rocmKVEncodedTensorPayloadBytes(keyEncoding, keyLength)
-	expectedValueBytes := rocmKVEncodedTensorPayloadBytes(valueEncoding, valueLength)
+	expectedKeyBytes := rocmKVEncodedTensorPayloadBytesRows(keyEncoding, keyLength, tokenCount)
+	expectedValueBytes := rocmKVEncodedTensorPayloadBytesRows(valueEncoding, valueLength, tokenCount)
 	if keyBytes != expectedKeyBytes || valueBytes != expectedValueBytes {
 		return rocmKVBlockRawMeta{}, nil, nil, core.E("rocm.KVCache.RawBlock", "raw block tensor byte count mismatch", nil)
 	}
@@ -193,6 +193,10 @@ func rocmKVEncodingCode(encoding string) (uint32, bool) {
 		return 2, true
 	case rocmKVEncodingQ4:
 		return 3, true
+	case rocmKVEncodingQ8Rows:
+		return 4, true
+	case rocmKVEncodingQ4Rows:
+		return 5, true
 	default:
 		return 0, false
 	}
@@ -206,12 +210,20 @@ func rocmKVEncodingFromCode(code uint32) (string, bool) {
 		return rocmKVEncodingQ8, true
 	case 3:
 		return rocmKVEncodingQ4, true
+	case 4:
+		return rocmKVEncodingQ8Rows, true
+	case 5:
+		return rocmKVEncodingQ4Rows, true
 	default:
 		return "", false
 	}
 }
 
 func rocmKVEncodedTensorPayloadBytes(encoding string, length int) int {
+	return rocmKVEncodedTensorPayloadBytesRows(encoding, length, 1)
+}
+
+func rocmKVEncodedTensorPayloadBytesRows(encoding string, length, rows int) int {
 	switch encoding {
 	case rocmKVEncodingFP16:
 		return length * 2
@@ -219,6 +231,16 @@ func rocmKVEncodedTensorPayloadBytes(encoding string, length int) int {
 		return length + 4
 	case rocmKVEncodingQ4:
 		return (length+1)/2 + 4
+	case rocmKVEncodingQ8Rows:
+		if rows <= 0 {
+			return -1
+		}
+		return length + rows*4
+	case rocmKVEncodingQ4Rows:
+		if rows <= 0 {
+			return -1
+		}
+		return (length+1)/2 + rows*4
 	default:
 		return -1
 	}

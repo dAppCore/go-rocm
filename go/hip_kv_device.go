@@ -48,9 +48,11 @@ const (
 )
 
 const (
-	rocmDeviceKVDescriptorEncodingFP16 uint32 = 1
-	rocmDeviceKVDescriptorEncodingQ8   uint32 = 2
-	rocmDeviceKVDescriptorEncodingQ4   uint32 = 3
+	rocmDeviceKVDescriptorEncodingFP16   uint32 = 1
+	rocmDeviceKVDescriptorEncodingQ8     uint32 = 2
+	rocmDeviceKVDescriptorEncodingQ4     uint32 = 3
+	rocmDeviceKVDescriptorEncodingQ8Rows uint32 = 4
+	rocmDeviceKVDescriptorEncodingQ4Rows uint32 = 5
 )
 
 type rocmDeviceKVCache struct {
@@ -283,6 +285,9 @@ type hipKVEncodeTokenLaunchArgs struct {
 	ValueOutputBytes   uint64
 	KeyEncoding        uint32
 	ValueEncoding      uint32
+	KeyWidth           int
+	ValueWidth         int
+	TokenCount         int
 }
 
 type hipKVDescriptorAppendLaunchArgs struct {
@@ -758,7 +763,7 @@ func (cache *rocmDeviceKVCache) withAppendedDeviceRowsWindow(ctx context.Context
 		valueByteOffset := nativeDevicePointer(tokenOffset * valueWidth * 4)
 		keyPage := hipBorrowDeviceByteBuffer(cache.driver, "device KV key row page", key.Pointer()+keyByteOffset, uint64(keyCount*4), keyCount)
 		valuePage := hipBorrowDeviceByteBuffer(cache.driver, "device KV value row page", value.Pointer()+valueByteOffset, uint64(valueCount*4), valueCount)
-		encodedKey, encodedValue, err := hipRunKVEncodeTokenKernel(ctx, cache.driver, keyPage, valuePage, mode)
+		encodedKey, encodedValue, err := hipRunKVEncodeRowsKernel(ctx, cache.driver, keyPage, valuePage, keyWidth, valueWidth, pageTokens, mode)
 		if err != nil {
 			return nil, err
 		}
@@ -932,14 +937,15 @@ func (cache *rocmDeviceKVCache) validateAppendedEncodedRows(key, value rocmDevic
 		return core.E("rocm.KVCache.DeviceAppend", "KV row widths must match device cache shape", nil)
 	}
 	expectedKeyEncoding, expectedValueEncoding := rocmKVEncodingsForMode(cache.mode)
-	if key.encoding != expectedKeyEncoding || value.encoding != expectedValueEncoding {
+	if !rocmDeviceKVEncodingCompatible(key.encoding, expectedKeyEncoding, tokenCount) ||
+		!rocmDeviceKVEncodingCompatible(value.encoding, expectedValueEncoding, tokenCount) {
 		return core.E("rocm.KVCache.DeviceAppend", "encoded device KV row encodings do not match cache mode", nil)
 	}
-	expectedKeyBytes, err := rocmKVTensorDeviceByteCount(key.encoding, keyWidth*tokenCount)
+	expectedKeyBytes, err := rocmKVTensorDeviceByteCountRows(key.encoding, keyWidth*tokenCount, tokenCount)
 	if err != nil {
 		return err
 	}
-	expectedValueBytes, err := rocmKVTensorDeviceByteCount(value.encoding, valueWidth*tokenCount)
+	expectedValueBytes, err := rocmKVTensorDeviceByteCountRows(value.encoding, valueWidth*tokenCount, tokenCount)
 	if err != nil {
 		return err
 	}
@@ -947,6 +953,23 @@ func (cache *rocmDeviceKVCache) validateAppendedEncodedRows(key, value rocmDevic
 		return core.E("rocm.KVCache.DeviceAppend", "encoded device KV row byte count mismatch", nil)
 	}
 	return nil
+}
+
+func rocmDeviceKVEncodingCompatible(got, want string, tokenCount int) bool {
+	if got == want {
+		return true
+	}
+	if tokenCount <= 1 {
+		return false
+	}
+	switch want {
+	case rocmKVEncodingQ8:
+		return got == rocmKVEncodingQ8Rows
+	case rocmKVEncodingQ4:
+		return got == rocmKVEncodingQ4Rows
+	default:
+		return false
+	}
 }
 
 func (cache *rocmDeviceKVCache) trimDeviceTokenWindow(window int) *rocmDeviceKVCache {
@@ -980,6 +1003,18 @@ func (cache *rocmDeviceKVCache) trimDeviceTokenWindow(window int) *rocmDeviceKVC
 }
 
 func hipRunKVEncodeTokenKernel(ctx context.Context, driver nativeHIPDriver, key, value *hipDeviceByteBuffer, mode string) (rocmDeviceKVTensor, rocmDeviceKVTensor, error) {
+	keyWidth := 0
+	if key != nil {
+		keyWidth = key.Count()
+	}
+	valueWidth := 0
+	if value != nil {
+		valueWidth = value.Count()
+	}
+	return hipRunKVEncodeRowsKernel(ctx, driver, key, value, keyWidth, valueWidth, 1, mode)
+}
+
+func hipRunKVEncodeRowsKernel(ctx context.Context, driver nativeHIPDriver, key, value *hipDeviceByteBuffer, keyWidth, valueWidth, tokenCount int, mode string) (rocmDeviceKVTensor, rocmDeviceKVTensor, error) {
 	if err := hipContextErr(ctx); err != nil {
 		return rocmDeviceKVTensor{}, rocmDeviceKVTensor{}, err
 	}
@@ -995,11 +1030,25 @@ func hipRunKVEncodeTokenKernel(ctx context.Context, driver nativeHIPDriver, key,
 	if value == nil || value.Pointer() == 0 || value.Count() <= 0 || value.SizeBytes() != uint64(value.Count())*4 {
 		return rocmDeviceKVTensor{}, rocmDeviceKVTensor{}, core.E("rocm.KVCache.DeviceAppend", "device KV value token buffer is required", nil)
 	}
+	if keyWidth <= 0 || valueWidth <= 0 || tokenCount <= 0 || key.Count() != keyWidth*tokenCount || value.Count() != valueWidth*tokenCount {
+		return rocmDeviceKVTensor{}, rocmDeviceKVTensor{}, core.E("rocm.KVCache.DeviceAppend", "device KV row shape mismatch", nil)
+	}
 	mode = firstNonEmptyString(mode, rocmKVCacheModeFP16)
 	if !isROCmKVCacheMode(mode) {
 		return rocmDeviceKVTensor{}, rocmDeviceKVTensor{}, core.E("rocm.KVCache.DeviceAppend", core.Sprintf("unsupported cache mode %q", mode), nil)
 	}
 	keyEncoding, valueEncoding := rocmKVEncodingsForMode(mode)
+	if tokenCount > 1 {
+		if keyEncoding == rocmKVEncodingQ8 {
+			keyEncoding = rocmKVEncodingQ8Rows
+		}
+		if valueEncoding == rocmKVEncodingQ4 {
+			valueEncoding = rocmKVEncodingQ4Rows
+		}
+		if valueEncoding == rocmKVEncodingQ8 {
+			valueEncoding = rocmKVEncodingQ8Rows
+		}
+	}
 	keyEncodingCode, err := rocmDeviceKVEncodingCode(keyEncoding)
 	if err != nil {
 		return rocmDeviceKVTensor{}, rocmDeviceKVTensor{}, err
@@ -1008,11 +1057,11 @@ func hipRunKVEncodeTokenKernel(ctx context.Context, driver nativeHIPDriver, key,
 	if err != nil {
 		return rocmDeviceKVTensor{}, rocmDeviceKVTensor{}, err
 	}
-	keyBytes, err := rocmKVTensorDeviceByteCount(keyEncoding, key.Count())
+	keyBytes, err := rocmKVTensorDeviceByteCountRows(keyEncoding, key.Count(), tokenCount)
 	if err != nil {
 		return rocmDeviceKVTensor{}, rocmDeviceKVTensor{}, err
 	}
-	valueBytes, err := rocmKVTensorDeviceByteCount(valueEncoding, value.Count())
+	valueBytes, err := rocmKVTensorDeviceByteCountRows(valueEncoding, value.Count(), tokenCount)
 	if err != nil {
 		return rocmDeviceKVTensor{}, rocmDeviceKVTensor{}, err
 	}
@@ -1038,6 +1087,9 @@ func hipRunKVEncodeTokenKernel(ctx context.Context, driver nativeHIPDriver, key,
 		ValueOutputBytes:   valueBytes,
 		KeyEncoding:        keyEncodingCode,
 		ValueEncoding:      valueEncodingCode,
+		KeyWidth:           keyWidth,
+		ValueWidth:         valueWidth,
+		TokenCount:         tokenCount,
 	}).Binary()
 	if err != nil {
 		_ = rocmDeviceKVTensorFree(driver, keyPointer, keyBytes)
@@ -1437,11 +1489,11 @@ func (cache *rocmDeviceKVCache) hostCache() (*rocmKVCache, error) {
 		return nil, err
 	}
 	for _, page := range cache.pages {
-		key, err := copyROCmDeviceKVTensorToHost(cache.driver, page.key, page.tokenCount*page.keyWidth)
+		key, err := copyROCmDeviceKVTensorRowsToHost(cache.driver, page.key, page.tokenCount*page.keyWidth, page.tokenCount)
 		if err != nil {
 			return nil, core.E("rocm.KVCache.DeviceSnapshot", "copy KV key page", err)
 		}
-		value, err := copyROCmDeviceKVTensorToHost(cache.driver, page.value, page.tokenCount*page.valueWidth)
+		value, err := copyROCmDeviceKVTensorRowsToHost(cache.driver, page.value, page.tokenCount*page.valueWidth, page.tokenCount)
 		if err != nil {
 			return nil, core.E("rocm.KVCache.DeviceSnapshot", "copy KV value page", err)
 		}
@@ -2021,6 +2073,10 @@ func rocmDeviceKVEncodingCode(encoding string) (uint32, error) {
 		return rocmDeviceKVDescriptorEncodingQ8, nil
 	case rocmKVEncodingQ4:
 		return rocmDeviceKVDescriptorEncodingQ4, nil
+	case rocmKVEncodingQ8Rows:
+		return rocmDeviceKVDescriptorEncodingQ8Rows, nil
+	case rocmKVEncodingQ4Rows:
+		return rocmDeviceKVDescriptorEncodingQ4Rows, nil
 	default:
 		return 0, core.E("rocm.KVCache.DeviceDescriptor", core.Sprintf("unsupported tensor encoding %q", encoding), nil)
 	}
@@ -2028,7 +2084,7 @@ func rocmDeviceKVEncodingCode(encoding string) (uint32, error) {
 
 func rocmDeviceKVValidateEncodingCode(code uint32) error {
 	switch code {
-	case rocmDeviceKVDescriptorEncodingFP16, rocmDeviceKVDescriptorEncodingQ8, rocmDeviceKVDescriptorEncodingQ4:
+	case rocmDeviceKVDescriptorEncodingFP16, rocmDeviceKVDescriptorEncodingQ8, rocmDeviceKVDescriptorEncodingQ4, rocmDeviceKVDescriptorEncodingQ8Rows, rocmDeviceKVDescriptorEncodingQ4Rows:
 		return nil
 	default:
 		return core.E("rocm.KVCache.DeviceDescriptor", core.Sprintf("unsupported tensor encoding code %d", code), nil)
@@ -2043,12 +2099,20 @@ func rocmDeviceKVEncodingName(code uint32) (string, error) {
 		return rocmKVEncodingQ8, nil
 	case rocmDeviceKVDescriptorEncodingQ4:
 		return rocmKVEncodingQ4, nil
+	case rocmDeviceKVDescriptorEncodingQ8Rows:
+		return rocmKVEncodingQ8Rows, nil
+	case rocmDeviceKVDescriptorEncodingQ4Rows:
+		return rocmKVEncodingQ4Rows, nil
 	default:
 		return "", core.E("rocm.KVCache.DeviceDescriptor", core.Sprintf("unsupported tensor encoding code %d", code), nil)
 	}
 }
 
 func rocmKVTensorDeviceByteCount(encoding string, length int) (uint64, error) {
+	return rocmKVTensorDeviceByteCountRows(encoding, length, 1)
+}
+
+func rocmKVTensorDeviceByteCountRows(encoding string, length, rows int) (uint64, error) {
 	if length <= 0 {
 		return 0, core.E("rocm.KVCache.DeviceDescriptor", "tensor length must be positive", nil)
 	}
@@ -2059,6 +2123,16 @@ func rocmKVTensorDeviceByteCount(encoding string, length int) (uint64, error) {
 		return uint64(length) + 4, nil
 	case rocmKVEncodingQ4:
 		return uint64((length+1)/2) + 4, nil
+	case rocmKVEncodingQ8Rows:
+		if rows <= 0 {
+			return 0, core.E("rocm.KVCache.DeviceDescriptor", "row-scaled tensor row count must be positive", nil)
+		}
+		return uint64(length) + uint64(rows)*4, nil
+	case rocmKVEncodingQ4Rows:
+		if rows <= 0 {
+			return 0, core.E("rocm.KVCache.DeviceDescriptor", "row-scaled tensor row count must be positive", nil)
+		}
+		return uint64((length+1)/2) + uint64(rows)*4, nil
 	default:
 		return 0, core.E("rocm.KVCache.DeviceDescriptor", core.Sprintf("unsupported tensor encoding %q", encoding), nil)
 	}
@@ -2100,11 +2174,22 @@ func (args hipKVEncodeTokenLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	expectedKeyBytes, err := rocmKVTensorDeviceByteCount(keyEncoding, int(keyCount))
+	tokenCount := 1
+	if args.TokenCount > 0 {
+		tokenCount = args.TokenCount
+	}
+	if args.KeyWidth > 0 || args.ValueWidth > 0 || args.TokenCount > 0 {
+		if args.KeyWidth <= 0 || args.ValueWidth <= 0 || args.TokenCount <= 0 ||
+			int(keyCount) != args.KeyWidth*args.TokenCount ||
+			int(valueCount) != args.ValueWidth*args.TokenCount {
+			return nil, core.E("rocm.KVCache.DeviceAppend", "KV encode token row shape mismatch", nil)
+		}
+	}
+	expectedKeyBytes, err := rocmKVTensorDeviceByteCountRows(keyEncoding, int(keyCount), tokenCount)
 	if err != nil {
 		return nil, err
 	}
-	expectedValueBytes, err := rocmKVTensorDeviceByteCount(valueEncoding, int(valueCount))
+	expectedValueBytes, err := rocmKVTensorDeviceByteCountRows(valueEncoding, int(valueCount), tokenCount)
 	if err != nil {
 		return nil, err
 	}
@@ -2142,6 +2227,9 @@ func (args hipKVEncodeTokenLaunchArgs) Binary() ([]byte, error) {
 	binary.LittleEndian.PutUint32(payload[60:], valueOutputBytes)
 	binary.LittleEndian.PutUint32(payload[64:], args.KeyEncoding)
 	binary.LittleEndian.PutUint32(payload[68:], args.ValueEncoding)
+	binary.LittleEndian.PutUint64(payload[72:], uint64(args.KeyWidth))
+	binary.LittleEndian.PutUint64(payload[80:], uint64(args.ValueWidth))
+	binary.LittleEndian.PutUint64(payload[88:], uint64(args.TokenCount))
 	return payload, nil
 }
 
@@ -2271,10 +2359,27 @@ func (tensor rocmKVEncodedTensor) deviceBytes() ([]byte, error) {
 			payload[4+i] = byte(value)
 		}
 		return payload, nil
+	case rocmKVEncodingQ8Rows:
+		payload := make([]byte, len(tensor.scales)*4+len(tensor.q8))
+		for i, scale := range tensor.scales {
+			binary.LittleEndian.PutUint32(payload[i*4:], math.Float32bits(scale))
+		}
+		offset := len(tensor.scales) * 4
+		for i, value := range tensor.q8 {
+			payload[offset+i] = byte(value)
+		}
+		return payload, nil
 	case rocmKVEncodingQ4:
 		payload := make([]byte, 4+len(tensor.packedQ4))
 		binary.LittleEndian.PutUint32(payload, math.Float32bits(tensor.scale))
 		copy(payload[4:], tensor.packedQ4)
+		return payload, nil
+	case rocmKVEncodingQ4Rows:
+		payload := make([]byte, len(tensor.scales)*4+len(tensor.packedQ4))
+		for i, scale := range tensor.scales {
+			binary.LittleEndian.PutUint32(payload[i*4:], math.Float32bits(scale))
+		}
+		copy(payload[len(tensor.scales)*4:], tensor.packedQ4)
 		return payload, nil
 	default:
 		return nil, core.E("rocm.KVCache.DeviceMirror", core.Sprintf("unsupported tensor encoding %q", tensor.encoding), nil)
@@ -2282,6 +2387,10 @@ func (tensor rocmKVEncodedTensor) deviceBytes() ([]byte, error) {
 }
 
 func copyROCmDeviceKVTensorToHost(driver nativeHIPDriver, tensor rocmDeviceKVTensor, length int) (rocmKVEncodedTensor, error) {
+	return copyROCmDeviceKVTensorRowsToHost(driver, tensor, length, 1)
+}
+
+func copyROCmDeviceKVTensorRowsToHost(driver nativeHIPDriver, tensor rocmDeviceKVTensor, length, rows int) (rocmKVEncodedTensor, error) {
 	if driver == nil {
 		return rocmKVEncodedTensor{}, core.E("rocm.KVCache.DeviceSnapshot", "HIP driver is nil", nil)
 	}
@@ -2299,10 +2408,14 @@ func copyROCmDeviceKVTensorToHost(driver nativeHIPDriver, tensor rocmDeviceKVTen
 	if err := driver.CopyDeviceToHost(tensor.pointer, payload); err != nil {
 		return rocmKVEncodedTensor{}, core.E("rocm.KVCache.DeviceSnapshot", "copy device tensor", err)
 	}
-	return rocmKVTensorFromDeviceBytes(tensor.encoding, length, payload)
+	return rocmKVTensorFromDeviceBytesRows(tensor.encoding, length, rows, payload)
 }
 
 func rocmKVTensorFromDeviceBytes(encoding string, length int, payload []byte) (rocmKVEncodedTensor, error) {
+	return rocmKVTensorFromDeviceBytesRows(encoding, length, 1, payload)
+}
+
+func rocmKVTensorFromDeviceBytesRows(encoding string, length, rows int, payload []byte) (rocmKVEncodedTensor, error) {
 	if length <= 0 {
 		return rocmKVEncodedTensor{}, core.E("rocm.KVCache.DeviceSnapshot", "tensor length must be positive", nil)
 	}
@@ -2328,6 +2441,22 @@ func rocmKVTensorFromDeviceBytes(encoding string, length int, payload []byte) (r
 		for index, value := range payload[4:] {
 			tensor.q8[index] = int8(value)
 		}
+	case rocmKVEncodingQ8Rows:
+		if rows <= 0 || len(payload) != length+rows*4 {
+			return rocmKVEncodedTensor{}, core.E("rocm.KVCache.DeviceSnapshot", "q8 row tensor byte count mismatch", nil)
+		}
+		tensor.scales = make([]float32, rows)
+		for index := range tensor.scales {
+			tensor.scales[index] = math.Float32frombits(binary.LittleEndian.Uint32(payload[index*4:]))
+			if tensor.scales[index] <= 0 || math.IsNaN(float64(tensor.scales[index])) || math.IsInf(float64(tensor.scales[index]), 0) {
+				return rocmKVEncodedTensor{}, core.E("rocm.KVCache.DeviceSnapshot", "q8 row scale must be positive and finite", nil)
+			}
+		}
+		tensor.q8 = make([]int8, length)
+		offset := rows * 4
+		for index, value := range payload[offset:] {
+			tensor.q8[index] = int8(value)
+		}
 	case rocmKVEncodingQ4:
 		packedLength := (length + 1) / 2
 		if len(payload) != packedLength+4 {
@@ -2338,6 +2467,19 @@ func rocmKVTensorFromDeviceBytes(encoding string, length int, payload []byte) (r
 			return rocmKVEncodedTensor{}, core.E("rocm.KVCache.DeviceSnapshot", "q4 scale must be positive and finite", nil)
 		}
 		tensor.packedQ4 = append([]byte(nil), payload[4:]...)
+	case rocmKVEncodingQ4Rows:
+		packedLength := (length + 1) / 2
+		if rows <= 0 || len(payload) != packedLength+rows*4 {
+			return rocmKVEncodedTensor{}, core.E("rocm.KVCache.DeviceSnapshot", "q4 row tensor byte count mismatch", nil)
+		}
+		tensor.scales = make([]float32, rows)
+		for index := range tensor.scales {
+			tensor.scales[index] = math.Float32frombits(binary.LittleEndian.Uint32(payload[index*4:]))
+			if tensor.scales[index] <= 0 || math.IsNaN(float64(tensor.scales[index])) || math.IsInf(float64(tensor.scales[index]), 0) {
+				return rocmKVEncodedTensor{}, core.E("rocm.KVCache.DeviceSnapshot", "q4 row scale must be positive and finite", nil)
+			}
+		}
+		tensor.packedQ4 = append([]byte(nil), payload[rows*4:]...)
 	default:
 		return rocmKVEncodedTensor{}, core.E("rocm.KVCache.DeviceSnapshot", core.Sprintf("unsupported tensor encoding %q", encoding), nil)
 	}

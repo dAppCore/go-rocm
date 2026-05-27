@@ -409,16 +409,34 @@ func TestKVCache_Good_KVEncodeTokenKernelEncodesDeviceToken(t *testing.T) {
 	core.AssertEqual(t, hipKernelNameKVEncodeToken, driver.launches[len(driver.launches)-1].Name)
 }
 
+func TestKVCache_Good_RowScaledTensorEncoding(t *testing.T) {
+	keyTensor, err := encodeROCmKVTensorRows(rocmKVEncodingQ8Rows, []float32{100, -100, 0.5, -0.5}, 2, 2)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, uint64(12), keyTensor.sizeBytes)
+	assertFloat32SlicesNear(t, []float32{100, -100, 0.5, -0.5}, keyTensor.decodeRows(2), 0.01)
+
+	valueTensor, err := encodeROCmKVTensorRows(rocmKVEncodingQ4Rows, []float32{7, -7, 0.25, -0.25}, 2, 2)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, uint64(10), valueTensor.sizeBytes)
+	assertFloat32SlicesNear(t, []float32{7, -7, 0.25, -0.25}, valueTensor.decodeRows(2), 0.02)
+
+	payload, err := valueTensor.deviceBytes()
+	core.RequireNoError(t, err)
+	restored, err := rocmKVTensorFromDeviceBytesRows(rocmKVEncodingQ4Rows, valueTensor.length, 2, payload)
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{7, -7, 0.25, -0.25}, restored.decodeRows(2), 0.02)
+}
+
 func TestKVCache_Good_DeviceMirrorAppendsDeviceRowsWindow(t *testing.T) {
 	driver := &fakeHIPDriver{available: true}
 	keyRows := []float32{
-		1, 0,
-		0, 1,
+		100, -100,
+		0.5, -0.5,
 		-1, 1,
 	}
 	valueRows := []float32{
-		2, 0,
-		0, 2,
+		7, -7,
+		0.25, -0.25,
 		3, -3,
 	}
 	keyInput, err := hipUploadByteBuffer(driver, "rocm.KVCache.Test", "key rows", mustHIPFloat32Payload(t, keyRows), len(keyRows))
@@ -439,6 +457,12 @@ func TestKVCache_Good_DeviceMirrorAppendsDeviceRowsWindow(t *testing.T) {
 	core.AssertEqual(t, 1, next.pages[1].tokenCount)
 	core.AssertEqual(t, 0, next.pages[0].tokenStart)
 	core.AssertEqual(t, 2, next.pages[1].tokenStart)
+	core.AssertEqual(t, rocmKVEncodingQ8Rows, next.pages[0].key.encoding)
+	core.AssertEqual(t, rocmKVEncodingQ4Rows, next.pages[0].value.encoding)
+	core.AssertEqual(t, uint64(12), next.pages[0].key.sizeBytes)
+	core.AssertEqual(t, uint64(10), next.pages[0].value.sizeBytes)
+	core.AssertEqual(t, rocmKVEncodingQ8, next.pages[1].key.encoding)
+	core.AssertEqual(t, rocmKVEncodingQ4, next.pages[1].value.encoding)
 	core.AssertEqual(t, 2, countLaunchName(driver.launches, hipKernelNameKVEncodeToken))
 
 	payload, err := next.Snapshot()
@@ -448,7 +472,7 @@ func TestKVCache_Good_DeviceMirrorAppendsDeviceRowsWindow(t *testing.T) {
 	keys, values, err := restored.Restore(0, 3)
 	core.RequireNoError(t, err)
 	assertFloat32SlicesNear(t, keyRows, keys, 0.02)
-	assertFloat32SlicesNear(t, valueRows, values, 0.20)
+	assertFloat32SlicesNear(t, valueRows, values, 0.06)
 
 	descriptor, err := next.KernelDescriptor()
 	core.RequireNoError(t, err)

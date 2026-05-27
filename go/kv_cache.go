@@ -20,6 +20,8 @@ const (
 	rocmKVEncodingFP16        = "fp16"
 	rocmKVEncodingQ8          = "q8"
 	rocmKVEncodingQ4          = "q4"
+	rocmKVEncodingQ8Rows      = "q8-rows"
+	rocmKVEncodingQ4Rows      = "q4-rows"
 	rocmKVSnapshotEncoding    = "rocm/kv-cache+json"
 	rocmKVBlockBundleEncoding = "rocm/kv-cache-block-bundle+json"
 	rocmKVBlockRawEncoding    = "rocm/kv-cache-block+raw"
@@ -53,6 +55,7 @@ type rocmKVEncodedTensor struct {
 	encoding  string
 	length    int
 	scale     float32
+	scales    []float32
 	f16       []uint16
 	q8        []int8
 	packedQ4  []byte
@@ -106,13 +109,14 @@ type rocmKVBlockBundleRef struct {
 }
 
 type rocmKVEncodedTensorSnapshot struct {
-	Encoding  string   `json:"encoding"`
-	Length    int      `json:"length"`
-	Scale     float32  `json:"scale,omitempty"`
-	F16       []uint16 `json:"f16,omitempty"`
-	Q8        []int8   `json:"q8,omitempty"`
-	PackedQ4  []byte   `json:"packed_q4,omitempty"`
-	SizeBytes uint64   `json:"size_bytes,omitempty"`
+	Encoding  string    `json:"encoding"`
+	Length    int       `json:"length"`
+	Scale     float32   `json:"scale,omitempty"`
+	Scales    []float32 `json:"scales,omitempty"`
+	F16       []uint16  `json:"f16,omitempty"`
+	Q8        []int8    `json:"q8,omitempty"`
+	PackedQ4  []byte    `json:"packed_q4,omitempty"`
+	SizeBytes uint64    `json:"size_bytes,omitempty"`
 }
 
 func newROCmKVCache(mode string, blockSize int) (*rocmKVCache, error) {
@@ -310,8 +314,8 @@ func (cache *rocmKVCache) Restore(tokenStart, tokenCount int) ([]float32, []floa
 		if block.tokenStart > cursor {
 			break
 		}
-		blockKeys := block.key.decode()
-		blockValues := block.value.decode()
+		blockKeys := block.key.decodeRows(block.keyWidth)
+		blockValues := block.value.decodeRows(block.valueWidth)
 		startOffset := cursor - block.tokenStart
 		endOffset := block.tokenCount
 		if blockEnd > end {
@@ -518,6 +522,7 @@ func (tensor rocmKVEncodedTensor) snapshot() rocmKVEncodedTensorSnapshot {
 		Encoding:  tensor.encoding,
 		Length:    tensor.length,
 		Scale:     tensor.scale,
+		Scales:    append([]float32(nil), tensor.scales...),
 		F16:       append([]uint16(nil), tensor.f16...),
 		Q8:        append([]int8(nil), tensor.q8...),
 		PackedQ4:  append([]byte(nil), tensor.packedQ4...),
@@ -530,6 +535,7 @@ func (tensor rocmKVEncodedTensor) clone() rocmKVEncodedTensor {
 		encoding:  tensor.encoding,
 		length:    tensor.length,
 		scale:     tensor.scale,
+		scales:    append([]float32(nil), tensor.scales...),
 		f16:       append([]uint16(nil), tensor.f16...),
 		q8:        append([]int8(nil), tensor.q8...),
 		packedQ4:  append([]byte(nil), tensor.packedQ4...),
@@ -545,6 +551,7 @@ func (snapshot rocmKVEncodedTensorSnapshot) toTensor() (rocmKVEncodedTensor, err
 		encoding:  snapshot.Encoding,
 		length:    snapshot.Length,
 		scale:     snapshot.Scale,
+		scales:    append([]float32(nil), snapshot.Scales...),
 		f16:       append([]uint16(nil), snapshot.F16...),
 		q8:        append([]int8(nil), snapshot.Q8...),
 		packedQ4:  append([]byte(nil), snapshot.PackedQ4...),
@@ -568,6 +575,21 @@ func (snapshot rocmKVEncodedTensorSnapshot) toTensor() (rocmKVEncodedTensor, err
 		if tensor.sizeBytes == 0 {
 			tensor.sizeBytes = uint64(len(tensor.q8) + 4)
 		}
+	case rocmKVEncodingQ8Rows:
+		if len(tensor.q8) != tensor.length {
+			return rocmKVEncodedTensor{}, core.E("rocm.KVCache.Snapshot", "q8 row tensor length mismatch", nil)
+		}
+		if len(tensor.scales) == 0 {
+			return rocmKVEncodedTensor{}, core.E("rocm.KVCache.Snapshot", "q8 row scales are required", nil)
+		}
+		for _, scale := range tensor.scales {
+			if scale <= 0 {
+				return rocmKVEncodedTensor{}, core.E("rocm.KVCache.Snapshot", "q8 row scale must be positive", nil)
+			}
+		}
+		if tensor.sizeBytes == 0 {
+			tensor.sizeBytes = uint64(len(tensor.q8) + len(tensor.scales)*4)
+		}
 	case rocmKVEncodingQ4:
 		if len(tensor.packedQ4) != (tensor.length+1)/2 {
 			return rocmKVEncodedTensor{}, core.E("rocm.KVCache.Snapshot", "q4 tensor length mismatch", nil)
@@ -578,6 +600,21 @@ func (snapshot rocmKVEncodedTensorSnapshot) toTensor() (rocmKVEncodedTensor, err
 		if tensor.sizeBytes == 0 {
 			tensor.sizeBytes = uint64(len(tensor.packedQ4) + 4)
 		}
+	case rocmKVEncodingQ4Rows:
+		if len(tensor.packedQ4) != (tensor.length+1)/2 {
+			return rocmKVEncodedTensor{}, core.E("rocm.KVCache.Snapshot", "q4 row tensor length mismatch", nil)
+		}
+		if len(tensor.scales) == 0 {
+			return rocmKVEncodedTensor{}, core.E("rocm.KVCache.Snapshot", "q4 row scales are required", nil)
+		}
+		for _, scale := range tensor.scales {
+			if scale <= 0 {
+				return rocmKVEncodedTensor{}, core.E("rocm.KVCache.Snapshot", "q4 row scale must be positive", nil)
+			}
+		}
+		if tensor.sizeBytes == 0 {
+			tensor.sizeBytes = uint64(len(tensor.packedQ4) + len(tensor.scales)*4)
+		}
 	default:
 		return rocmKVEncodedTensor{}, core.E("rocm.KVCache.Snapshot", core.Sprintf("unsupported tensor encoding %q", tensor.encoding), nil)
 	}
@@ -585,6 +622,13 @@ func (snapshot rocmKVEncodedTensorSnapshot) toTensor() (rocmKVEncodedTensor, err
 }
 
 func encodeROCmKVTensor(encoding string, values []float32) (rocmKVEncodedTensor, error) {
+	return encodeROCmKVTensorRows(encoding, values, len(values), 1)
+}
+
+func encodeROCmKVTensorRows(encoding string, values []float32, rowWidth, rowCount int) (rocmKVEncodedTensor, error) {
+	if rowWidth <= 0 || rowCount <= 0 || len(values) != rowWidth*rowCount {
+		return rocmKVEncodedTensor{}, core.E("rocm.KVCache.Encode", "row-scaled tensor shape mismatch", nil)
+	}
 	switch encoding {
 	case rocmKVEncodingFP16:
 		out := rocmKVEncodedTensor{encoding: encoding, length: len(values), f16: make([]uint16, len(values))}
@@ -601,6 +645,19 @@ func encodeROCmKVTensor(encoding string, values []float32) (rocmKVEncodedTensor,
 		}
 		out.sizeBytes = uint64(len(out.q8) + 4)
 		return out, nil
+	case rocmKVEncodingQ8Rows:
+		out := rocmKVEncodedTensor{encoding: encoding, length: len(values), scales: make([]float32, rowCount), q8: make([]int8, len(values))}
+		for row := 0; row < rowCount; row++ {
+			start := row * rowWidth
+			end := start + rowWidth
+			scale := rocmQuantScale(values[start:end], 127)
+			out.scales[row] = scale
+			for i, value := range values[start:end] {
+				out.q8[start+i] = int8(clampInt(int(math.Round(float64(value/scale))), -127, 127))
+			}
+		}
+		out.sizeBytes = uint64(len(out.q8) + len(out.scales)*4)
+		return out, nil
 	case rocmKVEncodingQ4:
 		scale := rocmQuantScale(values, 7)
 		out := rocmKVEncodedTensor{encoding: encoding, length: len(values), scale: scale, packedQ4: make([]byte, (len(values)+1)/2)}
@@ -615,12 +672,39 @@ func encodeROCmKVTensor(encoding string, values []float32) (rocmKVEncodedTensor,
 		}
 		out.sizeBytes = uint64(len(out.packedQ4) + 4)
 		return out, nil
+	case rocmKVEncodingQ4Rows:
+		out := rocmKVEncodedTensor{encoding: encoding, length: len(values), scales: make([]float32, rowCount), packedQ4: make([]byte, (len(values)+1)/2)}
+		for row := 0; row < rowCount; row++ {
+			start := row * rowWidth
+			end := start + rowWidth
+			scale := rocmQuantScale(values[start:end], 7)
+			out.scales[row] = scale
+			for i, value := range values[start:end] {
+				index := start + i
+				quantized := int8(clampInt(int(math.Round(float64(value/scale))), -8, 7))
+				packed := packSignedQ4(quantized)
+				if index%2 == 0 {
+					out.packedQ4[index/2] = packed
+				} else {
+					out.packedQ4[index/2] |= packed << 4
+				}
+			}
+		}
+		out.sizeBytes = uint64(len(out.packedQ4) + len(out.scales)*4)
+		return out, nil
 	default:
 		return rocmKVEncodedTensor{}, core.E("rocm.KVCache.Encode", core.Sprintf("unsupported tensor encoding %q", encoding), nil)
 	}
 }
 
 func (tensor rocmKVEncodedTensor) decode() []float32 {
+	return tensor.decodeRows(tensor.length)
+}
+
+func (tensor rocmKVEncodedTensor) decodeRows(rowWidth int) []float32 {
+	if rowWidth <= 0 {
+		rowWidth = tensor.length
+	}
 	out := make([]float32, tensor.length)
 	switch tensor.encoding {
 	case rocmKVEncodingFP16:
@@ -631,6 +715,13 @@ func (tensor rocmKVEncodedTensor) decode() []float32 {
 		for i, value := range tensor.q8 {
 			out[i] = float32(value) * tensor.scale
 		}
+	case rocmKVEncodingQ8Rows:
+		for i, value := range tensor.q8 {
+			row := i / rowWidth
+			if row >= 0 && row < len(tensor.scales) {
+				out[i] = float32(value) * tensor.scales[row]
+			}
+		}
 	case rocmKVEncodingQ4:
 		for i := 0; i < tensor.length; i++ {
 			packed := tensor.packedQ4[i/2]
@@ -638,6 +729,17 @@ func (tensor rocmKVEncodedTensor) decode() []float32 {
 				packed >>= 4
 			}
 			out[i] = float32(unpackSignedQ4(packed&0x0f)) * tensor.scale
+		}
+	case rocmKVEncodingQ4Rows:
+		for i := 0; i < tensor.length; i++ {
+			packed := tensor.packedQ4[i/2]
+			if i%2 == 1 {
+				packed >>= 4
+			}
+			row := i / rowWidth
+			if row >= 0 && row < len(tensor.scales) {
+				out[i] = float32(unpackSignedQ4(packed&0x0f)) * tensor.scales[row]
+			}
 		}
 	}
 	return out

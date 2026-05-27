@@ -5662,14 +5662,29 @@ func (driver *fakeHIPDriver) launchKVEncodeToken(args []byte) error {
 	valueOutputBytes := int(binary.LittleEndian.Uint32(args[60:]))
 	keyEncoding := fakeROCmKVEncoding(binary.LittleEndian.Uint32(args[64:]))
 	valueEncoding := fakeROCmKVEncoding(binary.LittleEndian.Uint32(args[68:]))
+	keyWidth := int(binary.LittleEndian.Uint64(args[72:]))
+	valueWidth := int(binary.LittleEndian.Uint64(args[80:]))
+	tokenCount := int(binary.LittleEndian.Uint64(args[88:]))
 	if keyCount <= 0 || valueCount <= 0 || keyInputBytes != keyCount*4 || valueInputBytes != valueCount*4 || keyEncoding == "" || valueEncoding == "" {
 		return core.E("rocm.hip.FakeLaunch", "KV encode token shape metadata mismatch", nil)
 	}
-	expectedKeyOutputBytes, err := rocmKVTensorDeviceByteCount(keyEncoding, keyCount)
+	if tokenCount == 0 {
+		tokenCount = 1
+	}
+	if keyWidth == 0 {
+		keyWidth = keyCount
+	}
+	if valueWidth == 0 {
+		valueWidth = valueCount
+	}
+	if tokenCount <= 0 || keyWidth <= 0 || valueWidth <= 0 || keyWidth*tokenCount != keyCount || valueWidth*tokenCount != valueCount {
+		return core.E("rocm.hip.FakeLaunch", "KV encode token row shape metadata mismatch", nil)
+	}
+	expectedKeyOutputBytes, err := rocmKVTensorDeviceByteCountRows(keyEncoding, keyCount, tokenCount)
 	if err != nil {
 		return err
 	}
-	expectedValueOutputBytes, err := rocmKVTensorDeviceByteCount(valueEncoding, valueCount)
+	expectedValueOutputBytes, err := rocmKVTensorDeviceByteCountRows(valueEncoding, valueCount, tokenCount)
 	if err != nil {
 		return err
 	}
@@ -5700,7 +5715,7 @@ func (driver *fakeHIPDriver) launchKVEncodeToken(args []byte) error {
 	if err != nil {
 		return err
 	}
-	keyTensor, err := encodeROCmKVTensor(keyEncoding, keyValues)
+	keyTensor, err := encodeROCmKVTensorRows(keyEncoding, keyValues, keyWidth, tokenCount)
 	if err != nil {
 		return err
 	}
@@ -5708,7 +5723,7 @@ func (driver *fakeHIPDriver) launchKVEncodeToken(args []byte) error {
 	if err != nil {
 		return err
 	}
-	valueTensor, err := encodeROCmKVTensor(valueEncoding, valueValues)
+	valueTensor, err := encodeROCmKVTensorRows(valueEncoding, valueValues, valueWidth, tokenCount)
 	if err != nil {
 		return err
 	}
@@ -5863,11 +5878,11 @@ func (driver *fakeHIPDriver) readDeviceKVDescriptorForAttention(pointer nativeDe
 		if tokenStart < 0 || pageTokens <= 0 || tokenStart+pageTokens > tokenCount || keyWidth != dim || valueWidth != dim || keyEncoding == "" || valueEncoding == "" {
 			return nil, nil, core.E("rocm.hip.FakeLaunch", "attention device KV descriptor page shape mismatch", nil)
 		}
-		pageKeys, err := driver.readDeviceKVTensor(keyPointer, keyBytes, keyEncoding, pageTokens*keyWidth)
+		pageKeys, err := driver.readDeviceKVTensorRows(keyPointer, keyBytes, keyEncoding, pageTokens*keyWidth, pageTokens)
 		if err != nil {
 			return nil, nil, err
 		}
-		pageValues, err := driver.readDeviceKVTensor(valuePointer, valueBytes, valueEncoding, pageTokens*valueWidth)
+		pageValues, err := driver.readDeviceKVTensorRows(valuePointer, valueBytes, valueEncoding, pageTokens*valueWidth, pageTokens)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -5878,15 +5893,23 @@ func (driver *fakeHIPDriver) readDeviceKVDescriptorForAttention(pointer nativeDe
 }
 
 func (driver *fakeHIPDriver) readDeviceKVTensor(pointer nativeDevicePointer, sizeBytes int, encoding string, length int) ([]float32, error) {
+	return driver.readDeviceKVTensorRows(pointer, sizeBytes, encoding, length, 1)
+}
+
+func (driver *fakeHIPDriver) readDeviceKVTensorRows(pointer nativeDevicePointer, sizeBytes int, encoding string, length, rows int) ([]float32, error) {
 	data, offset, ok := driver.memoryForPointer(pointer, sizeBytes)
 	if !ok {
 		return nil, core.E("rocm.hip.FakeLaunch", "attention device KV tensor buffer is missing", nil)
 	}
-	tensor, err := rocmKVTensorFromDeviceBytes(encoding, length, append([]byte(nil), data[offset:offset+sizeBytes]...))
+	tensor, err := rocmKVTensorFromDeviceBytesRows(encoding, length, rows, append([]byte(nil), data[offset:offset+sizeBytes]...))
 	if err != nil {
 		return nil, err
 	}
-	return tensor.decode(), nil
+	rowWidth := length
+	if rows > 0 {
+		rowWidth = length / rows
+	}
+	return tensor.decodeRows(rowWidth), nil
 }
 
 func fakeROCmKVEncoding(code uint32) string {
@@ -5897,6 +5920,10 @@ func fakeROCmKVEncoding(code uint32) string {
 		return rocmKVEncodingQ8
 	case rocmDeviceKVDescriptorEncodingQ4:
 		return rocmKVEncodingQ4
+	case rocmDeviceKVDescriptorEncodingQ8Rows:
+		return rocmKVEncodingQ8Rows
+	case rocmDeviceKVDescriptorEncodingQ4Rows:
+		return rocmKVEncodingQ4Rows
 	default:
 		return ""
 	}

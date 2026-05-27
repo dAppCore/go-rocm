@@ -1709,6 +1709,80 @@ func TestHIPHardwareKVCacheSmoke_Good(t *testing.T) {
 	}
 }
 
+func TestHIPHardwareKVEncodeRowsKernel_Good(t *testing.T) {
+	if os.Getenv("GO_ROCM_RUN_CACHE_TESTS") != "1" {
+		t.Skip("set GO_ROCM_RUN_CACHE_TESTS=1 to run ROCm cache hardware tests")
+	}
+	if os.Getenv("GO_ROCM_KERNEL_HSACO") == "" {
+		t.Skip("set GO_ROCM_KERNEL_HSACO to a compiled kernels/rocm_kernels.hip HSACO")
+	}
+	runtime := newSystemNativeRuntime()
+	if !runtime.Available() {
+		t.Fatalf("native ROCm runtime is not available")
+	}
+	hipRuntime, ok := runtime.(*hipRuntime)
+	if !ok || hipRuntime.driver == nil {
+		t.Fatalf("runtime = %T, want HIP runtime with driver", runtime)
+	}
+
+	keyRows := []float32{
+		100, -100,
+		0.5, -0.5,
+	}
+	valueRows := []float32{
+		7, -7,
+		0.25, -0.25,
+	}
+	keyInput, err := hipUploadByteBuffer(hipRuntime.driver, "rocm.KVCache.HardwareTest", "row-scaled key rows", mustHIPFloat32Payload(t, keyRows), len(keyRows))
+	core.RequireNoError(t, err)
+	defer keyInput.Close()
+	valueInput, err := hipUploadByteBuffer(hipRuntime.driver, "rocm.KVCache.HardwareTest", "row-scaled value rows", mustHIPFloat32Payload(t, valueRows), len(valueRows))
+	core.RequireNoError(t, err)
+	defer valueInput.Close()
+
+	key, value, err := hipRunKVEncodeRowsKernel(context.Background(), hipRuntime.driver, keyInput, valueInput, 2, 2, 2, rocmKVCacheModeKQ8VQ4)
+	core.RequireNoError(t, err)
+	defer hipRuntime.driver.Free(key.pointer)
+	defer hipRuntime.driver.Free(value.pointer)
+
+	core.AssertEqual(t, rocmKVEncodingQ8Rows, key.encoding)
+	core.AssertEqual(t, rocmKVEncodingQ4Rows, value.encoding)
+	core.AssertEqual(t, uint64(12), key.sizeBytes)
+	core.AssertEqual(t, uint64(10), value.sizeBytes)
+	keyDecoded, err := copyROCmDeviceKVTensorRowsToHost(hipRuntime.driver, key, len(keyRows), 2)
+	core.RequireNoError(t, err)
+	valueDecoded, err := copyROCmDeviceKVTensorRowsToHost(hipRuntime.driver, value, len(valueRows), 2)
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, keyRows, keyDecoded.decodeRows(2), 0.02)
+	assertFloat32SlicesNear(t, valueRows, valueDecoded.decodeRows(2), 0.02)
+
+	cache := &rocmDeviceKVCache{driver: hipRuntime.driver, mode: rocmKVCacheModeKQ8VQ4, blockSize: 2}
+	deviceKV, err := cache.withAppendedDeviceRowsWindow(context.Background(), keyInput, valueInput, 2, 2, 2, 0)
+	core.RequireNoError(t, err)
+	defer deviceKV.Close()
+	table, err := deviceKV.KernelDescriptorTable()
+	core.RequireNoError(t, err)
+	defer table.Close()
+	attentionOutput, err := hipRunAttentionKernel(context.Background(), hipRuntime.driver, hipAttentionRequest{
+		Query:           []float32{1, 0},
+		DeviceKV:        deviceKV,
+		DescriptorTable: table,
+	})
+	core.RequireNoError(t, err)
+	hostCache, err := deviceKV.hostCache()
+	core.RequireNoError(t, err)
+	restoredKeys, restoredValues, err := hostCache.Restore(0, deviceKV.TokenCount())
+	core.RequireNoError(t, err)
+	referenceKeys, err := splitHIPReferenceVectors(restoredKeys, 2)
+	core.RequireNoError(t, err)
+	referenceValues, err := splitHIPReferenceVectors(restoredValues, 2)
+	core.RequireNoError(t, err)
+	wantOutput, wantWeights, err := hipReferenceSingleHeadAttention([]float32{1, 0}, referenceKeys, referenceValues)
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, wantOutput, attentionOutput.Output, 0.0001)
+	assertFloat32SlicesNear(t, wantWeights, attentionOutput.Weights, 0.0001)
+}
+
 func TestHIPHardwareProjectionKernelSource_Good(t *testing.T) {
 	if os.Getenv("GO_ROCM_RUN_HIP_TESTS") != "1" {
 		t.Skip("set GO_ROCM_RUN_HIP_TESTS=1 to run ROCm hardware smoke tests")

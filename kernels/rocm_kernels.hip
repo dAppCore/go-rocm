@@ -21,6 +21,8 @@ constexpr uint32_t ROCM_DEVICE_KV_DESCRIPTOR_MODE_KQ8VQ4 = 3;
 constexpr uint32_t ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_FP16 = 1;
 constexpr uint32_t ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8 = 2;
 constexpr uint32_t ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4 = 3;
+constexpr uint32_t ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8_ROWS = 4;
+constexpr uint32_t ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4_ROWS = 5;
 constexpr uint32_t ROCM_KV_ENCODE_TOKEN_LAUNCH_ARGS_VERSION = 1;
 constexpr uint32_t ROCM_KV_ENCODE_TOKEN_LAUNCH_ARGS_BYTES = 96;
 constexpr uint32_t ROCM_KV_ENCODE_TOKEN_BLOCK_SIZE = 256;
@@ -2028,6 +2030,7 @@ __device__ bool rocm_valid_softcap_greedy_args(const rocm_softcap_greedy_launch_
 }
 
 __device__ uint64_t rocm_device_kv_tensor_bytes(uint32_t encoding, uint64_t length);
+__device__ uint64_t rocm_device_kv_tensor_bytes_rows(uint32_t encoding, uint64_t length, uint64_t rows);
 
 __device__ bool rocm_valid_device_kv_attention_descriptor_header(const rocm_attention_launch_args &args)
 {
@@ -2067,10 +2070,10 @@ __device__ bool rocm_valid_device_kv_attention_descriptor(const rocm_attention_l
 			page->value_width != args.dim ||
 			page->key_pointer == 0 ||
 			page->value_pointer == 0 ||
-			rocm_device_kv_tensor_bytes(page->key_encoding, static_cast<uint64_t>(page->token_count) * page->key_width) == 0 ||
-			rocm_device_kv_tensor_bytes(page->value_encoding, static_cast<uint64_t>(page->token_count) * page->value_width) == 0 ||
-			page->key_bytes != rocm_device_kv_tensor_bytes(page->key_encoding, static_cast<uint64_t>(page->token_count) * page->key_width) ||
-			page->value_bytes != rocm_device_kv_tensor_bytes(page->value_encoding, static_cast<uint64_t>(page->token_count) * page->value_width)) {
+			rocm_device_kv_tensor_bytes_rows(page->key_encoding, static_cast<uint64_t>(page->token_count) * page->key_width, page->token_count) == 0 ||
+			rocm_device_kv_tensor_bytes_rows(page->value_encoding, static_cast<uint64_t>(page->token_count) * page->value_width, page->token_count) == 0 ||
+			page->key_bytes != rocm_device_kv_tensor_bytes_rows(page->key_encoding, static_cast<uint64_t>(page->token_count) * page->key_width, page->token_count) ||
+			page->value_bytes != rocm_device_kv_tensor_bytes_rows(page->value_encoding, static_cast<uint64_t>(page->token_count) * page->value_width, page->token_count)) {
 			return false;
 		}
 	}
@@ -2088,18 +2091,43 @@ __device__ uint64_t rocm_device_kv_tensor_bytes(uint32_t encoding, uint64_t leng
 	if (encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4) {
 		return sizeof(uint32_t) + ((length + 1u) / 2u);
 	}
+	if (encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8_ROWS) {
+		return sizeof(uint32_t) + length * sizeof(int8_t);
+	}
+	if (encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4_ROWS) {
+		return sizeof(uint32_t) + ((length + 1u) / 2u);
+	}
 	return 0;
+}
+
+__device__ uint64_t rocm_device_kv_tensor_bytes_rows(uint32_t encoding, uint64_t length, uint64_t rows)
+{
+	if (rows == 0u) {
+		return 0;
+	}
+	if (encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8_ROWS) {
+		return rows * sizeof(uint32_t) + length * sizeof(int8_t);
+	}
+	if (encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4_ROWS) {
+		return rows * sizeof(uint32_t) + ((length + 1u) / 2u);
+	}
+	return rocm_device_kv_tensor_bytes(encoding, length);
 }
 
 __device__ bool rocm_valid_kv_tensor_encoding(uint32_t encoding)
 {
 	return encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_FP16 ||
 		encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8 ||
-		encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4;
+		encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4 ||
+		encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8_ROWS ||
+		encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4_ROWS;
 }
 
 __device__ bool rocm_valid_kv_encode_token_args(const rocm_kv_encode_token_launch_args &args)
 {
+	const uint64_t row_count = args.reserved2 == 0u ? 1u : args.reserved2;
+	const uint64_t key_width = args.reserved0 == 0u ? args.key_count : args.reserved0;
+	const uint64_t value_width = args.reserved1 == 0u ? args.value_count : args.reserved1;
 	return args.version == ROCM_KV_ENCODE_TOKEN_LAUNCH_ARGS_VERSION &&
 		args.total_bytes == ROCM_KV_ENCODE_TOKEN_LAUNCH_ARGS_BYTES &&
 		args.key_input_pointer != 0 &&
@@ -2112,8 +2140,15 @@ __device__ bool rocm_valid_kv_encode_token_args(const rocm_kv_encode_token_launc
 		args.value_input_bytes == args.value_count * sizeof(float) &&
 		rocm_valid_kv_tensor_encoding(args.key_encoding) &&
 		rocm_valid_kv_tensor_encoding(args.value_encoding) &&
-		args.key_output_bytes == rocm_device_kv_tensor_bytes(args.key_encoding, args.key_count) &&
-		args.value_output_bytes == rocm_device_kv_tensor_bytes(args.value_encoding, args.value_count);
+		row_count > 0u &&
+		key_width > 0u &&
+		value_width > 0u &&
+		static_cast<uint64_t>(args.key_count) == key_width * row_count &&
+		static_cast<uint64_t>(args.value_count) == value_width * row_count &&
+		(args.key_encoding != ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4_ROWS || (key_width & 1u) == 0u) &&
+		(args.value_encoding != ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4_ROWS || (value_width & 1u) == 0u) &&
+		args.key_output_bytes == rocm_device_kv_tensor_bytes_rows(args.key_encoding, args.key_count, row_count) &&
+		args.value_output_bytes == rocm_device_kv_tensor_bytes_rows(args.value_encoding, args.value_count, row_count);
 }
 
 __device__ uint8_t rocm_pack_signed_q4(int value)
@@ -2138,13 +2173,13 @@ __device__ int rocm_clamp_int(int value, int low, int high)
 __device__ int rocm_quantize_kv_value(float value, float scale, uint32_t encoding)
 {
 	const int quantized = static_cast<int>(roundf(value / scale));
-	if (encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8) {
+	if (encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8 || encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8_ROWS) {
 		return rocm_clamp_int(quantized, -127, 127);
 	}
 	return rocm_clamp_int(quantized, -8, 7);
 }
 
-__device__ void rocm_encode_kv_token_tensor(const float *input, unsigned char *output, uint32_t count, uint32_t encoding)
+__device__ void rocm_encode_kv_token_tensor(const float *input, unsigned char *output, uint32_t count, uint32_t encoding, uint32_t row_width, uint32_t row_count)
 {
 	const uint32_t tid = threadIdx.x;
 	const uint32_t threads = blockDim.x;
@@ -2157,6 +2192,52 @@ __device__ void rocm_encode_kv_token_tensor(const float *input, unsigned char *o
 	}
 
 	__shared__ float scratch[ROCM_KV_ENCODE_TOKEN_BLOCK_SIZE];
+	const bool row_scaled = encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8_ROWS || encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4_ROWS;
+	if (row_scaled) {
+		unsigned char *payload = output + row_count * sizeof(uint32_t);
+		for (uint32_t row = 0; row < row_count; ++row) {
+			const uint32_t row_start = row * row_width;
+			float max_abs = 0.0f;
+			for (uint32_t dim = tid; dim < row_width; dim += threads) {
+				const float magnitude = fabsf(input[row_start + dim]);
+				if (magnitude > max_abs) {
+					max_abs = magnitude;
+				}
+			}
+			scratch[tid] = max_abs;
+			__syncthreads();
+			for (uint32_t stride = threads >> 1; stride > 0; stride >>= 1) {
+				if (tid < stride && scratch[tid + stride] > scratch[tid]) {
+					scratch[tid] = scratch[tid + stride];
+				}
+				__syncthreads();
+			}
+			const float scale = scratch[0] == 0.0f ? 1.0f : scratch[0] / (encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8_ROWS ? 127.0f : 7.0f);
+			if (tid == 0) {
+				reinterpret_cast<uint32_t *>(output)[row] = rocm_float_bits(scale);
+			}
+			__syncthreads();
+			if (encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8_ROWS) {
+				int8_t *quantized = reinterpret_cast<int8_t *>(payload);
+				for (uint32_t dim = tid; dim < row_width; dim += threads) {
+					const uint32_t index = row_start + dim;
+					quantized[index] = static_cast<int8_t>(rocm_quantize_kv_value(input[index], scale, encoding));
+				}
+			} else {
+				const uint32_t packed_start = row_start >> 1u;
+				const uint32_t packed_count = row_width >> 1u;
+				for (uint32_t packed = tid; packed < packed_count; packed += threads) {
+					const uint32_t first = row_start + packed * 2u;
+					const int low = rocm_quantize_kv_value(input[first], scale, encoding);
+					const int high = rocm_quantize_kv_value(input[first + 1u], scale, encoding);
+					payload[packed_start + packed] = static_cast<unsigned char>(rocm_pack_signed_q4(low) | (rocm_pack_signed_q4(high) << 4));
+				}
+			}
+			__syncthreads();
+		}
+		return;
+	}
+
 	float max_abs = 0.0f;
 	for (uint32_t index = tid; index < count; index += threads) {
 		const float magnitude = fabsf(input[index]);
@@ -2213,7 +2294,11 @@ extern "C" __global__ void rocm_kv_encode_token(const unsigned char *packet)
 	unsigned char *output = reinterpret_cast<unsigned char *>(static_cast<uintptr_t>(encode_key ? args.key_output_pointer : args.value_output_pointer));
 	const uint32_t count = encode_key ? args.key_count : args.value_count;
 	const uint32_t encoding = encode_key ? args.key_encoding : args.value_encoding;
-	rocm_encode_kv_token_tensor(input, output, count, encoding);
+	const uint32_t row_count = args.reserved2 == 0u ? 1u : static_cast<uint32_t>(args.reserved2);
+	const uint32_t row_width = encode_key
+		? (args.reserved0 == 0u ? args.key_count : static_cast<uint32_t>(args.reserved0))
+		: (args.reserved1 == 0u ? args.value_count : static_cast<uint32_t>(args.reserved1));
+	rocm_encode_kv_token_tensor(input, output, count, encoding, row_width, row_count);
 }
 
 __device__ bool rocm_valid_kv_descriptor_append_args(const rocm_kv_descriptor_append_launch_args &args)
@@ -4847,6 +4932,44 @@ __device__ const rocm_device_kv_page_descriptor *rocm_attention_heads_batch_chun
 	return rocm_attention_device_kv_page(lookup, token);
 }
 
+__device__ bool rocm_device_kv_encoding_is_q8(uint32_t encoding)
+{
+	return encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8 ||
+		encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8_ROWS;
+}
+
+__device__ bool rocm_device_kv_encoding_is_q4(uint32_t encoding)
+{
+	return encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4 ||
+		encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4_ROWS;
+}
+
+__device__ bool rocm_device_kv_encoding_is_row_scaled(uint32_t encoding)
+{
+	return encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8_ROWS ||
+		encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4_ROWS;
+}
+
+__device__ uint64_t rocm_device_kv_tensor_payload_offset(uint32_t encoding, uint64_t rows)
+{
+	if (encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_FP16) {
+		return 0u;
+	}
+	if (rocm_device_kv_encoding_is_row_scaled(encoding)) {
+		return rows * sizeof(uint32_t);
+	}
+	return sizeof(uint32_t);
+}
+
+__device__ float rocm_device_kv_tensor_scale(const unsigned char *bytes, uint32_t encoding, uint64_t local_token)
+{
+	if (bytes == nullptr || encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_FP16) {
+		return 1.0f;
+	}
+	const uint64_t scale_index = rocm_device_kv_encoding_is_row_scaled(encoding) ? local_token : 0u;
+	return rocm_float_from_bits(reinterpret_cast<const uint32_t *>(bytes)[scale_index]);
+}
+
 __device__ bool rocm_attention_kq8vq4_page_valid(const rocm_device_kv_page_descriptor *page, uint32_t token, uint32_t dim)
 {
 	if (page == nullptr ||
@@ -4856,16 +4979,16 @@ __device__ bool rocm_attention_kq8vq4_page_valid(const rocm_device_kv_page_descr
 		page->key_width != dim ||
 		page->value_width != dim ||
 		(page->value_width & 1u) != 0u ||
-		page->key_encoding != ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8 ||
-		page->value_encoding != ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4 ||
+		!rocm_device_kv_encoding_is_q8(page->key_encoding) ||
+		!rocm_device_kv_encoding_is_q4(page->value_encoding) ||
 		page->key_pointer == 0 ||
 		page->value_pointer == 0) {
 		return false;
 	}
 	const uint64_t key_count = static_cast<uint64_t>(page->token_count) * page->key_width;
 	const uint64_t value_count = static_cast<uint64_t>(page->token_count) * page->value_width;
-	return page->key_bytes == rocm_device_kv_tensor_bytes(page->key_encoding, key_count) &&
-		page->value_bytes == rocm_device_kv_tensor_bytes(page->value_encoding, value_count);
+	return page->key_bytes == rocm_device_kv_tensor_bytes_rows(page->key_encoding, key_count, page->token_count) &&
+		page->value_bytes == rocm_device_kv_tensor_bytes_rows(page->value_encoding, value_count, page->token_count);
 }
 
 __device__ float rocm_attention_device_kv_value_from_page(const rocm_device_kv_page_descriptor *page, bool key, uint32_t token, uint32_t dim)
@@ -4883,14 +5006,14 @@ __device__ float rocm_attention_device_kv_value_from_page(const rocm_device_kv_p
 		return rocm_half_to_float(values[index]);
 	}
 	const unsigned char *bytes = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(pointer));
-	const uint32_t scale_bits = *reinterpret_cast<const uint32_t *>(bytes);
-	const float scale = rocm_float_from_bits(scale_bits);
-	if (encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8) {
-		const int8_t *values = reinterpret_cast<const int8_t *>(bytes + sizeof(uint32_t));
+	const float scale = rocm_device_kv_tensor_scale(bytes, encoding, local_token);
+	const unsigned char *payload = bytes + rocm_device_kv_tensor_payload_offset(encoding, page->token_count);
+	if (rocm_device_kv_encoding_is_q8(encoding)) {
+		const int8_t *values = reinterpret_cast<const int8_t *>(payload);
 		return static_cast<float>(values[index]) * scale;
 	}
-	if (encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4) {
-		const unsigned char *values = bytes + sizeof(uint32_t);
+	if (rocm_device_kv_encoding_is_q4(encoding)) {
+		const unsigned char *values = payload;
 		unsigned char packed = values[index / 2u];
 		if ((index & 1u) != 0u) {
 			packed >>= 4;
@@ -4923,9 +5046,10 @@ __device__ float rocm_attention_device_kv_dot_from_page(const rocm_device_kv_pag
 		return dot;
 	}
 	const unsigned char *bytes = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(pointer));
-	const float scale = rocm_float_from_bits(*reinterpret_cast<const uint32_t *>(bytes));
-	if (encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8) {
-		const int8_t *values = reinterpret_cast<const int8_t *>(bytes + sizeof(uint32_t));
+	const float scale = rocm_device_kv_tensor_scale(bytes, encoding, local_token);
+	const unsigned char *payload = bytes + rocm_device_kv_tensor_payload_offset(encoding, page->token_count);
+	if (rocm_device_kv_encoding_is_q8(encoding)) {
+		const int8_t *values = reinterpret_cast<const int8_t *>(payload);
 		float quantized_dot = 0.0f;
 		uint32_t dim = 0;
 		if ((base_index & 3u) == 0u) {
@@ -5007,8 +5131,8 @@ __device__ float rocm_attention_device_kv_dot_from_page(const rocm_device_kv_pag
 		}
 		return quantized_dot * scale;
 	}
-	if (encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4) {
-		const unsigned char *values = bytes + sizeof(uint32_t);
+	if (rocm_device_kv_encoding_is_q4(encoding)) {
+		const unsigned char *values = payload;
 		float quantized_dot = 0.0f;
 		for (uint32_t dim = 0; dim < dim_count; ++dim) {
 			const uint64_t index = base_index + dim;
@@ -5450,15 +5574,18 @@ __device__ void rocm_run_single_head_attention_token_parallel(const rocm_attenti
 						}
 						const uint64_t pointer = page->value_pointer;
 						const uint32_t encoding = page->value_encoding;
-						const uint64_t base_index = (static_cast<uint64_t>(token) - page->token_start) * page->value_width;
+						const uint64_t local_token = static_cast<uint64_t>(token) - page->token_start;
+						const uint64_t base_index = local_token * page->value_width;
+						uint64_t value_payload_offset = sizeof(uint32_t);
 						float value_scale = 0.0f;
 						if (encoding != ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_FP16 && pointer != 0) {
 							const unsigned char *bytes = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(pointer));
-							value_scale = rocm_float_from_bits(*reinterpret_cast<const uint32_t *>(bytes));
+							value_scale = rocm_device_kv_tensor_scale(bytes, encoding, local_token);
+							value_payload_offset = rocm_device_kv_tensor_payload_offset(encoding, page->token_count);
 						}
 						const uint64_t index0 = base_index + dim0;
-					if (pointer != 0 && encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4 && ((index0 & 1u) == 0u)) {
-						const unsigned char *values = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(pointer) + sizeof(uint32_t));
+					if (pointer != 0 && rocm_device_kv_encoding_is_q4(encoding) && ((index0 & 1u) == 0u)) {
+						const unsigned char *values = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(pointer) + value_payload_offset);
 						const unsigned char packed = values[index0 >> 1u];
 						int q0 = static_cast<int>(packed & 0x0fu);
 						if (q0 >= 8) {
@@ -5472,8 +5599,8 @@ __device__ void rocm_run_single_head_attention_token_parallel(const rocm_attenti
 							}
 							partial1 += weight * value_scale * static_cast<float>(q1);
 						}
-					} else if (pointer != 0 && encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8) {
-						const int8_t *values = reinterpret_cast<const int8_t *>(static_cast<uintptr_t>(pointer) + sizeof(uint32_t));
+					} else if (pointer != 0 && rocm_device_kv_encoding_is_q8(encoding)) {
+						const int8_t *values = reinterpret_cast<const int8_t *>(static_cast<uintptr_t>(pointer) + value_payload_offset);
 						partial0 += weight * value_scale * static_cast<float>(values[index0]);
 						if (dim1 < args.dim) {
 							partial1 += weight * value_scale * static_cast<float>(values[base_index + dim1]);
@@ -5528,16 +5655,19 @@ __device__ void rocm_run_single_head_attention_token_parallel(const rocm_attenti
 					}
 					const uint64_t pointer = page->value_pointer;
 						const uint32_t encoding = page->value_encoding;
-						const uint64_t base_index = (static_cast<uint64_t>(token) - page->token_start) * page->value_width;
+						const uint64_t local_token = static_cast<uint64_t>(token) - page->token_start;
+						const uint64_t base_index = local_token * page->value_width;
 						const float weight = weights[token];
 					float value_scale = 0.0f;
+					uint64_t value_payload_offset = sizeof(uint32_t);
 					if (encoding != ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_FP16 && pointer != 0) {
 						const unsigned char *bytes = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(pointer));
-						value_scale = rocm_float_from_bits(*reinterpret_cast<const uint32_t *>(bytes));
+						value_scale = rocm_device_kv_tensor_scale(bytes, encoding, local_token);
+						value_payload_offset = rocm_device_kv_tensor_payload_offset(encoding, page->token_count);
 					}
 					const uint64_t index = base_index + dim;
-					if (pointer != 0 && encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4) {
-						const unsigned char *values = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(pointer) + sizeof(uint32_t));
+					if (pointer != 0 && rocm_device_kv_encoding_is_q4(encoding)) {
+						const unsigned char *values = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(pointer) + value_payload_offset);
 						unsigned char packed = values[index / 2u];
 						if ((index & 1u) != 0u) {
 							packed >>= 4;
@@ -5547,8 +5677,8 @@ __device__ void rocm_run_single_head_attention_token_parallel(const rocm_attenti
 							quantized -= 16;
 						}
 						partial += weight * value_scale * static_cast<float>(quantized);
-					} else if (pointer != 0 && encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8) {
-						const int8_t *values = reinterpret_cast<const int8_t *>(static_cast<uintptr_t>(pointer) + sizeof(uint32_t));
+					} else if (pointer != 0 && rocm_device_kv_encoding_is_q8(encoding)) {
+						const int8_t *values = reinterpret_cast<const int8_t *>(static_cast<uintptr_t>(pointer) + value_payload_offset);
 						partial += weight * value_scale * static_cast<float>(values[index]);
 					} else {
 						partial += weight * rocm_attention_device_kv_value_from_tensor(pointer, encoding, base_index, dim, value_scale);
@@ -5583,19 +5713,22 @@ __device__ void rocm_run_single_head_attention_token_parallel(const rocm_attenti
 				}
 				const uint64_t pointer = page->value_pointer;
 				const uint32_t encoding = page->value_encoding;
-				const uint64_t base_index = (static_cast<uint64_t>(token) - page->token_start) * page->value_width;
+				const uint64_t local_token = static_cast<uint64_t>(token) - page->token_start;
+				const uint64_t base_index = local_token * page->value_width;
 				float value_scale = 0.0f;
+				uint64_t value_payload_offset = sizeof(uint32_t);
 				if (encoding != ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_FP16 && pointer != 0) {
 					const unsigned char *bytes = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(pointer));
-					value_scale = rocm_float_from_bits(*reinterpret_cast<const uint32_t *>(bytes));
+					value_scale = rocm_device_kv_tensor_scale(bytes, encoding, local_token);
+					value_payload_offset = rocm_device_kv_tensor_payload_offset(encoding, page->token_count);
 				}
 					const float weight = weights[token];
 					const float weighted_scale = weight * value_scale;
 				if (dim0 < args.dim) {
 					float value0 = 0.0f;
 					const uint64_t index0 = base_index + dim0;
-					if (pointer != 0 && encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4) {
-						const unsigned char *values = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(pointer) + sizeof(uint32_t));
+					if (pointer != 0 && rocm_device_kv_encoding_is_q4(encoding)) {
+						const unsigned char *values = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(pointer) + value_payload_offset);
 					unsigned char packed = values[index0 / 2u];
 					if ((index0 & 1u) != 0u) {
 						packed >>= 4;
@@ -5605,8 +5738,8 @@ __device__ void rocm_run_single_head_attention_token_parallel(const rocm_attenti
 							quantized -= 16;
 						}
 						out0 += weighted_scale * static_cast<float>(quantized);
-					} else if (pointer != 0 && encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8) {
-						const int8_t *values = reinterpret_cast<const int8_t *>(static_cast<uintptr_t>(pointer) + sizeof(uint32_t));
+					} else if (pointer != 0 && rocm_device_kv_encoding_is_q8(encoding)) {
+						const int8_t *values = reinterpret_cast<const int8_t *>(static_cast<uintptr_t>(pointer) + value_payload_offset);
 						out0 += weighted_scale * static_cast<float>(values[index0]);
 					} else {
 						value0 = rocm_attention_device_kv_value_from_tensor(pointer, encoding, base_index, dim0, value_scale);
@@ -5616,8 +5749,8 @@ __device__ void rocm_run_single_head_attention_token_parallel(const rocm_attenti
 				if (dim1 < args.dim) {
 					float value1 = 0.0f;
 					const uint64_t index1 = base_index + dim1;
-					if (pointer != 0 && encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4) {
-					const unsigned char *values = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(pointer) + sizeof(uint32_t));
+					if (pointer != 0 && rocm_device_kv_encoding_is_q4(encoding)) {
+					const unsigned char *values = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(pointer) + value_payload_offset);
 					unsigned char packed = values[index1 / 2u];
 					if ((index1 & 1u) != 0u) {
 						packed >>= 4;
@@ -5627,8 +5760,8 @@ __device__ void rocm_run_single_head_attention_token_parallel(const rocm_attenti
 							quantized -= 16;
 						}
 						out1 += weighted_scale * static_cast<float>(quantized);
-					} else if (pointer != 0 && encoding == ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8) {
-						const int8_t *values = reinterpret_cast<const int8_t *>(static_cast<uintptr_t>(pointer) + sizeof(uint32_t));
+					} else if (pointer != 0 && rocm_device_kv_encoding_is_q8(encoding)) {
+						const int8_t *values = reinterpret_cast<const int8_t *>(static_cast<uintptr_t>(pointer) + value_payload_offset);
 						out1 += weighted_scale * static_cast<float>(values[index1]);
 					} else {
 						value1 = rocm_attention_device_kv_value_from_tensor(pointer, encoding, base_index, dim1, value_scale);
@@ -5838,8 +5971,8 @@ extern "C" __global__ void rocm_attention_heads_chunked_stage1(const unsigned ch
 				const uint64_t local_token = direct_kq8vq4_token_pages ? 0u : static_cast<uint64_t>(token) - page->token_start;
 				const uint64_t key_base = direct_kq8vq4_token_pages ? 0u : local_token * page->key_width;
 				const unsigned char *key_bytes = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(page->key_pointer));
-				const float key_scale = rocm_float_from_bits(*reinterpret_cast<const uint32_t *>(key_bytes));
-				const int8_t *key_values = reinterpret_cast<const int8_t *>(key_bytes + sizeof(uint32_t));
+				const float key_scale = rocm_device_kv_tensor_scale(key_bytes, page->key_encoding, local_token);
+				const int8_t *key_values = reinterpret_cast<const int8_t *>(key_bytes + rocm_device_kv_tensor_payload_offset(page->key_encoding, page->token_count));
 				float quantized_dot = 0.0f;
 				for (uint32_t dim = lane; dim < args.dim; dim += score_lanes) {
 					quantized_dot += query_values[dim] * static_cast<float>(key_values[key_base + dim]);
@@ -5848,8 +5981,8 @@ extern "C" __global__ void rocm_attention_heads_chunked_stage1(const unsigned ch
 				if (lane == 0u) {
 					const uint64_t value_base = direct_kq8vq4_token_pages ? 0u : local_token * page->value_width;
 					const unsigned char *value_bytes = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(page->value_pointer));
-					value_pointer = page->value_pointer + sizeof(uint32_t) + (value_base >> 1u);
-					value_scale = rocm_float_from_bits(*reinterpret_cast<const uint32_t *>(value_bytes));
+					value_pointer = page->value_pointer + rocm_device_kv_tensor_payload_offset(page->value_encoding, page->token_count) + (value_base >> 1u);
+					value_scale = rocm_device_kv_tensor_scale(value_bytes, page->value_encoding, local_token);
 				}
 			}
 		}
@@ -5888,8 +6021,8 @@ extern "C" __global__ void rocm_attention_heads_chunked_stage1(const unsigned ch
 				const uint64_t local_token = direct_kq8vq4_token_pages ? 0u : static_cast<uint64_t>(token) - page->token_start;
 				const uint64_t value_base = direct_kq8vq4_token_pages ? 0u : local_token * page->value_width;
 				const unsigned char *value_bytes = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(page->value_pointer));
-				value_pointer = page->value_pointer + sizeof(uint32_t) + (value_base >> 1u);
-				value_scale = rocm_float_from_bits(*reinterpret_cast<const uint32_t *>(value_bytes));
+				value_pointer = page->value_pointer + rocm_device_kv_tensor_payload_offset(page->value_encoding, page->token_count) + (value_base >> 1u);
+				value_scale = rocm_device_kv_tensor_scale(value_bytes, page->value_encoding, local_token);
 				const float dot = rocm_attention_device_kv_dot_from_page(page, true, token, query_values, args.dim);
 				score = dot * scale;
 				if (score > local_max) {
@@ -6143,8 +6276,8 @@ extern "C" __global__ void rocm_attention_heads_batch_chunked_stage1(const unsig
 				const uint64_t local_token = direct_kq8vq4_token_pages ? 0u : static_cast<uint64_t>(token) - page->token_start;
 				const uint64_t key_base = direct_kq8vq4_token_pages ? 0u : local_token * page->key_width;
 				const unsigned char *key_bytes = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(page->key_pointer));
-				const float key_scale = rocm_float_from_bits(*reinterpret_cast<const uint32_t *>(key_bytes));
-				const int8_t *key_values = reinterpret_cast<const int8_t *>(key_bytes + sizeof(uint32_t));
+				const float key_scale = rocm_device_kv_tensor_scale(key_bytes, page->key_encoding, local_token);
+				const int8_t *key_values = reinterpret_cast<const int8_t *>(key_bytes + rocm_device_kv_tensor_payload_offset(page->key_encoding, page->token_count));
 				float quantized_dot = 0.0f;
 				for (uint32_t dim = lane; dim < args.dim; dim += score_lanes) {
 					quantized_dot += query_values[dim] * static_cast<float>(key_values[key_base + dim]);
@@ -6153,8 +6286,8 @@ extern "C" __global__ void rocm_attention_heads_batch_chunked_stage1(const unsig
 				if (lane == 0u) {
 					const uint64_t value_base = direct_kq8vq4_token_pages ? 0u : local_token * page->value_width;
 					const unsigned char *value_bytes = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(page->value_pointer));
-					value_pointer = page->value_pointer + sizeof(uint32_t) + (value_base >> 1u);
-					value_scale = rocm_float_from_bits(*reinterpret_cast<const uint32_t *>(value_bytes));
+					value_pointer = page->value_pointer + rocm_device_kv_tensor_payload_offset(page->value_encoding, page->token_count) + (value_base >> 1u);
+					value_scale = rocm_device_kv_tensor_scale(value_bytes, page->value_encoding, local_token);
 				}
 			}
 		}
@@ -6193,8 +6326,8 @@ extern "C" __global__ void rocm_attention_heads_batch_chunked_stage1(const unsig
 				const uint64_t local_token = direct_kq8vq4_token_pages ? 0u : static_cast<uint64_t>(token) - page->token_start;
 				const uint64_t value_base = direct_kq8vq4_token_pages ? 0u : local_token * page->value_width;
 				const unsigned char *value_bytes = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(page->value_pointer));
-				value_pointer = page->value_pointer + sizeof(uint32_t) + (value_base >> 1u);
-				value_scale = rocm_float_from_bits(*reinterpret_cast<const uint32_t *>(value_bytes));
+				value_pointer = page->value_pointer + rocm_device_kv_tensor_payload_offset(page->value_encoding, page->token_count) + (value_base >> 1u);
+				value_scale = rocm_device_kv_tensor_scale(value_bytes, page->value_encoding, local_token);
 				const float dot = rocm_attention_device_kv_dot_from_page(page, true, token, query_values, args.dim);
 				score = dot * scale;
 				if (score > local_max) {

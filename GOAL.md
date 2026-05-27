@@ -523,10 +523,26 @@ generated tokens, `36.31 tok/s` average, `21.45 tok/s` on turn 10,
 `24968304 B/op`, and `39751 allocs/op`, but chapter 10 retained `0` arc
 anchors and the `book_110s_production_candidate` metric stayed `0`. Do not
 promote larger page defaults by only changing `rocmGemma4Q4DeviceKVBlockSize`:
-the current multi-token page encoding still has page-level q8/q4 scales and
-falls off the direct-token KQ8/VQ4 attention fast path. The production block
-layout must preserve per-token scales inside block pages and keep attention
-able to address them without pointer chasing one descriptor per token.
+the old multi-token page encoding had page-level q8/q4 scales and fell off the
+direct-token KQ8/VQ4 attention fast path. The production block layout must
+preserve per-token scales inside block pages and keep attention able to address
+them without pointer chasing one descriptor per token.
+
+Accepted block-page repair probe: multi-token device KV pages now have
+row-scaled descriptor encodings (`q8-rows`/`q4-rows`) so every token in a page
+keeps its own q8/q4 scale. The fake HIP driver, raw KV block restore, descriptor
+validation, HIP row encoder, and device-KV attention readers all understand
+those encodings. `TestHIPHardwareKVEncodeRowsKernel_Good` runs the real
+`gfx1100` kernel on the RX 7800 XT, copies the row-scaled payloads back, and
+runs descriptor-backed attention over the row page; its `.err` file was empty.
+A first 2-turn retained sampled book probe with `block_size=16`,
+`context_len=2048`, full chapter generation, and `prefill_ubatch=512` completed
+with empty stderr at `16.25s` wall, `15.73s` decode, `1275` generated tokens,
+`78.48 tok/s` average, `97.08 tok/s` on turn 1, `67.81 tok/s` on turn 2,
+`8.82MB/op`, and `7831 allocs/op`. This repairs the scale-corruption bug in
+block pages but is not yet production acceptance: the 10-turn `48k` book route
+and chapter-10 arc gate still need to be rerun before block pages can replace
+the one-token default.
 
 Rejected prompt-shortening follow-up: replacing the anchored wording with a
 shorter "advance the arc / keep continuity words alive" instruction reduced
@@ -1601,6 +1617,10 @@ endpoint.
   token. A 100+ tok/s driver needs block/page descriptors that attention can
   address directly, with per-token q8/q4 scales preserved without pointer
   chasing a tiny page for every key/value access.
+  - 2026-05-27 progress: row-scaled `q8-rows`/`q4-rows` block pages now preserve
+    per-token scales and pass fake plus live `gfx1100` row-encode/attention
+    tests. Remaining work is the production full/SWA slot layout and a full
+    10-turn `48k` retained-book acceptance run.
 - [ ] Move GELU/SwiGLU/multiply and residual/norm chaining into HIP kernels or a
   fused per-layer kernel. No q4 MLP intermediate should become a Go `[]float32`.
 - [ ] Keep attention update and KV cache reads on device while replacing the
