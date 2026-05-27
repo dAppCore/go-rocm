@@ -14323,3 +14323,68 @@ breakthrough. The chapter-shaped 2048 guard moved from `8682136 B/op` and
 decode improved inside normal noise from `80.05 tok/s` to `80.48 tok/s`, and
 turn 10 crossed back over `70 tok/s`. The remaining production target is still
 the q4 projection/GELU/long-context attention hot path.
+
+## 2026-05-27: Retained State Must Be KV, Not Prompt Text
+
+This pass matched the `go-mlx` / `go-inference/state` lifecycle shape more
+closely for ROCm state:
+
+```text
+- SleepState now writes live session KV to a bundle URI and writes a durable
+  wake index beside it.
+- WakeState can restore through that index and installs the KV cache back into
+  the live session runtime.
+- Non-KV chunks now hard-error with "KV state is required" instead of creating
+  planned/text placeholder state.
+- SleepState without a live KV runtime now hard-errors instead of writing a
+  prompt placeholder.
+- ROCm model wake now resolves indexed bundle refs before trying direct HIP
+  block restore, so state-backed .kv/.mp4 vector pages can stream into device
+  state without resolving the index as if it were KV payload.
+```
+
+Descriptor append cleanup from the same pass:
+
+```text
+- no-trim descriptor appends reuse the previous table allocation in place when
+  capacity is sufficient;
+- trim/sliding-window appends still allocate a separate output table to avoid
+  unsafe overlapping copies;
+- descriptor ownership is transferred across finalized Gemma4 q4 device states
+  when the same table is reused.
+```
+
+AX-11 microbenchmark:
+
+```text
+BenchmarkROCmDeviceKVDescriptorAppendInPlace_HotWindow-32  3679 ns/op  0 B/op  0 allocs/op
+```
+
+Live guards from the accepted in-place descriptor run:
+
+```text
+2048 text:Hi:
+  18852766777 ns/op, 108.6 tok/s, 6614424 B/op, 2521 allocs/op
+
+2048 generated tokens, context_len=4096, chapter-1 lighthouse prompt:
+  20422172927 ns/op, 100.3 tok/s, 8107560 B/op, 3228 allocs/op
+
+retained 10-turn book:
+  book_wall_s/op 37.78
+  book_decode_s/op 33.65
+  book_generated_tokens/op 3021
+  book_tok/s 79.96
+  book_turn10_tok/s 69.02
+  B/op 204415912
+  allocs/op 93997
+```
+
+Verification:
+
+```text
+go test ./go -count=1
+go test ./... -count=1
+CGO_ENABLED=0 go test ./go -count=1
+go test ./go -run '^$' -bench 'BenchmarkROCmDeviceKVDescriptorAppendInPlace_HotWindow' -benchmem -count=1
+git diff --check
+```

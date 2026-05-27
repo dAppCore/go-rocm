@@ -1615,9 +1615,15 @@ func (cache *rocmDeviceKVCache) KernelDescriptorTableFromAppendedToken(ctx conte
 		return nil, err
 	}
 	outputBytes := uint64(rocmDeviceKVDescriptorHeaderBytes + cache.PageCount()*rocmDeviceKVDescriptorPageBytes)
-	pointer, allocationBytes, err := rocmDeviceKVDescriptorTableMalloc(cache.driver, outputBytes)
-	if err != nil {
-		return nil, core.E("rocm.KVCache.DeviceDescriptor", "allocate appended descriptor table", err)
+	pointer := previousTable.Pointer()
+	allocationBytes := previousTable.AllocationBytes()
+	inPlace := trimStart == 0 && !previousTable.borrowed && pointer != 0 && allocationBytes >= outputBytes
+	if !inPlace {
+		var err error
+		pointer, allocationBytes, err = rocmDeviceKVDescriptorTableMalloc(cache.driver, outputBytes)
+		if err != nil {
+			return nil, core.E("rocm.KVCache.DeviceDescriptor", "allocate appended descriptor table", err)
+		}
 	}
 	args, err := (hipKVDescriptorAppendLaunchArgs{
 		PreviousDescriptorPointer: previousTable.Pointer(),
@@ -1639,7 +1645,9 @@ func (cache *rocmDeviceKVCache) KernelDescriptorTableFromAppendedToken(ctx conte
 		TrimStart:                 trimStart,
 	}).Binary()
 	if err != nil {
-		_ = rocmDeviceKVDescriptorTableFree(cache.driver, pointer, allocationBytes)
+		if !inPlace {
+			_ = rocmDeviceKVDescriptorTableFree(cache.driver, pointer, allocationBytes)
+		}
 		return nil, err
 	}
 	config := hipKernelLaunchConfig{
@@ -1653,8 +1661,16 @@ func (cache *rocmDeviceKVCache) KernelDescriptorTableFromAppendedToken(ctx conte
 		BlockZ: 1,
 	}
 	if err := hipLaunchKernel(cache.driver, config); err != nil {
-		_ = rocmDeviceKVDescriptorTableFree(cache.driver, pointer, allocationBytes)
+		if !inPlace {
+			_ = rocmDeviceKVDescriptorTableFree(cache.driver, pointer, allocationBytes)
+		}
 		return nil, err
+	}
+	if inPlace {
+		previousTable.sizeBytes = outputBytes
+		previousTable.pageCount = cache.PageCount()
+		previousTable.version = rocmDeviceKVDescriptorVersion
+		return previousTable, nil
 	}
 	return rocmBorrowDeviceKVDescriptorTableAllocated(cache.driver, pointer, outputBytes, allocationBytes, rocmDeviceKVDescriptorVersion, cache.PageCount(), false, true), nil
 }

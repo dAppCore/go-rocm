@@ -2166,6 +2166,8 @@ type fakeHIPDriver struct {
 	pinnedCopies             int
 	memsets                  []uint64
 	launchErr                error
+	skipLaunchRecording      bool
+	releaseLaunchPackets     bool
 }
 
 func (driver *fakeHIPDriver) Available() bool { return driver.available }
@@ -2256,9 +2258,14 @@ func (driver *fakeHIPDriver) MemsetAsync(pointer nativeDevicePointer, value byte
 	return nil
 }
 func (driver *fakeHIPDriver) LaunchKernel(config hipKernelLaunchConfig) error {
-	copied := config
-	copied.Args = append([]byte(nil), config.Args...)
-	driver.launches = append(driver.launches, copied)
+	if driver.releaseLaunchPackets {
+		defer hipReleaseLaunchPacket(config.Args)
+	}
+	if !driver.skipLaunchRecording {
+		copied := config
+		copied.Args = append([]byte(nil), config.Args...)
+		driver.launches = append(driver.launches, copied)
+	}
 	if driver.launchErr != nil {
 		return driver.launchErr
 	}
@@ -5537,9 +5544,6 @@ func (driver *fakeHIPDriver) launchKVDescriptorAppend(args []byte) error {
 		return core.E("rocm.hip.FakeLaunch", "KV descriptor append previous descriptor size mismatch", nil)
 	}
 	output := outputData[outputOffset : outputOffset+outputBytes]
-	for index := range output {
-		output[index] = 0
-	}
 	outputIndex := 0
 	for pageIndex := 0; pageIndex < previousPageCount; pageIndex++ {
 		pageOffset := rocmDeviceKVDescriptorHeaderBytes + pageIndex*rocmDeviceKVDescriptorPageBytes

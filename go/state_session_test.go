@@ -18,13 +18,12 @@ import (
 
 func TestStateSession_Good_WakeStateReturnsRefs(t *testing.T) {
 	store := state.NewInMemoryStore(nil)
-	_, err := store.Put(context.Background(), "one two three", state.PutOptions{URI: "state://entry"})
-	core.RequireNoError(t, err)
 	session := NewStateSession(inference.ModelIdentity{Hash: "model-a"}, inference.TokenizerIdentity{Hash: "tok-a"}, nil)
+	sleep := seedStateSessionKV(t, store, "state://entry", inference.ModelIdentity{Hash: "model-a"}, inference.TokenizerIdentity{Hash: "tok-a"})
 
 	wake, err := session.WakeState(context.Background(), inference.AgentMemoryWakeRequest{
 		Store:     store,
-		EntryURI:  "state://entry",
+		IndexURI:  sleep.Entry.IndexURI,
 		Model:     inference.ModelIdentity{Hash: "model-a"},
 		Tokenizer: inference.TokenizerIdentity{Hash: "tok-a"},
 	})
@@ -34,9 +33,23 @@ func TestStateSession_Good_WakeStateReturnsRefs(t *testing.T) {
 	core.AssertEqual(t, 3, wake.PrefixTokens)
 	core.AssertEqual(t, defaultROCmStateBlockSize, wake.BlockSize)
 	core.AssertEqual(t, 1, wake.BlocksRead)
-	core.AssertEqual(t, "planned", wake.Labels["kv_restore"])
-	core.AssertEqual(t, "planned", wake.Bundle.Labels["kv_restore"])
+	core.AssertEqual(t, "runtime_owned", wake.Labels["kv_restore"])
+	core.AssertEqual(t, "block_stream", wake.Labels["kv_restore_path"])
+	core.AssertEqual(t, "runtime_owned", wake.Bundle.Labels["kv_restore"])
 	core.AssertEqual(t, "rocm", wake.Bundle.Labels["backend"])
+}
+
+func TestStateSession_Bad_WakeStateRejectsPromptTextState(t *testing.T) {
+	store := state.NewInMemoryStore(nil)
+	_, err := store.Put(context.Background(), "one two three", state.PutOptions{URI: "state://entry/text"})
+	core.RequireNoError(t, err)
+	session := NewStateSession(inference.ModelIdentity{}, inference.TokenizerIdentity{}, nil)
+
+	wake, err := session.WakeState(context.Background(), inference.AgentMemoryWakeRequest{Store: store, EntryURI: "state://entry/text"})
+
+	core.AssertNil(t, wake)
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "KV state is required")
 }
 
 func TestStateSession_Bad_CloseFailureKeepsRuntime(t *testing.T) {
@@ -81,8 +94,7 @@ func TestStateSession_Bad_WakeRejectsModelArchitectureMismatch(t *testing.T) {
 
 func TestStateSession_Good_WakeAllowsMismatchWithSkip(t *testing.T) {
 	store := state.NewInMemoryStore(nil)
-	_, err := store.Put(context.Background(), "one", state.PutOptions{URI: "state://entry"})
-	core.RequireNoError(t, err)
+	seedStateSessionKV(t, store, "state://entry", inference.ModelIdentity{Hash: "model-a"}, inference.TokenizerIdentity{})
 	session := NewStateSession(inference.ModelIdentity{Hash: "model-a"}, inference.TokenizerIdentity{}, nil)
 
 	wake, err := session.WakeState(context.Background(), inference.AgentMemoryWakeRequest{
@@ -93,13 +105,12 @@ func TestStateSession_Good_WakeAllowsMismatchWithSkip(t *testing.T) {
 	})
 
 	core.RequireNoError(t, err)
-	core.AssertEqual(t, 1, wake.PrefixTokens)
+	core.AssertEqual(t, 3, wake.PrefixTokens)
 }
 
 func TestStateSession_Good_WakeStateReturnsClonedLabels(t *testing.T) {
 	store := state.NewInMemoryStore(nil)
-	_, err := store.Put(context.Background(), "one two", state.PutOptions{URI: "state://entry"})
-	core.RequireNoError(t, err)
+	seedStateSessionKV(t, store, "state://entry", inference.ModelIdentity{}, inference.TokenizerIdentity{})
 	sessionLabels := map[string]string{"tenant": "a"}
 	requestLabels := map[string]string{"request": "wake"}
 	session := NewStateSession(inference.ModelIdentity{}, inference.TokenizerIdentity{}, sessionLabels)
@@ -131,8 +142,6 @@ func TestStateSession_Good_WakeStateReturnsClonedLabels(t *testing.T) {
 
 func TestStateSession_Good_IdentityLabelsCloned(t *testing.T) {
 	store := state.NewInMemoryStore(nil)
-	_, err := store.Put(context.Background(), "one", state.PutOptions{URI: "state://entry"})
-	core.RequireNoError(t, err)
 	modelLabels := map[string]string{"model": "source"}
 	tokenizerLabels := map[string]string{"tokenizer": "source"}
 	session := NewStateSession(
@@ -140,6 +149,7 @@ func TestStateSession_Good_IdentityLabelsCloned(t *testing.T) {
 		inference.TokenizerIdentity{Hash: "tok-a", Labels: tokenizerLabels},
 		nil,
 	)
+	seedStateSessionKV(t, store, "state://entry", inference.ModelIdentity{Hash: "model-a"}, inference.TokenizerIdentity{Hash: "tok-a"})
 	modelLabels["model"] = "mutated"
 	tokenizerLabels["tokenizer"] = "mutated"
 
@@ -180,15 +190,9 @@ func TestStateSession_Good_SleepStateURIFirstJSON(t *testing.T) {
 		Metadata: map[string]string{"scene": "test"},
 	})
 
-	core.RequireNoError(t, err)
-	core.AssertEqual(t, "state://entry/new", sleep.Entry.URI)
-	core.AssertEqual(t, "after", sleep.Entry.Title)
-	core.AssertEqual(t, 256, sleep.TokenCount)
-	core.AssertEqual(t, "planned", sleep.Labels["kv_serialize"])
-	payload, err := json.Marshal(sleep)
-	core.RequireNoError(t, err)
-	core.AssertNotContains(t, string(payload), "Store")
-	core.AssertNotContains(t, string(payload), "runtime")
+	core.AssertNil(t, sleep)
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "KV runtime is required")
 }
 
 func TestStateSession_Good_SleepStateWritesMergedPlaceholderTags(t *testing.T) {
@@ -202,13 +206,10 @@ func TestStateSession_Good_SleepStateWritesMergedPlaceholderTags(t *testing.T) {
 		Labels:   map[string]string{"request": "one"},
 	})
 
-	core.RequireNoError(t, err)
-	core.AssertEqual(t, "planned", sleep.Labels["kv_serialize"])
-	core.AssertEqual(t, "rocm", store.options.Tags["backend"])
-	core.AssertEqual(t, "a", store.options.Tags["tenant"])
-	core.AssertEqual(t, "test", store.options.Tags["scene"])
-	core.AssertEqual(t, "one", store.options.Tags["request"])
-	core.AssertEqual(t, "planned", store.options.Tags["kv_serialize"])
+	core.AssertNil(t, sleep)
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "KV runtime is required")
+	core.AssertEqual(t, 0, store.putCalls)
 }
 
 func TestStateSession_Bad_SleepStateRequiresStore(t *testing.T) {
@@ -232,7 +233,7 @@ func TestStateSession_Bad_SleepStatePlaceholderRequiresWriter(t *testing.T) {
 
 	core.AssertNil(t, sleep)
 	core.AssertError(t, err)
-	core.AssertContains(t, err.Error(), "state store is missing")
+	core.AssertContains(t, err.Error(), "KV runtime is required")
 }
 
 func TestStateSession_Bad_SleepStatePlaceholderWriteFailure(t *testing.T) {
@@ -247,21 +248,18 @@ func TestStateSession_Bad_SleepStatePlaceholderWriteFailure(t *testing.T) {
 
 	core.AssertNil(t, sleep)
 	core.AssertError(t, err)
-	core.AssertContains(t, err.Error(), "write state ref")
-	core.AssertContains(t, err.Error(), "write failed")
-	core.AssertEqual(t, 1, store.putCalls)
-	core.AssertEqual(t, "rocm state placeholder: native KV pages are not serialised yet", store.text)
-	core.AssertEqual(t, "rocm-state", store.options.Kind)
-	core.AssertEqual(t, "a", store.options.Tags["tenant"])
-	core.AssertEqual(t, "test", store.options.Tags["scene"])
-	core.AssertEqual(t, "planned", store.options.Tags["kv_serialize"])
+	core.AssertContains(t, err.Error(), "KV runtime is required")
+	core.AssertEqual(t, 0, store.putCalls)
 }
 
 func TestStateSession_Good_SleepStateReturnsClonedLabels(t *testing.T) {
 	store := state.NewInMemoryStore(nil)
 	sessionLabels := map[string]string{"tenant": "a"}
 	requestLabels := map[string]string{"request": "sleep"}
-	session := NewStateSession(inference.ModelIdentity{ContextLength: 128}, inference.TokenizerIdentity{}, sessionLabels)
+	cache, err := newROCmKVCache(rocmKVCacheModeQ8, defaultROCmStateBlockSize)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(0, 1, 1, []float32{1, 2}, []float32{2, 1}))
+	session := newStateSessionWithRuntime(inference.ModelIdentity{ContextLength: 128}, inference.TokenizerIdentity{}, sessionLabels, cache)
 	sessionLabels["tenant"] = "mutated"
 
 	sleep, err := session.SleepState(context.Background(), inference.AgentMemorySleepRequest{
@@ -286,13 +284,16 @@ func TestStateSession_Good_SleepStateReturnsClonedLabels(t *testing.T) {
 	core.AssertEqual(t, "a", second.Labels["tenant"])
 	core.AssertEqual(t, "sleep", second.Labels["request"])
 	core.AssertEqual(t, "rocm", second.Bundle.Labels["backend"])
-	core.AssertEqual(t, "planned", second.Entry.StateRefs[0].Labels["kv_serialize"])
+	core.AssertEqual(t, "runtime_owned_blocks", second.Entry.StateRefs[0].Labels["kv_serialize"])
 	core.AssertEqual(t, "sleep", second.Entry.Labels["request"])
 }
 
 func TestStateSession_Good_SleepStateBundleRefUsesWrittenURI(t *testing.T) {
 	store := state.NewInMemoryStore(nil)
-	session := NewStateSession(inference.ModelIdentity{ContextLength: 128}, inference.TokenizerIdentity{}, nil)
+	cache, err := newROCmKVCache(rocmKVCacheModeQ8, defaultROCmStateBlockSize)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(0, 1, 1, []float32{1}, []float32{2}))
+	session := newStateSessionWithRuntime(inference.ModelIdentity{ContextLength: 128}, inference.TokenizerIdentity{}, nil, cache)
 
 	sleep, err := session.SleepState(context.Background(), inference.AgentMemorySleepRequest{
 		Store:     store,
@@ -303,7 +304,7 @@ func TestStateSession_Good_SleepStateBundleRefUsesWrittenURI(t *testing.T) {
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, "state://entry/written", sleep.Entry.URI)
 	core.AssertEqual(t, "state://bundle/requested", sleep.Entry.BundleURI)
-	core.AssertEqual(t, "state://entry/written", sleep.Bundle.URI)
+	core.AssertEqual(t, "state://bundle/requested", sleep.Bundle.URI)
 	_, err = store.ResolveURI(context.Background(), sleep.Bundle.URI)
 	core.RequireNoError(t, err)
 }
@@ -319,6 +320,7 @@ func TestStateSession_Good_SleepStateSerializesRuntimeOwnedKVSnapshot(t *testing
 		Store:    store,
 		EntryURI: "state://entry/kv",
 		Model:    inference.ModelIdentity{Hash: "model-a"},
+		Encoding: rocmKVSnapshotEncoding,
 	})
 
 	core.RequireNoError(t, err)
@@ -339,7 +341,7 @@ func TestStateSession_Good_SleepStateSerializesRuntimeOwnedKVSnapshot(t *testing
 	core.AssertEqual(t, 3, sleep.TokenCount)
 	core.AssertEqual(t, 2, sleep.BlocksWritten)
 	core.AssertGreater(t, sleep.Bundle.SizeBytes, uint64(0))
-	chunk, err := store.ResolveURI(context.Background(), "state://entry/kv")
+	chunk, err := store.ResolveURI(context.Background(), sleep.Bundle.URI)
 	core.RequireNoError(t, err)
 	core.AssertContains(t, string(chunk.Data), rocmKVCacheModeQ8)
 }
@@ -370,7 +372,7 @@ func TestStateSession_Good_SleepWakeRuntimeOwnedKVBlockBundle(t *testing.T) {
 	core.AssertEqual(t, rocmKVBlockRawEncoding, sleep.Entry.StateRefs[0].Encoding)
 	core.AssertEqual(t, "0", sleep.Entry.StateRefs[0].Labels["kv_block_token_start"])
 	core.AssertEqual(t, "2", sleep.Entry.StateRefs[1].Labels["kv_block_token_start"])
-	chunk, err := store.ResolveURI(context.Background(), "state://entry/kv-blocks")
+	chunk, err := store.ResolveURI(context.Background(), sleep.Bundle.URI)
 	core.RequireNoError(t, err)
 	var manifest rocmKVBlockBundleSnapshot
 	core.RequireNoError(t, json.Unmarshal(chunk.Data, &manifest))
@@ -414,14 +416,14 @@ func TestStateSession_Good_WakeKVBlockBundleBorrowsChunkRefs(t *testing.T) {
 		[]float32{3, 2, 1, 0, -1, -2},
 	))
 	session := newStateSessionWithRuntime(inference.ModelIdentity{Hash: "model-a"}, inference.TokenizerIdentity{}, nil, cache)
-	_, err = session.SleepState(context.Background(), inference.AgentMemorySleepRequest{
+	sleep, err := session.SleepState(context.Background(), inference.AgentMemorySleepRequest{
 		Store:    store,
 		EntryURI: "state://entry/kv-borrow",
 		Model:    inference.ModelIdentity{Hash: "model-a"},
 		Encoding: rocmKVBlockBundleEncoding,
 	})
 	core.RequireNoError(t, err)
-	chunk, err := store.ResolveURI(context.Background(), "state://entry/kv-borrow")
+	chunk, err := store.ResolveURI(context.Background(), sleep.Bundle.URI)
 	core.RequireNoError(t, err)
 	var manifest rocmKVBlockBundleSnapshot
 	core.RequireNoError(t, json.Unmarshal(chunk.Data, &manifest))
@@ -451,6 +453,7 @@ func TestStateSession_Bad_SleepStateRuntimeOwnedKVWriteFailureKeepsRuntime(t *te
 		Store:    store,
 		EntryURI: "state://entry/kv-write-failed",
 		Model:    inference.ModelIdentity{Hash: "model-a"},
+		Encoding: rocmKVSnapshotEncoding,
 	})
 
 	core.AssertNil(t, sleep)
@@ -507,6 +510,7 @@ func TestStateSession_Good_SleepStateSerializesHIPDeviceKVSnapshot(t *testing.T)
 		Store:    store,
 		EntryURI: "state://entry/device-kv",
 		Model:    inference.ModelIdentity{Hash: "model-a"},
+		Encoding: rocmKVSnapshotEncoding,
 	})
 
 	core.RequireNoError(t, err)
@@ -522,7 +526,7 @@ func TestStateSession_Good_SleepStateSerializesHIPDeviceKVSnapshot(t *testing.T)
 	core.AssertEqual(t, 2, sleep.TokenCount)
 	core.AssertEqual(t, 1, sleep.BlocksWritten)
 	core.AssertGreater(t, sleep.Bundle.SizeBytes, uint64(0))
-	chunk, err := store.ResolveURI(context.Background(), "state://entry/device-kv")
+	chunk, err := store.ResolveURI(context.Background(), sleep.Bundle.URI)
 	core.RequireNoError(t, err)
 	restored, err := newROCmKVCacheFromSnapshot(chunk.Data)
 	core.RequireNoError(t, err)
@@ -546,6 +550,7 @@ func TestStateSession_Bad_SleepStateDeviceKVWriteFailureKeepsRuntime(t *testing.
 		Store:    store,
 		EntryURI: "state://entry/device-kv-write-failed",
 		Model:    inference.ModelIdentity{Hash: "model-a"},
+		Encoding: rocmKVSnapshotEncoding,
 	})
 
 	core.AssertNil(t, sleep)
@@ -635,6 +640,7 @@ func TestStateSession_Good_WakeStateRestoresHIPDeviceKVSnapshotAsPackageLocal(t 
 		Store:    store,
 		EntryURI: "state://entry/device-kv",
 		Model:    inference.ModelIdentity{Hash: "model-a"},
+		Encoding: rocmKVSnapshotEncoding,
 	})
 	core.RequireNoError(t, err)
 	waking := NewStateSession(inference.ModelIdentity{Hash: "model-a"}, inference.TokenizerIdentity{}, nil)
@@ -677,6 +683,7 @@ func TestStateSession_Good_WakeStateRestoresRuntimeOwnedKVSnapshot(t *testing.T)
 		Store:    store,
 		EntryURI: "state://entry/kv",
 		Model:    inference.ModelIdentity{Hash: "model-a"},
+		Encoding: rocmKVSnapshotEncoding,
 	})
 	core.RequireNoError(t, err)
 	waking := NewStateSession(inference.ModelIdentity{Hash: "model-a"}, inference.TokenizerIdentity{}, nil)
@@ -822,15 +829,14 @@ func TestStateSession_Bad_WakeRejectsMalformedKVSnapshot(t *testing.T) {
 
 func TestStateSession_Good_ForkStateCreatesIndependentSession(t *testing.T) {
 	store := state.NewInMemoryStore(nil)
-	_, err := store.Put(context.Background(), "one two", state.PutOptions{URI: "state://entry"})
-	core.RequireNoError(t, err)
+	seedStateSessionKV(t, store, "state://entry", inference.ModelIdentity{}, inference.TokenizerIdentity{})
 	session := NewStateSession(inference.ModelIdentity{}, inference.TokenizerIdentity{}, nil)
 
 	forked, wake, err := session.ForkState(context.Background(), inference.AgentMemoryWakeRequest{Store: store, EntryURI: "state://entry"})
 
 	core.RequireNoError(t, err)
 	core.AssertNotNil(t, forked)
-	core.AssertEqual(t, 2, wake.PrefixTokens)
+	core.AssertEqual(t, 3, wake.PrefixTokens)
 	if forked == session {
 		t.Fatal("forked session aliases parent")
 	}
@@ -1172,6 +1178,7 @@ func TestStateSession_Good_RocmModelPreservesWakeRuntimeForSleep(t *testing.T) {
 		Store:    store,
 		EntryURI: "state://entry/source",
 		Model:    inference.ModelIdentity{Hash: "model-a"},
+		Encoding: rocmKVSnapshotEncoding,
 	})
 	core.RequireNoError(t, err)
 	model := &rocmModel{modelInfo: inference.ModelInfo{Architecture: "qwen3"}}
@@ -1187,12 +1194,13 @@ func TestStateSession_Good_RocmModelPreservesWakeRuntimeForSleep(t *testing.T) {
 		Store:    store,
 		EntryURI: "state://entry/roundtrip",
 		Model:    inference.ModelIdentity{Hash: "model-a"},
+		Encoding: rocmKVSnapshotEncoding,
 	})
 
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, "runtime_owned", sleep.Labels["kv_serialize"])
 	core.AssertEqual(t, 2, sleep.TokenCount)
-	chunk, err := store.ResolveURI(context.Background(), "state://entry/roundtrip")
+	chunk, err := store.ResolveURI(context.Background(), sleep.Bundle.URI)
 	core.RequireNoError(t, err)
 	restored, err := newROCmKVCacheFromSnapshot(chunk.Data)
 	core.RequireNoError(t, err)
@@ -1215,6 +1223,7 @@ func TestStateSession_Good_RocmModelWakeStateRemirrorsKVSnapshotToHIPDevice(t *t
 		Store:    store,
 		EntryURI: "state://entry/kv",
 		Model:    inference.ModelIdentity{Hash: "model-a"},
+		Encoding: rocmKVSnapshotEncoding,
 	})
 	core.RequireNoError(t, err)
 	driver := &fakeHIPDriver{available: true}
@@ -1243,6 +1252,7 @@ func TestStateSession_Good_RocmModelWakeStateRemirrorsKVSnapshotToHIPDevice(t *t
 		Store:    store,
 		EntryURI: "state://entry/remirrored",
 		Model:    inference.ModelIdentity{Hash: "model-a"},
+		Encoding: rocmKVSnapshotEncoding,
 	})
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, "device_mirror", sleep.Labels["kv_serialize"])
@@ -1356,6 +1366,7 @@ func TestStateSession_Good_RocmModelWakeStateKeepsPackageLocalKVOnDeviceMirrorFa
 		Store:    store,
 		EntryURI: "state://entry/kv",
 		Model:    inference.ModelIdentity{Hash: "model-a"},
+		Encoding: rocmKVSnapshotEncoding,
 	})
 	core.RequireNoError(t, err)
 	driver := &fakeHIPDriver{available: true, copyErr: core.NewError("copy failed"), copyErrAt: 1}
@@ -1446,8 +1457,26 @@ func TestStateSession_Good_RocmModelAdapterChangeResetsState(t *testing.T) {
 	core.RequireNoError(t, err)
 	sleep, err := model.SleepState(context.Background(), inference.AgentMemorySleepRequest{Store: store, EntryURI: "state://entry/after-adapter"})
 
+	core.AssertNil(t, sleep)
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "KV runtime is required")
+}
+
+func seedStateSessionKV(t *testing.T, store *state.InMemoryStore, entryURI string, model inference.ModelIdentity, tokenizer inference.TokenizerIdentity) *inference.AgentMemorySleepResult {
+	t.Helper()
+	cache, err := newROCmKVCache(rocmKVCacheModeQ8, defaultROCmStateBlockSize)
 	core.RequireNoError(t, err)
-	core.AssertEqual(t, "planned", sleep.Labels["kv_serialize"])
+	core.RequireNoError(t, cache.AppendVectors(0, 1, 1, []float32{1, 2, 3}, []float32{3, 2, 1}))
+	session := newStateSessionWithRuntime(model, tokenizer, nil, cache)
+	sleep, err := session.SleepState(context.Background(), inference.AgentMemorySleepRequest{
+		Store:     store,
+		EntryURI:  entryURI,
+		Model:     model,
+		Tokenizer: tokenizer,
+		Encoding:  rocmKVBlockBundleEncoding,
+	})
+	core.RequireNoError(t, err)
+	return sleep
 }
 
 type recordingStateWriter struct {

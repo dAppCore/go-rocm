@@ -297,6 +297,7 @@ func hipFinalizeGemma4Q4ForwardDeviceState(previous, next *hipGemma4Q4DeviceDeco
 			oldLayer.cache = nil
 			rocmReleaseDeviceKVCache(oldCache)
 		}
+		hipTransferGemma4Q4DescriptorTableOwnership(oldLayer, newLayer)
 		if err := oldLayer.closeDescriptorTable(); err != nil {
 			return err
 		}
@@ -305,6 +306,15 @@ func hipFinalizeGemma4Q4ForwardDeviceState(previous, next *hipGemma4Q4DeviceDeco
 	previous.layers = nil
 	previous.closed = true
 	return nil
+}
+
+func hipTransferGemma4Q4DescriptorTableOwnership(oldLayer, newLayer *hipGemma4Q4DeviceLayerKVState) {
+	if oldLayer == nil || newLayer == nil || oldLayer.descriptorTable == nil {
+		return
+	}
+	if oldLayer.descriptorTable == newLayer.descriptorTable {
+		oldLayer.borrowedDescriptorTable = true
+	}
 }
 
 func hipMirrorGemma4Q4LayerDecodeState(driver nativeHIPDriver, cfg hipGemma4Q4Layer0Config, layerState hipGemma4Q4LayerKVState, mode string) (hipGemma4Q4DeviceLayerKVState, error) {

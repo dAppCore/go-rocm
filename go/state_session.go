@@ -6,7 +6,10 @@ package rocm
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"strconv"
 
 	core "dappco.re/go"
 	"dappco.re/go/inference"
@@ -14,6 +17,37 @@ import (
 )
 
 const defaultROCmStateBlockSize = 128
+
+const (
+	rocmKVStateIndexKind     = "rocm-kv-state-block-bundle-index"
+	rocmKVStateIndexEncoding = "rocm/kv-cache-block-bundle-index+json"
+)
+
+type rocmKVStateIndex struct {
+	Version    int                         `json:"version"`
+	Kind       string                      `json:"kind"`
+	BundleURI  string                      `json:"bundle_uri,omitempty"`
+	TokenCount int                         `json:"token_count,omitempty"`
+	BlockSize  int                         `json:"block_size,omitempty"`
+	Model      inference.ModelIdentity     `json:"model,omitempty"`
+	Tokenizer  inference.TokenizerIdentity `json:"tokenizer,omitempty"`
+	Entries    []rocmKVStateIndexEntry     `json:"entries,omitempty"`
+	Hash       string                      `json:"hash,omitempty"`
+}
+
+type rocmKVStateIndexEntry struct {
+	URI        string            `json:"uri"`
+	BundleURI  string            `json:"bundle_uri,omitempty"`
+	Title      string            `json:"title,omitempty"`
+	TokenStart int               `json:"token_start"`
+	TokenCount int               `json:"token_count"`
+	Labels     map[string]string `json:"labels,omitempty"`
+	Meta       map[string]string `json:"meta,omitempty"`
+}
+
+func (entry rocmKVStateIndexEntry) PrefixTokens() int {
+	return entry.TokenStart + entry.TokenCount
+}
 
 // StateSession owns ROCm state lifecycle metadata. Runtime handles remain
 // package-local and are not embedded in portable state refs.
@@ -95,15 +129,23 @@ func (session *StateSession) WakeState(ctx context.Context, req inference.AgentM
 	if !ok || store == nil {
 		return nil, core.E("rocm.WakeState", "state store is missing", nil)
 	}
-	uri := firstNonEmptyString(req.EntryURI, req.IndexURI)
-	if uri == "" {
+	if req.EntryURI == "" && req.IndexURI == "" {
 		return nil, core.E("rocm.WakeState", "entry or index URI is required", nil)
 	}
+	labels := mergeStringMaps(session.labels, req.Labels)
+	if req.IndexURI != "" {
+		return session.wakeStateFromIndex(ctx, store, req, labels)
+	}
+	uri := req.EntryURI
 	chunk, err := state.ResolveURI(ctx, store, uri)
 	if err != nil {
+		indexReq := req
+		indexReq.IndexURI = uri + "/index"
+		if wake, indexErr := session.wakeStateFromIndex(ctx, store, indexReq, cloneStringMap(labels)); indexErr == nil {
+			return wake, nil
+		}
 		return nil, core.E("rocm.WakeState", "resolve state URI", err)
 	}
-	labels := mergeStringMaps(session.labels, req.Labels)
 	if cache, ok, restoreLabels, err := wakeKVCacheFromChunk(ctx, store, chunk); err != nil {
 		return nil, err
 	} else if ok {
@@ -137,23 +179,7 @@ func (session *StateSession) WakeState(ctx context.Context, req inference.AgentM
 			Labels:       cloneStringMap(labels),
 		}, nil
 	}
-	tokens := len(approximateTokenIDs(firstNonEmptyString(chunk.Text, string(chunk.Data))))
-	if tokens == 0 {
-		tokens = req.Model.ContextLength
-	}
-	blockSize := defaultROCmStateBlockSize
-	blocks := blocksForTokens(tokens, blockSize)
-	labels["kv_restore"] = "planned"
-	return &inference.AgentMemoryWakeResult{
-		Entry:        inference.AgentMemoryRef{URI: uri, IndexURI: req.IndexURI, Kind: "prefix", TokenCount: tokens, Labels: cloneStringMap(labels)},
-		Bundle:       inference.StateRef{Kind: "kv", URI: firstNonEmptyString(req.EntryURI, uri), Encoding: "rocm/planned", Labels: cloneStringMap(labels)},
-		Index:        inference.StateRef{Kind: "index", URI: req.IndexURI},
-		PrefixTokens: tokens,
-		BundleTokens: tokens,
-		BlockSize:    blockSize,
-		BlocksRead:   blocks,
-		Labels:       cloneStringMap(labels),
-	}, nil
+	return nil, core.E("rocm.WakeState", "KV state is required; refusing to rebuild retained state from prompt text", nil)
 }
 
 func (session *StateSession) SleepState(ctx context.Context, req inference.AgentMemorySleepRequest) (*inference.AgentMemorySleepResult, error) {
@@ -177,8 +203,22 @@ func (session *StateSession) SleepState(ctx context.Context, req inference.Agent
 	if blockSize <= 0 {
 		blockSize = defaultROCmStateBlockSize
 	}
+	bundleURI := firstNonEmptyString(req.BundleURI, entryURI+"/bundle")
+	indexURI := firstNonEmptyString(req.IndexURI, entryURI+"/index")
+	encoding := req.Encoding
+	if encoding == "" {
+		encoding = rocmKVBlockBundleEncoding
+	}
+	req.Encoding = encoding
 	labels := mergeStringMaps(session.labels, req.Labels)
-	ref, stateRefs, encoding, sizeBytes, tokens, blocks, err := session.sleepStatePayload(ctx, req, entryURI, blockSize, labels)
+	ref, stateRefs, encoding, sizeBytes, tokens, blocks, err := session.sleepStatePayload(ctx, req, bundleURI, blockSize, labels)
+	if err != nil {
+		return nil, err
+	}
+	if parsedBlockSize, parseErr := strconv.Atoi(labels["kv_cache_block_size"]); parseErr == nil && parsedBlockSize > 0 {
+		blockSize = parsedBlockSize
+	}
+	_, indexBytes, err := sleepROCmKVStateIndex(ctx, req, entryURI, bundleURI, indexURI, tokens, blockSize, labels, session.model, session.tokenizer)
 	if err != nil {
 		return nil, err
 	}
@@ -188,13 +228,13 @@ func (session *StateSession) SleepState(ctx context.Context, req inference.Agent
 	}
 	refLabels["chunk_id"] = core.Sprintf("%d", ref.ChunkID)
 	if len(stateRefs) == 0 {
-		stateRefs = []inference.StateRef{{Kind: "kv", URI: entryURI, SizeBytes: sizeBytes, Encoding: encoding, Labels: cloneStringMap(refLabels)}}
+		stateRefs = []inference.StateRef{{Kind: "kv", URI: bundleURI, SizeBytes: sizeBytes, Encoding: encoding, Labels: cloneStringMap(refLabels)}}
 	}
 	return &inference.AgentMemorySleepResult{
 		Entry: inference.AgentMemoryRef{
 			URI:        entryURI,
-			BundleURI:  req.BundleURI,
-			IndexURI:   req.IndexURI,
+			BundleURI:  bundleURI,
+			IndexURI:   indexURI,
 			Title:      req.Title,
 			Kind:       "prefix",
 			TokenCount: tokens,
@@ -202,8 +242,8 @@ func (session *StateSession) SleepState(ctx context.Context, req inference.Agent
 			Labels:     cloneStringMap(labels),
 		},
 		Parent:        inference.AgentMemoryRef{URI: req.ParentEntryURI, BundleURI: req.ParentBundleURI, IndexURI: req.ParentIndexURI},
-		Bundle:        inference.StateRef{Kind: "bundle", URI: entryURI, SizeBytes: sizeBytes, Encoding: encoding, Labels: cloneStringMap(refLabels)},
-		Index:         inference.StateRef{Kind: "index", URI: req.IndexURI},
+		Bundle:        inference.StateRef{Kind: "bundle", URI: bundleURI, SizeBytes: sizeBytes, Encoding: encoding, Labels: cloneStringMap(refLabels)},
+		Index:         inference.StateRef{Kind: "index", URI: indexURI, SizeBytes: uint64(indexBytes), Encoding: rocmKVStateIndexEncoding, Labels: cloneStringMap(labels)},
 		TokenCount:    tokens,
 		BlockSize:     blockSize,
 		BlocksWritten: blocks,
@@ -237,6 +277,33 @@ func cloneModelIdentity(identity inference.ModelIdentity) inference.ModelIdentit
 func cloneTokenizerIdentity(identity inference.TokenizerIdentity) inference.TokenizerIdentity {
 	identity.Labels = cloneStringMap(identity.Labels)
 	return identity
+}
+
+func modelIdentityIsZero(identity inference.ModelIdentity) bool {
+	return identity.ID == "" &&
+		identity.Path == "" &&
+		identity.Architecture == "" &&
+		identity.Revision == "" &&
+		identity.Hash == "" &&
+		identity.QuantBits == 0 &&
+		identity.QuantGroup == 0 &&
+		identity.QuantType == "" &&
+		identity.ContextLength == 0 &&
+		identity.NumLayers == 0 &&
+		identity.HiddenSize == 0 &&
+		identity.VocabSize == 0 &&
+		len(identity.Labels) == 0
+}
+
+func tokenizerIdentityIsZero(identity inference.TokenizerIdentity) bool {
+	return identity.Kind == "" &&
+		identity.Path == "" &&
+		identity.Hash == "" &&
+		identity.ChatTemplate == "" &&
+		identity.BOSID == 0 &&
+		identity.EOSID == 0 &&
+		identity.PADID == 0 &&
+		len(identity.Labels) == 0
 }
 
 func (session *StateSession) checkWakeCompatibility(req inference.AgentMemoryWakeRequest) error {
@@ -387,7 +454,17 @@ func (m *rocmModel) restoreWakeStateDeviceKVBlocks(ctx context.Context, session 
 	if driver == nil || !driver.Available() {
 		return false
 	}
-	uri := firstNonEmptyString(req.EntryURI, req.IndexURI)
+	uri := wake.Bundle.URI
+	if uri == "" && req.IndexURI != "" {
+		if index, err := loadROCmKVStateIndex(ctx, store, req.IndexURI); err == nil {
+			if entry, ok := selectROCmKVStateIndexEntry(index, req.EntryURI); ok {
+				uri = firstNonEmptyString(entry.BundleURI, index.BundleURI)
+			}
+		}
+	}
+	if uri == "" {
+		uri = firstNonEmptyString(req.EntryURI, req.IndexURI)
+	}
 	if uri == "" {
 		return false
 	}
@@ -468,7 +545,233 @@ func blocksForTokens(tokens, blockSize int) int {
 	return (tokens + blockSize - 1) / blockSize
 }
 
+func (session *StateSession) wakeStateFromIndex(ctx context.Context, store state.Store, req inference.AgentMemoryWakeRequest, labels map[string]string) (*inference.AgentMemoryWakeResult, error) {
+	index, err := loadROCmKVStateIndex(ctx, store, req.IndexURI)
+	if err != nil {
+		return nil, err
+	}
+	if !req.SkipCompatibilityCheck {
+		if err := checkROCmStateModelCompatibility("rocm.WakeState", session.model, index.Model); err != nil {
+			return nil, err
+		}
+		if err := checkROCmStateTokenizerCompatibility("rocm.WakeState", session.tokenizer, index.Tokenizer); err != nil {
+			return nil, err
+		}
+		if err := checkROCmStateModelCompatibility("rocm.WakeState", req.Model, index.Model); err != nil {
+			return nil, err
+		}
+		if err := checkROCmStateTokenizerCompatibility("rocm.WakeState", req.Tokenizer, index.Tokenizer); err != nil {
+			return nil, err
+		}
+	}
+	entry, ok := selectROCmKVStateIndexEntry(index, req.EntryURI)
+	if !ok {
+		return nil, core.E("rocm.WakeState", "state index entry not found", nil)
+	}
+	bundleURI := firstNonEmptyString(entry.BundleURI, index.BundleURI)
+	if bundleURI == "" {
+		return nil, core.E("rocm.WakeState", "state index bundle URI is required", nil)
+	}
+	chunk, err := state.ResolveURI(ctx, store, bundleURI)
+	if err != nil {
+		return nil, core.E("rocm.WakeState", "resolve state bundle URI", err)
+	}
+	prefixTokens := entry.PrefixTokens()
+	cache, ok, restoreLabels, err := wakeKVCacheFromChunkWithPrefix(ctx, store, chunk, prefixTokens)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, core.E("rocm.WakeState", "KV state is required; refusing to rebuild retained state from prompt text", nil)
+	}
+	if err := session.replaceRuntime(cache); err != nil {
+		return nil, core.E("rocm.WakeState", "close previous state runtime", err)
+	}
+	for key, value := range cache.Stats().Labels {
+		labels[key] = value
+	}
+	for key, value := range restoreLabels {
+		labels[key] = value
+	}
+	for key, value := range entry.Labels {
+		if core.HasPrefix(key, "kv_") || key == "cache_mode" {
+			continue
+		}
+		labels[key] = value
+	}
+	labels["kv_restore"] = "runtime_owned"
+	labels["kv_device_backing"] = "planned"
+	labels["cache_mode"] = cache.mode
+	labels["kv_index_restore"] = "state_index"
+	bundleEncoding := rocmKVSnapshotEncoding
+	if restoreLabels["kv_restore_path"] == "block_stream" {
+		bundleEncoding = rocmKVBlockBundleEncoding
+	}
+	return &inference.AgentMemoryWakeResult{
+		Entry:        inference.AgentMemoryRef{URI: entry.URI, BundleURI: bundleURI, IndexURI: req.IndexURI, Title: entry.Title, Kind: "prefix", TokenCount: prefixTokens, Labels: cloneStringMap(labels)},
+		Bundle:       inference.StateRef{Kind: "kv", URI: bundleURI, SizeBytes: uint64(len(chunk.Data)), Encoding: bundleEncoding, Labels: cloneStringMap(labels)},
+		Index:        inference.StateRef{Kind: "index", URI: req.IndexURI, Encoding: rocmKVStateIndexEncoding},
+		PrefixTokens: prefixTokens,
+		BundleTokens: index.TokenCount,
+		BlockSize:    firstPositiveInt(index.BlockSize, cache.blockSize),
+		BlocksRead:   blocksForTokens(prefixTokens, firstPositiveInt(index.BlockSize, cache.blockSize)),
+		Labels:       cloneStringMap(labels),
+	}, nil
+}
+
+func sleepROCmKVStateIndex(ctx context.Context, req inference.AgentMemorySleepRequest, entryURI, bundleURI, indexURI string, tokens, blockSize int, labels map[string]string, model inference.ModelIdentity, tokenizer inference.TokenizerIdentity) (state.ChunkRef, int, error) {
+	writer, ok := req.Store.(state.Writer)
+	if !ok || writer == nil {
+		return state.ChunkRef{}, 0, core.E("rocm.SleepState", "state index store is missing", nil)
+	}
+	if tokens <= 0 {
+		return state.ChunkRef{}, 0, core.E("rocm.SleepState", "KV token count is empty", nil)
+	}
+	if blockSize <= 0 {
+		blockSize = defaultROCmStateBlockSize
+	}
+	if modelIdentityIsZero(model) {
+		model = cloneModelIdentity(req.Model)
+	} else {
+		model = cloneModelIdentity(model)
+	}
+	if tokenizerIdentityIsZero(tokenizer) {
+		tokenizer = cloneTokenizerIdentity(req.Tokenizer)
+	} else {
+		tokenizer = cloneTokenizerIdentity(tokenizer)
+	}
+	entryLabels := cloneStringMap(labels)
+	entryMeta := map[string]string{}
+	if req.ParentEntryURI != "" {
+		entryMeta["parent_entry_uri"] = req.ParentEntryURI
+	}
+	if req.ParentBundleURI != "" {
+		entryMeta["parent_bundle_uri"] = req.ParentBundleURI
+	}
+	if req.ParentIndexURI != "" {
+		entryMeta["parent_index_uri"] = req.ParentIndexURI
+	}
+	index := rocmKVStateIndex{
+		Version:    1,
+		Kind:       rocmKVStateIndexKind,
+		BundleURI:  bundleURI,
+		TokenCount: tokens,
+		BlockSize:  blockSize,
+		Model:      model,
+		Tokenizer:  tokenizer,
+		Entries: []rocmKVStateIndexEntry{{
+			URI:        entryURI,
+			BundleURI:  bundleURI,
+			Title:      req.Title,
+			TokenStart: 0,
+			TokenCount: tokens,
+			Labels:     entryLabels,
+			Meta:       entryMeta,
+		}},
+	}
+	index.Hash = rocmKVStateIndexHash(index)
+	payload, err := json.Marshal(index)
+	if err != nil {
+		return state.ChunkRef{}, 0, core.E("rocm.SleepState", "encode KV state index", err)
+	}
+	ref, err := writer.Put(ctx, string(payload), state.PutOptions{
+		URI:   indexURI,
+		Title: firstNonEmptyString(req.Title, "ROCm KV state index"),
+		Kind:  rocmKVStateIndexKind,
+		Track: rocmKVStateIndexEncoding,
+		Tags:  mergeStringMaps(req.Metadata, labels),
+	})
+	if err != nil {
+		return state.ChunkRef{}, 0, core.E("rocm.SleepState", "write KV state index", err)
+	}
+	return ref, len(payload), nil
+}
+
+func loadROCmKVStateIndex(ctx context.Context, store state.Store, uri string) (*rocmKVStateIndex, error) {
+	if uri == "" {
+		return nil, core.E("rocm.WakeState", "state index URI is required", nil)
+	}
+	chunk, err := state.ResolveURI(ctx, store, uri)
+	if err != nil {
+		return nil, core.E("rocm.WakeState", "resolve state index URI", err)
+	}
+	data := chunk.Data
+	if len(data) == 0 && chunk.Text != "" {
+		data = []byte(chunk.Text)
+	}
+	var index rocmKVStateIndex
+	if err := json.Unmarshal(data, &index); err != nil {
+		return nil, core.E("rocm.WakeState", "parse KV state index", err)
+	}
+	if err := validateROCmKVStateIndex(index); err != nil {
+		return nil, err
+	}
+	return &index, nil
+}
+
+func validateROCmKVStateIndex(index rocmKVStateIndex) error {
+	if index.Version != 1 {
+		return core.E("rocm.WakeState", "unsupported KV state index version", nil)
+	}
+	if index.Kind != rocmKVStateIndexKind {
+		return core.E("rocm.WakeState", "invalid KV state index kind", nil)
+	}
+	if index.TokenCount <= 0 {
+		return core.E("rocm.WakeState", "KV state index token count is empty", nil)
+	}
+	if len(index.Entries) == 0 {
+		return core.E("rocm.WakeState", "KV state index has no entries", nil)
+	}
+	if index.Hash != "" && rocmKVStateIndexHash(index) != index.Hash {
+		return core.E("rocm.WakeState", "KV state index hash mismatch", nil)
+	}
+	for _, entry := range index.Entries {
+		if entry.URI == "" {
+			return core.E("rocm.WakeState", "KV state index entry URI is required", nil)
+		}
+		if firstNonEmptyString(entry.BundleURI, index.BundleURI) == "" {
+			return core.E("rocm.WakeState", "KV state index entry bundle URI is required", nil)
+		}
+		if entry.TokenStart < 0 || entry.TokenCount <= 0 || entry.TokenStart+entry.TokenCount > index.TokenCount {
+			return core.E("rocm.WakeState", "KV state index entry token range is invalid", nil)
+		}
+	}
+	return nil
+}
+
+func selectROCmKVStateIndexEntry(index *rocmKVStateIndex, uri string) (rocmKVStateIndexEntry, bool) {
+	if index == nil || len(index.Entries) == 0 {
+		return rocmKVStateIndexEntry{}, false
+	}
+	if uri == "" {
+		return cloneROCmKVStateIndexEntry(index.Entries[0]), true
+	}
+	for _, entry := range index.Entries {
+		if entry.URI == uri {
+			return cloneROCmKVStateIndexEntry(entry), true
+		}
+	}
+	return rocmKVStateIndexEntry{}, false
+}
+
+func cloneROCmKVStateIndexEntry(entry rocmKVStateIndexEntry) rocmKVStateIndexEntry {
+	entry.Labels = cloneStringMap(entry.Labels)
+	entry.Meta = cloneStringMap(entry.Meta)
+	return entry
+}
+
+func rocmKVStateIndexHash(index rocmKVStateIndex) string {
+	index.Hash = ""
+	payload, _ := json.Marshal(index)
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
+}
+
 func wakeKVCacheFromChunk(ctx context.Context, store state.Store, chunk state.Chunk) (*rocmKVCache, bool, map[string]string, error) {
+	return wakeKVCacheFromChunkWithPrefix(ctx, store, chunk, 0)
+}
+
+func wakeKVCacheFromChunkWithPrefix(ctx context.Context, store state.Store, chunk state.Chunk, prefixTokens int) (*rocmKVCache, bool, map[string]string, error) {
 	data := chunk.Data
 	textFallback := false
 	if len(data) == 0 && chunk.Text != "" {
@@ -479,7 +782,7 @@ func wakeKVCacheFromChunk(ctx context.Context, store state.Store, chunk state.Ch
 		return nil, false, nil, nil
 	}
 	chunk.Data = data
-	if cache, ok, err := wakeKVCacheBlockBundleFromChunk(ctx, store, chunk); ok || err != nil {
+	if cache, ok, err := wakeKVCacheBlockBundleFromChunk(ctx, store, chunk, prefixTokens); ok || err != nil {
 		labels := map[string]string{"kv_restore_path": "block_stream"}
 		return cache, ok, labels, err
 	}
@@ -490,19 +793,48 @@ func wakeKVCacheFromChunk(ctx context.Context, store state.Store, chunk state.Ch
 		}
 		return nil, false, nil, core.E("rocm.WakeState", "restore KV cache snapshot", err)
 	}
+	if prefixTokens > 0 && prefixTokens < cache.TokenCount() {
+		keys, values, err := cache.Restore(0, prefixTokens)
+		if err != nil {
+			return nil, false, nil, err
+		}
+		prefix, err := newROCmKVCache(cache.mode, cache.blockSize)
+		if err != nil {
+			return nil, false, nil, err
+		}
+		keyWidth, valueWidth, ok := cache.LastVectorWidths()
+		if !ok {
+			return nil, false, nil, core.E("rocm.WakeState", "KV snapshot vector shape is missing", nil)
+		}
+		if err := prefix.AppendVectors(0, keyWidth, valueWidth, keys, values); err != nil {
+			return nil, false, nil, err
+		}
+		cache = prefix
+	}
 	return cache, true, nil, nil
 }
 
-func wakeKVCacheBlockBundleFromChunk(ctx context.Context, store state.Store, chunk state.Chunk) (*rocmKVCache, bool, error) {
+func wakeKVCacheBlockBundleFromChunk(ctx context.Context, store state.Store, chunk state.Chunk, prefixTokens int) (*rocmKVCache, bool, error) {
 	var bundle rocmKVBlockBundleSnapshot
 	if err := json.Unmarshal(chunk.Data, &bundle); err != nil || bundle.Kind != rocmKVBlockBundleKind {
 		return nil, false, nil
+	}
+	targetTokens := bundle.TokenCount
+	if prefixTokens > 0 {
+		if prefixTokens > bundle.TokenCount {
+			return nil, true, core.E("rocm.WakeState", "KV block prefix exceeds bundle token count", nil)
+		}
+		targetTokens = prefixTokens
 	}
 	cache, err := newROCmKVCache(bundle.Mode, bundle.BlockSize)
 	if err != nil {
 		return nil, true, err
 	}
+	nextStart := 0
 	for _, blockRef := range bundle.Blocks {
+		if blockRef.TokenStart >= targetTokens {
+			break
+		}
 		blockData, release, err := borrowROCmKVBlockBundleRefBytes(ctx, store, blockRef)
 		if err != nil {
 			return nil, true, err
@@ -517,16 +849,31 @@ func wakeKVCacheBlockBundleFromChunk(ctx context.Context, store state.Store, chu
 		if block.tokenStart != blockRef.TokenStart || block.tokenCount != blockRef.TokenCount {
 			return nil, true, core.E("rocm.WakeState", "KV block token range mismatch", nil)
 		}
+		if block.tokenStart != nextStart {
+			return nil, true, core.E("rocm.WakeState", "KV block token range mismatch", nil)
+		}
 		if err := cache.validateVectorShape(block.keyWidth, block.valueWidth); err != nil {
 			return nil, true, err
 		}
-		cache.blocks, err = insertROCmKVCacheBlock(cache.blocks, block)
+		blockEnd := block.tokenStart + block.tokenCount
+		if blockEnd > targetTokens {
+			keys := block.key.decode()
+			values := block.value.decode()
+			keepTokens := targetTokens - block.tokenStart
+			err = cache.AppendVectors(block.tokenStart, block.keyWidth, block.valueWidth, keys[:keepTokens*block.keyWidth], values[:keepTokens*block.valueWidth])
+		} else {
+			cache.blocks, err = insertROCmKVCacheBlock(cache.blocks, block)
+			cache.setVectorShape(block.keyWidth, block.valueWidth)
+		}
 		if err != nil {
 			return nil, true, err
 		}
-		cache.setVectorShape(block.keyWidth, block.valueWidth)
+		nextStart = min(blockEnd, targetTokens)
+		if nextStart == targetTokens {
+			break
+		}
 	}
-	if bundle.TokenCount > 0 && cache.TokenCount() != bundle.TokenCount {
+	if cache.TokenCount() != targetTokens {
 		return nil, true, core.E("rocm.WakeState", "KV block bundle token count mismatch", nil)
 	}
 	cache.restoreMillis += float64(cache.TokenCount()) * rocmKVRestoreMillisUnit
@@ -701,22 +1048,7 @@ func (session *StateSession) sleepStatePayload(ctx context.Context, req inferenc
 		return ref, nil, rocmKVSnapshotEncoding, uint64(len(payload)), cache.TokenCount(), cache.PageCount(), nil
 	}
 
-	writer, ok := req.Store.(state.Writer)
-	if !ok || writer == nil {
-		return state.ChunkRef{}, nil, "", 0, 0, 0, core.E("rocm.SleepState", "state store is missing", nil)
-	}
-	labels["kv_serialize"] = "planned"
-	ref, err := writer.Put(ctx, "rocm state placeholder: native KV pages are not serialised yet", state.PutOptions{
-		URI:   entryURI,
-		Title: req.Title,
-		Kind:  "rocm-state",
-		Tags:  mergeStringMaps(req.Metadata, labels),
-	})
-	if err != nil {
-		return state.ChunkRef{}, nil, "", 0, 0, 0, core.E("rocm.SleepState", "write state ref", err)
-	}
-	tokens := firstPositiveInt(req.Model.ContextLength, session.model.ContextLength, blockSize)
-	return ref, nil, firstNonEmptyString(req.Encoding, state.CodecMemory), 0, tokens, blocksForTokens(tokens, blockSize), nil
+	return state.ChunkRef{}, nil, "", 0, 0, 0, core.E("rocm.SleepState", "KV runtime is required; refusing to write prompt placeholder state", nil)
 }
 
 func sleepKVCacheBlockBundle(ctx context.Context, req inference.AgentMemorySleepRequest, writer state.BinaryWriter, entryURI string, labels map[string]string, cache *rocmKVCache, serializeMode string) (state.ChunkRef, []inference.StateRef, string, uint64, int, int, error) {

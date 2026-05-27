@@ -556,6 +556,142 @@ func TestKVCache_Good_DeviceDescriptorAppendBuildsTableOnDevice(t *testing.T) {
 	core.AssertEqual(t, true, device.closed)
 }
 
+func TestKVCache_Good_DeviceDescriptorAppendReusesCapacityInPlace(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 1)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(0, 2, 2,
+		[]float32{1, 0},
+		[]float32{2, 0},
+	))
+	driver := &fakeHIPDriver{available: true}
+	device, err := cache.MirrorToDevice(driver)
+	core.RequireNoError(t, err)
+	defer device.Close()
+	payload, err := device.KernelDescriptorBytes()
+	core.RequireNoError(t, err)
+	pointer, allocationBytes, err := rocmDeviceKVDescriptorTableMalloc(driver, uint64(len(payload)))
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, hipCopyHostToDevice(driver, pointer, payload))
+	previousTable := rocmBorrowDeviceKVDescriptorTableAllocated(driver, pointer, uint64(len(payload)), allocationBytes, rocmDeviceKVDescriptorVersion, device.PageCount(), false, true)
+	keyInput, err := hipUploadByteBuffer(driver, "rocm.KVCache.Test", "key token", mustHIPFloat32Payload(t, []float32{-1, 1}), 2)
+	core.RequireNoError(t, err)
+	defer keyInput.Close()
+	valueInput, err := hipUploadByteBuffer(driver, "rocm.KVCache.Test", "value token", mustHIPFloat32Payload(t, []float32{3, -3}), 2)
+	core.RequireNoError(t, err)
+	defer valueInput.Close()
+	next, err := device.withAppendedDeviceTokenWindow(context.Background(), keyInput, valueInput, 4)
+	core.RequireNoError(t, err)
+	defer next.closePagesFrom(device.PageCount())
+	allocationCount := len(driver.allocations)
+
+	table, err := next.KernelDescriptorTableFromAppendedToken(context.Background(), device, previousTable)
+	core.RequireNoError(t, err)
+	defer table.Close()
+
+	core.AssertEqual(t, previousTable, table)
+	core.AssertEqual(t, allocationCount, len(driver.allocations))
+	core.AssertEqual(t, uint64(rocmDeviceKVDescriptorHeaderBytes+2*rocmDeviceKVDescriptorPageBytes), table.SizeBytes())
+	core.AssertEqual(t, allocationBytes, table.AllocationBytes())
+	got := make([]byte, table.SizeBytes())
+	core.RequireNoError(t, driver.CopyDeviceToHost(table.Pointer(), got))
+	want, err := next.KernelDescriptorBytes()
+	core.RequireNoError(t, err)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("in-place device-built descriptor = %v, want %v", got, want)
+	}
+}
+
+func TestKVCache_Good_DeviceDescriptorAppendReusesCapacityAcrossTrim(t *testing.T) {
+	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 1)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(0, 2, 2,
+		[]float32{1, 0, 0, 1},
+		[]float32{2, 0, 0, 2},
+	))
+	driver := &fakeHIPDriver{available: true}
+	device, err := cache.MirrorToDevice(driver)
+	core.RequireNoError(t, err)
+	defer device.Close()
+	payload, err := device.KernelDescriptorBytes()
+	core.RequireNoError(t, err)
+	pointer, allocationBytes, err := rocmDeviceKVDescriptorTableMalloc(driver, uint64(len(payload)))
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, hipCopyHostToDevice(driver, pointer, payload))
+	previousTable := rocmBorrowDeviceKVDescriptorTableAllocated(driver, pointer, uint64(len(payload)), allocationBytes, rocmDeviceKVDescriptorVersion, device.PageCount(), false, true)
+	keyInput, err := hipUploadByteBuffer(driver, "rocm.KVCache.Test", "key token", mustHIPFloat32Payload(t, []float32{-1, 1}), 2)
+	core.RequireNoError(t, err)
+	defer keyInput.Close()
+	valueInput, err := hipUploadByteBuffer(driver, "rocm.KVCache.Test", "value token", mustHIPFloat32Payload(t, []float32{3, -3}), 2)
+	core.RequireNoError(t, err)
+	defer valueInput.Close()
+	next, err := device.withAppendedDeviceTokenWindow(context.Background(), keyInput, valueInput, 2)
+	core.RequireNoError(t, err)
+	defer next.closePagesFrom(device.PageCount())
+	allocationCount := len(driver.allocations)
+
+	table, err := next.KernelDescriptorTableFromAppendedToken(context.Background(), device, previousTable)
+	core.RequireNoError(t, err)
+	defer table.Close()
+
+	core.AssertNotEqual(t, previousTable, table)
+	core.AssertEqual(t, allocationCount+1, len(driver.allocations))
+	core.AssertEqual(t, 2, table.pageCount)
+	got := make([]byte, table.SizeBytes())
+	core.RequireNoError(t, driver.CopyDeviceToHost(table.Pointer(), got))
+	want, err := next.KernelDescriptorBytes()
+	core.RequireNoError(t, err)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("in-place trimmed device-built descriptor = %v, want %v", got, want)
+	}
+}
+
+func TestKVCache_Good_DeviceFinalizeTransfersInPlaceDescriptorTable(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	sourcePages := []rocmDeviceKVPage{{
+		tokenStart: 0,
+		tokenCount: 1,
+		key:        rocmDeviceKVTensor{pointer: 0x1001, sizeBytes: 4, encoding: rocmKVEncodingQ8},
+		value:      rocmDeviceKVTensor{pointer: 0x1002, sizeBytes: 4, encoding: rocmKVEncodingQ4},
+		owned:      true,
+	}}
+	targetPages := []rocmDeviceKVPage{
+		sourcePages[0],
+		{
+			tokenStart: 1,
+			tokenCount: 1,
+			key:        rocmDeviceKVTensor{pointer: 0x2001, sizeBytes: 4, encoding: rocmKVEncodingQ8},
+			value:      rocmDeviceKVTensor{pointer: 0x2002, sizeBytes: 4, encoding: rocmKVEncodingQ4},
+			owned:      true,
+		},
+	}
+	targetPages[0].owned = false
+	table := rocmBorrowDeviceKVDescriptorTableAllocated(
+		driver,
+		0x5000,
+		uint64(rocmDeviceKVDescriptorHeaderBytes+2*rocmDeviceKVDescriptorPageBytes),
+		rocmDeviceKVDescriptorTableAllocationBytes(uint64(rocmDeviceKVDescriptorHeaderBytes+2*rocmDeviceKVDescriptorPageBytes)),
+		rocmDeviceKVDescriptorVersion,
+		2,
+		false,
+		true,
+	)
+	previous := &hipGemma4Q4DeviceDecodeState{layers: []hipGemma4Q4DeviceLayerKVState{{
+		cache:           rocmBorrowDeviceKVCache(driver, rocmKVCacheModeKQ8VQ4, 1, 1, sourcePages, false),
+		descriptorTable: table,
+	}}}
+	next := &hipGemma4Q4DeviceDecodeState{layers: []hipGemma4Q4DeviceLayerKVState{{
+		cache:           rocmBorrowDeviceKVCache(driver, rocmKVCacheModeKQ8VQ4, 1, 2, targetPages, false),
+		descriptorTable: table,
+	}}}
+
+	core.RequireNoError(t, hipFinalizeGemma4Q4ForwardDeviceState(previous, next))
+
+	core.AssertEqual(t, false, table.closed)
+	core.AssertEqual(t, table, next.layers[0].descriptorTable)
+	core.AssertEqual(t, true, next.layers[0].cache.pages[0].owned)
+	core.RequireNoError(t, next.Close())
+}
+
 func TestKVCache_Good_DeviceMirrorWindowAppendTrimsAndTransfersPages(t *testing.T) {
 	cache, err := newROCmKVCache(rocmKVCacheModeQ8, 1)
 	core.RequireNoError(t, err)
@@ -1059,6 +1195,87 @@ func BenchmarkROCmDeviceKVDescriptorPointerPool_HotWindow(b *testing.B) {
 		}
 		if err := rocmDeviceKVDescriptorTableFree(driver, pointer, allocationBytes); err != nil {
 			b.Fatalf("descriptor free: %v", err)
+		}
+	}
+}
+
+func BenchmarkROCmDeviceKVDescriptorAppendInPlace_HotWindow(b *testing.B) {
+	driver := &fakeHIPDriver{available: true, skipLaunchRecording: true, releaseLaunchPackets: true}
+	const (
+		keyWidth   = 128
+		valueWidth = 128
+	)
+	keyBytes, err := rocmKVTensorDeviceByteCount(rocmKVEncodingQ8, keyWidth)
+	if err != nil {
+		b.Fatalf("key bytes: %v", err)
+	}
+	valueBytes, err := rocmKVTensorDeviceByteCount(rocmKVEncodingQ4, valueWidth)
+	if err != nil {
+		b.Fatalf("value bytes: %v", err)
+	}
+	pages := rocmDeviceKVBorrowPageSlice(0, rocmDeviceKVHotPageCapacity-1)
+	for token := 0; token < rocmDeviceKVHotPageCapacity-1; token++ {
+		pages = append(pages, rocmDeviceKVPage{
+			tokenStart: token,
+			tokenCount: 1,
+			keyWidth:   keyWidth,
+			valueWidth: valueWidth,
+			key:        rocmDeviceKVTensor{pointer: nativeDevicePointer(0x100000 + token*0x1000), sizeBytes: keyBytes, encoding: rocmKVEncodingQ8},
+			value:      rocmDeviceKVTensor{pointer: nativeDevicePointer(0x200000 + token*0x1000), sizeBytes: valueBytes, encoding: rocmKVEncodingQ4},
+		})
+	}
+	previous := rocmBorrowDeviceKVCache(driver, rocmKVCacheModeKQ8VQ4, rocmGemma4Q4DeviceKVBlockSize, rocmDeviceKVHotPageCapacity-1, pages, false)
+	nextPages := rocmDeviceKVCopyPagesWithExtra(previous.pages, 1)
+	nextPages = append(nextPages, rocmDeviceKVPage{
+		tokenStart: rocmDeviceKVHotPageCapacity - 1,
+		tokenCount: 1,
+		keyWidth:   keyWidth,
+		valueWidth: valueWidth,
+		key:        rocmDeviceKVTensor{pointer: 0x300000, sizeBytes: keyBytes, encoding: rocmKVEncodingQ8},
+		value:      rocmDeviceKVTensor{pointer: 0x400000, sizeBytes: valueBytes, encoding: rocmKVEncodingQ4},
+		owned:      true,
+	})
+	next := rocmBorrowDeviceKVCache(driver, rocmKVCacheModeKQ8VQ4, rocmGemma4Q4DeviceKVBlockSize, rocmDeviceKVHotPageCapacity, nextPages, false)
+	payload, err := previous.KernelDescriptorBytes()
+	if err != nil {
+		b.Fatalf("descriptor bytes: %v", err)
+	}
+	pointer, allocationBytes, err := rocmDeviceKVDescriptorTableMalloc(driver, uint64(len(payload)))
+	if err != nil {
+		b.Fatalf("descriptor malloc: %v", err)
+	}
+	if err := hipCopyHostToDevice(driver, pointer, payload); err != nil {
+		b.Fatalf("copy descriptor: %v", err)
+	}
+	table := rocmBorrowDeviceKVDescriptorTableAllocated(driver, pointer, uint64(len(payload)), allocationBytes, rocmDeviceKVDescriptorVersion, previous.PageCount(), false, true)
+	b.Cleanup(func() {
+		_ = table.Close()
+		rocmDeviceKVReleasePageSlice(next.pages)
+		next.pages = nil
+		rocmReleaseDeviceKVCache(next)
+		rocmDeviceKVReleasePageSlice(previous.pages)
+		previous.pages = nil
+		rocmReleaseDeviceKVCache(previous)
+	})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		table.sizeBytes = uint64(len(payload))
+		table.pageCount = previous.PageCount()
+		target, offset, ok := driver.memoryForPointer(pointer, len(payload))
+		if !ok {
+			b.Fatalf("descriptor pointer is missing")
+		}
+		copy(target[offset:], payload)
+		out, err := next.KernelDescriptorTableFromAppendedToken(context.Background(), previous, table)
+		if err != nil {
+			b.Fatalf("append descriptor in place: %v", err)
+		}
+		if out != table {
+			b.Fatalf("descriptor table was not reused in place")
+		}
+		if table.pageCount != next.PageCount() || table.SizeBytes() != uint64(rocmDeviceKVDescriptorHeaderBytes+next.PageCount()*rocmDeviceKVDescriptorPageBytes) {
+			b.Fatalf("descriptor shape = pages:%d bytes:%d", table.pageCount, table.SizeBytes())
 		}
 	}
 }

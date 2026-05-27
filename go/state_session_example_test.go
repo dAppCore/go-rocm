@@ -14,7 +14,10 @@ import (
 
 func ExampleStateSession_WakeState() {
 	store := state.NewInMemoryStore(nil)
-	_, _ = store.Put(context.Background(), "hello state", state.PutOptions{URI: "state://entry"})
+	cache, _ := newROCmKVCache(rocmKVCacheModeQ8, 2)
+	_ = cache.AppendVectors(0, 1, 1, []float32{1, 2}, []float32{2, 1})
+	sleeping := newStateSessionWithRuntime(inference.ModelIdentity{}, inference.TokenizerIdentity{}, nil, cache)
+	_, _ = sleeping.SleepState(context.Background(), inference.AgentMemorySleepRequest{Store: store, EntryURI: "state://entry"})
 	session := NewStateSession(inference.ModelIdentity{}, inference.TokenizerIdentity{}, nil)
 
 	wake, _ := session.WakeState(context.Background(), inference.AgentMemoryWakeRequest{Store: store, EntryURI: "state://entry"})
@@ -24,19 +27,20 @@ func ExampleStateSession_WakeState() {
 
 func ExampleStateSession_SleepState() {
 	store := state.NewInMemoryStore(nil)
-	session := NewStateSession(inference.ModelIdentity{ContextLength: 128}, inference.TokenizerIdentity{}, nil)
+	cache, _ := newROCmKVCache(rocmKVCacheModeQ8, 2)
+	_ = cache.AppendVectors(0, 1, 1, []float32{1, 2}, []float32{2, 1})
+	session := newStateSessionWithRuntime(inference.ModelIdentity{ContextLength: 128}, inference.TokenizerIdentity{}, nil, cache)
 
 	sleep, _ := session.SleepState(context.Background(), inference.AgentMemorySleepRequest{
 		Store:    store,
 		EntryURI: "state://entry/sleep",
 		Title:    "sleep",
-		Encoding: state.CodecMemory,
 	})
 	core.Println(sleep.Entry.URI)
 	core.Println(sleep.Labels["kv_serialize"])
 	// Output:
 	// state://entry/sleep
-	// planned
+	// runtime_owned_blocks
 }
 
 func ExampleStateSession_SleepState_kvSnapshot() {
@@ -48,6 +52,7 @@ func ExampleStateSession_SleepState_kvSnapshot() {
 	sleep, _ := session.SleepState(context.Background(), inference.AgentMemorySleepRequest{
 		Store:    store,
 		EntryURI: "state://entry/kv",
+		Encoding: rocmKVSnapshotEncoding,
 	})
 	core.Println(sleep.Encoding)
 	core.Println(sleep.Labels["kv_serialize"])
@@ -73,7 +78,10 @@ func ExampleStateSession_Close() {
 
 func ExampleStateSession_ForkState() {
 	store := state.NewInMemoryStore(nil)
-	_, _ = store.Put(context.Background(), "one two", state.PutOptions{URI: "state://entry"})
+	cache, _ := newROCmKVCache(rocmKVCacheModeQ8, 2)
+	_ = cache.AppendVectors(0, 1, 1, []float32{1, 2}, []float32{2, 1})
+	sleeping := newStateSessionWithRuntime(inference.ModelIdentity{}, inference.TokenizerIdentity{}, nil, cache)
+	_, _ = sleeping.SleepState(context.Background(), inference.AgentMemorySleepRequest{Store: store, EntryURI: "state://entry"})
 	session := NewStateSession(inference.ModelIdentity{}, inference.TokenizerIdentity{}, nil)
 
 	forked, wake, _ := session.ForkState(context.Background(), inference.AgentMemoryWakeRequest{Store: store, EntryURI: "state://entry"})
