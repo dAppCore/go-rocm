@@ -39,10 +39,27 @@ type inferenceBenchmarkHIPKernelEntry struct {
 	stats inferenceBenchmarkHIPKernelStats
 }
 
+type inferenceBenchmarkHIPKernelShapeKey struct {
+	name           string
+	gridX          uint32
+	gridY          uint32
+	gridZ          uint32
+	blockX         uint32
+	blockY         uint32
+	blockZ         uint32
+	sharedMemBytes uint32
+}
+
+type inferenceBenchmarkHIPKernelShapeEntry struct {
+	inferenceBenchmarkHIPKernelShapeKey
+	stats inferenceBenchmarkHIPKernelStats
+}
+
 type inferenceBenchmarkHIPKernelCountingDriver struct {
 	nativeHIPDriver
 	mu     sync.Mutex
 	kernel map[string]inferenceBenchmarkHIPKernelStats
+	shape  map[inferenceBenchmarkHIPKernelShapeKey]inferenceBenchmarkHIPKernelStats
 	total  inferenceBenchmarkHIPKernelStats
 }
 
@@ -50,6 +67,7 @@ func newInferenceBenchmarkHIPKernelCountingDriver(driver nativeHIPDriver) *infer
 	return &inferenceBenchmarkHIPKernelCountingDriver{
 		nativeHIPDriver: driver,
 		kernel:          make(map[string]inferenceBenchmarkHIPKernelStats),
+		shape:           make(map[inferenceBenchmarkHIPKernelShapeKey]inferenceBenchmarkHIPKernelStats),
 	}
 }
 
@@ -83,6 +101,20 @@ func (driver *inferenceBenchmarkHIPKernelCountingDriver) LaunchKernel(config hip
 	stats.Launches++
 	stats.Blocks += blocks
 	driver.kernel[config.Name] = stats
+	shapeKey := inferenceBenchmarkHIPKernelShapeKey{
+		name:           config.Name,
+		gridX:          config.GridX,
+		gridY:          config.GridY,
+		gridZ:          config.GridZ,
+		blockX:         config.BlockX,
+		blockY:         config.BlockY,
+		blockZ:         config.BlockZ,
+		sharedMemBytes: config.SharedMemBytes,
+	}
+	shapeStats := driver.shape[shapeKey]
+	shapeStats.Launches++
+	shapeStats.Blocks += blocks
+	driver.shape[shapeKey] = shapeStats
 	driver.total.Launches++
 	driver.total.Blocks += blocks
 	driver.mu.Unlock()
@@ -92,6 +124,7 @@ func (driver *inferenceBenchmarkHIPKernelCountingDriver) LaunchKernel(config hip
 func (driver *inferenceBenchmarkHIPKernelCountingDriver) ResetKernelStats() {
 	driver.mu.Lock()
 	clear(driver.kernel)
+	clear(driver.shape)
 	driver.total = inferenceBenchmarkHIPKernelStats{}
 	driver.mu.Unlock()
 }
@@ -108,6 +141,19 @@ func (driver *inferenceBenchmarkHIPKernelCountingDriver) KernelStatsSnapshot() m
 	snapshot := make(map[string]inferenceBenchmarkHIPKernelStats, len(driver.kernel))
 	for name, stats := range driver.kernel {
 		snapshot[name] = stats
+	}
+	return snapshot
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) KernelShapeStatsSnapshot() []inferenceBenchmarkHIPKernelShapeEntry {
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	snapshot := make([]inferenceBenchmarkHIPKernelShapeEntry, 0, len(driver.shape))
+	for key, stats := range driver.shape {
+		snapshot = append(snapshot, inferenceBenchmarkHIPKernelShapeEntry{
+			inferenceBenchmarkHIPKernelShapeKey: key,
+			stats:                               stats,
+		})
 	}
 	return snapshot
 }
@@ -143,6 +189,8 @@ func inferenceBenchmarkReportHIPKernelRouteMetrics(b *testing.B, driver *inferen
 	report(hipKernelNameMLXQ4GELUTanhProj, "kernel_mlx_q4_gelu_tanh_projection")
 	inferenceBenchmarkReportTopHIPKernels(b, driver, 12)
 	inferenceBenchmarkReportTopHIPKernelBlocks(b, driver, 12)
+	inferenceBenchmarkReportTopHIPKernelShapes(b, driver, 8, inferenceBenchmarkHIPKernelSortByLaunches)
+	inferenceBenchmarkReportTopHIPKernelShapes(b, driver, 8, inferenceBenchmarkHIPKernelSortByBlocks)
 }
 
 func inferenceBenchmarkReportHIPKernelGeneratedTokenMetrics(b *testing.B, driver *inferenceBenchmarkHIPKernelCountingDriver, generatedTokens int) {
@@ -175,6 +223,20 @@ func inferenceBenchmarkReportTopHIPKernelBlocks(b *testing.B, driver *inferenceB
 	entries := inferenceBenchmarkTopHIPKernelEntries(driver, limit, inferenceBenchmarkHIPKernelSortByBlocks)
 	for _, entry := range entries {
 		label := "kernel_by_blocks_" + inferenceBenchmarkSanitizeMetricName(entry.name)
+		b.ReportMetric(float64(entry.stats.Launches)/float64(b.N), label+"_launches/op")
+		b.ReportMetric(float64(entry.stats.Blocks)/float64(b.N), label+"_blocks/op")
+	}
+}
+
+func inferenceBenchmarkReportTopHIPKernelShapes(b *testing.B, driver *inferenceBenchmarkHIPKernelCountingDriver, limit int, sortMode inferenceBenchmarkHIPKernelSortMode) {
+	b.Helper()
+	entries := inferenceBenchmarkTopHIPKernelShapeEntries(driver, limit, sortMode)
+	prefix := "kernel_shape"
+	if sortMode == inferenceBenchmarkHIPKernelSortByBlocks {
+		prefix = "kernel_shape_by_blocks"
+	}
+	for _, entry := range entries {
+		label := prefix + "_" + inferenceBenchmarkSanitizeMetricName(inferenceBenchmarkHIPKernelShapeLabel(entry))
 		b.ReportMetric(float64(entry.stats.Launches)/float64(b.N), label+"_launches/op")
 		b.ReportMetric(float64(entry.stats.Blocks)/float64(b.N), label+"_blocks/op")
 	}
@@ -215,6 +277,63 @@ func inferenceBenchmarkTopHIPKernelEntries(driver *inferenceBenchmarkHIPKernelCo
 		entries = entries[:limit]
 	}
 	return entries
+}
+
+func inferenceBenchmarkTopHIPKernelShapeEntries(driver *inferenceBenchmarkHIPKernelCountingDriver, limit int, sortMode inferenceBenchmarkHIPKernelSortMode) []inferenceBenchmarkHIPKernelShapeEntry {
+	if driver == nil || limit <= 0 {
+		return nil
+	}
+	entries := driver.KernelShapeStatsSnapshot()
+	entries = slicesDeleteFunc(entries, func(entry inferenceBenchmarkHIPKernelShapeEntry) bool {
+		return entry.stats.Launches == 0 && entry.stats.Blocks == 0
+	})
+	sort.Slice(entries, func(i, j int) bool {
+		switch sortMode {
+		case inferenceBenchmarkHIPKernelSortByBlocks:
+			if entries[i].stats.Blocks != entries[j].stats.Blocks {
+				return entries[i].stats.Blocks > entries[j].stats.Blocks
+			}
+			if entries[i].stats.Launches != entries[j].stats.Launches {
+				return entries[i].stats.Launches > entries[j].stats.Launches
+			}
+		default:
+			if entries[i].stats.Launches != entries[j].stats.Launches {
+				return entries[i].stats.Launches > entries[j].stats.Launches
+			}
+			if entries[i].stats.Blocks != entries[j].stats.Blocks {
+				return entries[i].stats.Blocks > entries[j].stats.Blocks
+			}
+		}
+		return inferenceBenchmarkHIPKernelShapeLabel(entries[i]) < inferenceBenchmarkHIPKernelShapeLabel(entries[j])
+	})
+	if len(entries) > limit {
+		entries = entries[:limit]
+	}
+	return entries
+}
+
+func slicesDeleteFunc[S ~[]E, E any](s S, del func(E) bool) S {
+	i := 0
+	for _, v := range s {
+		if !del(v) {
+			s[i] = v
+			i++
+		}
+	}
+	var zero E
+	for j := i; j < len(s); j++ {
+		s[j] = zero
+	}
+	return s[:i]
+}
+
+func inferenceBenchmarkHIPKernelShapeLabel(entry inferenceBenchmarkHIPKernelShapeEntry) string {
+	return fmt.Sprintf("%s_g%d_%d_%d_b%d_%d_%d_sm%d",
+		entry.name,
+		entry.gridX, entry.gridY, entry.gridZ,
+		entry.blockX, entry.blockY, entry.blockZ,
+		entry.sharedMemBytes,
+	)
 }
 
 func inferenceBenchmarkSanitizeMetricName(name string) string {
@@ -305,6 +424,20 @@ func TestInferenceBenchmarkHIPKernelCountingDriver_Good(t *testing.T) {
 	if got := driver.KernelStats(hipKernelNameAttentionHeadsBatchChunkedStage1); got != stats {
 		t.Fatalf("mutated snapshot changed driver stats = %+v, want %+v", got, stats)
 	}
+	shapeSnapshot := driver.KernelShapeStatsSnapshot()
+	if len(shapeSnapshot) != 1 {
+		t.Fatalf("shape snapshot len = %d, want 1", len(shapeSnapshot))
+	}
+	if shapeSnapshot[0].name != hipKernelNameAttentionHeadsBatchChunkedStage1 ||
+		shapeSnapshot[0].gridX != 2 ||
+		shapeSnapshot[0].gridY != 3 ||
+		shapeSnapshot[0].gridZ != 4 ||
+		shapeSnapshot[0].blockX != 1 ||
+		shapeSnapshot[0].blockY != 1 ||
+		shapeSnapshot[0].blockZ != 1 ||
+		shapeSnapshot[0].stats != stats {
+		t.Fatalf("shape snapshot = %+v, want launch shape with stats %+v", shapeSnapshot[0], stats)
+	}
 	if got := inferenceBenchmarkSanitizeMetricName("rocm/foo-bar"); got != "rocm_foo_bar" {
 		t.Fatalf("sanitize metric name = %q, want rocm_foo_bar", got)
 	}
@@ -316,8 +449,10 @@ func TestInferenceBenchmarkHIPKernelCountingDriver_Good(t *testing.T) {
 	inferenceBenchmarkWriteHIPKernelRouteMetrics(&builder, driver, 1, 2)
 	if got := builder.String(); !strings.Contains(got, "HIP Kernel Route Metrics") ||
 		!strings.Contains(got, "Selected Hot Kernels") ||
+		!strings.Contains(got, "Top Shapes By Launches") ||
 		!strings.Contains(got, hipKernelNameMLXQ4PairProj) ||
 		!strings.Contains(got, hipKernelNameAttentionHeadsBatchChunkedStage1) ||
+		!strings.Contains(got, "2x3x4") ||
 		!strings.Contains(got, "launches/generated_token") {
 		t.Fatalf("kernel output summary = %q, want route metrics with kernel name", got)
 	}
@@ -1497,6 +1632,8 @@ func inferenceBenchmarkWriteHIPKernelRouteMetrics(builder *strings.Builder, driv
 	inferenceBenchmarkWriteHIPKernelRouteTable(builder, "Selected Hot Kernels", inferenceBenchmarkSelectedHIPKernelEntries(driver), generatedTokens)
 	inferenceBenchmarkWriteHIPKernelRouteTable(builder, "Top By Launches", inferenceBenchmarkTopHIPKernelEntries(driver, limit, inferenceBenchmarkHIPKernelSortByLaunches), generatedTokens)
 	inferenceBenchmarkWriteHIPKernelRouteTable(builder, "Top By Blocks", inferenceBenchmarkTopHIPKernelEntries(driver, limit, inferenceBenchmarkHIPKernelSortByBlocks), generatedTokens)
+	inferenceBenchmarkWriteHIPKernelShapeRouteTable(builder, "Top Shapes By Launches", inferenceBenchmarkTopHIPKernelShapeEntries(driver, limit, inferenceBenchmarkHIPKernelSortByLaunches), generatedTokens)
+	inferenceBenchmarkWriteHIPKernelShapeRouteTable(builder, "Top Shapes By Blocks", inferenceBenchmarkTopHIPKernelShapeEntries(driver, limit, inferenceBenchmarkHIPKernelSortByBlocks), generatedTokens)
 }
 
 func inferenceBenchmarkSelectedHIPKernelEntries(driver *inferenceBenchmarkHIPKernelCountingDriver) []inferenceBenchmarkHIPKernelEntry {
@@ -1555,6 +1692,50 @@ func inferenceBenchmarkWriteHIPKernelRouteTable(builder *strings.Builder, title 
 		builder.WriteString(" |\n")
 	}
 	builder.WriteString("\n")
+}
+
+func inferenceBenchmarkWriteHIPKernelShapeRouteTable(builder *strings.Builder, title string, entries []inferenceBenchmarkHIPKernelShapeEntry, generatedTokens int) {
+	if len(entries) == 0 {
+		return
+	}
+	builder.WriteString("### ")
+	builder.WriteString(title)
+	builder.WriteString("\n\n")
+	if generatedTokens > 0 {
+		builder.WriteString("| kernel | grid | block | shared_mem_bytes | launches | blocks | launches/generated_token | blocks/generated_token |\n")
+		builder.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|\n")
+	} else {
+		builder.WriteString("| kernel | grid | block | shared_mem_bytes | launches | blocks |\n")
+		builder.WriteString("|---|---:|---:|---:|---:|---:|\n")
+	}
+	for _, entry := range entries {
+		builder.WriteString("| `")
+		builder.WriteString(entry.name)
+		builder.WriteString("` | ")
+		builder.WriteString(inferenceBenchmarkFormatHIPKernelDims(entry.gridX, entry.gridY, entry.gridZ))
+		builder.WriteString(" | ")
+		builder.WriteString(inferenceBenchmarkFormatHIPKernelDims(entry.blockX, entry.blockY, entry.blockZ))
+		builder.WriteString(" | ")
+		builder.WriteString(strconv.FormatUint(uint64(entry.sharedMemBytes), 10))
+		builder.WriteString(" | ")
+		builder.WriteString(strconv.FormatUint(entry.stats.Launches, 10))
+		builder.WriteString(" | ")
+		builder.WriteString(strconv.FormatUint(entry.stats.Blocks, 10))
+		if generatedTokens > 0 {
+			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatFloat(float64(entry.stats.Launches)/float64(generatedTokens), 'f', 2, 64))
+			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatFloat(float64(entry.stats.Blocks)/float64(generatedTokens), 'f', 2, 64))
+		}
+		builder.WriteString(" |\n")
+	}
+	builder.WriteString("\n")
+}
+
+func inferenceBenchmarkFormatHIPKernelDims(x, y, z uint32) string {
+	return strconv.FormatUint(uint64(x), 10) + "x" +
+		strconv.FormatUint(uint64(y), 10) + "x" +
+		strconv.FormatUint(uint64(z), 10)
 }
 
 func inferenceBenchmarkReportBookRun(b *testing.B, run inferenceBenchmarkBookRun, contextLen, maxTokens int, turnTimeout time.Duration, mode string) {
