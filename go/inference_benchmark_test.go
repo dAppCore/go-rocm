@@ -48,6 +48,10 @@ type inferenceBenchmarkHIPKernelShapeKey struct {
 	blockY         uint32
 	blockZ         uint32
 	sharedMemBytes uint32
+	tensorRows     uint32
+	tensorCols     uint32
+	tensorGroup    uint32
+	tensorBatch    uint32
 }
 
 type inferenceBenchmarkHIPKernelShapeEntry struct {
@@ -86,9 +90,6 @@ func (driver *inferenceBenchmarkHIPKernelCountingDriver) MemsetAsync(pointer nat
 }
 
 func (driver *inferenceBenchmarkHIPKernelCountingDriver) LaunchKernel(config hipKernelLaunchConfig) error {
-	if err := hipLaunchKernel(driver.nativeHIPDriver, config); err != nil {
-		return err
-	}
 	blocks := uint64(config.GridX)
 	if config.GridY > 0 {
 		blocks *= uint64(config.GridY)
@@ -96,11 +97,6 @@ func (driver *inferenceBenchmarkHIPKernelCountingDriver) LaunchKernel(config hip
 	if config.GridZ > 0 {
 		blocks *= uint64(config.GridZ)
 	}
-	driver.mu.Lock()
-	stats := driver.kernel[config.Name]
-	stats.Launches++
-	stats.Blocks += blocks
-	driver.kernel[config.Name] = stats
 	shapeKey := inferenceBenchmarkHIPKernelShapeKey{
 		name:           config.Name,
 		gridX:          config.GridX,
@@ -111,6 +107,15 @@ func (driver *inferenceBenchmarkHIPKernelCountingDriver) LaunchKernel(config hip
 		blockZ:         config.BlockZ,
 		sharedMemBytes: config.SharedMemBytes,
 	}
+	shapeKey.tensorRows, shapeKey.tensorCols, shapeKey.tensorGroup, shapeKey.tensorBatch = inferenceBenchmarkHIPKernelTensorShape(config)
+	if err := hipLaunchKernel(driver.nativeHIPDriver, config); err != nil {
+		return err
+	}
+	driver.mu.Lock()
+	stats := driver.kernel[config.Name]
+	stats.Launches++
+	stats.Blocks += blocks
+	driver.kernel[config.Name] = stats
 	shapeStats := driver.shape[shapeKey]
 	shapeStats.Launches++
 	shapeStats.Blocks += blocks
@@ -328,12 +333,56 @@ func slicesDeleteFunc[S ~[]E, E any](s S, del func(E) bool) S {
 }
 
 func inferenceBenchmarkHIPKernelShapeLabel(entry inferenceBenchmarkHIPKernelShapeEntry) string {
+	if entry.tensorRows > 0 || entry.tensorCols > 0 || entry.tensorGroup > 0 || entry.tensorBatch > 0 {
+		return fmt.Sprintf("%s_g%d_%d_%d_b%d_%d_%d_sm%d_r%d_c%d_qg%d_bt%d",
+			entry.name,
+			entry.gridX, entry.gridY, entry.gridZ,
+			entry.blockX, entry.blockY, entry.blockZ,
+			entry.sharedMemBytes,
+			entry.tensorRows, entry.tensorCols, entry.tensorGroup, entry.tensorBatch,
+		)
+	}
 	return fmt.Sprintf("%s_g%d_%d_%d_b%d_%d_%d_sm%d",
 		entry.name,
 		entry.gridX, entry.gridY, entry.gridZ,
 		entry.blockX, entry.blockY, entry.blockZ,
 		entry.sharedMemBytes,
 	)
+}
+
+func inferenceBenchmarkHIPKernelTensorShape(config hipKernelLaunchConfig) (rows, cols, group, batch uint32) {
+	args := config.Args
+	switch config.Name {
+	case hipKernelNameMLXQ4Proj, hipKernelNameMLXQ4ProjGreedy, hipKernelNameMLXQ4ProjScores:
+		return inferenceBenchmarkU32At(args, 48), inferenceBenchmarkU32At(args, 52), inferenceBenchmarkU32At(args, 56), 0
+	case hipKernelNameMLXQ4ProjBatch:
+		return inferenceBenchmarkU32At(args, 48), inferenceBenchmarkU32At(args, 52), inferenceBenchmarkU32At(args, 60), inferenceBenchmarkU32At(args, 56)
+	case hipKernelNameMLXQ4TripleProj, hipKernelNameMLXQ4PairProj:
+		firstRows := inferenceBenchmarkU32At(args, 96)
+		secondRows := inferenceBenchmarkU32At(args, 100)
+		thirdRows := inferenceBenchmarkU32At(args, 104)
+		return firstRows + secondRows + thirdRows, inferenceBenchmarkU32At(args, 108), inferenceBenchmarkU32At(args, 112), 0
+	case hipKernelNameMLXQ4GELUTanhMul:
+		return inferenceBenchmarkU32At(args, 72), inferenceBenchmarkU32At(args, 76), inferenceBenchmarkU32At(args, 80), 0
+	case hipKernelNameMLXQ4GELUTanhMulBatch:
+		return inferenceBenchmarkU32At(args, 72), inferenceBenchmarkU32At(args, 76), inferenceBenchmarkU32At(args, 80), inferenceBenchmarkU32At(args, 120)
+	case hipKernelNameMLXQ4GELUTanhProj:
+		return inferenceBenchmarkU32At(args, 56), inferenceBenchmarkU32At(args, 60), inferenceBenchmarkU32At(args, 64), 0
+	case hipKernelNameMLXQ4GELUTanhProjBatch:
+		return inferenceBenchmarkU32At(args, 56), inferenceBenchmarkU32At(args, 60), inferenceBenchmarkU32At(args, 68), inferenceBenchmarkU32At(args, 64)
+	default:
+		return 0, 0, 0, 0
+	}
+}
+
+func inferenceBenchmarkU32At(data []byte, offset int) uint32 {
+	if offset < 0 || len(data) < offset+4 {
+		return 0
+	}
+	return uint32(data[offset]) |
+		uint32(data[offset+1])<<8 |
+		uint32(data[offset+2])<<16 |
+		uint32(data[offset+3])<<24
 }
 
 func inferenceBenchmarkSanitizeMetricName(name string) string {
@@ -455,6 +504,46 @@ func TestInferenceBenchmarkHIPKernelCountingDriver_Good(t *testing.T) {
 		!strings.Contains(got, "2x3x4") ||
 		!strings.Contains(got, "launches/generated_token") {
 		t.Fatalf("kernel output summary = %q, want route metrics with kernel name", got)
+	}
+	q4Args, err := (hipMLXQ4ProjectionLaunchArgs{
+		InputPointer:  1,
+		WeightPointer: 2,
+		ScalePointer:  3,
+		BiasPointer:   4,
+		OutputPointer: 5,
+		Rows:          1536,
+		Cols:          256,
+		GroupSize:     64,
+		Bits:          hipMLXQ4ProjectionBits,
+		InputBytes:    256 * 4,
+		WeightBytes:   1536 * (256 / 8) * 4,
+		ScaleBytes:    1536 * (256 / 64) * 2,
+		BiasBytes:     1536 * (256 / 64) * 2,
+		OutputBytes:   1536 * 4,
+	}).Binary()
+	if err != nil {
+		t.Fatalf("q4 projection args: %v", err)
+	}
+	err = driver.LaunchKernel(hipKernelLaunchConfig{
+		Name:   hipKernelNameMLXQ4Proj,
+		Args:   q4Args,
+		GridX:  192,
+		GridY:  1,
+		GridZ:  1,
+		BlockX: hipMLXQ4ProjectionBlockSize,
+		BlockY: 1,
+		BlockZ: 1,
+	})
+	if err != nil {
+		t.Fatalf("LaunchKernel q4 projection: %v", err)
+	}
+	shapeEntries := inferenceBenchmarkTopHIPKernelShapeEntries(driver, 1, inferenceBenchmarkHIPKernelSortByBlocks)
+	if len(shapeEntries) != 1 ||
+		shapeEntries[0].name != hipKernelNameMLXQ4Proj ||
+		shapeEntries[0].tensorRows != 1536 ||
+		shapeEntries[0].tensorCols != 256 ||
+		shapeEntries[0].tensorGroup != 64 {
+		t.Fatalf("top q4 shape = %+v, want q4 1536x256 qg64", shapeEntries)
 	}
 	driver.ResetKernelStats()
 	if got := driver.TotalKernelStats(); got != (inferenceBenchmarkHIPKernelStats{}) {
@@ -1702,11 +1791,11 @@ func inferenceBenchmarkWriteHIPKernelShapeRouteTable(builder *strings.Builder, t
 	builder.WriteString(title)
 	builder.WriteString("\n\n")
 	if generatedTokens > 0 {
-		builder.WriteString("| kernel | grid | block | shared_mem_bytes | launches | blocks | launches/generated_token | blocks/generated_token |\n")
-		builder.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|\n")
+		builder.WriteString("| kernel | grid | block | shared_mem_bytes | tensor | launches | blocks | launches/generated_token | blocks/generated_token |\n")
+		builder.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	} else {
-		builder.WriteString("| kernel | grid | block | shared_mem_bytes | launches | blocks |\n")
-		builder.WriteString("|---|---:|---:|---:|---:|---:|\n")
+		builder.WriteString("| kernel | grid | block | shared_mem_bytes | tensor | launches | blocks |\n")
+		builder.WriteString("|---|---:|---:|---:|---:|---:|---:|\n")
 	}
 	for _, entry := range entries {
 		builder.WriteString("| `")
@@ -1717,6 +1806,8 @@ func inferenceBenchmarkWriteHIPKernelShapeRouteTable(builder *strings.Builder, t
 		builder.WriteString(inferenceBenchmarkFormatHIPKernelDims(entry.blockX, entry.blockY, entry.blockZ))
 		builder.WriteString(" | ")
 		builder.WriteString(strconv.FormatUint(uint64(entry.sharedMemBytes), 10))
+		builder.WriteString(" | ")
+		builder.WriteString(inferenceBenchmarkFormatHIPKernelTensorShape(entry))
 		builder.WriteString(" | ")
 		builder.WriteString(strconv.FormatUint(entry.stats.Launches, 10))
 		builder.WriteString(" | ")
@@ -1736,6 +1827,21 @@ func inferenceBenchmarkFormatHIPKernelDims(x, y, z uint32) string {
 	return strconv.FormatUint(uint64(x), 10) + "x" +
 		strconv.FormatUint(uint64(y), 10) + "x" +
 		strconv.FormatUint(uint64(z), 10)
+}
+
+func inferenceBenchmarkFormatHIPKernelTensorShape(entry inferenceBenchmarkHIPKernelShapeEntry) string {
+	if entry.tensorRows == 0 && entry.tensorCols == 0 && entry.tensorGroup == 0 && entry.tensorBatch == 0 {
+		return "-"
+	}
+	if entry.tensorBatch > 0 {
+		return strconv.FormatUint(uint64(entry.tensorRows), 10) + "x" +
+			strconv.FormatUint(uint64(entry.tensorCols), 10) +
+			" qg" + strconv.FormatUint(uint64(entry.tensorGroup), 10) +
+			" batch" + strconv.FormatUint(uint64(entry.tensorBatch), 10)
+	}
+	return strconv.FormatUint(uint64(entry.tensorRows), 10) + "x" +
+		strconv.FormatUint(uint64(entry.tensorCols), 10) +
+		" qg" + strconv.FormatUint(uint64(entry.tensorGroup), 10)
 }
 
 func inferenceBenchmarkReportBookRun(b *testing.B, run inferenceBenchmarkBookRun, contextLen, maxTokens int, turnTimeout time.Duration, mode string) {

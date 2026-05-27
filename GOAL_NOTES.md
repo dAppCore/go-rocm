@@ -17077,10 +17077,13 @@ PASS
 ## 2026-05-27 Accepted Shape-Aware Kernel Route Metrics
 
 Added benchmark-only route metrics keyed by HIP kernel launch shape
-(`kernel + grid + block + shared_mem_bytes`) so long-context tuning can see
-which projection/attention geometry is actually carrying blocks and launches.
-The counter uses a comparable struct key in the hot launch wrapper; an initial
-string-key version was discarded because it inflated benchmark allocations.
+(`kernel + grid + block + shared_mem_bytes`) and, for q4 projection-family
+kernels, semantic tensor shape (`rows + cols + q4 group + batch`). This lets
+long-context tuning see which projection/attention geometry is actually
+carrying blocks and launches. The counter uses a comparable struct key in the
+hot launch wrapper; an initial string-key version was discarded because it
+inflated benchmark allocations. The q4 packet dimensions must be parsed before
+the cgo launch because the native driver releases and clears launch packets.
 
 Accepted 2048-token route check on the RX 7800 XT:
 
@@ -17089,29 +17092,33 @@ ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85
 GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100-global-kv-blocks.hsaco
 GO_ROCM_BENCH_KERNEL_ROUTE_METRICS=1
 GO_ROCM_BENCH_TOKENS=2048
-BenchmarkInferenceGemma4Q4Generate-32 1 19103932495 ns/op
+BenchmarkInferenceGemma4Q4Generate-32 1 19109942958 ns/op
 tok/s=107.2
 tokens=2048
-B/op=5450008
-allocs/op=4687
+B/op=5455960
+allocs/op=4685
 kernel_total_launches/op=999352
 kernel_total_blocks/op=175800259
-stderr: .bench-errors/2048_shape_routes_struct_key_20260527.err (0 bytes)
+stderr: .bench-errors/2048_tensor_shape_routes_prelaunch_20260527.err (0 bytes)
 ```
 
 Top shape findings:
 
-- `rocm_mlx_q4_gelu_tanh_multiply g1536x1x1 b256`: `62,883,840 blocks/op`,
-  `40,940 launches/op`.
-- `rocm_mlx_q4_projection g192x1x1 b256`: `41,267,520 blocks/op`,
-  `214,935 launches/op`.
-- `rocm_mlx_q4_gelu_tanh_multiply g768x1x1 b256`: `23,581,440 blocks/op`,
-  `30,705 launches/op`.
-- `rocm_mlx_q4_projection_greedy g8192x1x1 b256`: `16,801,792 blocks/op`,
-  `2,051 launches/op`.
-- `rocm_mlx_q4_triple_projection g320x1x1 b256`: `7,860,480 blocks/op`,
-  `24,564 launches/op`.
+- `rocm_mlx_q4_gelu_tanh_multiply rows=12288 cols=1536 qg64`:
+  `62,883,840 blocks/op`, `40,940 launches/op`.
+- `rocm_mlx_q4_gelu_tanh_multiply rows=6144 cols=1536 qg64`:
+  `23,581,440 blocks/op`, `30,705 launches/op`.
+- `rocm_mlx_q4_projection rows=1536 cols=256 qg64`:
+  `13,755,840 blocks/op`, `71,645 launches/op` (per-layer input projection).
+- `rocm_mlx_q4_projection rows=1536 cols=2048 qg64`:
+  `11,004,672 blocks/op`, `57,316 launches/op` (sliding attention output).
+- `rocm_mlx_q4_projection rows=1536 cols=12288 qg64`:
+  `7,860,480 blocks/op`, `40,940 launches/op` (double-wide MLP down).
+- `rocm_mlx_q4_projection_greedy rows=262144 cols=1536 qg64`:
+  `16,801,792 blocks/op`, `2,051 launches/op`.
 
-This confirms the next optimization target should be the large MLP q4
-GELU/multiply and q4 projection shapes, not the already-rejected small-column
-projection route.
+This splits the old `g192` bucket into concrete projection families. The next
+optimization target should treat PLE projection, sliding attention output, and
+MLP down projection separately; the already-rejected generic small-column
+projection route should not be revived without a more specific design and a
+retained-book proof.
