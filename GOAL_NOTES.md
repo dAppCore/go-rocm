@@ -1,5 +1,85 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Gemma4 SWA Batch Attention Window Bound
+
+- Pulled `external/go-inference` from `e05c165` to `10c951b` on `dev`:
+  `perf(state): bound filestore open preallocation`,
+  `perf(discover): cache Core handle via sync.Once`, and
+  `perf(gguf): bufio.Reader for ReadGGUFInfo`.
+- The Gemma4 q4 batched prefill path now passes `cfg.SlidingWindow` through
+  the batch-causal and batch-chunked HIP launch packets. Local SWA layers use
+  the lower causal bound `[visible_tokens-window_size, visible_tokens)`, while
+  full/global layers keep window `0` and preserve the prior full-prefix path.
+- The batch-causal kernel only switches to the ranged attention helper when
+  the window actually trims old tokens. This keeps the old no-trim math route
+  for short prefixes and global layers. The batch-chunked stage-1 kernel now
+  skips chunks fully outside the SWA window and offsets in-window chunks without
+  materializing or replaying trimmed tokens.
+- Added fake-driver coverage for a 5-token/2-query `window_size=2` causal
+  batch, plus launch-packet offset checks for both batch-causal and
+  batch-chunked packets. The packet ABI sizes stay unchanged by using reserved
+  space.
+- Verification:
+
+```text
+go test ./go -run 'TestHIPKernels_AttentionHeadsBatchCausalWindow_Good|TestHIPKernels_AttentionHeadsBatchCausalLaunchArgs_Good|TestHIPKernels_AttentionHeadsBatchChunkedLaunchArgs_Good|TestHIPKernelSource_AttentionChunkedStage1ScoreLaneReduction_Good' -count=1
+go test ./go -run 'TestHIPKernels_AttentionHeadsBatch|TestHIPGemma4Q4Prefill|TestHIPGemma4Q4PackagePrefillDecode_Good|TestHIPGemma4Q4Layer0_DeviceOnlySharedKV_Good|TestHIPKernelSource' -count=1
+go test ./go -count=1
+go test ./... -count=1
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./... -count=1
+go test -tags rocm_legacy_server ./... -count=1
+git diff --check
+```
+
+- HIP source and runtime checks:
+
+```text
+AMD gfx1100: hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2
+  hsaco: /tmp/go-rocm-kernels-gfx1100-swa-window.hsaco
+  hsaco_bytes: 388872
+  stderr: /tmp/go-rocm-swa-window-build.err (empty)
+
+Cross-target compile:
+  NVIDIA/CUDA std=c++20 arch=sm_75 object_bytes=1578592
+  AMD std=c++23 arch=gfx1100 hsaco_bytes=388872
+  HIP-CPU x86_64 object_bytes=9641952
+  HIP-CPU aarch64 object_bytes=3549784
+  stderr: /tmp/go-rocm-swa-window-cross-compile.err (empty)
+
+HIP-CPU runtime:
+  hip_cpu_smoke_ok device="AMD Ryzen 9 9950X 16-Core Processor" values=1.0,3.0,5.0,7.0
+  hip_cpu_rocm_kernel_smoke_ok device="AMD Ryzen 9 9950X 16-Core Processor" values=5.0,6.0,7.0,8.0
+  stderr: /tmp/go-rocm-swa-window-hipcpu-runtime.err (empty)
+
+ZLUDA CUDA runtime:
+  zluda_cuda_smoke_ok count=2 values=7,8,9,10
+  stderr: /tmp/go-rocm-swa-window-zluda.err (empty)
+```
+
+- Live RX 7800 XT checks used
+  `ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85` and ran one at a time:
+
+```text
+TestHIPHardwareTransformerKernelSource_Good:
+  passed with /tmp/go-rocm-swa-window-transformer.err empty
+
+TestNativeDecodeSmokeKernelStatus_Good, new SWA HSACO:
+  prompt_tokens=[2 10979]
+  generated tokens=[107 4968]
+  text=["\n" "Model"]
+  stderr: /tmp/go-rocm-swa-window-model.err (empty)
+
+TestNativeDecodeSmokeKernelStatus_Good, prior accepted HSACO:
+  prompt_tokens=[2 10979]
+  generated tokens=[107 4968]
+  text=["\n" "Model"]
+  stderr: /tmp/go-rocm-current-hsaco-model.err (empty)
+```
+
+- The short `text:Hi` output differs from an older note sample, but the prior
+  accepted HSACO gives the same output under the current Go/dependency/model
+  path. That drift is therefore independent of this SWA window kernel patch.
+
 ## 2026-05-27 Prefill Batch Attention Workspace Pass
 
 - Changed the default Gemma4 q4 public prefill ubatch size from `512` to `16`

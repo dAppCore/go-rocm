@@ -872,6 +872,7 @@ func hipRunGemma4Q4PrefillAttentionBatchWorkspace(ctx context.Context, driver na
 		HeadCount:       cfg.QueryHeads,
 		QueryCount:      tokenCount,
 		QueryStartToken: queryStartToken,
+		WindowSize:      cfg.SlidingWindow,
 		Scale:           hipGemma4Q4AttentionScale(cfg.HeadDim),
 	}
 	contiguousKey := layer.QK.Key

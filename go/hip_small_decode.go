@@ -1986,6 +1986,7 @@ type hipAttentionHeadsBatchCausalDeviceRequest struct {
 	HeadCount       int
 	QueryCount      int
 	QueryStartToken int
+	WindowSize      int
 	Scale           float32
 }
 
@@ -2005,6 +2006,9 @@ func hipRunAttentionHeadsBatchCausalOutputFromDeviceQueryToDeviceKernelWorkspace
 	if req.QueryStartToken < 0 || uint64(req.QueryStartToken)+uint64(req.QueryCount) > uint64(req.TokenCount) {
 		return core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "causal query window exceeds token count", nil)
 	}
+	if req.WindowSize < 0 {
+		return core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "window size must be non-negative", nil)
+	}
 	if req.Scale < 0 || math.IsNaN(float64(req.Scale)) || math.IsInf(float64(req.Scale), 0) {
 		return core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "scale must be non-negative and finite", nil)
 	}
@@ -2023,6 +2027,7 @@ func hipRunAttentionHeadsBatchCausalOutputFromDeviceQueryToDeviceKernelWorkspace
 		HeadCount:       req.HeadCount,
 		QueryCount:      req.QueryCount,
 		QueryStartToken: req.QueryStartToken,
+		WindowSize:      req.WindowSize,
 		QueryBytes:      query.SizeBytes(),
 		OutputBytes:     output.SizeBytes(),
 		Scale:           req.Scale,
@@ -2155,6 +2160,9 @@ func hipRunAttentionHeadsBatchChunkedOutputFromDeviceQueryToDeviceKernelWorkspac
 	if req.QueryStartToken < 0 || uint64(req.QueryStartToken)+uint64(req.QueryCount) > uint64(req.TokenCount) {
 		return core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "causal query window exceeds token count", nil)
 	}
+	if req.WindowSize < 0 {
+		return core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "window size must be non-negative", nil)
+	}
 	if req.Scale < 0 || math.IsNaN(float64(req.Scale)) || math.IsInf(float64(req.Scale), 0) {
 		return core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "scale must be non-negative and finite", nil)
 	}
@@ -2193,6 +2201,7 @@ func hipRunAttentionHeadsBatchChunkedOutputFromDeviceQueryToDeviceKernelWorkspac
 		HeadCount:         req.HeadCount,
 		QueryCount:        req.QueryCount,
 		QueryStartToken:   req.QueryStartToken,
+		WindowSize:        req.WindowSize,
 		ChunkSize:         chunkSize,
 		ChunkCount:        chunkCount,
 		QueryBytes:        query.SizeBytes(),

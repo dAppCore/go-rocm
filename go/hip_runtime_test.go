@@ -5444,8 +5444,9 @@ func (driver *fakeHIPDriver) launchAttentionHeadsBatchCausal(args []byte) error 
 	scale := math.Float32frombits(binary.LittleEndian.Uint32(args[92:]))
 	descriptorPointer := nativeDevicePointer(binary.LittleEndian.Uint64(args[96:]))
 	descriptorBytes := int(binary.LittleEndian.Uint64(args[104:]))
+	windowSize := int(binary.LittleEndian.Uint32(args[120:]))
 	if dim <= 0 || tokenCount <= 0 || headCount <= 0 || queryCount <= 0 ||
-		queryStartToken < 0 || uint64(queryStartToken)+uint64(queryCount) > uint64(tokenCount) ||
+		queryStartToken < 0 || windowSize < 0 || uint64(queryStartToken)+uint64(queryCount) > uint64(tokenCount) ||
 		queryBytes != queryCount*headCount*dim*4 ||
 		outputBytes != queryCount*headCount*dim*4 {
 		return core.E("rocm.hip.FakeLaunch", "attention heads batch causal shape metadata mismatch", nil)
@@ -5523,6 +5524,10 @@ func (driver *fakeHIPDriver) launchAttentionHeadsBatchCausal(args []byte) error 
 	}
 	for queryIndex := 0; queryIndex < queryCount; queryIndex++ {
 		visibleTokens := queryStartToken + queryIndex + 1
+		windowStart := 0
+		if windowSize > 0 && visibleTokens > windowSize {
+			windowStart = visibleTokens - windowSize
+		}
 		for head := 0; head < headCount; head++ {
 			baseIndex := queryIndex*headCount + head
 			queryStart := queryOffset + baseIndex*dim*4
@@ -5530,7 +5535,7 @@ func (driver *fakeHIPDriver) launchAttentionHeadsBatchCausal(args []byte) error 
 			if err != nil {
 				return err
 			}
-			output, weights, err := hipReferenceSingleHeadAttentionWithScale(query, keys[:visibleTokens], values[:visibleTokens], scale)
+			output, weights, err := hipReferenceSingleHeadAttentionWithScale(query, keys[windowStart:visibleTokens], values[windowStart:visibleTokens], scale)
 			if err != nil {
 				return err
 			}
@@ -5545,7 +5550,7 @@ func (driver *fakeHIPDriver) launchAttentionHeadsBatchCausal(args []byte) error 
 					return err
 				}
 				weightStart := weightOffset + baseIndex*tokenCount*4
-				copy(weightData[weightStart:weightStart+visibleTokens*4], weightPayload)
+				copy(weightData[weightStart+windowStart*4:weightStart+visibleTokens*4], weightPayload)
 			}
 		}
 	}
@@ -5578,8 +5583,9 @@ func (driver *fakeHIPDriver) launchAttentionHeadsBatchChunked(args []byte, write
 	statsBytes := int(binary.LittleEndian.Uint32(args[92:]))
 	outputBytes := int(binary.LittleEndian.Uint32(args[96:]))
 	scale := math.Float32frombits(binary.LittleEndian.Uint32(args[100:]))
+	windowSize := int(binary.LittleEndian.Uint32(args[104:]))
 	if dim <= 0 || dim > hipAttentionHeadsChunkedBlockSize || tokenCount <= 0 || headCount <= 0 || queryCount <= 0 ||
-		queryStartToken < 0 || uint64(queryStartToken)+uint64(queryCount) > uint64(tokenCount) ||
+		queryStartToken < 0 || windowSize < 0 || uint64(queryStartToken)+uint64(queryCount) > uint64(tokenCount) ||
 		chunkSize <= 0 || chunkCount != (tokenCount+chunkSize-1)/chunkSize ||
 		queryBytes != queryCount*headCount*dim*4 ||
 		partialBytes != queryCount*headCount*chunkCount*dim*4 ||
@@ -5621,6 +5627,10 @@ func (driver *fakeHIPDriver) launchAttentionHeadsBatchChunked(args []byte, write
 	}
 	for queryIndex := 0; queryIndex < queryCount; queryIndex++ {
 		visibleTokens := queryStartToken + queryIndex + 1
+		windowStart := 0
+		if windowSize > 0 && visibleTokens > windowSize {
+			windowStart = visibleTokens - windowSize
+		}
 		for head := 0; head < headCount; head++ {
 			baseIndex := queryIndex*headCount + head
 			queryStart := queryOffset + baseIndex*dim*4
@@ -5628,7 +5638,7 @@ func (driver *fakeHIPDriver) launchAttentionHeadsBatchChunked(args []byte, write
 			if err != nil {
 				return err
 			}
-			output, _, err := hipReferenceSingleHeadAttentionWithScale(query, keys[:visibleTokens], values[:visibleTokens], scale)
+			output, _, err := hipReferenceSingleHeadAttentionWithScale(query, keys[windowStart:visibleTokens], values[windowStart:visibleTokens], scale)
 			if err != nil {
 				return err
 			}

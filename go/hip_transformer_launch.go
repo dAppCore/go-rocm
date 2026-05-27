@@ -361,6 +361,7 @@ type hipAttentionHeadsBatchCausalLaunchArgs struct {
 	DescriptorPointer nativeDevicePointer
 	DescriptorBytes   uint64
 	SharedMemBytes    uint64
+	WindowSize        int
 }
 
 type hipAttentionHeadsChunkedLaunchArgs struct {
@@ -401,6 +402,7 @@ type hipAttentionHeadsBatchChunkedLaunchArgs struct {
 	StatsBytes        uint64
 	OutputBytes       uint64
 	Scale             float32
+	WindowSize        int
 }
 
 type hipAttentionResult struct {
@@ -2040,6 +2042,10 @@ func (args hipAttentionHeadsBatchCausalLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	windowSize, err := rocmDeviceKVUint32("window size", args.WindowSize)
+	if err != nil {
+		return nil, err
+	}
 	if uint64(queryStartToken)+uint64(queryCount) > uint64(tokenCount) {
 		return nil, core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "causal query window exceeds token count", nil)
 	}
@@ -2105,6 +2111,7 @@ func (args hipAttentionHeadsBatchCausalLaunchArgs) Binary() ([]byte, error) {
 	binary.LittleEndian.PutUint64(payload[96:], uint64(args.DescriptorPointer))
 	binary.LittleEndian.PutUint64(payload[104:], args.DescriptorBytes)
 	binary.LittleEndian.PutUint64(payload[112:], args.SharedMemBytes)
+	binary.LittleEndian.PutUint32(payload[120:], windowSize)
 	return payload, nil
 }
 
@@ -2208,6 +2215,10 @@ func (args hipAttentionHeadsBatchChunkedLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	windowSize, err := rocmDeviceKVUint32("window size", args.WindowSize)
+	if err != nil {
+		return nil, err
+	}
 	if uint64(queryStartToken)+uint64(queryCount) > uint64(tokenCount) {
 		return nil, core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "causal query window exceeds token count", nil)
 	}
@@ -2265,6 +2276,7 @@ func (args hipAttentionHeadsBatchChunkedLaunchArgs) Binary() ([]byte, error) {
 	binary.LittleEndian.PutUint32(payload[92:], statsBytes)
 	binary.LittleEndian.PutUint32(payload[96:], outputBytes)
 	binary.LittleEndian.PutUint32(payload[100:], math.Float32bits(args.Scale))
+	binary.LittleEndian.PutUint32(payload[104:], windowSize)
 	return payload, nil
 }
 
