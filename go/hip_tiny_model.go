@@ -1097,7 +1097,7 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 						runErr = err
 						return
 					}
-					outputToken := ubatch.OutputTokens[index]
+					outputToken := ubatch.OutputToken(index)
 					var err error
 					current, state, err = hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx, model.driver, cfg, state, hipGemma4Q4ForwardRequest{
 						TokenID:            promptToken,

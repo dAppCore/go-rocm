@@ -55,6 +55,10 @@ type hipGemma4Q4PrefillUBatch struct {
 	OutputTokens []bool
 }
 
+func (batch hipGemma4Q4PrefillUBatch) OutputToken(index int) bool {
+	return index >= 0 && index < len(batch.OutputTokens) && batch.OutputTokens[index]
+}
+
 type hipGemma4Q4PrefillQKVBatch struct {
 	Query *hipDeviceByteBuffer
 	Key   *hipDeviceByteBuffer
