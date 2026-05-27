@@ -1787,8 +1787,18 @@ Remaining blocker:
   Retained-book acceptance stayed quality-clean at `37.54s` wall,
   `80.48 tok/s` average, turn 10 `70.22 tok/s`, `204416384 B/op`,
   `93969 allocs/op`, `chapter10_arc_anchor_hits=3`.
+- 2026-05-27 rechecked the current source with a fresh `gfx1100 -O2` HSACO:
+  `512` tokens measured `4531496458 ns/op`, `113.0 tok/s`,
+  `3157648 B/op`, and `2367 allocs/op` with empty stderr. Rebuilding with
+  `-O3` was neutral/slightly worse at `112.8 tok/s`, so keep `-O2` as the
+  documented build flag. Retuning only the final q4 LM-head
+  greedy/scores row geometry was also rejected: `16` rows per block measured
+  `111.9 tok/s`, and `8` rows per block measured `110.6 tok/s`, both with
+  empty stderr and both below the kept `32` rows per block shape. A q4 row-sum
+  `__restrict__` pointer hint was neutral at `113.0 tok/s` and was also
+  reverted rather than kept without a measurable gain.
 
-- [ ] Phase 0: Snapshot the tree and establish the baseline.
+- [x] Phase 0: Snapshot the tree and establish the baseline.
   - Run `git status --short`.
   - Read `AGENTS.md`, `README.md`, `docs/architecture.md`,
     `external/go-inference/go/capability.go`, and
@@ -1796,6 +1806,11 @@ Remaining blocker:
   - Run `go test ./... -count=1`.
   - Run `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./... -count=1`.
   - Record failures in the working notes before editing.
+  - 2026-05-27 recheck: branch `dev...origin/dev [ahead 70]`, no local
+    uncommitted changes. Read the listed root and shared-contract files. Gates
+    passed: `go test ./... -count=1`,
+    `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./... -count=1`, and
+    `go test -tags rocm_legacy_server ./... -count=1`.
 
 - [ ] Phase 1: Synchronise shared contracts.
   - Ensure local `external/go-inference/go` contains the contract primitives
