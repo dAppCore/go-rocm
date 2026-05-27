@@ -45,6 +45,7 @@ The exported symbols must stay in sync with the Go launcher names:
 - `rocm_mlx_q4_projection_batch`
 - `rocm_mlx_q4_projection_greedy`
 - `rocm_mlx_q4_triple_projection`
+- `rocm_mlx_q4_pair_projection`
 - `rocm_mlx_q4_gelu_tanh_multiply`
 - `rocm_mlx_q4_gelu_tanh_multiply_batch`
 - `rocm_mlx_q4_gelu_tanh_projection`

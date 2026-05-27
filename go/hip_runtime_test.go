@@ -2294,6 +2294,8 @@ func (driver *fakeHIPDriver) LaunchKernel(config hipKernelLaunchConfig) error {
 		return driver.launchPackedTopK(config.Args)
 	case hipKernelNameMLXQ4TripleProj:
 		return driver.launchMLXQ4TripleProjection(config.Args)
+	case hipKernelNameMLXQ4PairProj:
+		return driver.launchMLXQ4TripleProjection(config.Args)
 	case hipKernelNameMLXQ4GELUTanhMul:
 		return driver.launchMLXQ4GELUTanhMultiply(config.Args)
 	case hipKernelNameMLXQ4GELUTanhMulBatch:
@@ -3137,6 +3139,12 @@ func (driver *fakeHIPDriver) launchMLXQ4TripleProjection(args []byte) error {
 	}
 	combined := make([]float32, 0, totalRows)
 	for index := 0; index < 3; index++ {
+		if rows[index] == 0 {
+			if weightBytes[index] != 0 || scaleBytes[index] != 0 || biasBytes[index] != 0 {
+				return core.E("rocm.hip.FakeLaunch", "MLX q4 triple projection zero-row byte metadata mismatch", nil)
+			}
+			continue
+		}
 		if validateHIPMLXQ4ProjectionShape(cols, weightBytes[index]/4, scaleBytes[index]/2, biasBytes[index]/2, rows[index], cols, groupSize) != nil {
 			return core.E("rocm.hip.FakeLaunch", "MLX q4 triple projection shape metadata mismatch", nil)
 		}

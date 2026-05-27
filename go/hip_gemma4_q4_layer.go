@@ -1230,6 +1230,30 @@ func hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(ctx context.Context, driv
 		queryBuffer = &queryBufferView
 		keyBuffer = &keyBufferView
 		valueBuffer = &valueBufferView
+	} else if projectLocalKV &&
+		cfg.AttentionKEqV &&
+		cfg.QueryProjection.Cols == cfg.KeyProjection.Cols &&
+		cfg.QueryProjection.GroupSize == cfg.KeyProjection.GroupSize {
+		if req.AttentionWorkspace != nil && req.OmitDebugTensors {
+			qkvCount := cfg.QueryProjection.Rows + cfg.KeyProjection.Rows
+			qkvOutputBuffer, err = req.AttentionWorkspace.EnsureQKVOutput(driver, qkvCount)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			queryBufferView, keyBufferView, err = hipRunMLXQ4PairProjectionKernelWithDeviceInputViewsOutput(ctx, driver, layerInputBuffer, cfg.QueryProjection, cfg.KeyProjection, qkvOutputBuffer)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+		} else {
+			qkvOutputBuffer, queryBufferView, keyBufferView, err = hipRunMLXQ4PairProjectionKernelWithDeviceInputViews(ctx, driver, layerInputBuffer, cfg.QueryProjection, cfg.KeyProjection)
+			if err != nil {
+				return hipGemma4Q4DecoderLayerResult{}, err
+			}
+			defer qkvOutputBuffer.Close()
+		}
+		queryBuffer = &queryBufferView
+		keyBuffer = &keyBufferView
+		valueBuffer = keyBuffer
 	} else {
 		if req.AttentionWorkspace != nil && req.OmitDebugTensors {
 			queryBuffer, err = req.AttentionWorkspace.EnsureProjectionOutput(driver, cfg.QueryProjection.Rows)

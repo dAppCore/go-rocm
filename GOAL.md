@@ -2430,6 +2430,21 @@ and `0 allocs/op` while leaving public `KernelDescriptorBytes` as an exact raw
 serialization benchmark. This keeps the go-mlx/IDEAS rule honest: reduce
 retained-state descriptor churn without hiding logical descriptor shape from
 the kernels.
+The full-attention Gemma4 `attention_k_eq_v` decoder route now has a dedicated
+q/k pair projection kernel, `rocm_mlx_q4_pair_projection`, using the existing
+triple-projection launch packet with `third_rows=0`. This removes the separate
+q4 query/key projection launches for local-KV K=V owner layers and aliases V to
+K before the normal value RMS and key RoPE kernels. Fake-driver coverage asserts
+the pair route, exact borrowed output views, and no accidental triple-kernel
+launch for that layer shape. Live 2048-token guards were clean but not a
+throughput win yet: the reused-triple experiment reported `107.9 tok/s`,
+`6666192 B/op`, `2639 allocs/op`, and empty
+`.bench-errors/2048_pair_projection_20260527.err`; the dedicated pair kernel
+reported `108.2 tok/s`, `6673344 B/op`, `2632 allocs/op`, and empty
+`.bench-errors/2048_pair_kernel_20260527.err`. Keep this as a correctness and
+launch-count cleanup, not as final performance proof. The next high-impact
+target remains the much larger per-token q4 projection/GELU launch volume from
+output/down/MLP routes.
 
 Run these before handoff:
 

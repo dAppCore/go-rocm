@@ -33,6 +33,7 @@ func TestHIPKernelSource_ExportsLaunchABI_Good(t *testing.T) {
 		`extern "C" __global__ void rocm_mlx_q4_projection_scores`,
 		`extern "C" __global__ void rocm_packed_topk`,
 		`extern "C" __global__ void rocm_mlx_q4_triple_projection`,
+		`extern "C" __global__ void rocm_mlx_q4_pair_projection`,
 		`extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply`,
 		`extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply_batch`,
 		`extern "C" __global__ void rocm_mlx_q4_gelu_tanh_projection`,

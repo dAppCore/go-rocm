@@ -1550,9 +1550,6 @@ __device__ bool rocm_valid_mlx_q4_triple_projection_args(const rocm_mlx_q4_tripl
 		args.second_weight_pointer == 0 ||
 		args.second_scale_pointer == 0 ||
 		args.second_bias_pointer == 0 ||
-		args.third_weight_pointer == 0 ||
-		args.third_scale_pointer == 0 ||
-		args.third_bias_pointer == 0 ||
 		args.cols == 0 ||
 		args.group_size == 0 ||
 		args.bits != ROCM_MLX_Q4_PROJECTION_BITS ||
@@ -1562,9 +1559,21 @@ __device__ bool rocm_valid_mlx_q4_triple_projection_args(const rocm_mlx_q4_tripl
 		static_cast<uint64_t>(args.output_bytes) != total_rows * sizeof(float)) {
 		return false;
 	}
+	if (args.third_rows > 0 &&
+		(args.third_weight_pointer == 0 ||
+			args.third_scale_pointer == 0 ||
+			args.third_bias_pointer == 0)) {
+		return false;
+	}
+	if (args.third_rows == 0 &&
+		(args.third_weight_bytes != 0 ||
+			args.third_scale_bytes != 0 ||
+			args.third_bias_bytes != 0)) {
+		return false;
+	}
 	return rocm_valid_mlx_q4_triple_projection_part(args.first_rows, args.cols, args.group_size, args.first_weight_bytes, args.first_scale_bytes, args.first_bias_bytes) &&
 		rocm_valid_mlx_q4_triple_projection_part(args.second_rows, args.cols, args.group_size, args.second_weight_bytes, args.second_scale_bytes, args.second_bias_bytes) &&
-		rocm_valid_mlx_q4_triple_projection_part(args.third_rows, args.cols, args.group_size, args.third_weight_bytes, args.third_scale_bytes, args.third_bias_bytes);
+		(args.third_rows == 0 || rocm_valid_mlx_q4_triple_projection_part(args.third_rows, args.cols, args.group_size, args.third_weight_bytes, args.third_scale_bytes, args.third_bias_bytes));
 }
 
 __device__ bool rocm_valid_mlx_q4_gelu_tanh_mul_args(const rocm_mlx_q4_gelu_tanh_mul_launch_args &args)
@@ -3570,6 +3579,46 @@ extern "C" __global__ void rocm_mlx_q4_triple_projection(const unsigned char *pa
 		weights = reinterpret_cast<const uint32_t *>(static_cast<uintptr_t>(args.third_weight_pointer));
 		scales = reinterpret_cast<const uint16_t *>(static_cast<uintptr_t>(args.third_scale_pointer));
 		biases = reinterpret_cast<const uint16_t *>(static_cast<uintptr_t>(args.third_bias_pointer));
+	}
+	float *output = reinterpret_cast<float *>(static_cast<uintptr_t>(args.output_pointer));
+	float sum = rocm_mlx_q4_projection_row_sum(input, weights, scales, biases, local_row, args.cols, args.group_size, col_lane);
+	sum = rocm_mlx_q4_row_reduce(sum);
+	if (col_lane == 0) {
+		output[row] = sum;
+	}
+}
+
+extern "C" __global__ void rocm_mlx_q4_pair_projection(const unsigned char *packet)
+{
+	if (packet == nullptr) {
+		return;
+	}
+	const rocm_mlx_q4_triple_projection_launch_args &args = *reinterpret_cast<const rocm_mlx_q4_triple_projection_launch_args *>(packet);
+	if (!rocm_valid_mlx_q4_triple_projection_args(args) || args.third_rows != 0) {
+		return;
+	}
+
+	if (blockDim.x != ROCM_MLX_Q4_PROJECTION_BLOCK_SIZE) {
+		return;
+	}
+	const uint32_t row_lane = threadIdx.x / ROCM_MLX_Q4_PROJECTION_THREADS_PER_ROW;
+	const uint32_t col_lane = threadIdx.x - row_lane * ROCM_MLX_Q4_PROJECTION_THREADS_PER_ROW;
+	const uint32_t row = blockIdx.x * ROCM_MLX_Q4_PROJECTION_ROWS_PER_BLOCK + row_lane;
+	const uint32_t total_rows = args.first_rows + args.second_rows;
+	if (row >= total_rows) {
+		return;
+	}
+
+	const float *input = reinterpret_cast<const float *>(static_cast<uintptr_t>(args.input_pointer));
+	const uint32_t *weights = reinterpret_cast<const uint32_t *>(static_cast<uintptr_t>(args.first_weight_pointer));
+	const uint16_t *scales = reinterpret_cast<const uint16_t *>(static_cast<uintptr_t>(args.first_scale_pointer));
+	const uint16_t *biases = reinterpret_cast<const uint16_t *>(static_cast<uintptr_t>(args.first_bias_pointer));
+	uint32_t local_row = row;
+	if (row >= args.first_rows) {
+		local_row = row - args.first_rows;
+		weights = reinterpret_cast<const uint32_t *>(static_cast<uintptr_t>(args.second_weight_pointer));
+		scales = reinterpret_cast<const uint16_t *>(static_cast<uintptr_t>(args.second_scale_pointer));
+		biases = reinterpret_cast<const uint16_t *>(static_cast<uintptr_t>(args.second_bias_pointer));
 	}
 	float *output = reinterpret_cast<float *>(static_cast<uintptr_t>(args.output_pointer));
 	float sum = rocm_mlx_q4_projection_row_sum(input, weights, scales, biases, local_row, args.cols, args.group_size, col_lane);

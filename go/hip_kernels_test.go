@@ -904,6 +904,98 @@ func TestHIPKernels_MLXQ4TripleProjectionLaunchArgs_Good(t *testing.T) {
 	assertFloat32SlicesNear(t, []float32{16}, reusedThirdValues, 0.0001)
 }
 
+func TestHIPKernels_MLXQ4PairProjectionLaunchArgs_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	firstReq := hipMLXQ4ProjectionRequest{
+		Input:     []float32{1, 1, 1, 1, 1, 1, 1, 1},
+		Weight:    []uint32{0x76543210, 0xfedcba98},
+		Scales:    []uint16{0x3f80, 0x3f00},
+		Biases:    []uint16{0x0000, 0xbf80},
+		Rows:      2,
+		Cols:      8,
+		GroupSize: 8,
+	}
+	secondReq := hipMLXQ4ProjectionRequest{
+		Input:     firstReq.Input,
+		Weight:    []uint32{0x11111111},
+		Scales:    []uint16{0x3f80},
+		Biases:    []uint16{0x0000},
+		Rows:      1,
+		Cols:      8,
+		GroupSize: 8,
+	}
+	firstBuffers, err := firstReq.deviceBuffers(driver)
+	core.AssertNoError(t, err)
+	defer firstBuffers.Close()
+	secondBuffers, err := secondReq.deviceBuffers(driver)
+	core.AssertNoError(t, err)
+	defer secondBuffers.Close()
+	launchBytes, err := (hipMLXQ4TripleProjLaunchArgs{
+		InputPointer:        firstBuffers.Input.Pointer(),
+		OutputPointer:       nativeDevicePointer(99),
+		FirstWeightPointer:  firstBuffers.Weight.Pointer(),
+		FirstScalePointer:   firstBuffers.Scales.Pointer(),
+		FirstBiasPointer:    firstBuffers.Biases.Pointer(),
+		SecondWeightPointer: secondBuffers.Weight.Pointer(),
+		SecondScalePointer:  secondBuffers.Scales.Pointer(),
+		SecondBiasPointer:   secondBuffers.Biases.Pointer(),
+		FirstRows:           firstReq.Rows,
+		SecondRows:          secondReq.Rows,
+		Cols:                firstReq.Cols,
+		GroupSize:           firstReq.GroupSize,
+		Bits:                hipMLXQ4ProjectionBits,
+		InputBytes:          firstBuffers.Input.SizeBytes(),
+		OutputBytes:         uint64((firstReq.Rows + secondReq.Rows) * 4),
+		FirstWeightBytes:    firstBuffers.Weight.SizeBytes(),
+		FirstScaleBytes:     firstBuffers.Scales.SizeBytes(),
+		FirstBiasBytes:      firstBuffers.Biases.SizeBytes(),
+		SecondWeightBytes:   secondBuffers.Weight.SizeBytes(),
+		SecondScaleBytes:    secondBuffers.Scales.SizeBytes(),
+		SecondBiasBytes:     secondBuffers.Biases.SizeBytes(),
+	}).Binary()
+	core.AssertNoError(t, err)
+	core.AssertEqual(t, hipMLXQ4TripleProjLaunchArgsBytes, len(launchBytes))
+	core.AssertEqual(t, uint32(0), binary.LittleEndian.Uint32(launchBytes[104:]))
+	core.AssertEqual(t, uint32(0), binary.LittleEndian.Uint32(launchBytes[152:]))
+	core.AssertEqual(t, uint32(0), binary.LittleEndian.Uint32(launchBytes[156:]))
+	core.AssertEqual(t, uint32(0), binary.LittleEndian.Uint32(launchBytes[160:]))
+
+	output, first, second, err := hipRunMLXQ4PairProjectionKernelWithDeviceInputViews(context.Background(), driver, firstBuffers.Input,
+		hipMLXQ4DeviceWeightConfig{
+			WeightPointer: firstBuffers.Weight.Pointer(),
+			ScalePointer:  firstBuffers.Scales.Pointer(),
+			BiasPointer:   firstBuffers.Biases.Pointer(),
+			WeightBytes:   firstBuffers.Weight.SizeBytes(),
+			ScaleBytes:    firstBuffers.Scales.SizeBytes(),
+			BiasBytes:     firstBuffers.Biases.SizeBytes(),
+			Rows:          firstReq.Rows,
+			Cols:          firstReq.Cols,
+			GroupSize:     firstReq.GroupSize,
+		},
+		hipMLXQ4DeviceWeightConfig{
+			WeightPointer: secondBuffers.Weight.Pointer(),
+			ScalePointer:  secondBuffers.Scales.Pointer(),
+			BiasPointer:   secondBuffers.Biases.Pointer(),
+			WeightBytes:   secondBuffers.Weight.SizeBytes(),
+			ScaleBytes:    secondBuffers.Scales.SizeBytes(),
+			BiasBytes:     secondBuffers.Biases.SizeBytes(),
+			Rows:          secondReq.Rows,
+			Cols:          secondReq.Cols,
+			GroupSize:     secondReq.GroupSize,
+		})
+	core.AssertNoError(t, err)
+	defer output.Close()
+	core.AssertEqual(t, hipKernelNameMLXQ4PairProj, driver.launches[len(driver.launches)-1].Name)
+	core.AssertEqual(t, output.Pointer(), first.Pointer())
+	core.AssertEqual(t, output.Pointer()+nativeDevicePointer(firstReq.Rows*4), second.Pointer())
+	firstValues, err := hipReadFloat32DeviceOutput(&first, "rocm.hip.MLXQ4PairProjectionLaunch", "first output", firstReq.Rows)
+	core.AssertNoError(t, err)
+	secondValues, err := hipReadFloat32DeviceOutput(&second, "rocm.hip.MLXQ4PairProjectionLaunch", "second output", secondReq.Rows)
+	core.AssertNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{28, 38}, firstValues, 0.0001)
+	assertFloat32SlicesNear(t, []float32{8}, secondValues, 0.0001)
+}
+
 func TestHIPKernels_MLXQ4GELUTanhMultiplyLaunchArgs_Good(t *testing.T) {
 	driver := &fakeHIPDriver{available: true}
 	gateReq := hipMLXQ4ProjectionRequest{
