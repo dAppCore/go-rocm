@@ -1,5 +1,76 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-27 Rejected Cols256 64-Row Geometry
+
+- Tested changing the specialized `rocm_mlx_q4_projection_cols256` Gemma4 shape
+  from `32` rows per 256-thread block to `64` rows per block. The idea was to
+  match `cols=256, group_size=64` to four row lanes instead of eight, halving
+  the fixed `1536x256 qg64` block volume reported by the retained-book artifact.
+- Source guards, `gfx1100` compile, and the hardware transformer smoke passed,
+  but the live model metrics did not improve. The source change was reverted.
+
+Verification while the candidate was applied:
+
+```text
+go test ./go -run 'TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good|TestHIPKernelSource_ExportsLaunchABI_Good|TestHIPKernels_MLXQ4ProjectionLaunchArgs_Good' -count=1
+PASS
+
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-cols256-rows64-20260528.hsaco
+stderr: .bench-errors/hipcc_gfx1100_cols256_rows64_20260528.err (0 bytes)
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_HIP_TESTS=1 GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100-cols256-rows64-20260528.hsaco go test ./go -run '^TestHIPHardwareTransformerKernelSource_Good$' -count=1 -v
+PASS
+stderr: .bench-errors/hip_transformer_cols256_rows64_20260528.err (0 bytes)
+```
+
+Live RX 7800 XT route guards:
+
+```text
+512 text:Hi:
+BenchmarkInferenceGemma4Q4Generate-32 1 4304469330 ns/op
+tok/s=118.9
+B/op=3263824
+allocs/op=2463
+kernel_mlx_q4_projection_cols256_blocks=429240
+kernel_shape_rocm_mlx_q4_projection_cols256_g24_1_1_b256_1_1_sm0_r1536_c256_qg64_bt0_blocks=429240
+stderr: .bench-errors/512_cols256_rows64_20260528.err (0 bytes)
+
+2048 text:Hi:
+BenchmarkInferenceGemma4Q4Generate-32 1 17873519800 ns/op
+tok/s=114.6
+B/op=6442816
+allocs/op=2631
+kernel_mlx_q4_projection_cols256_blocks=1719480
+kernel_shape_rocm_mlx_q4_projection_cols256_g24_1_1_b256_1_1_sm0_r1536_c256_qg64_bt0_blocks=1719480
+stderr: .bench-errors/2048_cols256_rows64_20260528.err (0 bytes)
+
+Strict 48k retained book:
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 55040960602 ns/op
+book_wall_s=55.01
+book_decode_s=45.07
+book_generated_tokens=3963
+book_tok/s=72.04
+book_turn10_tok/s=73.42
+book_turn10_retained_tokens=6116
+book_maxed_turns=0
+book_repeated_turns=0
+chapter10_arc_anchor_hits=4
+B/op=23073704
+allocs/op=69021
+peak_memory_bytes=5881090048
+kernel_mlx_q4_projection_cols256_blocks=3337320
+kernel_shape_rocm_mlx_q4_projection_cols256_g24_1_1_b256_1_1_sm0_r1536_c256_qg64_bt0_blocks=3337320
+stderr: .bench-errors/book10_cols256_rows64_20260528.err (0 bytes)
+artifact: /tmp/go-rocm-book-cols256-rows64-20260528.md
+```
+
+Rejected reason: the block table moved exactly as expected, from `48` to `24`
+blocks per `1536x256` launch, but the short guard regressed from `115.3` to
+`114.6 tok/s` and the strict book regressed from `44.68s` wall / `77.00 tok/s`
+turn 10 to `55.01s` wall / `73.42 tok/s` turn 10. The narrower row geometry
+likely reduced useful occupancy or memory scheduling enough to erase the lower
+block count. Keep the existing 32-row cols256 geometry.
+
 ## 2026-05-27 Accepted Chunked Stage2 Weight Cache
 
 - `rocm_attention_heads_chunked_stage2` and the batch stage2 variant previously
