@@ -16610,3 +16610,38 @@ The scale fusion removed a kernel conceptually, but it moved work into the
 projection hot loop and did not reduce Go allocations or bytes transferred in
 the benchmark contract. Keep the separate projection and vector-scale path until
 a broader PLE fusion can combine projection, normalization, and add in one pass.
+
+## 2026-05-27 Rejected PLE Projection Epsilon Fusion
+
+Tested the mathematically equivalent scale/RMSNorm rewrite:
+
+```text
+RMSNorm(scale * x, eps) == RMSNorm(x, eps / (scale * scale))
+```
+
+The Gemma4 PLE device path skipped the post-projection `rocm_vector_scale` and
+fed the raw BF16 projection into `rocm_rms_norm_heads` with the adjusted
+epsilon. This avoided adding multiply work to `rocm_projection`, unlike the
+output-scale experiment above.
+
+Rejected result:
+
+```text
+Focused tests passed:
+go test ./go -run 'TestHIPKernelSource_ABIConstants_Good|TestHIPKernels_Projection|TestHIPSmallDecode|TestGemma4|TestInferenceBenchmarkBook' -count=1
+go test ./go -count=1
+
+Compiled cleanly:
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-ple-epsilon-fusion.hsaco
+stderr: .bench-errors/hipcc_gfx1100_ple_epsilon_fusion_20260527.err (0 bytes)
+
+2048 live non-route guard:
+BenchmarkInferenceGemma4Q4Generate-32  1  18943803574 ns/op
+108.1 tok/s, 2048 tokens, 6673808 B/op, 2634 allocs/op
+stderr: .bench-errors/2048_ple_epsilon_fusion_noroute_20260527.err (0 bytes)
+```
+
+This is close to neutral but still does not improve the accepted 2048 guard or
+the benchmark allocation/byte contract. Keep the explicit vector-scale pass for
+now; future PLE work should fuse a larger group of operations or target device
+workspace lifetime instead of only removing this one launch.
