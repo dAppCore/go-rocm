@@ -343,6 +343,13 @@ func TestHIPKernelSource_AttentionChunkedStage1ScoreLaneReduction_Good(t *testin
 	core.RequireNoError(t, err)
 	source := string(sourceBytes)
 
+	chunkedLookup := hipKernelSourceFunctionBodyForTest(t, source, `__device__ const rocm_device_kv_page_descriptor *rocm_attention_heads_chunked_device_kv_page`)
+	core.AssertTrue(t, strings.Contains(chunkedLookup, `rocm_attention_device_kv_page_from_descriptor(args.descriptor_pointer, token)`), "chunked lookup must call the descriptor-only lookup directly")
+	core.AssertTrue(t, !strings.Contains(chunkedLookup, `rocm_attention_launch_args lookup`), "chunked lookup must not rebuild generic launch args per token")
+	batchChunkedLookup := hipKernelSourceFunctionBodyForTest(t, source, `__device__ const rocm_device_kv_page_descriptor *rocm_attention_heads_batch_chunked_device_kv_page`)
+	core.AssertTrue(t, strings.Contains(batchChunkedLookup, `rocm_attention_device_kv_page_from_descriptor(args.descriptor_pointer, token)`), "batch chunked lookup must call the descriptor-only lookup directly")
+	core.AssertTrue(t, !strings.Contains(batchChunkedLookup, `rocm_attention_launch_args lookup`), "batch chunked lookup must not rebuild generic launch args per token")
+
 	stage1 := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_attention_heads_chunked_stage1`)
 	core.AssertTrue(t, strings.Contains(stage1, `(score_lanes & (score_lanes - 1u)) == 0u`), "stage1 score lanes must stay shuffle-width safe")
 	core.AssertTrue(t, strings.Contains(stage1, `local < local_count && lane == 0u`), "stage1 score lanes must resolve KV pages once per token")

@@ -4912,9 +4912,12 @@ extern "C" __global__ void rocm_grpo_advantage(const unsigned char *packet)
 	}
 }
 
-__device__ const rocm_device_kv_page_descriptor *rocm_attention_device_kv_page(const rocm_attention_launch_args &args, uint32_t token)
+__device__ const rocm_device_kv_page_descriptor *rocm_attention_device_kv_page_from_descriptor(uint64_t descriptor_pointer, uint32_t token)
 {
-	const rocm_device_kv_descriptor_header *header = reinterpret_cast<const rocm_device_kv_descriptor_header *>(static_cast<uintptr_t>(args.descriptor_pointer));
+	if (descriptor_pointer == 0u) {
+		return nullptr;
+	}
+	const rocm_device_kv_descriptor_header *header = reinterpret_cast<const rocm_device_kv_descriptor_header *>(static_cast<uintptr_t>(descriptor_pointer));
 	const unsigned char *base = reinterpret_cast<const unsigned char *>(header);
 	if (header->block_size > 0u) {
 		const uint32_t page_index = token / header->block_size;
@@ -4964,30 +4967,19 @@ __device__ const rocm_device_kv_page_descriptor *rocm_attention_device_kv_page(c
 	return nullptr;
 }
 
+__device__ const rocm_device_kv_page_descriptor *rocm_attention_device_kv_page(const rocm_attention_launch_args &args, uint32_t token)
+{
+	return rocm_attention_device_kv_page_from_descriptor(args.descriptor_pointer, token);
+}
+
 __device__ const rocm_device_kv_page_descriptor *rocm_attention_heads_chunked_device_kv_page(const rocm_attention_heads_chunked_launch_args &args, uint32_t token)
 {
-	rocm_attention_launch_args lookup = {};
-	lookup.version = ROCM_ATTENTION_LAUNCH_ARGS_VERSION;
-	lookup.total_bytes = ROCM_ATTENTION_LAUNCH_ARGS_BYTES;
-	lookup.dim = args.dim;
-	lookup.token_count = args.token_count;
-	lookup.kv_source = ROCM_ATTENTION_KV_SOURCE_DEVICE;
-	lookup.descriptor_pointer = args.descriptor_pointer;
-	lookup.descriptor_bytes = args.descriptor_bytes;
-	return rocm_attention_device_kv_page(lookup, token);
+	return rocm_attention_device_kv_page_from_descriptor(args.descriptor_pointer, token);
 }
 
 __device__ const rocm_device_kv_page_descriptor *rocm_attention_heads_batch_chunked_device_kv_page(const rocm_attention_heads_batch_chunked_launch_args &args, uint32_t token)
 {
-	rocm_attention_launch_args lookup = {};
-	lookup.version = ROCM_ATTENTION_LAUNCH_ARGS_VERSION;
-	lookup.total_bytes = ROCM_ATTENTION_LAUNCH_ARGS_BYTES;
-	lookup.dim = args.dim;
-	lookup.token_count = args.token_count;
-	lookup.kv_source = ROCM_ATTENTION_KV_SOURCE_DEVICE;
-	lookup.descriptor_pointer = args.descriptor_pointer;
-	lookup.descriptor_bytes = args.descriptor_bytes;
-	return rocm_attention_device_kv_page(lookup, token);
+	return rocm_attention_device_kv_page_from_descriptor(args.descriptor_pointer, token);
 }
 
 __device__ bool rocm_device_kv_encoding_is_q8(uint32_t encoding)

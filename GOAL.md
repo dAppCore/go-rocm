@@ -668,6 +668,18 @@ stderr at `12.16s` wall, `11.64s` decode, `1163` generated tokens,
 `2605 allocs/op`. This is a small state-kernel cleanup; the long-context
 turn-10 decode target remains open.
 
+Accepted chunked descriptor lookup flattening: the chunked decode and
+batch-chunked attention page lookup helpers now call a descriptor-pointer
+lookup directly instead of constructing a temporary generic attention launch
+args struct for every token lookup. This keeps the same sorted `.kv`/MP4 page
+walk and only removes per-token setup work inside the kernel. Source/package
+tests, the focused hardware chunked-attention subtest, and the `gfx1100` HSACO
+build passed with empty stderr. A serialized 2-turn `2k` retained sampled book
+guard with `block_size=16` completed with empty runtime stderr at `10.26s`
+wall, `9.75s` decode, `972` generated tokens, `94.73 tok/s` average, and
+`93.80 tok/s` on turn 2. The canonical `text:Hi` 2048-token guard stayed green
+at `108.3 tok/s`, `5379448 B/op`, and `2606 allocs/op`.
+
 Rejected prompt-shortening follow-up: replacing the anchored wording with a
 shorter "advance the arc / keep continuity words alive" instruction reduced
 prompt tokens to `1581` and still passed the arc gate with `3` anchors, but it
