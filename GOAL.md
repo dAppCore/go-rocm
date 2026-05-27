@@ -39,11 +39,14 @@ The 100+ tok/s goal is complete only when all of these are true:
 
 Current status as of 2026-05-27: the q4 performance endpoint is met on the
 pinned RX 7800 XT with a fresh live `gfx1100` HSACO. The latest stricter
-`GO_ROCM_BENCH_TOKENS=2048` run reports `20120275799 ns/op`, `101.8 tok/s`,
-`6668608 B/op`, and `2652 allocs/op`. Earlier corrected runs also reported
-`19629810772 ns/op` and `101.9 tok/s` at `2000` tokens and `20156670616 ns/op`
-and `101.6 tok/s` at `2048` tokens. These numbers use the benchmark's
-`inference.WithContextLen(128)` load setting, now correctly applied to Gemma4 q4
+`GO_ROCM_BENCH_TOKENS=2048` `text:Hi` run reports `17964551296 ns/op`,
+`114.0 tok/s`, `6624528 B/op`, and `2635 allocs/op`. The chapter-shaped
+2048-token fast guard at `context_len=4096` reports `19536530899 ns/op`,
+`104.8 tok/s`, `8017064 B/op`, and `3438 allocs/op`. The strict retained
+10-turn book gate is now a wall-time production candidate at `54.75s` wall with
+`5` chapter-10 arc anchors, but late-turn decode is still below the final target
+at `57.72 tok/s` on turn 10. These numbers use the benchmark's
+`inference.WithContextLen` load setting, now correctly applied to Gemma4 q4
 sliding-window layers, and keep full-attention layers uncapped.
 
 Current dependency/platform baseline as of 2026-05-26: local development uses
