@@ -37,13 +37,14 @@ The 100+ tok/s goal is complete only when all of these are true:
 - Normal, Linux no-cgo, legacy-server, HIP, model, and cache smoke gates keep
   passing or skip cleanly when hardware is absent.
 
-Current status as of 2026-05-17: the q4 performance endpoint is met on the
-pinned RX 7800 XT with the live `gfx1100` HSACO. The latest corrected
-`GO_ROCM_BENCH_TOKENS=2000` run reports `19629810772 ns/op` and `101.9 tok/s`;
-the stricter `2048` run reports `20156670616 ns/op` and `101.6 tok/s`. These
-numbers use the benchmark's `inference.WithContextLen(128)` load setting, now
-correctly applied to Gemma4 q4 sliding-window layers, and keep full-attention
-layers uncapped.
+Current status as of 2026-05-27: the q4 performance endpoint is met on the
+pinned RX 7800 XT with a fresh live `gfx1100` HSACO. The latest stricter
+`GO_ROCM_BENCH_TOKENS=2048` run reports `20120275799 ns/op`, `101.8 tok/s`,
+`6668608 B/op`, and `2652 allocs/op`. Earlier corrected runs also reported
+`19629810772 ns/op` and `101.9 tok/s` at `2000` tokens and `20156670616 ns/op`
+and `101.6 tok/s` at `2048` tokens. These numbers use the benchmark's
+`inference.WithContextLen(128)` load setting, now correctly applied to Gemma4 q4
+sliding-window layers, and keep full-attention layers uncapped.
 
 Current dependency/platform baseline as of 2026-05-26: local development uses
 Go `1.26.x`, `dappco.re/go v0.10.3`, canonical `go-inference v0.10.0`, and
@@ -1842,6 +1843,16 @@ endpoint.
   contiguous/slot-based full and SWA KV caches. The target is llama.cpp's shape:
   prepare base/full and sliding-window caches per ubatch, then execute the graph
   against device-side K/V indices and masks.
+  - 2026-05-27 progress: batched prefill now keeps the wider
+    `sliding_window + current_ubatch` cache only for the attention computation,
+    then trims the retained decode state back to the real SWA window. Shared KV
+    layers resolve their source before the trim and borrow aliases from the
+    trimmed owner descriptor, so shared local layers no longer pin oversized
+    prompt-batch tails in persistent state. This is still descriptor/page KV,
+    not the final slot-based full/SWA layout. The focused fake-driver tests cover
+    both retained SWA trimming and shared-alias ownership; the live 2-turn
+    retained-book smoke on `gfx1100` passed with empty stderr and turn 2 at
+    `108.5 tok/s`.
 - [ ] Add batched q4 projection/MLP kernels for prompt matrices. Single-token
   GEMV launch chains are acceptable for decode, but long prompt prefill needs
   GEMM/MMQ-style work over `[hidden, batch]` activations.

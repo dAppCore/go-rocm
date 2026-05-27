@@ -100,6 +100,7 @@ type hipGemma4Q4PrefillDeviceKVBatch struct {
 	Cache           *rocmDeviceKVCache
 	DescriptorTable *rocmDeviceKVDescriptorTable
 	Launch          rocmDeviceKVLaunchDescriptor
+	RetainWindow    int
 }
 
 func (batch *hipGemma4Q4PrefillDeviceKVBatch) Close() error {
@@ -708,6 +709,7 @@ func hipRunGemma4Q4PrefillDeviceKVBatchWithPrior(ctx context.Context, driver nat
 		Cache:           cache,
 		DescriptorTable: table,
 		Launch:          launch,
+		RetainWindow:    cfg.SlidingWindow,
 	}, nil
 }
 
@@ -833,6 +835,7 @@ func hipRunGemma4Q4PrefillLayerQueryBatchWithSharedKV(ctx context.Context, drive
 		Cache:           cache,
 		DescriptorTable: table,
 		Launch:          launch,
+		RetainWindow:    shared.RetainWindow,
 	}
 	success = true
 	return out, nil
@@ -1210,6 +1213,8 @@ func hipGemma4Q4DeviceDecodeStateFromPrefillForward(forward *hipGemma4Q4PrefillF
 	if forward == nil {
 		return nil, core.E(hipGemma4Q4Layer0Operation, "prefill forward output is required", nil)
 	}
+	var sharedSourceScratch [128]int
+	sharedSources := hipGemma4Q4PrefillForwardSharedSourceLayers(forward, sharedSourceScratch[:0])
 	state := hipNewGemma4Q4DeviceDecodeState(firstNonEmptyString(mode, rocmKVCacheModeFP16), len(forward.Layers))
 	state.appendLayers = len(forward.Layers)
 	success := false
@@ -1226,6 +1231,17 @@ func hipGemma4Q4DeviceDecodeStateFromPrefillForward(forward *hipGemma4Q4PrefillF
 		if deviceKV == nil || deviceKV.Cache == nil || deviceKV.DescriptorTable == nil {
 			return nil, core.E(hipGemma4Q4Layer0Operation, "prefill forward layer device KV is required", nil)
 		}
+		if deviceKV.Cache.borrowed {
+			shared, err := hipGemma4Q4PrefillSharedDecodeLayerState(state, sharedSources[index])
+			if err != nil {
+				return nil, err
+			}
+			state.layers = append(state.layers, shared)
+			continue
+		}
+		if err := hipGemma4Q4PrefillFinalizeRetainWindow(deviceKV); err != nil {
+			return nil, core.E(hipGemma4Q4Layer0Operation, core.Sprintf("finalize prefill layer %d retained KV", index), err)
+		}
 		state.layers = append(state.layers, hipGemma4Q4DeviceLayerKVState{
 			cache:           deviceKV.Cache,
 			descriptorTable: deviceKV.DescriptorTable,
@@ -1237,6 +1253,100 @@ func hipGemma4Q4DeviceDecodeStateFromPrefillForward(forward *hipGemma4Q4PrefillF
 	}
 	success = true
 	return state, nil
+}
+
+func hipGemma4Q4PrefillForwardSharedSourceLayers(forward *hipGemma4Q4PrefillForwardBatch, sources []int) []int {
+	if forward == nil {
+		return sources[:0]
+	}
+	if cap(sources) < len(forward.Layers) {
+		sources = make([]int, len(forward.Layers))
+	} else {
+		sources = sources[:len(forward.Layers)]
+	}
+	for index := range sources {
+		sources[index] = index
+	}
+	for index := range forward.Layers {
+		deviceKV := (*hipGemma4Q4PrefillDeviceKVBatch)(nil)
+		if forward.Layers[index].KV != nil {
+			deviceKV = forward.Layers[index].KV.DeviceKV
+		}
+		if deviceKV == nil || deviceKV.Cache == nil || !deviceKV.Cache.borrowed {
+			continue
+		}
+		sources[index] = -1
+		for sourceIndex := index - 1; sourceIndex >= 0; sourceIndex-- {
+			sourceKV := (*hipGemma4Q4PrefillDeviceKVBatch)(nil)
+			if forward.Layers[sourceIndex].KV != nil {
+				sourceKV = forward.Layers[sourceIndex].KV.DeviceKV
+			}
+			if sourceKV == nil || sourceKV.Cache == nil || !deviceKV.Cache.sharesPagesFrom(sourceKV.Cache) {
+				continue
+			}
+			sources[index] = sourceIndex
+			break
+		}
+	}
+	return sources
+}
+
+func hipGemma4Q4PrefillFinalizeRetainWindow(deviceKV *hipGemma4Q4PrefillDeviceKVBatch) error {
+	if deviceKV == nil || deviceKV.Cache == nil || deviceKV.RetainWindow <= 0 || deviceKV.Cache.TokenCount() <= deviceKV.RetainWindow {
+		return nil
+	}
+	beforeTokens := deviceKV.Cache.TokenCount()
+	deviceKV.Cache = deviceKV.Cache.trimDeviceTokenWindow(deviceKV.RetainWindow)
+	if deviceKV.Cache.TokenCount() == beforeTokens {
+		return nil
+	}
+	if err := deviceKV.DescriptorTable.Close(); err != nil {
+		return err
+	}
+	table, err := deviceKV.Cache.KernelDescriptorTable()
+	if err != nil {
+		return err
+	}
+	launch, err := deviceKV.Cache.KernelLaunchDescriptor(table)
+	if err != nil {
+		_ = table.Close()
+		return err
+	}
+	deviceKV.DescriptorTable = table
+	deviceKV.Launch = launch
+	return nil
+}
+
+func hipGemma4Q4PrefillSharedDecodeLayerState(state *hipGemma4Q4DeviceDecodeState, sourceIndex int) (hipGemma4Q4DeviceLayerKVState, error) {
+	if state == nil || sourceIndex < 0 || sourceIndex >= len(state.layers) {
+		return hipGemma4Q4DeviceLayerKVState{}, core.E(hipGemma4Q4Layer0Operation, "prefill shared KV source state is required", nil)
+	}
+	source := &state.layers[sourceIndex]
+	if source.cache == nil || source.descriptorTable == nil {
+		return hipGemma4Q4DeviceLayerKVState{}, core.E(hipGemma4Q4Layer0Operation, "prefill shared KV source layer is unavailable", nil)
+	}
+	cache, err := source.cache.borrowedAlias()
+	if err != nil {
+		return hipGemma4Q4DeviceLayerKVState{}, err
+	}
+	table, err := source.descriptorTable.borrowedAlias()
+	if err != nil {
+		_ = cache.Close()
+		return hipGemma4Q4DeviceLayerKVState{}, err
+	}
+	launch, err := cache.KernelLaunchDescriptor(table)
+	if err != nil {
+		_ = table.Close()
+		_ = cache.Close()
+		return hipGemma4Q4DeviceLayerKVState{}, err
+	}
+	return hipGemma4Q4DeviceLayerKVState{
+		cache:                   cache,
+		descriptorTable:         table,
+		launch:                  launch,
+		borrowedCache:           true,
+		borrowedDescriptorTable: true,
+	}, nil
 }
 
 func hipRunGemma4Q4PrefillPerLayerInputProjectionBatch(ctx context.Context, driver nativeHIPDriver, cfg hipGemma4Q4Layer0Config, input, perLayerInput *hipDeviceByteBuffer, tokenCount int) (*hipDeviceByteBuffer, error) {

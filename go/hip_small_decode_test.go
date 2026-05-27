@@ -1494,6 +1494,197 @@ func TestHIPGemma4Q4PrefillForwardBatchWithPrior_Good(t *testing.T) {
 	core.AssertEqual(t, len(cfg.Layers)*gemma4Q4DeviceKVPagesForTokens(len(tokens)), countLaunchName(launches, hipKernelNameKVEncodeToken))
 }
 
+func TestHIPGemma4Q4PrefillDecodeStateTrimsSlidingWindow_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup0()
+	layer1, cleanup1 := hipGemma4Q4FixtureConfig(t, driver, 1, 4, 2, 8)
+	defer cleanup1()
+	hipGemma4Q4InstallNonzeroEmbeddingFixture(t, driver, &layer0, "prefill decode trim")
+	layer0.SlidingWindow = 1
+	layer1.SlidingWindow = 0
+	layer0.PerLayerInput = hipGemma4Q4PerLayerInputConfig{}
+	layer1.PerLayerInput = hipGemma4Q4PerLayerInputConfig{}
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0, layer1}}
+	tokens := []int32{0, 1}
+
+	firstForward, err := hipRunGemma4Q4PrefillForwardBatch(context.Background(), driver, cfg, tokens, 0, 1e-6, rocmKVCacheModeKQ8VQ4, nil, nil, nil)
+	core.RequireNoError(t, err)
+	firstState, err := hipGemma4Q4DeviceDecodeStateFromPrefillForward(firstForward, rocmKVCacheModeKQ8VQ4)
+	core.RequireNoError(t, err)
+	closeErr := firstForward.Close()
+	core.RequireNoError(t, closeErr)
+	defer firstState.Close()
+	core.AssertEqual(t, []int{1, len(tokens)}, firstState.LayerTokenCounts())
+
+	priorLayerKV := hipGemma4Q4DeviceLayerCaches(firstState, nil, len(cfg.Layers))
+	start := len(driver.launches)
+	secondForward, err := hipRunGemma4Q4PrefillForwardBatchWithPrior(context.Background(), driver, cfg, tokens, len(tokens), 1e-6, rocmKVCacheModeKQ8VQ4, priorLayerKV, nil, nil, nil)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 1+len(tokens), secondForward.Layers[0].KV.DeviceKV.Cache.TokenCount())
+	core.AssertEqual(t, len(tokens)*2, secondForward.Layers[1].KV.DeviceKV.Cache.TokenCount())
+
+	secondState, err := hipGemma4Q4DeviceDecodeStateFromPrefillForward(secondForward, rocmKVCacheModeKQ8VQ4)
+	core.RequireNoError(t, err)
+	closeErr = secondForward.Close()
+	core.RequireNoError(t, closeErr)
+	defer secondState.Close()
+	core.AssertEqual(t, []int{1, len(tokens) * 2}, secondState.LayerTokenCounts())
+
+	core.RequireNoError(t, hipFinalizeGemma4Q4ForwardDeviceState(firstState, secondState))
+	hipReleaseClosedGemma4Q4DeviceDecodeState(firstState)
+	firstState = nil
+
+	launches := driver.launches[start:]
+	var attentionLaunches []hipKernelLaunchConfig
+	for _, launch := range launches {
+		if launch.Name == hipKernelNameAttentionHeadsBatchCausal {
+			attentionLaunches = append(attentionLaunches, launch)
+		}
+	}
+	core.AssertEqual(t, 2, len(attentionLaunches))
+	core.AssertEqual(t, uint32(1+len(tokens)), binary.LittleEndian.Uint32(attentionLaunches[0].Args[52:]))
+	core.AssertEqual(t, uint32(len(tokens)), binary.LittleEndian.Uint32(attentionLaunches[0].Args[60:]))
+	core.AssertEqual(t, uint32(1), binary.LittleEndian.Uint32(attentionLaunches[0].Args[64:]))
+	core.AssertEqual(t, uint32(len(tokens)*2), binary.LittleEndian.Uint32(attentionLaunches[1].Args[52:]))
+	core.AssertEqual(t, uint32(len(tokens)), binary.LittleEndian.Uint32(attentionLaunches[1].Args[60:]))
+	core.AssertEqual(t, uint32(len(tokens)), binary.LittleEndian.Uint32(attentionLaunches[1].Args[64:]))
+}
+
+func TestHIPGemma4Q4PrefillDecodeStateSharedAliasesFollowTrimmedSource_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 8, 1, 8)
+	defer cleanup0()
+	layer1, cleanup1 := hipGemma4Q4FixtureConfig(t, driver, 1, 4, 2, 8)
+	defer cleanup1()
+	layer2, cleanup2 := hipGemma4Q4FixtureConfig(t, driver, 2, 8, 1, 8)
+	defer cleanup2()
+	layer3, cleanup3 := hipGemma4Q4FixtureConfig(t, driver, 3, 4, 2, 8)
+	defer cleanup3()
+	hipGemma4Q4InstallNonzeroEmbeddingFixture(t, driver, &layer0, "prefill shared trim")
+	layer0.LayerType = "sliding_attention"
+	layer0.SlidingWindow = 1
+	layer1.LayerType = "full_attention"
+	layer1.SlidingWindow = 0
+	layer2.LayerType = "sliding_attention"
+	layer2.SlidingWindow = 1
+	layer3.LayerType = "full_attention"
+	layer3.SlidingWindow = 0
+	layer0.PerLayerInput = hipGemma4Q4PerLayerInputConfig{}
+	layer1.PerLayerInput = hipGemma4Q4PerLayerInputConfig{}
+	layer2.PerLayerInput = hipGemma4Q4PerLayerInputConfig{}
+	layer3.PerLayerInput = hipGemma4Q4PerLayerInputConfig{}
+	cfg := hipGemma4Q4ForwardConfig{
+		Layers:         []hipGemma4Q4Layer0Config{layer0, layer1, layer2, layer3},
+		KVSharedLayers: 2,
+	}
+
+	forward, err := hipRunGemma4Q4PrefillForwardBatch(context.Background(), driver, cfg, []int32{0, 1}, 0, 1e-6, rocmKVCacheModeKQ8VQ4, nil, nil, nil)
+	core.RequireNoError(t, err)
+	state, err := hipGemma4Q4DeviceDecodeStateFromPrefillForward(forward, rocmKVCacheModeKQ8VQ4)
+	core.RequireNoError(t, err)
+	closeErr := forward.Close()
+	core.RequireNoError(t, closeErr)
+	defer state.Close()
+
+	core.AssertEqual(t, []int{1, 2, 1, 2}, state.LayerTokenCounts())
+	core.AssertEqual(t, true, state.layers[2].borrowedCache)
+	core.AssertEqual(t, true, state.layers[2].borrowedDescriptorTable)
+	core.AssertEqual(t, true, state.layers[3].borrowedCache)
+	core.AssertEqual(t, true, state.layers[3].borrowedDescriptorTable)
+	core.AssertEqual(t, state.layers[0].cache.TokenCount(), state.layers[2].cache.TokenCount())
+	core.AssertEqual(t, state.layers[1].cache.TokenCount(), state.layers[3].cache.TokenCount())
+}
+
+func hipGemma4Q4InstallNonzeroEmbeddingFixture(t *testing.T, driver nativeHIPDriver, layer *hipGemma4Q4Layer0Config, label string) {
+	t.Helper()
+	if layer == nil {
+		t.Fatal("layer is nil")
+	}
+	count := layer.VocabSize * (layer.HiddenSize / layer.GroupSize)
+	embeddingWeightsPayload, err := hipUint32Payload(make([]uint32, count))
+	core.RequireNoError(t, err)
+	embeddingWeights, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, label+" embedding weights", embeddingWeightsPayload, count)
+	core.RequireNoError(t, err)
+	t.Cleanup(func() {
+		_ = embeddingWeights.Close()
+	})
+	scaleValues := make([]uint16, count)
+	for index := range scaleValues {
+		scaleValues[index] = 0x3f80
+	}
+	embeddingScalesPayload, err := hipUint16Payload(scaleValues)
+	core.RequireNoError(t, err)
+	embeddingScales, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, label+" embedding scales", embeddingScalesPayload, count)
+	core.RequireNoError(t, err)
+	t.Cleanup(func() {
+		_ = embeddingScales.Close()
+	})
+	embeddingBiasesPayload, err := hipUint16Payload(scaleValues)
+	core.RequireNoError(t, err)
+	embeddingBiases, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, label+" embedding biases", embeddingBiasesPayload, count)
+	core.RequireNoError(t, err)
+	t.Cleanup(func() {
+		_ = embeddingBiases.Close()
+	})
+	layer.Embedding = hipDeviceEmbeddingLookupConfig{
+		EmbeddingPointer: embeddingWeights.Pointer(),
+		EmbeddingBytes:   embeddingWeights.SizeBytes(),
+		TableEncoding:    hipEmbeddingTableEncodingMLXQ4,
+		VocabSize:        layer.VocabSize,
+		HiddenSize:       layer.HiddenSize,
+		GroupSize:        layer.GroupSize,
+		ScalePointer:     embeddingScales.Pointer(),
+		BiasPointer:      embeddingBiases.Pointer(),
+		ScaleBytes:       embeddingScales.SizeBytes(),
+		BiasBytes:        embeddingBiases.SizeBytes(),
+	}
+}
+
+func BenchmarkHIPGemma4Q4PrefillForwardSharedSourceLayers_SharedSuffix(b *testing.B) {
+	const layerCount = 42
+	forward := &hipGemma4Q4PrefillForwardBatch{
+		Layers: make([]hipGemma4Q4PrefillForwardLayerBatch, layerCount),
+	}
+	for index := 0; index < layerCount; index++ {
+		pointerBase := nativeDevicePointer(0x100000 + index*0x100)
+		pages := []rocmDeviceKVPage{{
+			tokenStart: 0,
+			tokenCount: 1,
+			keyWidth:   512,
+			valueWidth: 512,
+			key:        rocmDeviceKVTensor{pointer: pointerBase + 1, sizeBytes: 516, encoding: rocmKVEncodingQ8},
+			value:      rocmDeviceKVTensor{pointer: pointerBase + 2, sizeBytes: 260, encoding: rocmKVEncodingQ4},
+		}}
+		cache := &rocmDeviceKVCache{mode: rocmKVCacheModeKQ8VQ4, blockSize: 1, tokenCount: 1, pages: pages}
+		forward.Layers[index].KV = &hipGemma4Q4PrefillLayerKVBatch{
+			DeviceKV: &hipGemma4Q4PrefillDeviceKVBatch{Cache: cache},
+		}
+	}
+	for index := 24; index < layerCount; index++ {
+		source := index - 18
+		forward.Layers[index].KV.DeviceKV.Cache = &rocmDeviceKVCache{
+			mode:       rocmKVCacheModeKQ8VQ4,
+			blockSize:  1,
+			tokenCount: 1,
+			pages:      forward.Layers[source].KV.DeviceKV.Cache.pages,
+			borrowed:   true,
+		}
+	}
+	scratch := make([]int, 0, layerCount)
+	sources := hipGemma4Q4PrefillForwardSharedSourceLayers(forward, scratch)
+	if len(sources) != layerCount || sources[24] != 6 || sources[41] != 23 {
+		b.Fatalf("shared sources[24,41] = %d,%d", sources[24], sources[41])
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		sources = hipGemma4Q4PrefillForwardSharedSourceLayers(forward, scratch)
+		if len(sources) != layerCount || sources[24] != 6 || sources[41] != 23 {
+			b.Fatalf("shared sources[24,41] = %d,%d", sources[24], sources[41])
+		}
+	}
+}
+
 func TestHIPGemma4Q4PrefillForwardBatchWithGeneratedPerLayerInput_Good(t *testing.T) {
 	driver := &fakeHIPDriver{available: true}
 	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
