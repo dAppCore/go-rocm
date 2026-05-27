@@ -3050,7 +3050,7 @@ func hipAttentionHeadsChunkedEligible(req hipAttentionRequest, dim, tokenCount i
 	if req.DeviceKV.mode != rocmKVCacheModeKQ8VQ4 {
 		return false
 	}
-	return req.DeviceKV.TokenCount() == tokenCount && req.DeviceKV.PageCount() == tokenCount
+	return req.DeviceKV.TokenCount() == tokenCount && req.DeviceKV.PageCount() > 0
 }
 
 func hipRunAttentionHeadsChunked(ctx context.Context, driver nativeHIPDriver, req hipAttentionRequest, query *hipDeviceByteBuffer, headCount, dim, tokenCount int, output *hipDeviceByteBuffer, workspace *hipAttentionHeadsChunkedWorkspace) error {

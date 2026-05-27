@@ -2639,7 +2639,7 @@ __device__ bool rocm_valid_attention_heads_chunked_args(const rocm_attention_hea
 		header->header_bytes == ROCM_DEVICE_KV_DESCRIPTOR_HEADER_BYTES &&
 		header->page_bytes == ROCM_DEVICE_KV_DESCRIPTOR_PAGE_BYTES &&
 		header->mode_code == ROCM_DEVICE_KV_DESCRIPTOR_MODE_KQ8VQ4 &&
-		header->page_count == args.token_count &&
+		header->page_count > 0 &&
 		header->token_count == args.token_count &&
 		args.descriptor_bytes == static_cast<uint64_t>(ROCM_DEVICE_KV_DESCRIPTOR_HEADER_BYTES) + static_cast<uint64_t>(header->page_count) * ROCM_DEVICE_KV_DESCRIPTOR_PAGE_BYTES;
 }

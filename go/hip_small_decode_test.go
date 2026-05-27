@@ -2153,6 +2153,33 @@ func TestHIPAttentionHeadsChunkedSharedMemBytes_Good(t *testing.T) {
 	core.AssertNotEqual(t, nil, err)
 }
 
+func TestHIPAttentionHeadsChunkedEligible_BlockPagesGood(t *testing.T) {
+	pages := make([]rocmDeviceKVPage, 0, 20)
+	for index := 0; index < 20; index++ {
+		pages = append(pages, rocmDeviceKVPage{
+			tokenStart: index * 16,
+			tokenCount: 16,
+			keyWidth:   256,
+			valueWidth: 256,
+			key:        rocmDeviceKVTensor{pointer: nativeDevicePointer(1000 + index), encoding: rocmKVEncodingQ8Rows, sizeBytes: 16*256 + 16*4},
+			value:      rocmDeviceKVTensor{pointer: nativeDevicePointer(2000 + index), encoding: rocmKVEncodingQ4Rows, sizeBytes: (16*256)/2 + 16*4},
+		})
+	}
+	req := hipAttentionRequest{
+		DeviceKV: &rocmDeviceKVCache{
+			mode:       rocmKVCacheModeKQ8VQ4,
+			blockSize:  16,
+			pages:      pages,
+			tokenCount: 320,
+		},
+		DescriptorTable: &rocmDeviceKVDescriptorTable{},
+	}
+	core.AssertEqual(t, true, hipAttentionHeadsChunkedEligible(req, 256, 320))
+
+	req.DeviceKV.mode = rocmKVCacheModeQ8
+	core.AssertEqual(t, false, hipAttentionHeadsChunkedEligible(req, 256, 320))
+}
+
 func BenchmarkHIPDeviceByteBufferPool_ReusedSize(b *testing.B) {
 	driver := &fakeHIPDriver{available: true}
 	const sizeBytes uint64 = 4096

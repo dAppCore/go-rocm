@@ -2434,6 +2434,69 @@ func TestHIPHardwareTransformerKernelSource_Good(t *testing.T) {
 		}
 	})
 
+	t.Run("attention-heads-chunked-block-row-kv", func(t *testing.T) {
+		const (
+			dim        = 256
+			tokenCount = 320
+			headCount  = 2
+		)
+		queryValues := make([]float32, headCount*dim)
+		keyValues := make([]float32, tokenCount*dim)
+		valueValues := make([]float32, tokenCount*dim)
+		for index := range queryValues {
+			queryValues[index] = float32(math.Sin(float64(index)*0.013) * 0.75)
+		}
+		for index := range keyValues {
+			keyValues[index] = float32(math.Sin(float64(index)*0.017) * 0.5)
+		}
+		for index := range valueValues {
+			valueValues[index] = float32(math.Cos(float64(index)*0.011) * 0.5)
+		}
+		keyPayload, err := hipFloat32Payload(keyValues)
+		core.RequireNoError(t, err)
+		keyBuffer, err := hipUploadByteBuffer(hipRuntime.driver, "rocm.hip.AttentionHeadsChunkedLaunch", "hardware block row key values", keyPayload, len(keyValues))
+		core.RequireNoError(t, err)
+		defer keyBuffer.Close()
+		valuePayload, err := hipFloat32Payload(valueValues)
+		core.RequireNoError(t, err)
+		valueBuffer, err := hipUploadByteBuffer(hipRuntime.driver, "rocm.hip.AttentionHeadsChunkedLaunch", "hardware block row value values", valuePayload, len(valueValues))
+		core.RequireNoError(t, err)
+		defer valueBuffer.Close()
+		cache := &rocmDeviceKVCache{driver: hipRuntime.driver, mode: rocmKVCacheModeKQ8VQ4, blockSize: 16}
+		deviceKV, err := cache.withAppendedDeviceRowsWindow(context.Background(), keyBuffer, valueBuffer, dim, dim, tokenCount, 0)
+		core.RequireNoError(t, err)
+		defer deviceKV.Close()
+		table, err := deviceKV.KernelDescriptorTable()
+		core.RequireNoError(t, err)
+		defer table.Close()
+		queryPayload, err := hipFloat32Payload(queryValues)
+		core.RequireNoError(t, err)
+		queryBuffer, err := hipUploadByteBuffer(hipRuntime.driver, "rocm.hip.AttentionHeadsChunkedLaunch", "hardware block row attention query", queryPayload, len(queryValues))
+		core.RequireNoError(t, err)
+		defer queryBuffer.Close()
+		normalOutput, err := hipAllocateByteBuffer(hipRuntime.driver, "rocm.hip.AttentionHeadsLaunch", "hardware block row normal attention output", uint64(len(queryValues)*4), len(queryValues))
+		core.RequireNoError(t, err)
+		defer normalOutput.Close()
+		chunkedOutput, err := hipAllocateByteBuffer(hipRuntime.driver, "rocm.hip.AttentionHeadsChunkedLaunch", "hardware block row chunked attention output", uint64(len(queryValues)*4), len(queryValues))
+		core.RequireNoError(t, err)
+		defer chunkedOutput.Close()
+		req := hipAttentionRequest{
+			QueryDim:        dim,
+			DeviceKV:        deviceKV,
+			DescriptorTable: table,
+			Scale:           1,
+		}
+		core.RequireNoError(t, hipRunAttentionHeadsOutputFromDeviceQueryToDeviceKernel(context.Background(), hipRuntime.driver, req, queryBuffer, headCount, normalOutput))
+		workspace := &hipAttentionHeadsChunkedWorkspace{}
+		defer workspace.Close()
+		core.RequireNoError(t, hipRunAttentionHeadsChunked(context.Background(), hipRuntime.driver, req, queryBuffer, headCount, dim, tokenCount, chunkedOutput, workspace))
+		normalGot, err := hipReadFloat32DeviceOutput(normalOutput, "rocm.hip.AttentionHeadsLaunch", "hardware block row normal attention output", len(queryValues))
+		core.RequireNoError(t, err)
+		chunkedGot, err := hipReadFloat32DeviceOutput(chunkedOutput, "rocm.hip.AttentionHeadsChunkedLaunch", "hardware block row chunked attention output", len(queryValues))
+		core.RequireNoError(t, err)
+		assertFloat32SlicesNear(t, normalGot, chunkedGot, 0.001)
+	})
+
 	t.Run("attention-heads-batch-chunked-block-kv", func(t *testing.T) {
 		const (
 			dim             = 4

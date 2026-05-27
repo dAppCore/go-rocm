@@ -549,6 +549,20 @@ better than the rejected page-scale run, but block pages cannot replace the
 one-token default until attention can address the block layout without the
 current long-context page lookup/payload overhead.
 
+Accepted block-page chunked decode repair: the single-token decode chunked
+attention route now accepts block-paged KQ8/VQ4 descriptors instead of requiring
+`page_count == token_count`. A live `gfx1100` hardware subtest compares normal
+attention and chunked attention over row-scaled 16-token KV pages with empty
+stderr. The 2-turn `2k` block-page probe improved from `78.48 tok/s` average
+and `67.81 tok/s` on turn 2 to `95.61 tok/s` average and `93.73 tok/s` on turn
+2. The full 10-turn `48k` retained book with `block_size=16` then passed the
+production wall and arc gates with empty stderr at `50.17s` wall, `43.39s`
+decode, `3597` generated tokens, `71.70 tok/s` average, `68.76 tok/s` on turn
+10, `28243032 B/op`, `33983 allocs/op`, `0` repeated turns, `0` max-token hits,
+and `4` chapter-10 arc anchors. This makes row-scaled block pages a valid
+production-candidate route, but the later-turn decode rate is still below the
+`90-100+ tok/s` long-context target.
+
 Rejected prompt-shortening follow-up: replacing the anchored wording with a
 shorter "advance the arc / keep continuity words alive" instruction reduced
 prompt tokens to `1581` and still passed the arc gate with `3` anchors, but it
@@ -1624,9 +1638,11 @@ endpoint.
   chasing a tiny page for every key/value access.
   - 2026-05-27 progress: row-scaled `q8-rows`/`q4-rows` block pages now preserve
     per-token scales and pass fake plus live `gfx1100` row-encode/attention
-    tests. A full 10-turn `48k` retained-book run still failed the `110s` gate
-    at `134.08s` wall and `17.33 tok/s` on turn 10, so the remaining work is
-    the production full/SWA slot layout and block-aware attention kernel.
+    tests. Allowing chunked decode attention to consume block-paged descriptors
+    made the full 10-turn `48k` retained-book run pass at `50.17s` wall with
+    `4` arc anchors, but turn 10 is still only `68.76 tok/s`; remaining work is
+    the production full/SWA slot layout and a faster block-aware attention
+    kernel.
 - [ ] Move GELU/SwiGLU/multiply and residual/norm chaining into HIP kernels or a
   fused per-layer kernel. No q4 MLP intermediate should become a Go `[]float32`.
 - [ ] Keep attention update and KV cache reads on device while replacing the
