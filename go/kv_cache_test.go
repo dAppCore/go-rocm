@@ -1193,6 +1193,110 @@ func TestKVCache_Good_DeviceTransferSharedPagesTrimmedSuffix(t *testing.T) {
 	core.RequireNoError(t, target.Close())
 }
 
+func TestKVCache_Good_DeviceTransferSharedPagesOneTokenWindowShift(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	sourcePages := []rocmDeviceKVPage{
+		{
+			tokenStart: 0,
+			tokenCount: 1,
+			key:        rocmDeviceKVTensor{pointer: 0x1001, sizeBytes: 4, encoding: rocmKVEncodingQ8},
+			value:      rocmDeviceKVTensor{pointer: 0x1002, sizeBytes: 4, encoding: rocmKVEncodingQ4},
+			owned:      true,
+		},
+		{
+			tokenStart: 1,
+			tokenCount: 1,
+			key:        rocmDeviceKVTensor{pointer: 0x2001, sizeBytes: 4, encoding: rocmKVEncodingQ8},
+			value:      rocmDeviceKVTensor{pointer: 0x2002, sizeBytes: 4, encoding: rocmKVEncodingQ4},
+			owned:      true,
+		},
+		{
+			tokenStart: 2,
+			tokenCount: 1,
+			key:        rocmDeviceKVTensor{pointer: 0x3001, sizeBytes: 4, encoding: rocmKVEncodingQ8},
+			value:      rocmDeviceKVTensor{pointer: 0x3002, sizeBytes: 4, encoding: rocmKVEncodingQ4},
+			owned:      true,
+		},
+	}
+	targetPages := []rocmDeviceKVPage{
+		sourcePages[1],
+		sourcePages[2],
+		{
+			tokenStart: 2,
+			tokenCount: 1,
+			key:        rocmDeviceKVTensor{pointer: 0x4001, sizeBytes: 4, encoding: rocmKVEncodingQ8},
+			value:      rocmDeviceKVTensor{pointer: 0x4002, sizeBytes: 4, encoding: rocmKVEncodingQ4},
+			owned:      true,
+		},
+	}
+	targetPages[0].tokenStart = 0
+	targetPages[0].owned = false
+	targetPages[1].tokenStart = 1
+	targetPages[1].owned = false
+	source := rocmBorrowDeviceKVCache(driver, rocmKVCacheModeKQ8VQ4, 1, len(sourcePages), sourcePages, false)
+	target := rocmBorrowDeviceKVCache(driver, rocmKVCacheModeKQ8VQ4, 1, len(targetPages), targetPages, false)
+
+	core.RequireNoError(t, source.transferSharedPagesTo(target))
+
+	core.AssertEqual(t, true, source.closed)
+	core.AssertEqual(t, []nativeDevicePointer{0x1001, 0x1002}, driver.frees)
+	core.AssertEqual(t, true, target.pages[0].owned)
+	core.AssertEqual(t, true, target.pages[1].owned)
+	core.AssertEqual(t, true, target.pages[2].owned)
+	core.AssertEqual(t, nativeDevicePointer(0x2001), target.pages[0].key.pointer)
+	core.AssertEqual(t, nativeDevicePointer(0x3002), target.pages[1].value.pointer)
+	core.RequireNoError(t, target.Close())
+}
+
+func BenchmarkROCmDeviceKVTransferSharedPages_HotWindowShift(b *testing.B) {
+	const (
+		pageCount  = 512
+		keyBytes   = uint64(260)
+		valueBytes = uint64(132)
+	)
+	driver := &fakeHIPDriver{available: true, skipLaunchRecording: true, releaseLaunchPackets: true}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		sourcePages := rocmDeviceKVBorrowPageSlice(0, pageCount)
+		for token := 0; token < pageCount; token++ {
+			sourcePages = append(sourcePages, rocmDeviceKVPage{
+				tokenStart: token,
+				tokenCount: 1,
+				keyWidth:   256,
+				valueWidth: 256,
+				key:        rocmDeviceKVTensor{pointer: nativeDevicePointer(0x100000 + token*0x1000), sizeBytes: keyBytes, encoding: rocmKVEncodingQ8},
+				value:      rocmDeviceKVTensor{pointer: nativeDevicePointer(0x200000 + token*0x1000), sizeBytes: valueBytes, encoding: rocmKVEncodingQ4},
+				owned:      true,
+			})
+		}
+		targetPages := rocmDeviceKVBorrowPageSlice(0, pageCount)
+		for token := 1; token < pageCount; token++ {
+			page := sourcePages[token]
+			page.tokenStart--
+			page.owned = false
+			targetPages = append(targetPages, page)
+		}
+		targetPages = append(targetPages, rocmDeviceKVPage{
+			tokenStart: pageCount - 1,
+			tokenCount: 1,
+			keyWidth:   256,
+			valueWidth: 256,
+			key:        rocmDeviceKVTensor{pointer: 0x900000, sizeBytes: keyBytes, encoding: rocmKVEncodingQ8},
+			value:      rocmDeviceKVTensor{pointer: 0xa00000, sizeBytes: valueBytes, encoding: rocmKVEncodingQ4},
+			owned:      true,
+		})
+		source := rocmBorrowDeviceKVCache(driver, rocmKVCacheModeKQ8VQ4, 1, pageCount, sourcePages, false)
+		target := rocmBorrowDeviceKVCache(driver, rocmKVCacheModeKQ8VQ4, 1, pageCount, targetPages, false)
+		if err := source.transferSharedPagesTo(target); err != nil {
+			b.Fatalf("transfer shared pages: %v", err)
+		}
+		rocmReleaseDeviceKVCache(source)
+		rocmDeviceKVReleasePageSlice(target.pages)
+		target.pages = nil
+		rocmReleaseDeviceKVCache(target)
+	}
+}
+
 func TestKVCache_Bad_DeviceMirrorAppendRollbackOnDescriptorFailure(t *testing.T) {
 	cache, err := newROCmKVCache(rocmKVCacheModeQ8, 2)
 	core.RequireNoError(t, err)
@@ -1397,6 +1501,42 @@ func TestKVCache_DeviceDescriptorTableLogicalAndAllocationBytes_Good(t *testing.
 	core.AssertEqual(t, logicalBytes, table.SizeBytes())
 	core.AssertEqual(t, allocationBytes, table.AllocationBytes())
 	rocmReleaseDeviceKVDescriptorTable(table)
+}
+
+func TestKVCache_DeviceKVTensorPoolReusesInlineAndRestEntries_Good(t *testing.T) {
+	t.Setenv("GO_ROCM_ENABLE_KV_TENSOR_POOL", "1")
+	rocmDeviceKVTensorPool.Lock()
+	rocmDeviceKVTensorPool.entries = make(map[uint64]rocmDeviceKVTensorPoolBucket)
+	rocmDeviceKVTensorPool.bytes = 0
+	rocmDeviceKVTensorPool.Unlock()
+	defer func() {
+		rocmDeviceKVTensorPool.Lock()
+		rocmDeviceKVTensorPool.entries = make(map[uint64]rocmDeviceKVTensorPoolBucket)
+		rocmDeviceKVTensorPool.bytes = 0
+		rocmDeviceKVTensorPool.Unlock()
+	}()
+
+	driver := &fakeHIPDriver{available: true}
+	first, err := rocmDeviceKVTensorMalloc(driver, 392)
+	core.RequireNoError(t, err)
+	second, err := rocmDeviceKVTensorMalloc(driver, 392)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, []uint64{392, 392}, driver.allocations)
+
+	core.RequireNoError(t, rocmDeviceKVTensorFree(driver, first, 392))
+	core.RequireNoError(t, rocmDeviceKVTensorFree(driver, second, 392))
+	core.AssertEqual(t, 0, len(driver.frees))
+	core.AssertEqual(t, uint64(784), rocmDeviceKVTensorPool.bytes)
+
+	reusedFirst, err := rocmDeviceKVTensorMalloc(driver, 392)
+	core.RequireNoError(t, err)
+	reusedSecond, err := rocmDeviceKVTensorMalloc(driver, 392)
+	core.RequireNoError(t, err)
+
+	core.AssertEqual(t, first, reusedFirst)
+	core.AssertEqual(t, second, reusedSecond)
+	core.AssertEqual(t, []uint64{392, 392}, driver.allocations)
+	core.AssertEqual(t, uint64(0), rocmDeviceKVTensorPool.bytes)
 }
 
 func TestKVCache_Bad_DeviceDescriptorBytesRejectUnsupportedABIValues(t *testing.T) {

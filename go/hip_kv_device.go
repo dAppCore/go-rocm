@@ -364,12 +364,30 @@ type rocmDeviceKVTensorPoolEntry struct {
 	pointer nativeDevicePointer
 }
 
+type rocmDeviceKVTensorPoolBucket struct {
+	first rocmDeviceKVTensorPoolEntry
+	rest  []rocmDeviceKVTensorPoolEntry
+}
+
+func (bucket rocmDeviceKVTensorPoolBucket) len() int {
+	if bucket.first.pointer == 0 {
+		return 0
+	}
+	return 1 + len(bucket.rest)
+}
+
 var rocmDeviceKVTensorPool = struct {
 	sync.Mutex
-	entries map[uint64][]rocmDeviceKVTensorPoolEntry
+	entries map[uint64]rocmDeviceKVTensorPoolBucket
+	bytes   uint64
 }{
-	entries: make(map[uint64][]rocmDeviceKVTensorPoolEntry),
+	entries: make(map[uint64]rocmDeviceKVTensorPoolBucket),
 }
+
+const (
+	rocmDeviceKVTensorPoolMaxPerSize = 4096
+	rocmDeviceKVTensorPoolMaxBytes   = 64 << 20
+)
 
 func hipGemma4Q4DeviceKVBlockSize() int {
 	raw := os.Getenv("GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE")
@@ -535,6 +553,9 @@ func rocmDeviceKVReleaseDescriptorBytes(payload []byte) {
 }
 
 func rocmDeviceKVTensorPoolEnabled() bool {
+	if os.Getenv("GO_ROCM_DISABLE_KV_TENSOR_POOL") == "1" {
+		return false
+	}
 	return os.Getenv("GO_ROCM_ENABLE_KV_TENSOR_POOL") == "1"
 }
 
@@ -551,22 +572,36 @@ func rocmDeviceKVTensorMalloc(driver nativeHIPDriver, sizeBytes uint64) (nativeD
 		return driver.Malloc(sizeBytes)
 	}
 	rocmDeviceKVTensorPool.Lock()
-	entries := rocmDeviceKVTensorPool.entries[sizeBytes]
-	for index := len(entries) - 1; index >= 0; index-- {
-		entry := entries[index]
-		if entry.driver != driver {
-			continue
+	bucket := rocmDeviceKVTensorPool.entries[sizeBytes]
+	if bucket.first.pointer != 0 {
+		if bucket.first.driver == driver {
+			pointer := bucket.first.pointer
+			if count := len(bucket.rest); count > 0 {
+				bucket.first = bucket.rest[count-1]
+				bucket.rest[count-1] = rocmDeviceKVTensorPoolEntry{}
+				bucket.rest = bucket.rest[:count-1]
+			} else {
+				bucket.first = rocmDeviceKVTensorPoolEntry{}
+			}
+			rocmDeviceKVTensorPool.entries[sizeBytes] = bucket
+			rocmDeviceKVTensorPool.bytes -= sizeBytes
+			rocmDeviceKVTensorPool.Unlock()
+			return pointer, nil
 		}
-		pointer := entry.pointer
-		entries[index] = entries[len(entries)-1]
-		entries = entries[:len(entries)-1]
-		if len(entries) == 0 {
-			delete(rocmDeviceKVTensorPool.entries, sizeBytes)
-		} else {
-			rocmDeviceKVTensorPool.entries[sizeBytes] = entries
+		for index := len(bucket.rest) - 1; index >= 0; index-- {
+			entry := bucket.rest[index]
+			if entry.driver != driver {
+				continue
+			}
+			pointer := entry.pointer
+			bucket.rest[index] = bucket.rest[len(bucket.rest)-1]
+			bucket.rest[len(bucket.rest)-1] = rocmDeviceKVTensorPoolEntry{}
+			bucket.rest = bucket.rest[:len(bucket.rest)-1]
+			rocmDeviceKVTensorPool.entries[sizeBytes] = bucket
+			rocmDeviceKVTensorPool.bytes -= sizeBytes
+			rocmDeviceKVTensorPool.Unlock()
+			return pointer, nil
 		}
-		rocmDeviceKVTensorPool.Unlock()
-		return pointer, nil
 	}
 	rocmDeviceKVTensorPool.Unlock()
 	return driver.Malloc(sizeBytes)
@@ -578,10 +613,20 @@ func rocmDeviceKVTensorFree(driver nativeHIPDriver, pointer nativeDevicePointer,
 	}
 	if rocmDeviceKVTensorPoolEnabled() && driver != nil && sizeBytes > 0 {
 		rocmDeviceKVTensorPool.Lock()
-		entries := rocmDeviceKVTensorPool.entries[sizeBytes]
-		const maxPooledPerSize = 4096
-		if len(entries) < maxPooledPerSize {
-			rocmDeviceKVTensorPool.entries[sizeBytes] = append(entries, rocmDeviceKVTensorPoolEntry{driver: driver, pointer: pointer})
+		bucket := rocmDeviceKVTensorPool.entries[sizeBytes]
+		if bucket.len() < rocmDeviceKVTensorPoolMaxPerSize &&
+			rocmDeviceKVTensorPool.bytes+sizeBytes <= rocmDeviceKVTensorPoolMaxBytes {
+			entry := rocmDeviceKVTensorPoolEntry{driver: driver, pointer: pointer}
+			if bucket.first.pointer == 0 {
+				bucket.first = entry
+			} else {
+				if bucket.rest == nil {
+					bucket.rest = make([]rocmDeviceKVTensorPoolEntry, 0, 8)
+				}
+				bucket.rest = append(bucket.rest, entry)
+			}
+			rocmDeviceKVTensorPool.entries[sizeBytes] = bucket
+			rocmDeviceKVTensorPool.bytes += sizeBytes
 			rocmDeviceKVTensorPool.Unlock()
 			return nil
 		}
@@ -1776,12 +1821,24 @@ func (cache *rocmDeviceKVCache) transferSharedPagesTo(next *rocmDeviceKVCache) e
 		cache.finishTransferSharedPages()
 		return lastErr
 	}
+	if len(sourcePages) > 1 && len(sourcePages) == len(targetPages) &&
+		rocmDeviceKVPagePointersEqual(&sourcePages[1], &targetPages[0]) &&
+		rocmDeviceKVPagePointersEqual(&sourcePages[len(sourcePages)-1], &targetPages[len(targetPages)-2]) {
+		rocmDeviceKVFreeOwnedPage(cache.driver, &sourcePages[0], &lastErr)
+		for targetIndex := 0; targetIndex < len(targetPages)-1; targetIndex++ {
+			rocmDeviceKVTransferPageOwnership(&sourcePages[targetIndex+1], &targetPages[targetIndex])
+		}
+		cache.finishTransferSharedPages()
+		return lastErr
+	}
+	slowStorageMatch := rocmDeviceKVPageSliceHasSlicedStorage(sourcePages) || rocmDeviceKVPageSliceHasSlicedStorage(targetPages)
 	for sourceIndex := range sourcePages {
 		source := &sourcePages[sourceIndex]
 		matched := false
 		for targetIndex := range targetPages {
 			target := &targetPages[targetIndex]
-			if rocmDeviceKVPageSharesStorage(source, target) {
+			if rocmDeviceKVPagePointersEqual(source, target) ||
+				(slowStorageMatch && rocmDeviceKVPageSharesStorage(source, target)) {
 				rocmDeviceKVTransferPageOwnership(source, target)
 				matched = true
 				break
@@ -1808,6 +1865,26 @@ func rocmDeviceKVPagePointersEqual(source, target *rocmDeviceKVPage) bool {
 	return source != nil && target != nil &&
 		source.key.pointer == target.key.pointer &&
 		source.value.pointer == target.value.pointer
+}
+
+func rocmDeviceKVPageSliceHasSlicedStorage(pages []rocmDeviceKVPage) bool {
+	for index := range pages {
+		if rocmDeviceKVPageHasSlicedStorage(&pages[index]) {
+			return true
+		}
+	}
+	return false
+}
+
+func rocmDeviceKVPageHasSlicedStorage(page *rocmDeviceKVPage) bool {
+	if page == nil {
+		return false
+	}
+	return rocmDeviceKVTensorHasSlicedStorage(page.key) || rocmDeviceKVTensorHasSlicedStorage(page.value)
+}
+
+func rocmDeviceKVTensorHasSlicedStorage(tensor rocmDeviceKVTensor) bool {
+	return tensor.allocationPointer != 0 && tensor.allocationBytes != 0 && tensor.pointer != tensor.allocationPointer
 }
 
 func rocmDeviceKVPageSharesStorage(source, target *rocmDeviceKVPage) bool {
@@ -1888,6 +1965,16 @@ func (cache *rocmDeviceKVCache) sharesPagesFrom(source *rocmDeviceKVCache) bool 
 		return false
 	}
 	if cache.driver != source.driver || cache.mode != source.mode || cache.blockSize != source.blockSize {
+		return false
+	}
+	for sourceIndex := range source.pages {
+		for targetIndex := range cache.pages {
+			if rocmDeviceKVPagePointersEqual(&source.pages[sourceIndex], &cache.pages[targetIndex]) {
+				return true
+			}
+		}
+	}
+	if !rocmDeviceKVPageSliceHasSlicedStorage(source.pages) && !rocmDeviceKVPageSliceHasSlicedStorage(cache.pages) {
 		return false
 	}
 	for sourceIndex := range source.pages {

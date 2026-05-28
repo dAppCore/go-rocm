@@ -1,5 +1,152 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-28 Accepted SWA Ownership Transfer Fast Path
+
+Re-read `/home/claude/Code/core/go-mlx/IDEAS.md` before this pass. The relevant
+Gemma4 rule for ROCm is still: local/SWA KV must stay exact and bounded at
+`512`/`1024`, while global/full KV carries retained context. The 2048 route
+guard had fallen from the accepted `~110-116 tok/s` band to `~101 tok/s` after
+the local block-page experiments even though kernel launch counts were
+unchanged.
+
+The regression was host-side ownership plumbing, not GPU math. The sliced
+interleaved-page experiment changed shared-page matching to use storage-range
+checks for every page comparison. That preserves correctness for optional
+sliced interleaved pages, but it put the default one-token SWA window through
+the slow matching path on every append/finalize. Restored exact-pointer matching
+as the hot path, added a dedicated one-token local-window shift transfer, and
+kept storage-range matching only as a fallback when a page actually points into
+the middle of a larger allocation.
+
+Focused validation:
+
+```text
+go test ./go -run '^(TestKVCache_Good_DeviceTransferSharedPagesOneTokenWindowShift|TestKVCache_Good_DeviceAppendSlicesInterleavedWindowPage|TestKVCache_Good_DeviceDescriptorAppendGrowsAndTrimsInterleavedWindow|TestInferenceBenchmarkHIPKernelCountingDriver_Good|TestKVCache_DeviceKVTensorPoolReusesInlineAndRestEntries_Good)$' -count=1
+PASS
+
+BenchmarkROCmDeviceKVTransferSharedPages_HotWindowShift-32  177859  6664 ns/op  94 B/op  0 allocs/op
+```
+
+Live RX 7800 XT validation:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 18553017328 ns/op
+tok/s=110.4
+B/op=3165672
+allocs/op=2557
+device_mallocs/op=25217
+device_malloc_size_392_count/op=24588
+kernel_total_launches/op=941890
+stderr: .bench-errors/2048_transfer_fastpath_route_metrics_20260528.err (0 bytes)
+```
+
+Strict retained 48k 10-turn book, explicit `GO_ROCM_BOOK_PREFILL_UBATCH_TOKENS=512`,
+no prompt replay:
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 44453884636 ns/op
+book_wall_s=44.44
+book_decode_s=35.84
+book_generated_tokens=3388
+book_tok/s=76.23
+book_last_turn_tok/s=88.24
+book_turn10_retained_tokens=5576
+book_90s_success=1
+book_110s_production_candidate=1
+book_maxed_turns=0
+book_repeated_turns=0
+book_max_adjacent_repeat=0.005758
+chapter10_arc_anchor_hits=5
+B/op=7354896
+allocs/op=37511
+peak_memory_bytes=5866106880
+stderr: .bench-errors/book10_transfer_fastpath_20260528.err (0 bytes)
+artifact: /tmp/go-rocm-book-transfer-fastpath-10turn-20260528.md
+```
+
+Also checked the native reported `gfx1101` target because `rocm-smi` reports the
+RX 7800 XT as `gfx1101`: `hipcc --std=c++23 --genco --offload-arch=gfx1101`
+compiled cleanly, but `hipModuleLoadData` rejected that image with HIP error
+`200`. Keep using the accepted `gfx1100` HSACO route on this host.
+
+## 2026-05-28 Malloc-Size Metrics and Rejected Default KV Tensor Pool
+
+Added benchmark route metrics for top HIP device allocation sizes. This makes
+the state-traffic problem visible beside the existing kernel launch/block
+tables. A fresh default `text:Hi` 2048-token route-metrics run showed the top
+device malloc bucket was the generated local/SWA KQ8/VQ4 interleaved one-token
+page size:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 19204244852 ns/op
+tok/s=106.6
+B/op=3165912
+allocs/op=2558
+device_mallocs/op=25217
+device_malloc_bytes/op=30712776
+device_malloc_size_392_count/op=24588
+device_malloc_size_392_bytes/op=9638496
+stderr: .bench-errors/2048_malloc_size_metrics_safe_default_20260528.err (0 bytes)
+```
+
+The previous `GO_ROCM_ENABLE_KV_TENSOR_POOL=1` path had been rejected because it
+cut HIP mallocs but added substantial Go allocation churn. Reworked that pool
+from a raw slice per size into an inline-first bucket and added a `64MiB` total
+retained-byte cap. The optimized pool is still opt-in behind
+`GO_ROCM_ENABLE_KV_TENSOR_POOL=1`.
+
+The same 2048-token route-metrics guard with `GO_ROCM_ENABLE_KV_TENSOR_POOL=1`
+now cuts the hot 392-byte bucket without the earlier Go allocation regression:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 19197639279 ns/op
+tok/s=106.7
+B/op=3261576
+allocs/op=2566
+device_mallocs/op=2177
+device_malloc_bytes/op=21681096
+device_malloc_size_392_count/op=1548
+device_malloc_size_392_bytes/op=606816
+stderr: .bench-errors/2048_kv_tensor_pool_bucket_20260528.err (0 bytes)
+```
+
+This removes `23040` logical HIP malloc requests from the short 2048 guard while
+keeping speed and Go allocation pressure noise-flat. Promoting the pool to a
+cgo-driver default was tested and rejected, however: the strict 48k retained
+10-turn book gate with the default pool completed with empty stderr and retained
+the chapter arc, but late-turn decode collapsed to `38.74 tok/s` and wall time
+rose to `100.86s`:
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState
+book_wall_s=100.860
+book_generated_tokens=3950
+book_turn10_tok/s=38.74
+book_repeated_turns=0
+book_maxed_turns=0
+chapter10_arc_anchor_hits>=3
+stderr: .bench-errors/book10_default_kv_tensor_pool_nometrics_20260528.err (0 bytes)
+artifact: /tmp/go-rocm-book-default-kv-tensor-pool-nometrics-20260528.md
+```
+
+Conclusion: keep the allocation-size metrics and the optimized pool
+implementation, but do not enable the KV tensor pool by default. The next
+production move is still a scoped retained-KV arena/ring layout or fused
+long-context attention/q4 projection work, not a global freed-pointer pool.
+
+Focused validation:
+
+```text
+go test ./go -run '^(TestInferenceBenchmarkHIPKernelCountingDriver_Good|TestKVCache_DeviceKVTensorPoolReusesInlineAndRestEntries_Good)$' -count=1
+PASS
+
+go test ./go -count=1
+PASS
+
+CGO_ENABLED=0 go test ./go -count=1
+PASS
+```
+
 ## 2026-05-28 Gemma4 Absolute Position From Global Owner State
 
 Re-read `/home/claude/Code/core/go-mlx/IDEAS.md` and checked the current

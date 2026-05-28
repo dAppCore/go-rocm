@@ -39,6 +39,12 @@ type inferenceBenchmarkHIPKernelEntry struct {
 	stats inferenceBenchmarkHIPKernelStats
 }
 
+type inferenceBenchmarkHIPAllocationEntry struct {
+	size  uint64
+	count uint64
+	bytes uint64
+}
+
 type inferenceBenchmarkHIPKernelShapeKey struct {
 	name           string
 	gridX          uint32
@@ -87,6 +93,7 @@ type inferenceBenchmarkHIPKernelCountingDriver struct {
 	total       inferenceBenchmarkHIPKernelStats
 	traffic     inferenceBenchmarkHIPDriverTrafficStats
 	allocations map[nativeDevicePointer]uint64
+	allocSizes  map[uint64]uint64
 }
 
 func newInferenceBenchmarkHIPKernelCountingDriver(driver nativeHIPDriver) *inferenceBenchmarkHIPKernelCountingDriver {
@@ -95,6 +102,7 @@ func newInferenceBenchmarkHIPKernelCountingDriver(driver nativeHIPDriver) *infer
 		kernel:          make(map[string]inferenceBenchmarkHIPKernelStats),
 		shape:           make(map[inferenceBenchmarkHIPKernelShapeKey]inferenceBenchmarkHIPKernelStats),
 		allocations:     make(map[nativeDevicePointer]uint64),
+		allocSizes:      make(map[uint64]uint64),
 	}
 }
 
@@ -107,6 +115,7 @@ func (driver *inferenceBenchmarkHIPKernelCountingDriver) Malloc(size uint64) (na
 	driver.traffic.Mallocs++
 	driver.traffic.MallocBytes += size
 	driver.allocations[pointer] = size
+	driver.allocSizes[size]++
 	driver.mu.Unlock()
 	return pointer, nil
 }
@@ -243,6 +252,7 @@ func (driver *inferenceBenchmarkHIPKernelCountingDriver) ResetKernelStats() {
 	driver.total = inferenceBenchmarkHIPKernelStats{}
 	driver.traffic = inferenceBenchmarkHIPDriverTrafficStats{}
 	clear(driver.allocations)
+	clear(driver.allocSizes)
 	driver.mu.Unlock()
 }
 
@@ -295,6 +305,16 @@ func (driver *inferenceBenchmarkHIPKernelCountingDriver) TrafficStats() inferenc
 	driver.mu.Lock()
 	defer driver.mu.Unlock()
 	return driver.traffic
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) AllocationSizeSnapshot() map[uint64]uint64 {
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	snapshot := make(map[uint64]uint64, len(driver.allocSizes))
+	for size, count := range driver.allocSizes {
+		snapshot[size] = count
+	}
+	return snapshot
 }
 
 func inferenceBenchmarkBookKernelSnapshot(driver *inferenceBenchmarkHIPKernelCountingDriver) inferenceBenchmarkHIPKernelStatsSnapshot {
@@ -392,6 +412,7 @@ func inferenceBenchmarkReportHIPDriverTrafficMetrics(b *testing.B, driver *infer
 	report(traffic.DeviceToHostBytes, "d2h_bytes")
 	report(traffic.Memsets, "device_memsets")
 	report(traffic.MemsetBytes, "device_memset_bytes")
+	inferenceBenchmarkReportTopHIPAllocationSizes(b, driver, 8)
 }
 
 func inferenceBenchmarkReportHIPKernelGeneratedTokenMetrics(b *testing.B, driver *inferenceBenchmarkHIPKernelCountingDriver, generatedTokens int) {
@@ -435,6 +456,15 @@ func inferenceBenchmarkReportTopHIPKernelBlocks(b *testing.B, driver *inferenceB
 		label := "kernel_by_blocks_" + inferenceBenchmarkSanitizeMetricName(entry.name)
 		b.ReportMetric(float64(entry.stats.Launches)/float64(b.N), label+"_launches/op")
 		b.ReportMetric(float64(entry.stats.Blocks)/float64(b.N), label+"_blocks/op")
+	}
+}
+
+func inferenceBenchmarkReportTopHIPAllocationSizes(b *testing.B, driver *inferenceBenchmarkHIPKernelCountingDriver, limit int) {
+	b.Helper()
+	for _, entry := range inferenceBenchmarkTopHIPAllocationSizeEntries(driver, limit) {
+		label := fmt.Sprintf("device_malloc_size_%d", entry.size)
+		b.ReportMetric(float64(entry.count)/float64(b.N), label+"_count/op")
+		b.ReportMetric(float64(entry.bytes)/float64(b.N), label+"_bytes/op")
 	}
 }
 
@@ -482,6 +512,37 @@ func inferenceBenchmarkTopHIPKernelEntries(driver *inferenceBenchmarkHIPKernelCo
 			}
 		}
 		return entries[i].name < entries[j].name
+	})
+	if len(entries) > limit {
+		entries = entries[:limit]
+	}
+	return entries
+}
+
+func inferenceBenchmarkTopHIPAllocationSizeEntries(driver *inferenceBenchmarkHIPKernelCountingDriver, limit int) []inferenceBenchmarkHIPAllocationEntry {
+	if driver == nil || limit <= 0 {
+		return nil
+	}
+	snapshot := driver.AllocationSizeSnapshot()
+	entries := make([]inferenceBenchmarkHIPAllocationEntry, 0, len(snapshot))
+	for size, count := range snapshot {
+		if size == 0 || count == 0 {
+			continue
+		}
+		entries = append(entries, inferenceBenchmarkHIPAllocationEntry{
+			size:  size,
+			count: count,
+			bytes: size * count,
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].bytes != entries[j].bytes {
+			return entries[i].bytes > entries[j].bytes
+		}
+		if entries[i].count != entries[j].count {
+			return entries[i].count > entries[j].count
+		}
+		return entries[i].size > entries[j].size
 	})
 	if len(entries) > limit {
 		entries = entries[:limit]
@@ -757,6 +818,27 @@ func TestInferenceBenchmarkHIPKernelCountingDriver_Good(t *testing.T) {
 		traffic.MemsetBytes != 8 {
 		t.Fatalf("traffic stats = %+v, want counted allocation/copy/memset traffic", traffic)
 	}
+	allocSnapshot := driver.AllocationSizeSnapshot()
+	if allocSnapshot[16] != 1 {
+		t.Fatalf("allocation size snapshot = %+v, want one 16-byte allocation", allocSnapshot)
+	}
+	pointer, err = driver.Malloc(32)
+	if err != nil {
+		t.Fatalf("Malloc second pointer: %v", err)
+	}
+	if err := driver.Free(pointer); err != nil {
+		t.Fatalf("Free second pointer: %v", err)
+	}
+	allocEntries := inferenceBenchmarkTopHIPAllocationSizeEntries(driver, 2)
+	if len(allocEntries) != 2 ||
+		allocEntries[0].size != 32 ||
+		allocEntries[0].count != 1 ||
+		allocEntries[0].bytes != 32 ||
+		allocEntries[1].size != 16 ||
+		allocEntries[1].count != 1 ||
+		allocEntries[1].bytes != 16 {
+		t.Fatalf("allocation size entries = %+v, want 32-byte then 16-byte buckets", allocEntries)
+	}
 	entries := inferenceBenchmarkTopHIPKernelEntries(driver, 1, inferenceBenchmarkHIPKernelSortByBlocks)
 	if len(entries) != 1 || entries[0].name != hipKernelNameAttentionHeadsBatchChunkedStage1 {
 		t.Fatalf("top kernel entries = %+v, want %s", entries, hipKernelNameAttentionHeadsBatchChunkedStage1)
@@ -769,6 +851,8 @@ func TestInferenceBenchmarkHIPKernelCountingDriver_Good(t *testing.T) {
 		!strings.Contains(got, hipKernelNameMLXQ4PairProj) ||
 		!strings.Contains(got, hipKernelNameAttentionHeadsBatchChunkedStage1) ||
 		!strings.Contains(got, "2x3x4") ||
+		!strings.Contains(got, "Top Device Malloc Sizes") ||
+		!strings.Contains(got, "| 32 | 1 | 32 |") ||
 		!strings.Contains(got, "h2d_bytes") ||
 		!strings.Contains(got, "d2h_bytes") ||
 		!strings.Contains(got, "launches/generated_token") {
@@ -2625,6 +2709,7 @@ func inferenceBenchmarkWriteHIPKernelRouteMetrics(builder *strings.Builder, driv
 	inferenceBenchmarkWriteHIPKernelRouteTable(builder, "Selected Hot Kernels", inferenceBenchmarkSelectedHIPKernelEntries(driver), generatedTokens)
 	inferenceBenchmarkWriteHIPKernelRouteTable(builder, "Top By Launches", inferenceBenchmarkTopHIPKernelEntries(driver, limit, inferenceBenchmarkHIPKernelSortByLaunches), generatedTokens)
 	inferenceBenchmarkWriteHIPKernelRouteTable(builder, "Top By Blocks", inferenceBenchmarkTopHIPKernelEntries(driver, limit, inferenceBenchmarkHIPKernelSortByBlocks), generatedTokens)
+	inferenceBenchmarkWriteHIPAllocationSizeRouteTable(builder, "Top Device Malloc Sizes", inferenceBenchmarkTopHIPAllocationSizeEntries(driver, limit), generatedTokens)
 	inferenceBenchmarkWriteHIPKernelShapeRouteTable(builder, "Top Shapes By Launches", inferenceBenchmarkTopHIPKernelShapeEntries(driver, limit, inferenceBenchmarkHIPKernelSortByLaunches), generatedTokens)
 	inferenceBenchmarkWriteHIPKernelShapeRouteTable(builder, "Top Shapes By Blocks", inferenceBenchmarkTopHIPKernelShapeEntries(driver, limit, inferenceBenchmarkHIPKernelSortByBlocks), generatedTokens)
 }
@@ -2864,6 +2949,38 @@ func inferenceBenchmarkWriteHIPKernelShapeRouteTable(builder *strings.Builder, t
 			builder.WriteString(strconv.FormatFloat(float64(entry.stats.Launches)/float64(generatedTokens), 'f', 2, 64))
 			builder.WriteString(" | ")
 			builder.WriteString(strconv.FormatFloat(float64(entry.stats.Blocks)/float64(generatedTokens), 'f', 2, 64))
+		}
+		builder.WriteString(" |\n")
+	}
+	builder.WriteString("\n")
+}
+
+func inferenceBenchmarkWriteHIPAllocationSizeRouteTable(builder *strings.Builder, title string, entries []inferenceBenchmarkHIPAllocationEntry, generatedTokens int) {
+	if len(entries) == 0 {
+		return
+	}
+	builder.WriteString("### ")
+	builder.WriteString(title)
+	builder.WriteString("\n\n")
+	if generatedTokens > 0 {
+		builder.WriteString("| size_bytes | count | bytes | count/generated_token | bytes/generated_token |\n")
+		builder.WriteString("|---:|---:|---:|---:|---:|\n")
+	} else {
+		builder.WriteString("| size_bytes | count | bytes |\n")
+		builder.WriteString("|---:|---:|---:|\n")
+	}
+	for _, entry := range entries {
+		builder.WriteString("| ")
+		builder.WriteString(strconv.FormatUint(entry.size, 10))
+		builder.WriteString(" | ")
+		builder.WriteString(strconv.FormatUint(entry.count, 10))
+		builder.WriteString(" | ")
+		builder.WriteString(strconv.FormatUint(entry.bytes, 10))
+		if generatedTokens > 0 {
+			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatFloat(float64(entry.count)/float64(generatedTokens), 'f', 2, 64))
+			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatFloat(float64(entry.bytes)/float64(generatedTokens), 'f', 2, 64))
 		}
 		builder.WriteString(" |\n")
 	}

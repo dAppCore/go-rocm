@@ -38,17 +38,21 @@ The 100+ tok/s goal is complete only when all of these are true:
   passing or skip cleanly when hardware is absent.
 
 Current status as of 2026-05-28: the q4 2048-token performance endpoint remains
-met on the pinned RX 7800 XT with a fresh live `gfx1100` HSACO. The latest
+met on the pinned RX 7800 XT with the accepted `gfx1100` HSACO. The latest
 route-metric `GO_ROCM_BENCH_TOKENS=2048` `text:Hi` run, after contiguous encoded
 K/V pair allocation, fused embedding-output scaling, Gemma4 SWA-window-aware
 decode attention routing, chunked stage2 per-chunk weight caching, a 64-token
-chunked-attention grain, and interleaved generated global/full KV page growth,
-reports `17627114456 ns/op`, `116.2 tok/s`, `3199080 B/op`, and
-`2556 allocs/op`. It also reports `25217` device mallocs/op,
-`30712776` device malloc bytes/op, `941890` kernel launches/op, and keeps
-chunked stage1/stage2 launches at `13902` each. This is the best current
-2048-token short guard by allocation pressure while staying within noise of the
-previous `116.6 tok/s` speed sample.
+chunked-attention grain, interleaved generated global/full KV page growth,
+malloc-size route metrics, and the restored exact-pointer SWA ownership
+transfer fast path, reports `18553017328 ns/op`, `110.4 tok/s`, `3165672 B/op`,
+and `2557 allocs/op`. It also reports `25217` device mallocs/op, `30712776`
+device malloc bytes/op, `941890` kernel launches/op, and keeps chunked
+stage1/stage2 launches at `13902` each. The new allocation-size metrics show
+the dominant generated local/SWA one-token KQ8/VQ4 page bucket is `392` bytes
+and accounts for `24588` mallocs/op. The optimized
+`GO_ROCM_ENABLE_KV_TENSOR_POOL=1` bucketed path cuts the short guard to `2177`
+device mallocs/op without hurting short tok/s, but remains opt-in because the
+full retained-book gate regresses late-turn decode.
 The chapter-shaped 2048-token fast guard at `context_len=4096` reports
 `19536530899 ns/op`, `104.8 tok/s`, `8017064 B/op`, and `3438 allocs/op`.
 Full-attention/global Gemma4 generated device KV pages now use growable
@@ -57,12 +61,13 @@ one-token pages for 512/1024 SWA trimming. The latest strict retained 10-turn
 book gate with device-reduced sampled top-k partials, contiguous encoded K/V
 pair allocation, fused embedding-output scaling, SWA-window-aware decode
 routing, chunked stage2 per-chunk weight caching, the 64-token chunked-attention
-grain, the stronger chapter-10 final paragraph instruction, and interleaved
-global/full page growth reports `43.12s` wall, `35.30s` decode, `3375`
-generated tokens, `78.27 tok/s` average, `89.69 tok/s` on turn 10, no repeated
-or maxed turns, `15060872 B/op`, and `63030` allocs/op. It kept `4` chapter-10
-arc anchors with empty stderr and produced
-`/tmp/go-rocm-book-interleaved-kv-grow-10turn-20260528.md`, so
+grain, the stronger chapter-10 final paragraph instruction, interleaved
+global/full page growth, and fast exact-pointer local-window page ownership
+transfer reports `44.44s` wall, `35.84s` decode, `3388` generated tokens,
+`76.23 tok/s` average, `88.24 tok/s` on turn 10, no repeated or maxed turns,
+`7354896 B/op`, and `37511` allocs/op. It kept `5` chapter-10 arc anchors with
+empty stderr and produced
+`/tmp/go-rocm-book-transfer-fastpath-10turn-20260528.md`, so
 `book_90s_success=1` and `book_110s_production_candidate=1`. This makes the
 wall/story production-candidate gate green and moves late-turn decode to the
 edge of the retained `90-100+ tok/s` target; the final driver endpoint remains
