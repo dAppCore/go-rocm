@@ -69,6 +69,48 @@ RX 7800 XT as `gfx1101`: `hipcc --std=c++23 --genco --offload-arch=gfx1101`
 compiled cleanly, but `hipModuleLoadData` rejected that image with HIP error
 `200`. Keep using the accepted `gfx1100` HSACO route on this host.
 
+Post-fast-path KV tensor pool recheck:
+
+```text
+GO_ROCM_ENABLE_KV_TENSOR_POOL=1
+BenchmarkInferenceGemma4Q4Generate-32 1 18547259583 ns/op
+tok/s=110.4
+B/op=3261048
+allocs/op=2562
+device_mallocs/op=2177
+device_malloc_bytes/op=21681096
+device_malloc_size_392_count/op=1548
+stderr: .bench-errors/2048_kv_tensor_pool_after_fastpath_20260528.err (0 bytes)
+```
+
+The pool no longer causes the severe retained-book collapse once the SWA
+ownership fast path is restored, but it is still not a production default. The
+strict retained sample stayed green yet generated a longer book and measured
+slower wall/late-turn decode than the default sample:
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 56190565455 ns/op
+book_wall_s=56.18
+book_decode_s=46.92
+book_generated_tokens=4379
+book_tok/s=77.94
+book_last_turn_tok/s=86.25
+book_turn10_retained_tokens=6567
+book_90s_success=1
+book_110s_production_candidate=1
+book_maxed_turns=0
+book_repeated_turns=0
+chapter10_arc_anchor_hits=5
+B/op=8026512
+allocs/op=40485
+stderr: .bench-errors/book10_kv_tensor_pool_after_fastpath_20260528.err (0 bytes)
+artifact: /tmp/go-rocm-book-kv-tensor-pool-after-fastpath-10turn-20260528.md
+```
+
+Conclusion: keep the pool as a useful diagnostic/opt-in malloc-pressure probe,
+but do not make it the default route. The next default-path work remains a
+scoped retained-KV arena/ring or direct reduction in q4/attention launch volume.
+
 ## 2026-05-28 Malloc-Size Metrics and Rejected Default KV Tensor Pool
 
 Added benchmark route metrics for top HIP device allocation sizes. This makes

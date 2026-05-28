@@ -51,8 +51,10 @@ stage1/stage2 launches at `13902` each. The new allocation-size metrics show
 the dominant generated local/SWA one-token KQ8/VQ4 page bucket is `392` bytes
 and accounts for `24588` mallocs/op. The optimized
 `GO_ROCM_ENABLE_KV_TENSOR_POOL=1` bucketed path cuts the short guard to `2177`
-device mallocs/op without hurting short tok/s, but remains opt-in because the
-full retained-book gate regresses late-turn decode.
+device mallocs/op without hurting short tok/s. After the SWA ownership
+fast-path repair it no longer collapses the retained-book gate, but it remains
+opt-in because the strict 10-turn sample was slower at `56.18s` wall and
+`86.25 tok/s` on turn 10 versus the default `44.44s` / `88.24 tok/s` sample.
 The chapter-shaped 2048-token fast guard at `context_len=4096` reports
 `19536530899 ns/op`, `104.8 tok/s`, `8017064 B/op`, and `3438 allocs/op`.
 Full-attention/global Gemma4 generated device KV pages now use growable
