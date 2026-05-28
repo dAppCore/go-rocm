@@ -2380,6 +2380,27 @@ func (state hipGemma4Q4DecodeState) tokenCount(headDim int) int {
 	return len(state.Layers[0].Keys) / headDim
 }
 
+func (state hipGemma4Q4DecodeState) tokenCountForConfig(cfg hipGemma4Q4ForwardConfig) int {
+	if len(state.Layers) == 0 || len(cfg.Layers) == 0 {
+		return 0
+	}
+	maxTokens := 0
+	for index, layerState := range state.Layers {
+		headDim := cfg.Layers[0].HeadDim
+		if index < len(cfg.Layers) && cfg.Layers[index].HeadDim > 0 {
+			headDim = cfg.Layers[index].HeadDim
+		}
+		if headDim <= 0 || len(layerState.Keys) == 0 {
+			continue
+		}
+		tokens := len(layerState.Keys) / headDim
+		if tokens > maxTokens {
+			maxTokens = tokens
+		}
+	}
+	return maxTokens
+}
+
 func (req hipGemma4Q4Layer0Request) validate(cfg hipGemma4Q4Layer0Config) error {
 	if req.TokenID < 0 || int(req.TokenID) >= cfg.VocabSize {
 		return core.E(hipGemma4Q4Layer0Operation, "token ID is outside vocabulary", nil)
@@ -3103,7 +3124,7 @@ func hipGemma4Q4GreedyDecodeLabels(cfg hipGemma4Q4ForwardConfig, req hipGemma4Q4
 		"decode_prompt_tokens":        core.Sprintf("%d", len(req.PromptTokenIDs)),
 		"decode_generated_tokens":     core.Sprintf("%d", req.MaxNewTokens),
 		"decode_forward_steps":        core.Sprintf("%d", len(req.PromptTokenIDs)+req.MaxNewTokens-1),
-		"decode_state_tokens":         core.Sprintf("%d", state.tokenCount(first.HeadDim)),
+		"decode_state_tokens":         core.Sprintf("%d", state.tokenCountForConfig(cfg)),
 		"decode_vocab_size":           core.Sprintf("%d", first.VocabSize),
 		"decode_hidden_size":          core.Sprintf("%d", first.HiddenSize),
 		"final_logit_softcap":         core.Sprintf("%g", first.FinalLogitSoftcap),

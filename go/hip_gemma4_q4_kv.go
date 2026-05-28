@@ -430,9 +430,29 @@ func (state *hipGemma4Q4DeviceDecodeState) LayerTokenCounts() []int {
 	}
 	counts := make([]int, 0, len(state.layers))
 	for _, layer := range state.layers {
+		if layer.cache == nil {
+			counts = append(counts, 0)
+			continue
+		}
 		counts = append(counts, layer.cache.TokenCount())
 	}
 	return counts
+}
+
+func (state *hipGemma4Q4DeviceDecodeState) maxLayerTokenCount() int {
+	if state == nil {
+		return 0
+	}
+	maxTokens := 0
+	for _, layer := range state.layers {
+		if layer.cache == nil {
+			continue
+		}
+		if tokens := layer.cache.TokenCount(); tokens > maxTokens {
+			maxTokens = tokens
+		}
+	}
+	return maxTokens
 }
 
 func (state *hipGemma4Q4DeviceDecodeState) MemoryBytes() uint64 {

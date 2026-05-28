@@ -171,7 +171,11 @@ func hipGemma4Q4PackageDecodePosition(cfg hipGemma4Q4ForwardConfig, req hipDecod
 	if req.Position > 0 {
 		return req.Position, nil
 	}
-	return req.Gemma4Q4State.tokenCount(cfg.Layers[0].HeadDim), nil
+	position := req.Gemma4Q4State.tokenCountForConfig(cfg)
+	if devicePosition := req.Gemma4Q4DeviceState.maxLayerTokenCount(); devicePosition > position {
+		position = devicePosition
+	}
+	return position, nil
 }
 
 func hipGemma4Q4PackagePrefillLabels(cfg hipGemma4Q4ForwardConfig, mode string, tokenCount int, forwardLabels map[string]string, deviceState *hipGemma4Q4DeviceDecodeState) map[string]string {
@@ -217,7 +221,7 @@ func hipGemma4Q4PackageDecodeLabels(cfg hipGemma4Q4ForwardConfig, mode string, s
 	labels["production_kv_cache_backing"] = hipKernelStatusNotLinked
 	labels["runtime_status"] = string(inference.FeatureRuntimeExperimental)
 	if len(cfg.Layers) > 0 {
-		labels["decode_state_tokens"] = core.Sprintf("%d", state.tokenCount(cfg.Layers[0].HeadDim))
+		labels["decode_state_tokens"] = core.Sprintf("%d", state.tokenCountForConfig(cfg))
 	}
 	for key, value := range deviceState.Labels() {
 		labels[key] = value

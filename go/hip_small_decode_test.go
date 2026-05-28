@@ -224,7 +224,7 @@ func TestHIPGemma4Q4Layer0_Good(t *testing.T) {
 	core.AssertEqual(t, "2", decode.Labels["decode_prompt_tokens"])
 	core.AssertEqual(t, "2", decode.Labels["decode_generated_tokens"])
 	core.AssertEqual(t, "3", decode.Labels["decode_forward_steps"])
-	core.AssertEqual(t, "2", decode.Labels["decode_state_tokens"])
+	core.AssertEqual(t, "3", decode.Labels["decode_state_tokens"])
 	core.AssertEqual(t, hipKernelStatusNotLinked, decode.Labels["production_decode"])
 	core.AssertEqual(t, hipKernelStatusNotLinked, decode.Labels["production_kv_cache_backing"])
 	core.AssertEqual(t, "hip_device_mirror", decode.Labels["gemma4_q4_device_kv_backing"])
@@ -2629,6 +2629,43 @@ func TestHIPGemma4Q4PackagePrefillDecode_Good(t *testing.T) {
 	if countDeviceAttentionLaunches(driver.launches[launchStart:]) == 0 {
 		t.Fatalf("Gemma4 q4 classify launched no descriptor-backed attention kernels")
 	}
+}
+
+func TestHIPGemma4Q4PackageDecodePositionUsesGlobalOwnerState_Good(t *testing.T) {
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{
+		{LayerType: "sliding_attention", HeadDim: 4, SlidingWindow: 2},
+		{LayerType: "full_attention", HeadDim: 8},
+	}}
+	state := hipGemma4Q4DecodeState{Layers: []hipGemma4Q4LayerKVState{
+		{Keys: make([]float32, 2*4), Values: make([]float32, 2*4)},
+		{Keys: make([]float32, 9*8), Values: make([]float32, 9*8)},
+	}}
+
+	position, err := hipGemma4Q4PackageDecodePosition(cfg, hipDecodeRequest{Gemma4Q4State: state})
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 9, position)
+	core.AssertEqual(t, 9, state.tokenCountForConfig(cfg))
+
+	labels := hipGemma4Q4PackageDecodeLabels(cfg, rocmKVCacheModeKQ8VQ4, state, nil, nil)
+	core.AssertEqual(t, "9", labels["decode_state_tokens"])
+
+	deviceState := &hipGemma4Q4DeviceDecodeState{layers: []hipGemma4Q4DeviceLayerKVState{
+		{cache: &rocmDeviceKVCache{tokenCount: 11}},
+	}}
+	position, err = hipGemma4Q4PackageDecodePosition(cfg, hipDecodeRequest{
+		Gemma4Q4State:       state,
+		Gemma4Q4DeviceState: deviceState,
+	})
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 11, position)
+
+	position, err = hipGemma4Q4PackageDecodePosition(cfg, hipDecodeRequest{
+		Position:            7,
+		Gemma4Q4State:       state,
+		Gemma4Q4DeviceState: deviceState,
+	})
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 7, position)
 }
 
 func assertFloat32SlicesNearRelative(t *testing.T, want, got []float32, absoluteTolerance, relativeTolerance float32) {

@@ -1,5 +1,33 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-28 Gemma4 Absolute Position From Global Owner State
+
+Re-read `/home/claude/Code/core/go-mlx/IDEAS.md` and checked the current
+`go-mlx` Gemma4 decoder implementation. The important parity point is that
+local/SWA caches can rotate at `sliding_window`, but RoPE/cache offsets remain
+the absolute stream position. ROCm package decode was falling back to
+`len(layer0.KV)` when `hipDecodeRequest.Position` was unset; on Gemma4 layer 0
+is usually sliding, so that fallback can collapse to `512`/`1024` after local
+window trim even while full/global owner layers still retain the longer state.
+
+Changed the fallback and `decode_state_tokens` labels to use the maximum token
+count across configured host layers, plus the device-state maximum when present.
+This keeps no-replay `.kv` restores aligned with the global owner layers and
+prevents local-window length from becoming the decode position.
+
+Focused validation:
+
+```text
+go test ./go -run '^(TestHIPGemma4Q4Layer0_Good|TestHIPGemma4Q4PackageDecodePositionUsesGlobalOwnerState_Good)$' -count=1
+PASS
+
+go test ./go -count=1
+PASS
+
+CGO_ENABLED=0 go test ./go -count=1
+PASS
+```
+
 ## 2026-05-28 Rejected Local/SWA Block-16 Interleaved Window KV
 
 Re-read `/home/claude/Code/core/go-mlx/IDEAS.md` and rechecked the local

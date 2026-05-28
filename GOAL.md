@@ -72,6 +72,10 @@ Local/SWA attention remains bounded according to the `go-mlx/IDEAS.md` Gemma4
 rule, q4/RoPE work stays flat per generated token, and full/global
 `head_dim=512` chunked attention plus q4 projection/GELU block volume remain the
 late-turn scaling blockers.
+Package decode now also derives an unset decode position from the maximum
+retained host/device layer token count instead of `layer0` alone, so a trimmed
+local/SWA cache cannot reset the absolute RoPE stream position while full/global
+owner layers still carry the longer state.
 2026-05-28 local/SWA block-page experiments are not production defaults. Exact
 block-16 interleaved local KV reduced the 2048-token guard to `3617` device
 mallocs/op while keeping `117.3 tok/s`, but the strict retained 10-turn book
