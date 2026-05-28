@@ -18767,3 +18767,78 @@ chapter-10 anchors), but turn 10 is `86.83 tok/s`, still below the retained
 late-turn `90-100+ tok/s` target. Continue targeting global/full
 `head_dim=512` chunked attention and q4 projection/GELU launch/block volume; the
 next pass should improve decode without weakening the no-replay state contract.
+
+## 2026-05-27 Rejected Q4 Affine FMA Accumulation
+
+Tested replacing the q4 affine accumulation sites in the MLX q4 projection,
+paired GELU multiply, batched q4 projection, and batched GELU projection kernels
+with `fmaf(scale, q_dot, bias * input_sum)`. This was a narrow HIP-only probe:
+no launch geometry, descriptor layout, retained-state semantics, or prompt
+format changed.
+
+Validation before the live checks:
+
+```text
+go test ./go -run 'TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good|TestHIPKernels_MLXQ4Projection|TestHIPGemma4Q4DeviceGELUTanhMLP' -count=1
+PASS
+
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-q4-fmaf-20260527.hsaco
+stderr: .bench-errors/hipcc_gfx1100_q4_fmaf_20260527.err (0 bytes)
+
+TestNativeDecodeSmokeKernelStatus_Good
+Gemma4 q4 public Generate prompt="text:Hi" prompt_tokens=[2 10979] generated tokens=[107 4968] text=["\n" "Model"]
+stderr: .bench-errors/q4_fmaf_smoke_20260527.err (0 bytes)
+```
+
+2048-token route-metric guard:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 17548550647 ns/op
+tok/s=116.7
+tokens=2048
+B/op=6499528
+allocs/op=2696
+device_mallocs/op=31316
+device_malloc_bytes/op=31300464
+kernel_attention_decode_chunked_stage1_launches=13902
+kernel_attention_decode_chunked_stage2_launches=13902
+kernel_total_launches=941890
+stderr: .bench-errors/2048_q4_fmaf_20260527.err (0 bytes)
+```
+
+Strict retained 48k 10-turn book:
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 64107047793 ns/op
+book_wall_s=64.07
+book_decode_s=52.37
+book_generated_tokens=4824
+book_tok/s=75.29
+book_turn10_tok/s=83.63
+book_turn10_retained_tokens=7012
+book_90s_success=1
+book_110s_production_candidate=1
+book_maxed_turns=0
+book_repeated_turns=0
+book_max_adjacent_repeat=0.05323
+chapter10_arc_anchor_hits=5
+B/op=30801416
+allocs/op=74918
+peak_memory_bytes=5881081856
+device_mallocs/op=105259
+device_malloc_bytes/op=12869544692
+kernel_attention_decode_chunked_stage1_launches=33838
+kernel_attention_decode_chunked_stage1_blocks=14626472
+kernel_total_launches=2270988
+kernel_total_blocks=436033232
+stderr: .bench-errors/book10_q4_fmaf_20260527.err (0 bytes)
+output: /tmp/go-rocm-book-q4-fmaf-20260527.md
+```
+
+Conclusion: rejected and reverted. The 2048-token guard was only noise-level
+better than the current chunk64 baseline (`116.7 tok/s` versus `116.6 tok/s`),
+while the strict retained-book late-turn rate fell from the current
+production-green `86.83 tok/s` to `83.63 tok/s` and allocation/device-malloc
+volume rose with the longer sample. Do not reintroduce the q4 affine FMA
+accumulation unless a later kernel layout change materially changes the
+generated-token and late-turn profile.
