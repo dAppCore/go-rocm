@@ -571,6 +571,9 @@ func TestHIPGemma4Q4DeviceKVBlockSizeForSlidingWindow_Good(t *testing.T) {
 	t.Setenv("GO_ROCM_GEMMA4_Q4_GLOBAL_DEVICE_KV_BLOCK_SIZE", "")
 	t.Setenv("GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE", "16")
 	core.AssertEqual(t, 16, hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(0))
+	core.AssertEqual(t, rocmGemma4Q4DeviceKVBlockSize, hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(512))
+
+	t.Setenv("GO_ROCM_GEMMA4_Q4_INTERLEAVED_ROW_PAGES", "1")
 	core.AssertEqual(t, 16, hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(512))
 }
 

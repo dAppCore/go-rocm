@@ -75,7 +75,11 @@ mallocs/op while keeping `117.3 tok/s`, but the strict retained 10-turn book
 lost chapter-10 arc retention (`chapter10_arc_anchor_hits=1`). Block-4 was
 also rejected: the short guard reported `115.0 tok/s`, but the retained book
 collapsed to `452` generated tokens, `6` repeated turns, and only `1`
-chapter-10 arc anchor. The page-aligned local-window slack variant is also
+chapter-10 arc anchor. That run also exposed an invalid experimental shape:
+local/SWA block pages without `GO_ROCM_GEMMA4_Q4_INTERLEAVED_ROW_PAGES=1` can
+create unsliceable prefill row pages, so the Gemma4 local block-size selector
+now falls back to exact one-token local pages unless exact interleaved row-page
+slicing is enabled. The page-aligned local-window slack variant is also
 rejected. Keep local/SWA pages exact by default until a ring-buffer or
 descriptor layout passes the book-quality gate.
 These numbers use the

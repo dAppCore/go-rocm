@@ -1,6 +1,6 @@
 # go-rocm Goal Working Notes
 
-## 2026-05-28 Rejected Local/SWA Block-4 Interleaved Window KV
+## 2026-05-28 Guarded Local/SWA Block Pages Behind Exact Row Slicing
 
 Re-read `/home/claude/Code/core/go-mlx/IDEAS.md` and used its Gemma4 notes as
 the parity checklist: five local/SWA layers must remain exact and bounded at
@@ -8,8 +8,35 @@ the parity checklist: five local/SWA layers must remain exact and bounded at
 tokens stay in the live state, and the retained book workload is the correctness
 gate for any KV layout optimization.
 
-Tested a smaller block-page local/SWA variant after the rejected block-16 and
-page-aligned attempts. The 2048-token `text:Hi` route guard looked attractive:
+The rejected block-4 run exposed a bad experimental shape: setting
+`GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE=4` without
+`GO_ROCM_GEMMA4_Q4_INTERLEAVED_ROW_PAGES=1` allowed local/SWA prefill rows to
+use multi-token non-interleaved q8/q4 row pages. Those pages cannot be sliced
+exactly when the `512` window boundary lands in the middle of a page, so the
+local window can temporarily leak beyond the Gemma4 bound. Changed the Gemma4
+local block-size selector so sliding-window layers fall back to the exact
+one-token default unless interleaved row pages are explicitly enabled. Full/global
+layers still use the global block-size route because they do not trim to the
+local window.
+
+Added a HIP hardware regression for the exact row-sliced path:
+
+```text
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85
+GO_ROCM_RUN_HIP_TESTS=1
+GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100-interleaved-kv-grow-20260528.hsaco
+go test ./go -run '^TestHIPHardwareTransformerKernelSource_Good$/attention-heads-batch-causal-sliced-interleaved-window-kv-reference$' -count=1
+PASS
+stderr: .bench-errors/hip_batch_causal_sliced_block4_20260528.err (0 bytes)
+```
+
+That regression builds a sliced block-4 local cache, appends an 8-token prompt
+batch, runs descriptor-backed batch-causal attention with `WindowSize=512`, and
+matches the host attention reference. This rules out the simple batch-causal
+descriptor read path and keeps the remaining block-page work focused on retained
+state/finalization and quality gates.
+
+The invalid block-4 `text:Hi` route guard looked attractive before the guard:
 
 ```text
 GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE=4
@@ -43,10 +70,9 @@ artifact: /tmp/go-rocm-book-local-block4-10turn-20260528.md
 
 Conclusion: block-4 is rejected despite the short-guard `115 tok/s`. It
 collapses after the local retained window starts trimming and repeats
-`Interaction of light`, so it is likely exposing a retained-state descriptor,
-trim, or shared-alias bug rather than a sampler issue. Do not promote any
-interleaved local block page route until it passes the strict retained book
-gate without chapter drift.
+`Interaction of light`. Do not promote any local block-page route unless
+interleaved row pages are enabled, local/SWA windows remain exactly bounded, and
+the strict retained book gate passes without chapter drift.
 
 ## 2026-05-28 Accepted Default-Small KV Tensor Pool
 

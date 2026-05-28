@@ -419,7 +419,11 @@ func hipGemma4Q4GlobalDeviceKVBlockSize() int {
 
 func hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(slidingWindow int) int {
 	if slidingWindow > 0 {
-		return hipGemma4Q4DeviceKVBlockSize()
+		blockSize := hipGemma4Q4DeviceKVBlockSize()
+		if blockSize > 1 && !rocmDeviceKVInterleavedRowPagesEnabled() {
+			return rocmGemma4Q4DeviceKVBlockSize
+		}
+		return blockSize
 	}
 	return hipGemma4Q4GlobalDeviceKVBlockSize()
 }
