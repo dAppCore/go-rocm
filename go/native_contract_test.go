@@ -993,6 +993,73 @@ func TestNativeContract_Gemma4LayerTypesDefaultPatternForcesFinalFull_Good(t *te
 	}, cfg.LayerTypes)
 }
 
+func TestNativeContract_Gemma4PreservesE2BLayerMetadata_Good(t *testing.T) {
+	kvShared := 20
+	layerTypes := []string{
+		"sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+		"sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+		"sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+		"sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+		"sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+		"sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+		"sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+	}
+	cfg := rocmNativeGemma4TextConfigFromProbe(rocmModelPackConfigProbe{
+		ModelType: "gemma4",
+		TextConfig: rocmModelPackTextConfigProbe{
+			ModelType:         "gemma4_text",
+			NumHiddenLayers:   35,
+			SlidingWindow:     512,
+			NumKVSharedLayers: &kvShared,
+			LayerTypes:        layerTypes,
+			RoPEParameters: map[string]rocmRoPEProbe{
+				"sliding_attention": {RopeTheta: 10000, RopeType: "default"},
+				"full_attention":    {PartialRotaryFactor: 0.25, RopeTheta: 1000000, RopeType: "proportional"},
+			},
+		},
+	})
+
+	core.AssertEqual(t, 35, len(cfg.LayerTypes))
+	core.AssertEqual(t, layerTypes, cfg.LayerTypes)
+	core.AssertEqual(t, true, cfg.KVSharedLayersSet)
+	core.AssertEqual(t, 20, cfg.KVSharedLayers)
+	core.AssertEqual(t, 512, cfg.SlidingWindow)
+	core.AssertEqual(t, float64(10000), cfg.RoPEParameters["sliding_attention"].RopeTheta)
+	core.AssertEqual(t, "default", cfg.RoPEParameters["sliding_attention"].RopeType)
+	core.AssertEqual(t, float64(1000000), cfg.RoPEParameters["full_attention"].RopeTheta)
+	core.AssertEqual(t, float64(0.25), cfg.RoPEParameters["full_attention"].PartialRotaryFactor)
+	core.AssertEqual(t, "proportional", cfg.RoPEParameters["full_attention"].RopeType)
+
+	layers := make([]hipGemma4Q4Layer0Config, len(cfg.LayerTypes))
+	slidingLayers := 0
+	fullLayers := 0
+	for index, layerType := range cfg.LayerTypes {
+		layers[index] = hipGemma4Q4Layer0Config{Layer: index, LayerType: layerType}
+		switch layerType {
+		case "sliding_attention":
+			slidingLayers++
+		case "full_attention":
+			fullLayers++
+		}
+	}
+	sources := hipGemma4Q4BuildSharedKVSourceByLayer(hipGemma4Q4ForwardConfig{
+		Layers:         layers,
+		KVSharedLayers: cfg.KVSharedLayers,
+	})
+	ownerCount := 0
+	for index, source := range sources {
+		if source == index {
+			ownerCount++
+		}
+	}
+	core.AssertEqual(t, 28, slidingLayers)
+	core.AssertEqual(t, 7, fullLayers)
+	core.AssertEqual(t, 15, ownerCount)
+	core.AssertEqual(t, 13, sources[15])
+	core.AssertEqual(t, 14, sources[19])
+	core.AssertEqual(t, 14, sources[34])
+}
+
 func TestNativeContract_LoadModelSafetensorsShardedPackUsesNativeRuntime_Good(t *testing.T) {
 	dir := t.TempDir()
 	writeNativeContractFile(t, core.PathJoin(dir, "config.json"), `{
