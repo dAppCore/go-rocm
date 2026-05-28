@@ -426,6 +426,26 @@ func TestKVCache_Good_RowScaledTensorEncoding(t *testing.T) {
 	restored, err := rocmKVTensorFromDeviceBytesRows(rocmKVEncodingQ4Rows, valueTensor.length, 2, payload)
 	core.RequireNoError(t, err)
 	assertFloat32SlicesNear(t, []float32{7, -7, 0.25, -0.25}, restored.decodeRows(2), 0.02)
+
+	keyInterleaved, err := encodeROCmKVTensorRows(rocmKVEncodingQ8RowsI, []float32{100, -100, 0.5, -0.5}, 2, 2)
+	core.RequireNoError(t, err)
+	keyPayload, err := keyInterleaved.deviceBytes()
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, uint64(12), keyInterleaved.sizeBytes)
+	core.AssertEqual(t, 12, len(keyPayload))
+	keyInterleavedRestored, err := rocmKVTensorFromDeviceBytesRows(rocmKVEncodingQ8RowsI, keyInterleaved.length, 2, keyPayload)
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{100, -100, 0.5, -0.5}, keyInterleavedRestored.decodeRows(2), 0.01)
+
+	valueInterleaved, err := encodeROCmKVTensorRows(rocmKVEncodingQ4RowsI, []float32{7, -7, 0.25, -0.25}, 2, 2)
+	core.RequireNoError(t, err)
+	valuePayload, err := valueInterleaved.deviceBytes()
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, uint64(10), valueInterleaved.sizeBytes)
+	core.AssertEqual(t, 10, len(valuePayload))
+	valueInterleavedRestored, err := rocmKVTensorFromDeviceBytesRows(rocmKVEncodingQ4RowsI, valueInterleaved.length, 2, valuePayload)
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{7, -7, 0.25, -0.25}, valueInterleavedRestored.decodeRows(2), 0.02)
 }
 
 func TestKVCache_Good_DeviceMirrorAppendsDeviceRowsWindow(t *testing.T) {
@@ -480,6 +500,62 @@ func TestKVCache_Good_DeviceMirrorAppendsDeviceRowsWindow(t *testing.T) {
 	core.AssertEqual(t, 2, len(descriptor.Pages))
 	core.AssertEqual(t, 2, descriptor.Pages[0].TokenCount)
 	core.AssertEqual(t, 1, descriptor.Pages[1].TokenCount)
+}
+
+func TestKVCache_Good_DeviceAppendGrowsInterleavedGlobalPage(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	keyInput, err := hipUploadByteBuffer(driver, "rocm.KVCache.Test", "key token", mustHIPFloat32Payload(t, []float32{1, -1}), 2)
+	core.RequireNoError(t, err)
+	defer keyInput.Close()
+	valueInput, err := hipUploadByteBuffer(driver, "rocm.KVCache.Test", "value token", mustHIPFloat32Payload(t, []float32{0.5, -0.5}), 2)
+	core.RequireNoError(t, err)
+	defer valueInput.Close()
+
+	first, err := newROCmDeviceKVCacheFromDeviceToken(context.Background(), driver, rocmKVCacheModeKQ8VQ4, 4, keyInput, valueInput, 0)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 1, first.PageCount())
+	core.AssertEqual(t, rocmKVEncodingQ8RowsI, first.pages[0].key.encoding)
+	core.AssertEqual(t, rocmKVEncodingQ4RowsI, first.pages[0].value.encoding)
+	core.AssertTrue(t, first.pages[0].key.allocationBytes > first.pages[0].key.sizeBytes, "interleaved page should retain block capacity")
+	table, err := first.KernelDescriptorTable()
+	core.RequireNoError(t, err)
+
+	secondKeyInput, err := hipUploadByteBuffer(driver, "rocm.KVCache.Test", "key token 2", mustHIPFloat32Payload(t, []float32{0.25, -0.25}), 2)
+	core.RequireNoError(t, err)
+	defer secondKeyInput.Close()
+	secondValueInput, err := hipUploadByteBuffer(driver, "rocm.KVCache.Test", "value token 2", mustHIPFloat32Payload(t, []float32{0.75, -0.75}), 2)
+	core.RequireNoError(t, err)
+	defer secondValueInput.Close()
+
+	second, err := first.withAppendedDeviceTokenWindow(context.Background(), secondKeyInput, secondValueInput, 0)
+	core.RequireNoError(t, err)
+	defer func() {
+		core.RequireNoError(t, second.Close())
+		rocmReleaseDeviceKVCache(second)
+	}()
+	core.AssertEqual(t, 2, second.TokenCount())
+	core.AssertEqual(t, 1, second.PageCount())
+	core.AssertEqual(t, 2, second.pages[0].tokenCount)
+	core.AssertEqual(t, first.pages[0].key.pointer, second.pages[0].key.pointer)
+	core.AssertTrue(t, second.pages[0].key.sizeBytes > first.pages[0].key.sizeBytes, "grown page should expose another key row")
+
+	grownTable, err := second.KernelDescriptorTableFromAppendedToken(context.Background(), first, table)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, table, grownTable)
+	core.AssertEqual(t, 1, grownTable.pageCount)
+	descriptorBytes, descriptorOffset, ok := driver.memoryForPointer(grownTable.Pointer(), int(grownTable.SizeBytes()))
+	core.AssertTrue(t, ok, "grown descriptor table must remain readable")
+	core.AssertEqual(t, second.TokenCount(), int(binary.LittleEndian.Uint64(descriptorBytes[descriptorOffset+24:])))
+	core.RequireNoError(t, first.transferPagesTo(second))
+	rocmReleaseDeviceKVCache(first)
+	defer grownTable.Close()
+
+	host, err := second.hostCache()
+	core.RequireNoError(t, err)
+	keys, values, err := host.Restore(0, 2)
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{1, -1, 0.25, -0.25}, keys, 0.02)
+	assertFloat32SlicesNear(t, []float32{0.5, -0.5, 0.75, -0.75}, values, 0.12)
 }
 
 func TestKVCache_Bad_DeviceMirrorAppendsDeviceRowsWindow(t *testing.T) {

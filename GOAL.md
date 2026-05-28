@@ -37,33 +37,37 @@ The 100+ tok/s goal is complete only when all of these are true:
 - Normal, Linux no-cgo, legacy-server, HIP, model, and cache smoke gates keep
   passing or skip cleanly when hardware is absent.
 
-Current status as of 2026-05-27: the q4 2048-token performance endpoint remains
+Current status as of 2026-05-28: the q4 2048-token performance endpoint remains
 met on the pinned RX 7800 XT with a fresh live `gfx1100` HSACO. The latest
 route-metric `GO_ROCM_BENCH_TOKENS=2048` `text:Hi` run, after contiguous encoded
 K/V pair allocation, fused embedding-output scaling, Gemma4 SWA-window-aware
-decode attention routing, chunked stage2 per-chunk weight caching, and a
-64-token chunked-attention grain, reports `17563788511 ns/op`, `116.6 tok/s`,
-`6499080 B/op`, and `2694 allocs/op`. It also reports `31316` device mallocs/op,
-`31300464` device malloc bytes/op, `941890` kernel launches/op, and keeps
+decode attention routing, chunked stage2 per-chunk weight caching, a 64-token
+chunked-attention grain, and interleaved generated global/full KV page growth,
+reports `17627114456 ns/op`, `116.2 tok/s`, `3199080 B/op`, and
+`2556 allocs/op`. It also reports `25217` device mallocs/op,
+`30712776` device malloc bytes/op, `941890` kernel launches/op, and keeps
 chunked stage1/stage2 launches at `13902` each. This is the best current
-2048-token short guard, but it spends more temporary device workspace than the
-128-token chunk baseline because chunk count doubles.
+2048-token short guard by allocation pressure while staying within noise of the
+previous `116.6 tok/s` speed sample.
 The chapter-shaped 2048-token fast guard at `context_len=4096` reports
 `19536530899 ns/op`, `104.8 tok/s`, `8017064 B/op`, and `3438 allocs/op`.
-Full-attention/global Gemma4 device KV pages now use 128-token blocks while
-sliding-window layers keep exact one-token pages for 512/1024 SWA trimming. The
-latest strict retained 10-turn book gate with device-reduced sampled top-k
-partials, contiguous encoded K/V pair allocation, fused embedding-output
-scaling, SWA-window-aware decode routing, chunked stage2 per-chunk weight
-caching, the 64-token chunked-attention grain, and a stronger chapter-10 final
-paragraph instruction reports `46.27s` wall, `36.72s` decode, `3461` generated
-tokens, `74.80 tok/s` average, `86.83 tok/s` on turn 10, no repeated or maxed
-turns, `23149352 B/op`, and `68346` allocs/op. It kept `4` chapter-10 arc
-anchors with empty stderr and produced
-`/tmp/go-rocm-book-attn-chunk64-final-sentence-20260527.md`, so
+Full-attention/global Gemma4 generated device KV pages now use growable
+128-token interleaved row blocks while sliding-window layers keep exact
+one-token pages for 512/1024 SWA trimming. The latest strict retained 10-turn
+book gate with device-reduced sampled top-k partials, contiguous encoded K/V
+pair allocation, fused embedding-output scaling, SWA-window-aware decode
+routing, chunked stage2 per-chunk weight caching, the 64-token chunked-attention
+grain, the stronger chapter-10 final paragraph instruction, and interleaved
+global/full page growth reports `43.12s` wall, `35.30s` decode, `3375`
+generated tokens, `78.27 tok/s` average, `89.69 tok/s` on turn 10, no repeated
+or maxed turns, `15060872 B/op`, and `63030` allocs/op. It kept `4` chapter-10
+arc anchors with empty stderr and produced
+`/tmp/go-rocm-book-interleaved-kv-grow-10turn-20260528.md`, so
 `book_90s_success=1` and `book_110s_production_candidate=1`. This makes the
-wall/story production-candidate gate green, but it is not the final driver
-endpoint because late-turn decode remains below the `90-100+ tok/s` target.
+wall/story production-candidate gate green and moves late-turn decode to the
+edge of the retained `90-100+ tok/s` target; the final driver endpoint remains
+sustained `90-100+ tok/s` late-turn decode with lower transfer/device-malloc
+volume.
 Local/SWA attention remains bounded according to the `go-mlx/IDEAS.md` Gemma4
 rule, q4/RoPE work stays flat per generated token, and full/global
 `head_dim=512` chunked attention plus q4 projection/GELU block volume remain the
@@ -437,9 +441,18 @@ generated tokens, `74.80 tok/s` average, `86.83 tok/s` on turn 10, no cap hits,
 no repeats, `4` chapter-10 arc anchors, `23149352 B/op`, and `68346 allocs/op`.
 It still appends only the new turn prompt plus Gemma4 chat-control tokens; prior
 chapters are carried by retained KV state and are never rebuilt as prompt text.
-This is still not the final driver endpoint because the latest production-green
-sample remains below the `90-100+ tok/s` late-turn target. Keep tuning retained
-long-context attention and state quality until later turns stay near the target.
+Interleaved generated global/full KV page growth then replaced the unsafe
+grow-in-place row-scaled layout with row-local scale+payload records inside
+128-token global pages, while leaving local/SWA layers as exact one-token pages
+for 512/1024 trimming. The strict 48k book gate stayed production-green at
+`43.12s` wall, `35.30s` decode, `3375` generated tokens, `78.27 tok/s`
+average, `89.69 tok/s` on turn 10, no cap hits, no repeats, `4` chapter-10 arc
+anchors, `15060872 B/op`, and `63030 allocs/op`. It still appends only the new
+turn prompt plus Gemma4 chat-control tokens; prior chapters are carried by
+retained KV state and are never rebuilt as prompt text. This is the current best
+retained-book route and is right at the `90 tok/s` late-turn edge. Keep tuning
+retained long-context attention, device-malloc volume, and state quality until
+later turns sustain the `90-100+ tok/s` target.
 
 Current decode-scaling status as of 2026-05-26: Gemma4 E2B/E4B context is
 `128k` tokens, not `128` tokens; the context-128 short decode numbers remain a

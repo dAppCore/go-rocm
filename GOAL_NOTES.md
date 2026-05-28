@@ -18919,3 +18919,103 @@ retained-book late turn (`85.87 tok/s` versus the current production-green
 `86.83 tok/s`). Keep the generic descriptor lookup until there is a real
 token-to-page index or slot layout that removes the extra branch without adding
 work to every lookup.
+
+## 2026-05-28 Accepted Interleaved Global KV Page Growth
+
+Re-read `/home/claude/Code/core/go-mlx/IDEAS.md` before this pass. The relevant
+Gemma4 constraints are unchanged: local/SWA layers must stay bounded at
+`512`/`1024`, global/full layers carry the long retained context, dynamic KV
+concatenation is the enemy, and retained turns must append only the current turn
+request plus chat-control tokens. Prior chapters are never rebuilt as prompt
+text.
+
+Code change:
+
+- Added `q8-rows-interleaved` and `q4-rows-interleaved` device KV encodings.
+  Each row stores its own `float32` scale followed by the row payload, so the
+  payload base no longer depends on the page's live token count.
+- Full/global generated Gemma4 q4 pages now allocate a 128-token interleaved
+  key/value block and grow the last page in place until that capacity is full.
+- Added a descriptor append grow mode that updates the last page's token count
+  and byte lengths on device. Local/SWA layers still use exact one-token pages
+  so 512/1024 sliding-window trimming remains simple and bounded.
+- Updated the fake HIP driver, source ABI checks, host snapshot/restore decode,
+  and chunked attention value/key lookups for the interleaved encodings.
+
+Focused validation:
+
+```text
+go test ./go -run 'TestKVCache_Good_(RowScaledTensorEncoding|DeviceAppendGrowsInterleavedGlobalPage|DeviceMirrorAppendsDeviceRowsWindow)|TestHIPKernelSource_ExportsLaunchABI_Good' -count=1 -v
+PASS
+
+go test ./go -run 'TestKVCache|TestStateSession|TestHIPAttentionHeads(ChunkedSharedMemBytes|ChunkedEligible)_Good|TestHIPKernels_AttentionHeadsBatchChunked|TestHIPKernelSource_ExportsLaunchABI_Good' -count=1
+PASS
+
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-interleaved-kv-grow-20260528.hsaco
+stderr: .bench-errors/hipcc_gfx1100_interleaved_kv_grow_20260528.err (0 bytes)
+```
+
+q4 smoke:
+
+```text
+TestNativeDecodeSmokeKernelStatus_Good
+Gemma4 q4 public Generate prompt="text:Hi" prompt_tokens=[2 10979] generated tokens=[107 4968] text=["\n" "Model"]
+stderr: .bench-errors/q4_interleaved_kv_grow_smoke_20260528.err (0 bytes)
+```
+
+2048-token route-metric guard:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 17627114456 ns/op
+tok/s=116.2
+tokens=2048
+B/op=3199080
+allocs/op=2556
+device_mallocs/op=25217
+device_malloc_bytes/op=30712776
+kernel_attention_decode_chunked_stage1_launches=13902
+kernel_attention_decode_chunked_stage2_launches=13902
+kernel_rocm_kv_descriptor_append_launches=30705
+kernel_rocm_kv_encode_token_launches=30732
+kernel_total_launches=941890
+stderr: .bench-errors/2048_interleaved_kv_grow_20260528.err (0 bytes)
+```
+
+Strict retained 48k 10-turn book:
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 43127948148 ns/op
+book_wall_s=43.12
+book_decode_s=35.30
+book_generated_tokens=3375
+book_tok/s=78.27
+book_last_turn_tok/s=89.69
+book_turn10_tok/s=89.69
+book_turn10_retained_tokens=5563
+book_90s_success=1
+book_110s_production_candidate=1
+book_maxed_turns=0
+book_repeated_turns=0
+book_max_adjacent_repeat=0.02385
+chapter10_arc_anchor_hits=4
+B/op=15060872
+allocs/op=63030
+peak_memory_bytes=5862285312
+device_mallocs/op=73453
+device_malloc_bytes/op=12347148740
+kernel_attention_decode_chunked_stage1_launches=23695
+kernel_attention_decode_chunked_stage1_blocks=8306760
+kernel_total_launches=1600101
+kernel_total_blocks=313040040
+stderr: .bench-errors/book10_interleaved_kv_grow_20260528.err (0 bytes)
+output: /tmp/go-rocm-book-interleaved-kv-grow-10turn-20260528.md
+```
+
+Conclusion: accepted. Compared with the prior production-green strict retained
+book sample, wall time improved from `46.27s` to `43.12s`, average decode moved
+from `74.80 tok/s` to `78.27 tok/s`, turn 10 moved from `86.83 tok/s` to
+`89.69 tok/s`, Go allocation volume dropped from `23.1MB/op` to `15.1MB/op`,
+and object count dropped from `68346` to `63030 allocs/op`. The short 2048-token
+guard stayed above the endpoint (`116.2 tok/s`) while cutting Go heap pressure
+roughly in half. This is now the best retained-book route and keeps the no-replay
+state contract intact.

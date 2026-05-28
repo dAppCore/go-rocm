@@ -5802,21 +5802,28 @@ func (driver *fakeHIPDriver) launchKVDescriptorAppend(args []byte) error {
 	keyEncodingCode := binary.LittleEndian.Uint32(args[96:])
 	valueEncodingCode := binary.LittleEndian.Uint32(args[100:])
 	trimStart := int(binary.LittleEndian.Uint64(args[104:]))
+	appendMode := binary.LittleEndian.Uint64(args[112:])
 	if previousBytes < rocmDeviceKVDescriptorHeaderBytes || outputBytes != rocmDeviceKVDescriptorHeaderBytes+outputPageCount*rocmDeviceKVDescriptorPageBytes ||
 		outputPageCount <= 0 || outputTokenCount <= 0 || blockSize <= 0 || keyWidth <= 0 || valueWidth <= 0 ||
 		fakeROCmKVEncoding(keyEncodingCode) == "" || fakeROCmKVEncoding(valueEncodingCode) == "" {
 		return core.E("rocm.hip.FakeLaunch", "KV descriptor append shape metadata mismatch", nil)
 	}
-	expectedKeyBytes, err := rocmKVTensorDeviceByteCount(fakeROCmKVEncoding(keyEncodingCode), keyWidth)
-	if err != nil {
-		return err
-	}
-	expectedValueBytes, err := rocmKVTensorDeviceByteCount(fakeROCmKVEncoding(valueEncodingCode), valueWidth)
-	if err != nil {
-		return err
-	}
-	if newKeyBytes != expectedKeyBytes || newValueBytes != expectedValueBytes || newKeyPointer == 0 || newValuePointer == 0 {
-		return core.E("rocm.hip.FakeLaunch", "KV descriptor append new page metadata mismatch", nil)
+	if appendMode == rocmKVDescriptorAppendModeGrowLastPage {
+		if trimStart != 0 || newKeyBytes == 0 || newValueBytes == 0 || newKeyPointer == 0 || newValuePointer == 0 {
+			return core.E("rocm.hip.FakeLaunch", "KV descriptor grow page metadata mismatch", nil)
+		}
+	} else {
+		expectedKeyBytes, err := rocmKVTensorDeviceByteCount(fakeROCmKVEncoding(keyEncodingCode), keyWidth)
+		if err != nil {
+			return err
+		}
+		expectedValueBytes, err := rocmKVTensorDeviceByteCount(fakeROCmKVEncoding(valueEncodingCode), valueWidth)
+		if err != nil {
+			return err
+		}
+		if newKeyBytes != expectedKeyBytes || newValueBytes != expectedValueBytes || newKeyPointer == 0 || newValuePointer == 0 {
+			return core.E("rocm.hip.FakeLaunch", "KV descriptor append new page metadata mismatch", nil)
+		}
 	}
 	previousData, previousOffset, ok := driver.memoryForPointer(previousPointer, previousBytes)
 	if !ok {
@@ -5841,6 +5848,23 @@ func (driver *fakeHIPDriver) launchKVDescriptorAppend(args []byte) error {
 		return core.E("rocm.hip.FakeLaunch", "KV descriptor append previous descriptor size mismatch", nil)
 	}
 	output := outputData[outputOffset : outputOffset+outputBytes]
+	if appendMode == rocmKVDescriptorAppendModeGrowLastPage {
+		if outputPageCount != previousPageCount || outputTokenCount != previousTokenCount+1 {
+			return core.E("rocm.hip.FakeLaunch", "KV descriptor grow page count mismatch", nil)
+		}
+		copy(output, previous)
+		lastOffset := rocmDeviceKVDescriptorHeaderBytes + (previousPageCount-1)*rocmDeviceKVDescriptorPageBytes
+		if int(binary.LittleEndian.Uint64(output[lastOffset:])+binary.LittleEndian.Uint64(output[lastOffset+8:])) != previousTokenCount ||
+			nativeDevicePointer(binary.LittleEndian.Uint64(output[lastOffset+32:])) != newKeyPointer ||
+			nativeDevicePointer(binary.LittleEndian.Uint64(output[lastOffset+40:])) != newValuePointer {
+			return core.E("rocm.hip.FakeLaunch", "KV descriptor grow last page mismatch", nil)
+		}
+		binary.LittleEndian.PutUint64(output[lastOffset+8:], binary.LittleEndian.Uint64(output[lastOffset+8:])+1)
+		binary.LittleEndian.PutUint64(output[lastOffset+48:], newKeyBytes)
+		binary.LittleEndian.PutUint64(output[lastOffset+56:], newValueBytes)
+		binary.LittleEndian.PutUint64(output[24:], uint64(outputTokenCount))
+		return nil
+	}
 	outputIndex := 0
 	for pageIndex := 0; pageIndex < previousPageCount; pageIndex++ {
 		pageOffset := rocmDeviceKVDescriptorHeaderBytes + pageIndex*rocmDeviceKVDescriptorPageBytes
@@ -5965,6 +5989,10 @@ func fakeROCmKVEncoding(code uint32) string {
 		return rocmKVEncodingQ8Rows
 	case rocmDeviceKVDescriptorEncodingQ4Rows:
 		return rocmKVEncodingQ4Rows
+	case rocmDeviceKVDescriptorEncodingQ8RowsI:
+		return rocmKVEncodingQ8RowsI
+	case rocmDeviceKVDescriptorEncodingQ4RowsI:
+		return rocmKVEncodingQ4RowsI
 	default:
 		return ""
 	}

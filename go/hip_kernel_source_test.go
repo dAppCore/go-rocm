@@ -94,12 +94,15 @@ func TestHIPKernelSource_ExportsLaunchABI_Good(t *testing.T) {
 		core.Sprintf("ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4 = %d", rocmDeviceKVDescriptorEncodingQ4),
 		core.Sprintf("ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8_ROWS = %d", rocmDeviceKVDescriptorEncodingQ8Rows),
 		core.Sprintf("ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4_ROWS = %d", rocmDeviceKVDescriptorEncodingQ4Rows),
+		core.Sprintf("ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q8_ROWS_INTERLEAVED = %d", rocmDeviceKVDescriptorEncodingQ8RowsI),
+		core.Sprintf("ROCM_DEVICE_KV_DESCRIPTOR_ENCODING_Q4_ROWS_INTERLEAVED = %d", rocmDeviceKVDescriptorEncodingQ4RowsI),
 		core.Sprintf("ROCM_KV_ENCODE_TOKEN_LAUNCH_ARGS_VERSION = %d", hipKVEncodeTokenLaunchArgsVersion),
 		core.Sprintf("ROCM_KV_ENCODE_TOKEN_LAUNCH_ARGS_BYTES = %d", hipKVEncodeTokenLaunchArgsBytes),
 		core.Sprintf("ROCM_KV_ENCODE_TOKEN_BLOCK_SIZE = %d", hipKVEncodeTokenBlockSize),
 		core.Sprintf("ROCM_KV_DESCRIPTOR_APPEND_LAUNCH_ARGS_VERSION = %d", hipKVDescriptorAppendLaunchArgsVersion),
 		core.Sprintf("ROCM_KV_DESCRIPTOR_APPEND_LAUNCH_ARGS_BYTES = %d", hipKVDescriptorAppendLaunchArgsBytes),
 		core.Sprintf("ROCM_KV_DESCRIPTOR_APPEND_BLOCK_SIZE = %d", hipKVDescriptorAppendBlockSize),
+		core.Sprintf("ROCM_KV_DESCRIPTOR_APPEND_MODE_GROW_LAST_PAGE = %d", rocmKVDescriptorAppendModeGrowLastPage),
 		core.Sprintf("ROCM_PROJECTION_LAUNCH_ARGS_VERSION = %d", hipProjectionLaunchArgsVersion),
 		core.Sprintf("ROCM_PROJECTION_LAUNCH_ARGS_BYTES = %d", hipProjectionLaunchArgsBytes),
 		core.Sprintf("ROCM_PROJECTION_BATCH_LAUNCH_ARGS_VERSION = %d", hipProjectionBatchLaunchArgsVersion),
@@ -383,7 +386,7 @@ func TestHIPKernelSource_AttentionChunkedStage1ScoreLaneReduction_Good(t *testin
 	core.AssertTrue(t, strings.Contains(batchStage2, `const bool cached_chunk_weights = chunk_count <= threads`), "batch stage2 must cache per-chunk softmax weights when they fit in shared scratch")
 	heads := hipKernelSourceFunctionBodyForTest(t, source, `__device__ void rocm_run_single_head_attention_token_parallel`)
 	core.AssertTrue(t, strings.Contains(heads, `device_kv_header->block_size == 1u`), "shared attention direct token-page fast path must reject mixed block/page MP4 KV streams")
-	core.AssertTrue(t, strings.Contains(heads, `cached_pointer = page->value_pointer + rocm_device_kv_tensor_payload_offset(page->value_encoding, page->token_count) + (value_base >> 1u)`), "shared attention must cache MP4 block q4 value row payload pointers")
+	core.AssertTrue(t, strings.Contains(heads, `cached_pointer = reinterpret_cast<uint64_t>(rocm_device_kv_row_payload_pointer(bytes, page->value_encoding, page->token_count, page->value_width, local_token)) + (value_base >> 1u)`), "shared attention must cache MP4 block q4 value row payload pointers")
 	core.AssertTrue(t, strings.Contains(heads, `const unsigned char *values = reinterpret_cast<const unsigned char *>(static_cast<uintptr_t>(cached_pointer));`), "shared attention cached value pointers must already point at the q4 row payload")
 }
 
