@@ -1,5 +1,102 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-28 Accepted Default-Small KV Tensor Pool
+
+Re-read `/home/claude/Code/core/go-mlx/IDEAS.md` before this pass. The Gemma4
+constraint remains unchanged: local/SWA KV must stay exact and bounded at
+`512`/`1024`, full/global layers carry retained context with the long
+`head_dim=512` path, and the retained-state book benchmark must extend the KV
+state rather than replay old prompt text.
+
+Changed the KV tensor pool policy from all-or-nothing opt-in to a conservative
+default for small tensors on real/system HIP drivers only. `cgoHIPDriver`
+advertises that it can use the default small pool, route-metric wrappers unwrap
+to the real driver, and fake/plain drivers still free normally unless
+`GO_ROCM_ENABLE_KV_TENSOR_POOL=1` is set. `GO_ROCM_DISABLE_KV_TENSOR_POOL=1`
+remains the hard off switch. The default threshold is `<=4096` bytes, covering
+the hot generated local/SWA one-token KQ8/VQ4 page bucket without pooling large
+retained global pages.
+
+Focused validation:
+
+```text
+go test ./go -run '^(TestKVCache_DeviceKVTensorPool(ReusesInlineAndRestEntries|DefaultSmallSystemDriverOnly)_Good|TestInferenceBenchmarkHIPKernelCountingDriver_Good)$' -count=1
+PASS
+
+CGO_ENABLED=0 go test ./go -run '^TestKVCache_DeviceKVTensorPool(DefaultSmallSystemDriverOnly|ReusesInlineAndRestEntries)_Good$' -count=1
+PASS
+
+BenchmarkROCmDeviceKVPageSlicePool_ReusedCapacity-32              4646042  248.4 ns/op  0 B/op   0 allocs/op
+BenchmarkROCmDeviceKVTransferSharedPages_HotWindowShift-32        177248   6654 ns/op  94 B/op  0 allocs/op
+```
+
+2048-token RX 7800 XT route-metric controls, all with empty stderr:
+
+```text
+default-small pool:
+BenchmarkInferenceGemma4Q4Generate-32 1 20249505545 ns/op
+tok/s=101.1
+B/op=4201976
+allocs/op=2643
+device_mallocs/op=6785
+device_malloc_bytes/op=23487432
+device_malloc_size_392_count/op=6156
+stderr: .bench-errors/2048_default_small_kv_pool_20260528.err (0 bytes)
+
+GO_ROCM_ENABLE_KV_TENSOR_POOL=1:
+BenchmarkInferenceGemma4Q4Generate-32 1 20245962102 ns/op
+tok/s=101.2
+B/op=4209072
+allocs/op=2643
+device_mallocs/op=6785
+device_malloc_size_392_count/op=6156
+stderr: .bench-errors/2048_full_kv_pool_recheck_20260528.err (0 bytes)
+
+GO_ROCM_DISABLE_KV_TENSOR_POOL=1:
+BenchmarkInferenceGemma4Q4Generate-32 1 20247951925 ns/op
+tok/s=101.1
+B/op=3847192
+allocs/op=2627
+device_mallocs/op=25217
+device_malloc_bytes/op=30712776
+device_malloc_size_392_count/op=24588
+stderr: .bench-errors/2048_no_kv_pool_control_20260528.err (0 bytes)
+```
+
+Conclusion from the 2048 controls: the current GPU/session is speed-neutral
+around `101 tok/s`, but the small default pool cuts device mallocs from `25217`
+to `6785` and the hot `392`-byte bucket from `24588` to `6156`. This is accepted
+as allocation/transfer-pressure cleanup, not as a token-speed fix.
+
+Strict retained 48k 10-turn book, no prompt replay, default-small pool:
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 50794423249 ns/op
+book_wall_s=50.79
+book_decode_s=41.98
+book_generated_tokens=3937
+book_tok/s=77.52
+book_last_turn_tok/s=87.14
+book_turn10_retained_tokens=6125
+book_90s_success=1
+book_110s_production_candidate=1
+book_maxed_turns=0
+book_repeated_turns=0
+book_max_adjacent_repeat=0.02513
+chapter10_arc_anchor_hits=5
+B/op=7904040
+allocs/op=39252
+peak_memory_bytes=5866110976
+stderr: .bench-errors/book10_default_small_kv_pool_20260528.err (0 bytes)
+artifact: /tmp/go-rocm-book-default-small-kv-pool-10turn-20260528.md
+```
+
+The wall/story gate is green, but this does not complete the goal. The next
+meaningful blockers remain q4 projection/GELU volume, full/global
+`head_dim=512` chunked attention, and a more structural retained-KV arena/ring
+that reduces transfer/device-malloc pressure without relying on a broad freed
+pointer pool.
+
 ## 2026-05-28 Accepted SWA Ownership Transfer Fast Path
 
 Re-read `/home/claude/Code/core/go-mlx/IDEAS.md` before this pass. The relevant

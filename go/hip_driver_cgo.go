@@ -552,6 +552,8 @@ type cgoHIPDriver struct {
 	kernelModulePath string
 }
 
+func (cgoHIPDriver) rocmDefaultKVTensorPool() {}
+
 const rocmHIPPinnedHostCopySupported = true
 
 var cgoHIPAvailability = struct {

@@ -14,6 +14,12 @@ import (
 	core "dappco.re/go"
 )
 
+type fakeSystemKVPoolHIPDriver struct {
+	*fakeHIPDriver
+}
+
+func (*fakeSystemKVPoolHIPDriver) rocmDefaultKVTensorPool() {}
+
 func TestKVCache_Good_FP16RoundTripsFakeBlocks(t *testing.T) {
 	cache, err := newROCmKVCache(rocmKVCacheModeFP16, 2)
 	core.RequireNoError(t, err)
@@ -1537,6 +1543,41 @@ func TestKVCache_DeviceKVTensorPoolReusesInlineAndRestEntries_Good(t *testing.T)
 	core.AssertEqual(t, second, reusedSecond)
 	core.AssertEqual(t, []uint64{392, 392}, driver.allocations)
 	core.AssertEqual(t, uint64(0), rocmDeviceKVTensorPool.bytes)
+}
+
+func TestKVCache_DeviceKVTensorPoolDefaultSmallSystemDriverOnly_Good(t *testing.T) {
+	resetPool := func() {
+		rocmDeviceKVTensorPool.Lock()
+		rocmDeviceKVTensorPool.entries = make(map[uint64]rocmDeviceKVTensorPoolBucket)
+		rocmDeviceKVTensorPool.bytes = 0
+		rocmDeviceKVTensorPool.Unlock()
+	}
+	resetPool()
+	defer resetPool()
+
+	plainDriver := &fakeHIPDriver{available: true}
+	plain, err := rocmDeviceKVTensorMalloc(plainDriver, 392)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, rocmDeviceKVTensorFree(plainDriver, plain, 392))
+	core.AssertEqual(t, []nativeDevicePointer{plain}, plainDriver.frees)
+	core.AssertEqual(t, uint64(0), rocmDeviceKVTensorPool.bytes)
+
+	systemDriver := &fakeSystemKVPoolHIPDriver{fakeHIPDriver: &fakeHIPDriver{available: true}}
+	small, err := rocmDeviceKVTensorMalloc(systemDriver, 392)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, rocmDeviceKVTensorFree(systemDriver, small, 392))
+	core.AssertEqual(t, 0, len(systemDriver.frees))
+	core.AssertEqual(t, uint64(392), rocmDeviceKVTensorPool.bytes)
+	reused, err := rocmDeviceKVTensorMalloc(systemDriver, 392)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, small, reused)
+	core.AssertEqual(t, []uint64{392}, systemDriver.allocations)
+	core.AssertEqual(t, uint64(0), rocmDeviceKVTensorPool.bytes)
+
+	large, err := rocmDeviceKVTensorMalloc(systemDriver, rocmDeviceKVTensorPoolSmallBytes+1)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, rocmDeviceKVTensorFree(systemDriver, large, rocmDeviceKVTensorPoolSmallBytes+1))
+	core.AssertEqual(t, []nativeDevicePointer{large}, systemDriver.frees)
 }
 
 func TestKVCache_Bad_DeviceDescriptorBytesRejectUnsupportedABIValues(t *testing.T) {

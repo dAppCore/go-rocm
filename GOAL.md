@@ -38,43 +38,29 @@ The 100+ tok/s goal is complete only when all of these are true:
   passing or skip cleanly when hardware is absent.
 
 Current status as of 2026-05-28: the q4 2048-token performance endpoint remains
-met on the pinned RX 7800 XT with the accepted `gfx1100` HSACO. The latest
-route-metric `GO_ROCM_BENCH_TOKENS=2048` `text:Hi` run, after contiguous encoded
-K/V pair allocation, fused embedding-output scaling, Gemma4 SWA-window-aware
-decode attention routing, chunked stage2 per-chunk weight caching, a 64-token
-chunked-attention grain, interleaved generated global/full KV page growth,
-malloc-size route metrics, and the restored exact-pointer SWA ownership
-transfer fast path, reports `18553017328 ns/op`, `110.4 tok/s`, `3165672 B/op`,
-and `2557 allocs/op`. It also reports `25217` device mallocs/op, `30712776`
-device malloc bytes/op, `941890` kernel launches/op, and keeps chunked
-stage1/stage2 launches at `13902` each. The new allocation-size metrics show
-the dominant generated local/SWA one-token KQ8/VQ4 page bucket is `392` bytes
-and accounts for `24588` mallocs/op. The optimized
-`GO_ROCM_ENABLE_KV_TENSOR_POOL=1` bucketed path cuts the short guard to `2177`
-device mallocs/op without hurting short tok/s. After the SWA ownership
-fast-path repair it no longer collapses the retained-book gate, but it remains
-opt-in because the strict 10-turn sample was slower at `56.18s` wall and
-`86.25 tok/s` on turn 10 versus the default `44.44s` / `88.24 tok/s` sample.
-The chapter-shaped 2048-token fast guard at `context_len=4096` reports
-`19536530899 ns/op`, `104.8 tok/s`, `8017064 B/op`, and `3438 allocs/op`.
-Full-attention/global Gemma4 generated device KV pages now use growable
-128-token interleaved row blocks while sliding-window layers keep exact
-one-token pages for 512/1024 SWA trimming. The latest strict retained 10-turn
-book gate with device-reduced sampled top-k partials, contiguous encoded K/V
-pair allocation, fused embedding-output scaling, SWA-window-aware decode
-routing, chunked stage2 per-chunk weight caching, the 64-token chunked-attention
-grain, the stronger chapter-10 final paragraph instruction, interleaved
-global/full page growth, and fast exact-pointer local-window page ownership
-transfer reports `44.44s` wall, `35.84s` decode, `3388` generated tokens,
-`76.23 tok/s` average, `88.24 tok/s` on turn 10, no repeated or maxed turns,
-`7354896 B/op`, and `37511` allocs/op. It kept `5` chapter-10 arc anchors with
-empty stderr and produced
-`/tmp/go-rocm-book-transfer-fastpath-10turn-20260528.md`, so
-`book_90s_success=1` and `book_110s_production_candidate=1`. This makes the
-wall/story production-candidate gate green and moves late-turn decode to the
-edge of the retained `90-100+ tok/s` target; the final driver endpoint remains
-sustained `90-100+ tok/s` late-turn decode with lower transfer/device-malloc
-volume.
+met on the pinned RX 7800 XT with the accepted `gfx1100` HSACO. After re-reading
+`/home/claude/Code/core/go-mlx/IDEAS.md`, the accepted default keeps local/SWA
+KV exact and bounded at `512`/`1024`, lets full/global KV carry retained
+context, and now enables the KV tensor pool only for small tensors
+(`<=4096` bytes) on the real cgo/system HIP driver. The full pool remains
+available behind `GO_ROCM_ENABLE_KV_TENSOR_POOL=1`; all pooling can be disabled
+with `GO_ROCM_DISABLE_KV_TENSOR_POOL=1`. The latest `GO_ROCM_BENCH_TOKENS=2048`
+`text:Hi` recheck reports `20249505545 ns/op`, `101.1 tok/s`, `4201976 B/op`,
+`2643 allocs/op`, `6785` device mallocs/op, and `6156` allocations in the hot
+`392`-byte local/SWA page bucket. The no-pool control was speed-neutral at
+`101.1 tok/s` but required `25217` device mallocs/op and `24588` hot-bucket
+allocations, so the small default pool is accepted as malloc/transfer-pressure
+cleanup rather than a token-speed win.
+
+The latest strict retained 48k 10-turn book gate using that default-small pool
+reports `50.79s` wall, `41.98s` decode, `3937` generated tokens,
+`77.52 tok/s` average, `87.14 tok/s` on turn 10, `6125` turn-10 retained tokens,
+no repeated or maxed turns, `5` chapter-10 arc anchors, `7904040 B/op`, and
+`39252` allocs/op. Stderr was empty and the artifact is
+`/tmp/go-rocm-book-default-small-kv-pool-10turn-20260528.md`, so
+`book_90s_success=1` and `book_110s_production_candidate=1`. This keeps the
+wall/story gate green, but the final driver endpoint remains sustained
+`90-100+ tok/s` late-turn decode with lower transfer/device-malloc volume.
 Local/SWA attention remains bounded according to the `go-mlx/IDEAS.md` Gemma4
 rule, q4/RoPE work stays flat per generated token, and full/global
 `head_dim=512` chunked attention plus q4 projection/GELU block volume remain the
@@ -227,7 +213,10 @@ onboard GPU remains idle. The retained-state book benchmark appends only the new
 turn prompt plus Gemma4 chat-control tokens; it does not replay prior chapters.
 The Gemma4 chat template is matched to the local HF tokenizer for
 `<bos><|turn>user\n...<turn|>\n<|turn>model\n`, and the `text:` parser
-preserves the final generation-prompt newline. A full-cap 10-turn retained run
+preserves the final generation-prompt newline. The latest default-small
+small-tensor KV pool run completed at `50.79s` wall with empty stderr,
+`3937` generated tokens, no cap hits, no repeats, `5` chapter-10 arc anchors,
+and `87.14 tok/s` on turn 10. Historical path: a full-cap 10-turn retained run
 with the old 16-token device-KV pages completed cleanly but took `438.9s` wall
 and fell from `93.8 tok/s` on turn 1 to `10.6 tok/s` by turn 10. With
 one-token device-KV pages and the distractor placed before the final continuation
@@ -466,10 +455,12 @@ for 512/1024 trimming. The strict 48k book gate stayed production-green at
 average, `89.69 tok/s` on turn 10, no cap hits, no repeats, `4` chapter-10 arc
 anchors, `15060872 B/op`, and `63030 allocs/op`. It still appends only the new
 turn prompt plus Gemma4 chat-control tokens; prior chapters are carried by
-retained KV state and are never rebuilt as prompt text. This is the current best
-retained-book route and is right at the `90 tok/s` late-turn edge. Keep tuning
-retained long-context attention, device-malloc volume, and state quality until
-later turns sustain the `90-100+ tok/s` target.
+retained KV state and are never rebuilt as prompt text. The latest accepted
+default-small KV tensor pool route is slower than that earlier best wall sample
+but substantially reduces hot small device allocation requests compared with the
+no-pool control, so it is the current default pressure-reduction route. Keep
+tuning retained long-context attention, device-malloc volume, and state quality
+until later turns sustain the `90-100+ tok/s` target.
 
 Current decode-scaling status as of 2026-05-26: Gemma4 E2B/E4B context is
 `128k` tokens, not `128` tokens; the context-128 short decode numbers remain a

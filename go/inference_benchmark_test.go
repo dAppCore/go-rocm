@@ -106,6 +106,13 @@ func newInferenceBenchmarkHIPKernelCountingDriver(driver nativeHIPDriver) *infer
 	}
 }
 
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) rocmUnwrapNativeHIPDriver() nativeHIPDriver {
+	if driver == nil {
+		return nil
+	}
+	return driver.nativeHIPDriver
+}
+
 func (driver *inferenceBenchmarkHIPKernelCountingDriver) Malloc(size uint64) (nativeDevicePointer, error) {
 	pointer, err := driver.nativeHIPDriver.Malloc(size)
 	if err != nil {

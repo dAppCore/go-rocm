@@ -387,6 +387,7 @@ var rocmDeviceKVTensorPool = struct {
 const (
 	rocmDeviceKVTensorPoolMaxPerSize = 4096
 	rocmDeviceKVTensorPoolMaxBytes   = 64 << 20
+	rocmDeviceKVTensorPoolSmallBytes = 4096
 )
 
 func hipGemma4Q4DeviceKVBlockSize() int {
@@ -552,11 +553,38 @@ func rocmDeviceKVReleaseDescriptorBytes(payload []byte) {
 	pool.Unlock()
 }
 
-func rocmDeviceKVTensorPoolEnabled() bool {
+type rocmDeviceKVTensorPoolDefaultDriver interface {
+	rocmDefaultKVTensorPool()
+}
+
+type rocmNativeHIPDriverUnwrapper interface {
+	rocmUnwrapNativeHIPDriver() nativeHIPDriver
+}
+
+func rocmDeviceKVTensorPoolDefaultDriverEnabled(driver nativeHIPDriver) bool {
+	for depth := 0; driver != nil && depth < 4; depth++ {
+		if _, ok := driver.(rocmDeviceKVTensorPoolDefaultDriver); ok {
+			return true
+		}
+		unwrapper, ok := driver.(rocmNativeHIPDriverUnwrapper)
+		if !ok {
+			return false
+		}
+		driver = unwrapper.rocmUnwrapNativeHIPDriver()
+	}
+	return false
+}
+
+func rocmDeviceKVTensorPoolEnabled(driver nativeHIPDriver, sizeBytes uint64) bool {
 	if os.Getenv("GO_ROCM_DISABLE_KV_TENSOR_POOL") == "1" {
 		return false
 	}
-	return os.Getenv("GO_ROCM_ENABLE_KV_TENSOR_POOL") == "1"
+	if os.Getenv("GO_ROCM_ENABLE_KV_TENSOR_POOL") == "1" {
+		return true
+	}
+	return sizeBytes > 0 &&
+		sizeBytes <= rocmDeviceKVTensorPoolSmallBytes &&
+		rocmDeviceKVTensorPoolDefaultDriverEnabled(driver)
 }
 
 func rocmDeviceKVPageAlignedWindowEnabled() bool {
@@ -568,7 +596,7 @@ func rocmDeviceKVInterleavedRowPagesEnabled() bool {
 }
 
 func rocmDeviceKVTensorMalloc(driver nativeHIPDriver, sizeBytes uint64) (nativeDevicePointer, error) {
-	if !rocmDeviceKVTensorPoolEnabled() {
+	if !rocmDeviceKVTensorPoolEnabled(driver, sizeBytes) {
 		return driver.Malloc(sizeBytes)
 	}
 	rocmDeviceKVTensorPool.Lock()
@@ -611,7 +639,7 @@ func rocmDeviceKVTensorFree(driver nativeHIPDriver, pointer nativeDevicePointer,
 	if pointer == 0 {
 		return nil
 	}
-	if rocmDeviceKVTensorPoolEnabled() && driver != nil && sizeBytes > 0 {
+	if rocmDeviceKVTensorPoolEnabled(driver, sizeBytes) && driver != nil && sizeBytes > 0 {
 		rocmDeviceKVTensorPool.Lock()
 		bucket := rocmDeviceKVTensorPool.entries[sizeBytes]
 		if bucket.len() < rocmDeviceKVTensorPoolMaxPerSize &&
