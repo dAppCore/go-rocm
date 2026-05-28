@@ -1,5 +1,53 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-28 Rejected Local/SWA Block-4 Interleaved Window KV
+
+Re-read `/home/claude/Code/core/go-mlx/IDEAS.md` and used its Gemma4 notes as
+the parity checklist: five local/SWA layers must remain exact and bounded at
+`512`/`1024`, the full/global owner layers carry retained context, generated
+tokens stay in the live state, and the retained book workload is the correctness
+gate for any KV layout optimization.
+
+Tested a smaller block-page local/SWA variant after the rejected block-16 and
+page-aligned attempts. The 2048-token `text:Hi` route guard looked attractive:
+
+```text
+GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE=4
+GO_ROCM_GEMMA4_Q4_GLOBAL_DEVICE_KV_BLOCK_SIZE=128
+BenchmarkInferenceGemma4Q4Generate-32 1 17810519735 ns/op
+tok/s=115.0
+B/op=17126520
+allocs/op=19873
+device_mallocs/op=6797
+device_malloc_bytes/op=33684648
+device_malloc_size_2080_count/op=5760
+h2d_async_bytes/op=11982352
+h2d_async_copies/op=5778
+kernel_total_launches/op=936120
+stderr: .bench-errors/2048_local_block4_route_metrics_20260528.err (0 bytes)
+```
+
+The strict retained 48k 10-turn book rejected it:
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState
+FAIL: chapter 10 anchor hits = 1 below GO_ROCM_BOOK_MIN_ARC_ANCHOR_HITS=3
+wall_seconds=11.181
+generated_tokens=452
+prompt_tokens=2188
+repeated_turns=6
+max_adjacent_repeat=1.000
+stderr: .bench-errors/book10_local_block4_20260528.err (0 bytes)
+artifact: /tmp/go-rocm-book-local-block4-10turn-20260528.md
+```
+
+Conclusion: block-4 is rejected despite the short-guard `115 tok/s`. It
+collapses after the local retained window starts trimming and repeats
+`Interaction of light`, so it is likely exposing a retained-state descriptor,
+trim, or shared-alias bug rather than a sampler issue. Do not promote any
+interleaved local block page route until it passes the strict retained book
+gate without chapter drift.
+
 ## 2026-05-28 Accepted Default-Small KV Tensor Pool
 
 Re-read `/home/claude/Code/core/go-mlx/IDEAS.md` before this pass. The Gemma4

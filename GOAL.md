@@ -72,9 +72,12 @@ owner layers still carry the longer state.
 2026-05-28 local/SWA block-page experiments are not production defaults. Exact
 block-16 interleaved local KV reduced the 2048-token guard to `3617` device
 mallocs/op while keeping `117.3 tok/s`, but the strict retained 10-turn book
-lost chapter-10 arc retention (`chapter10_arc_anchor_hits=1`). The page-aligned
-local-window slack variant is also rejected. Keep local/SWA pages exact by
-default until a ring-buffer or descriptor layout passes the book-quality gate.
+lost chapter-10 arc retention (`chapter10_arc_anchor_hits=1`). Block-4 was
+also rejected: the short guard reported `115.0 tok/s`, but the retained book
+collapsed to `452` generated tokens, `6` repeated turns, and only `1`
+chapter-10 arc anchor. The page-aligned local-window slack variant is also
+rejected. Keep local/SWA pages exact by default until a ring-buffer or
+descriptor layout passes the book-quality gate.
 These numbers use the
 benchmark's
 `inference.WithContextLen` load setting, now correctly applied to Gemma4 q4
