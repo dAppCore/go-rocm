@@ -18842,3 +18842,80 @@ production-green `86.83 tok/s` to `83.63 tok/s` and allocation/device-malloc
 volume rose with the longer sample. Do not reintroduce the q4 affine FMA
 accumulation unless a later kernel layout change materially changes the
 generated-token and late-turn profile.
+
+## 2026-05-27 Rejected Checked Tail Descriptor Lookup
+
+Tested a safe descriptor lookup shortcut for mixed retained `.kv`/MP4 layouts:
+after the existing direct block and direct one-token checks, the kernel computed
+`tail_index = page_count - (token_count - token)` and returned that page only if
+it verified `token_start == token && token_count == 1`. This deliberately did
+not repeat the rejected direct `token / block_size` shortcut; the candidate kept
+the generic binary search fallback and only targeted generated one-token pages
+at the current descriptor tail.
+
+Validation before live checks:
+
+```text
+go test ./go -run 'TestHIPKernelSource_AttentionChunkedStage1ScoreLaneReduction_Good|TestHIPAttentionHeads(ChunkedSharedMemBytes|ChunkedEligible)_Good|TestHIPAttentionHeadsChunkedEligible_Gemma4HeadDim512_Good|TestHIPKernels_AttentionHeadsBatchChunked' -count=1
+PASS
+
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-tail-lookup-20260527.hsaco
+stderr: .bench-errors/hipcc_gfx1100_tail_lookup_20260527.err (0 bytes)
+
+TestNativeDecodeSmokeKernelStatus_Good
+Gemma4 q4 public Generate prompt="text:Hi" prompt_tokens=[2 10979] generated tokens=[107 4968] text=["\n" "Model"]
+stderr: .bench-errors/q4_tail_lookup_smoke_20260527.err (0 bytes)
+```
+
+2048-token route-metric guard:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 17651089841 ns/op
+tok/s=116.0
+tokens=2048
+B/op=6514920
+allocs/op=2689
+device_mallocs/op=31316
+device_malloc_bytes/op=31300464
+kernel_attention_decode_chunked_stage1_launches=13902
+kernel_attention_decode_chunked_stage2_launches=13902
+kernel_total_launches=941890
+stderr: .bench-errors/2048_tail_lookup_20260527.err (0 bytes)
+```
+
+Strict retained 48k 10-turn book:
+
+```text
+BenchmarkInferenceGemma4Q4Book10Turn_RetainedState-32 1 53559723562 ns/op
+book_wall_s=53.53
+book_decode_s=42.63
+book_generated_tokens=3997
+book_tok/s=74.67
+book_turn10_tok/s=85.87
+book_turn10_retained_tokens=6185
+book_90s_success=1
+book_110s_production_candidate=1
+book_maxed_turns=0
+book_repeated_turns=0
+book_max_adjacent_repeat=0.08991
+chapter10_arc_anchor_hits=4
+B/op=23396272
+allocs/op=71292
+peak_memory_bytes=5874831360
+device_mallocs/op=92860
+device_malloc_bytes/op=12609555244
+kernel_attention_decode_chunked_stage1_launches=28049
+kernel_attention_decode_chunked_stage1_blocks=10863272
+kernel_total_launches=1888087
+kernel_total_blocks=365679992
+stderr: .bench-errors/book10_tail_lookup_20260527.err (0 bytes)
+output: /tmp/go-rocm-book-tail-lookup-20260527.md
+```
+
+Conclusion: rejected and reverted. The checked tail shortcut was semantically
+safer than the earlier mixed-page direct lookup, but it still regressed the
+2048-token guard (`116.0 tok/s` versus `116.6 tok/s`) and did not improve the
+retained-book late turn (`85.87 tok/s` versus the current production-green
+`86.83 tok/s`). Keep the generic descriptor lookup until there is a real
+token-to-page index or slot layout that removes the extra branch without adding
+work to every lookup.
