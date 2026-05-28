@@ -1,5 +1,113 @@
 # go-rocm Goal Working Notes
 
+## 2026-05-28 Rejected Local/SWA Block-16 Interleaved Window KV
+
+Re-read `/home/claude/Code/core/go-mlx/IDEAS.md` and rechecked the local
+Gemma4-E2B q4 config before this pass. The local model pack matches the
+go-mlx notes: 35 text layers, 5:1 `sliding_attention`/`full_attention`,
+`head_dim=256`, `global_head_dim=512`, `sliding_window=512`, and
+`num_kv_shared_layers=20`. The accepted production route remains: full/global
+layers can grow retained KV, while local/SWA owner layers must remain exact and
+bounded at the configured sliding window.
+
+Experimental code added behind env/shape gates:
+
+- `GO_ROCM_GEMMA4_Q4_INTERLEAVED_ROW_PAGES=1` lets prefill/device-row pages use
+  the interleaved q8/q4 row encodings instead of the older contiguous row-scale
+  layout.
+- `GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE=16` exercises local/SWA block pages
+  instead of the default exact one-token local pages.
+- Descriptor append now understands exact trim plus grow-last-page for sliced
+  interleaved pages, so a retained window can advance without rebuilding the
+  descriptor table on every local append.
+- `GO_ROCM_GEMMA4_Q4_PAGE_ALIGNED_LOCAL_KV=1` was tested as a bounded-slack
+  mode that only drops complete local pages. It is not production-safe.
+
+Correctness/guard coverage added:
+
+```text
+go test ./go -run 'TestKVCache_Good_DeviceDescriptorAppendGrowsAndTrimsInterleavedWindow|TestKVCache_Good_DeviceAppendSlicesInterleavedWindowPage|TestKVCache_Good_DeviceRowsWindowSlicesInterleavedPage|TestKVCache_Good_DeviceRowsWindowPageAlignedKeepsBoundedSlack|TestKVCache_Good_DeviceDescriptorAppend' -count=1
+PASS
+
+go test ./go -count=1
+PASS
+
+hipcc --std=c++23 --genco --offload-arch=gfx1100 -O2 kernels/rocm_kernels.hip -o /tmp/go-rocm-kernels-gfx1100-descriptor-slice-grow-20260528.hsaco
+stderr: .bench-errors/hipcc_gfx1100_descriptor_slice_grow_20260528.err (0 bytes)
+
+ROCR_VISIBLE_DEVICES=GPU-880ed6479d653a85 GO_ROCM_RUN_HIP_TESTS=1 GO_ROCM_KERNEL_HSACO=/tmp/go-rocm-kernels-gfx1100-descriptor-slice-grow-20260528.hsaco go test ./go -run '^TestHIPHardwareTransformerKernelSource_Good$/attention-heads-sliced-interleaved-window-kv-reference$' -count=1 -timeout=120s
+PASS
+stderr: .bench-errors/hardware_sliced_interleaved_window_attention_20260528.err (0 bytes)
+```
+
+The hardware reference test builds a 529-token block-16 interleaved local KV
+cache, trims it to an exact 512-token window so the first retained page is
+sliced, runs descriptor-backed attention, restores the quantized device KV to a
+host reference, and compares the GPU result against the CPU softmax reference.
+That passed, so descriptor lookup and interleaved q8/q4 row decode are not the
+current quality failure.
+
+Fast 2048-token signal with exact local block-16 and interleaved row pages:
+
+```text
+BenchmarkInferenceGemma4Q4Generate-32 1 17462884341 ns/op
+tok/s=117.3
+B/op=4095464
+allocs/op=6863
+device_mallocs/op=3617
+device_malloc_bytes/op=31859256
+h2d_async_bytes/op=784912
+kernel_rocm_kv_descriptor_append_launches=29265
+kernel_rocm_kv_encode_token_launches=30720
+kernel_total_launches=940438
+stderr: .bench-errors/2048_local_block16_descriptor_slice_grow_rerun_20260528.err (0 bytes)
+```
+
+Short conclusion from the 2048 guard: this shape greatly reduces HIP
+`Malloc`/`Free` churn compared with the accepted default (`3617` device mallocs
+vs `25217`) and stays above the 100 tok/s short endpoint, but it increases Go
+heap/object pressure compared with the production default (`4.10MB` and
+`6863 allocs/op` vs `3.20MB` and `2556 allocs/op`). It is useful as a diagnostic
+but not a default promotion.
+
+Retained book checks:
+
+```text
+2-turn exact local block-16:
+book_wall_s=8.727
+book_generated_tokens=884
+book_tok/s=101.3
+book_last_turn_tok/s=106.4
+book_maxed_turns=0
+book_repeated_turns=0
+stderr: .bench-errors/book2_local_block16_descriptor_slice_grow_20260528.err (0 bytes)
+output: /tmp/go-rocm-book-local-block16-descriptor-slice-grow-2turn-20260528.md
+
+10-turn strict exact local block-16:
+book_wall_s=42.456
+book_generated_tokens=3482
+effective_wall_tok/s=82.01
+book_last_turn_tok/s=95.93
+book_maxed_turns=0
+book_repeated_turns=0
+chapter10_arc_anchor_hits=1
+stderr: .bench-errors/book10_local_block16_descriptor_slice_grow_20260528.err (0 bytes)
+output: /tmp/go-rocm-book-local-block16-descriptor-slice-grow-10turn-20260528.md
+FAIL: chapter 10 anchor hits below GO_ROCM_BOOK_MIN_ARC_ANCHOR_HITS=3
+```
+
+Rejected reason: exact local block-16 is fast and has much lower device-malloc
+count, but the strict retained 10-turn book lost the lighthouse/deep/ocean arc
+by chapter 10. The artifact collapses into repeated "truth of the light"
+phrasing late in the run. Keep local/SWA block pages and interleaved row prefill
+behind explicit env knobs until a ring-buffer or descriptor layout can preserve
+the book-quality gate.
+
+The page-aligned bounded-slack variant is also rejected. It measured
+`118.3 tok/s`, `4095176 B/op`, `6862 allocs/op`, and `3617` device mallocs/op
+on the 2048 guard, but the 10-turn book failed chapter-10 anchors and repeated
+late-chapter framing. Local/SWA windows must remain exact, not page-slack.
+
 ## 2026-05-27 Rejected Cols256 64-Row Geometry
 
 - Tested changing the specialized `rocm_mlx_q4_projection_cols256` Gemma4 shape

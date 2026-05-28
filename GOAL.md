@@ -72,6 +72,12 @@ Local/SWA attention remains bounded according to the `go-mlx/IDEAS.md` Gemma4
 rule, q4/RoPE work stays flat per generated token, and full/global
 `head_dim=512` chunked attention plus q4 projection/GELU block volume remain the
 late-turn scaling blockers.
+2026-05-28 local/SWA block-page experiments are not production defaults. Exact
+block-16 interleaved local KV reduced the 2048-token guard to `3617` device
+mallocs/op while keeping `117.3 tok/s`, but the strict retained 10-turn book
+lost chapter-10 arc retention (`chapter10_arc_anchor_hits=1`). The page-aligned
+local-window slack variant is also rejected. Keep local/SWA pages exact by
+default until a ring-buffer or descriptor layout passes the book-quality gate.
 These numbers use the
 benchmark's
 `inference.WithContextLen` load setting, now correctly applied to Gemma4 q4

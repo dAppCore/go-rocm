@@ -2497,6 +2497,80 @@ func TestHIPHardwareTransformerKernelSource_Good(t *testing.T) {
 		assertFloat32SlicesNear(t, normalGot, chunkedGot, 0.001)
 	})
 
+	t.Run("attention-heads-sliced-interleaved-window-kv-reference", func(t *testing.T) {
+		t.Setenv("GO_ROCM_GEMMA4_Q4_INTERLEAVED_ROW_PAGES", "1")
+		const (
+			dim         = 256
+			inputTokens = 529
+			window      = 512
+			headCount   = 2
+		)
+		queryValues := make([]float32, headCount*dim)
+		keyValues := make([]float32, inputTokens*dim)
+		valueValues := make([]float32, inputTokens*dim)
+		for index := range queryValues {
+			queryValues[index] = float32(math.Sin(float64(index)*0.013) * 0.75)
+		}
+		for index := range keyValues {
+			keyValues[index] = float32(math.Sin(float64(index)*0.017) * 0.5)
+		}
+		for index := range valueValues {
+			valueValues[index] = float32(math.Cos(float64(index)*0.011) * 0.5)
+		}
+		keyPayload, err := hipFloat32Payload(keyValues)
+		core.RequireNoError(t, err)
+		keyBuffer, err := hipUploadByteBuffer(hipRuntime.driver, "rocm.hip.AttentionHeadsLaunch", "hardware sliced interleaved key values", keyPayload, len(keyValues))
+		core.RequireNoError(t, err)
+		defer keyBuffer.Close()
+		valuePayload, err := hipFloat32Payload(valueValues)
+		core.RequireNoError(t, err)
+		valueBuffer, err := hipUploadByteBuffer(hipRuntime.driver, "rocm.hip.AttentionHeadsLaunch", "hardware sliced interleaved value values", valuePayload, len(valueValues))
+		core.RequireNoError(t, err)
+		defer valueBuffer.Close()
+		cache := &rocmDeviceKVCache{driver: hipRuntime.driver, mode: rocmKVCacheModeKQ8VQ4, blockSize: 16}
+		deviceKV, err := cache.withAppendedDeviceRowsWindow(context.Background(), keyBuffer, valueBuffer, dim, dim, inputTokens, window)
+		core.RequireNoError(t, err)
+		defer deviceKV.Close()
+		if deviceKV.TokenCount() != window || deviceKV.PageCount() == 0 || deviceKV.pages[0].tokenCount != 15 {
+			t.Fatalf("sliced window shape = tokens:%d pages:%d first:%d, want 512 tokens and sliced first page", deviceKV.TokenCount(), deviceKV.PageCount(), deviceKV.pages[0].tokenCount)
+		}
+		table, err := deviceKV.KernelDescriptorTable()
+		core.RequireNoError(t, err)
+		defer table.Close()
+		queryPayload, err := hipFloat32Payload(queryValues)
+		core.RequireNoError(t, err)
+		queryBuffer, err := hipUploadByteBuffer(hipRuntime.driver, "rocm.hip.AttentionHeadsLaunch", "hardware sliced interleaved attention query", queryPayload, len(queryValues))
+		core.RequireNoError(t, err)
+		defer queryBuffer.Close()
+		output, err := hipAllocateByteBuffer(hipRuntime.driver, "rocm.hip.AttentionHeadsLaunch", "hardware sliced interleaved attention output", uint64(len(queryValues)*4), len(queryValues))
+		core.RequireNoError(t, err)
+		defer output.Close()
+		req := hipAttentionRequest{
+			QueryDim:        dim,
+			DeviceKV:        deviceKV,
+			DescriptorTable: table,
+			Scale:           1,
+		}
+		core.RequireNoError(t, hipRunAttentionHeadsOutputFromDeviceQueryToDeviceKernel(context.Background(), hipRuntime.driver, req, queryBuffer, headCount, output))
+		got, err := hipReadFloat32DeviceOutput(output, "rocm.hip.AttentionHeadsLaunch", "hardware sliced interleaved attention output", len(queryValues))
+		core.RequireNoError(t, err)
+		host, err := deviceKV.hostCache()
+		core.RequireNoError(t, err)
+		restoredKeys, restoredValues, err := host.Restore(0, window)
+		core.RequireNoError(t, err)
+		keys, err := splitHIPReferenceVectors(restoredKeys, dim)
+		core.RequireNoError(t, err)
+		values, err := splitHIPReferenceVectors(restoredValues, dim)
+		core.RequireNoError(t, err)
+		want := make([]float32, 0, len(queryValues))
+		for head := 0; head < headCount; head++ {
+			headOutput, _, err := hipReferenceSingleHeadAttentionWithScale(queryValues[head*dim:(head+1)*dim], keys, values, 1)
+			core.RequireNoError(t, err)
+			want = append(want, headOutput...)
+		}
+		assertFloat32SlicesNear(t, want, got, 0.001)
+	})
+
 	t.Run("attention-heads-batch-chunked-block-kv", func(t *testing.T) {
 		const (
 			dim             = 4

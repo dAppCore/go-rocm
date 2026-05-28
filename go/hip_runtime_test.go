@@ -5809,7 +5809,7 @@ func (driver *fakeHIPDriver) launchKVDescriptorAppend(args []byte) error {
 		return core.E("rocm.hip.FakeLaunch", "KV descriptor append shape metadata mismatch", nil)
 	}
 	if appendMode == rocmKVDescriptorAppendModeGrowLastPage {
-		if trimStart != 0 || newKeyBytes == 0 || newValueBytes == 0 || newKeyPointer == 0 || newValuePointer == 0 {
+		if newKeyBytes == 0 || newValueBytes == 0 || newKeyPointer == 0 || newValuePointer == 0 {
 			return core.E("rocm.hip.FakeLaunch", "KV descriptor grow page metadata mismatch", nil)
 		}
 	} else {
@@ -5849,19 +5849,66 @@ func (driver *fakeHIPDriver) launchKVDescriptorAppend(args []byte) error {
 	}
 	output := outputData[outputOffset : outputOffset+outputBytes]
 	if appendMode == rocmKVDescriptorAppendModeGrowLastPage {
-		if outputPageCount != previousPageCount || outputTokenCount != previousTokenCount+1 {
+		if outputPageCount != previousPageCount {
 			return core.E("rocm.hip.FakeLaunch", "KV descriptor grow page count mismatch", nil)
 		}
-		copy(output, previous)
+		if trimStart == 0 {
+			if outputTokenCount != previousTokenCount+1 {
+				return core.E("rocm.hip.FakeLaunch", "KV descriptor grow page count mismatch", nil)
+			}
+			copy(output, previous)
+			lastOffset := rocmDeviceKVDescriptorHeaderBytes + (previousPageCount-1)*rocmDeviceKVDescriptorPageBytes
+			if int(binary.LittleEndian.Uint64(output[lastOffset:])+binary.LittleEndian.Uint64(output[lastOffset+8:])) != previousTokenCount ||
+				nativeDevicePointer(binary.LittleEndian.Uint64(output[lastOffset+32:])) != newKeyPointer ||
+				nativeDevicePointer(binary.LittleEndian.Uint64(output[lastOffset+40:])) != newValuePointer {
+				return core.E("rocm.hip.FakeLaunch", "KV descriptor grow last page mismatch", nil)
+			}
+			binary.LittleEndian.PutUint64(output[lastOffset+8:], binary.LittleEndian.Uint64(output[lastOffset+8:])+1)
+			binary.LittleEndian.PutUint64(output[lastOffset+48:], newKeyBytes)
+			binary.LittleEndian.PutUint64(output[lastOffset+56:], newValueBytes)
+			binary.LittleEndian.PutUint64(output[24:], uint64(outputTokenCount))
+			return nil
+		}
+		outputIndex := 0
+		for pageIndex := 0; pageIndex < previousPageCount-1; pageIndex++ {
+			pageOffset := rocmDeviceKVDescriptorHeaderBytes + pageIndex*rocmDeviceKVDescriptorPageBytes
+			retained, err := fakeROCmKVDescriptorTrimPage(previous[pageOffset:pageOffset+rocmDeviceKVDescriptorPageBytes], trimStart)
+			if err != nil {
+				return err
+			}
+			if !retained.ok {
+				continue
+			}
+			if outputIndex >= outputPageCount-1 {
+				return core.E("rocm.hip.FakeLaunch", "KV descriptor grow retained page mismatch", nil)
+			}
+			outOffset := rocmDeviceKVDescriptorHeaderBytes + outputIndex*rocmDeviceKVDescriptorPageBytes
+			copy(output[outOffset:outOffset+rocmDeviceKVDescriptorPageBytes], retained.payload[:])
+			outputIndex++
+		}
+		if outputIndex != outputPageCount-1 {
+			return core.E("rocm.hip.FakeLaunch", "KV descriptor grow output page count mismatch", nil)
+		}
 		lastOffset := rocmDeviceKVDescriptorHeaderBytes + (previousPageCount-1)*rocmDeviceKVDescriptorPageBytes
-		if int(binary.LittleEndian.Uint64(output[lastOffset:])+binary.LittleEndian.Uint64(output[lastOffset+8:])) != previousTokenCount ||
-			nativeDevicePointer(binary.LittleEndian.Uint64(output[lastOffset+32:])) != newKeyPointer ||
-			nativeDevicePointer(binary.LittleEndian.Uint64(output[lastOffset+40:])) != newValuePointer {
+		previousLast := previous[lastOffset : lastOffset+rocmDeviceKVDescriptorPageBytes]
+		if int(binary.LittleEndian.Uint64(previousLast[0:])+binary.LittleEndian.Uint64(previousLast[8:])) != previousTokenCount ||
+			int(binary.LittleEndian.Uint64(previousLast[0:])) < trimStart ||
+			nativeDevicePointer(binary.LittleEndian.Uint64(previousLast[32:])) != newKeyPointer ||
+			nativeDevicePointer(binary.LittleEndian.Uint64(previousLast[40:])) != newValuePointer {
 			return core.E("rocm.hip.FakeLaunch", "KV descriptor grow last page mismatch", nil)
 		}
-		binary.LittleEndian.PutUint64(output[lastOffset+8:], binary.LittleEndian.Uint64(output[lastOffset+8:])+1)
-		binary.LittleEndian.PutUint64(output[lastOffset+48:], newKeyBytes)
-		binary.LittleEndian.PutUint64(output[lastOffset+56:], newValueBytes)
+		lastOutOffset := rocmDeviceKVDescriptorHeaderBytes + (outputPageCount-1)*rocmDeviceKVDescriptorPageBytes
+		copy(output[lastOutOffset:lastOutOffset+rocmDeviceKVDescriptorPageBytes], previousLast)
+		binary.LittleEndian.PutUint64(output[lastOutOffset:], binary.LittleEndian.Uint64(previousLast[0:])-uint64(trimStart))
+		binary.LittleEndian.PutUint64(output[lastOutOffset+8:], binary.LittleEndian.Uint64(previousLast[8:])+1)
+		binary.LittleEndian.PutUint64(output[lastOutOffset+48:], newKeyBytes)
+		binary.LittleEndian.PutUint64(output[lastOutOffset+56:], newValueBytes)
+		binary.LittleEndian.PutUint32(output[0:], rocmDeviceKVDescriptorVersion)
+		binary.LittleEndian.PutUint32(output[4:], uint32(rocmDeviceKVDescriptorHeaderBytes))
+		binary.LittleEndian.PutUint32(output[8:], uint32(rocmDeviceKVDescriptorPageBytes))
+		binary.LittleEndian.PutUint32(output[12:], modeCode)
+		binary.LittleEndian.PutUint32(output[16:], uint32(outputPageCount))
+		binary.LittleEndian.PutUint32(output[20:], uint32(blockSize))
 		binary.LittleEndian.PutUint64(output[24:], uint64(outputTokenCount))
 		return nil
 	}
@@ -5874,12 +5921,18 @@ func (driver *fakeHIPDriver) launchKVDescriptorAppend(args []byte) error {
 		if tokenStart+tokenCount <= trimStart {
 			continue
 		}
-		if tokenStart < trimStart || outputIndex+1 >= outputPageCount {
+		if outputIndex+1 >= outputPageCount {
+			return core.E("rocm.hip.FakeLaunch", "KV descriptor append retained page mismatch", nil)
+		}
+		retained, err := fakeROCmKVDescriptorTrimPage(page, trimStart)
+		if err != nil {
+			return err
+		}
+		if !retained.ok {
 			return core.E("rocm.hip.FakeLaunch", "KV descriptor append retained page mismatch", nil)
 		}
 		outOffset := rocmDeviceKVDescriptorHeaderBytes + outputIndex*rocmDeviceKVDescriptorPageBytes
-		copy(output[outOffset:outOffset+rocmDeviceKVDescriptorPageBytes], page)
-		binary.LittleEndian.PutUint64(output[outOffset:], uint64(tokenStart-trimStart))
+		copy(output[outOffset:outOffset+rocmDeviceKVDescriptorPageBytes], retained.payload[:])
 		outputIndex++
 	}
 	if outputIndex+1 != outputPageCount {
@@ -5904,6 +5957,56 @@ func (driver *fakeHIPDriver) launchKVDescriptorAppend(args []byte) error {
 	binary.LittleEndian.PutUint32(output[20:], uint32(blockSize))
 	binary.LittleEndian.PutUint64(output[24:], uint64(outputTokenCount))
 	return nil
+}
+
+type fakeROCmKVDescriptorTrimmedPage struct {
+	payload [rocmDeviceKVDescriptorPageBytes]byte
+	ok      bool
+}
+
+func fakeROCmKVDescriptorTrimPage(page []byte, trimStart int) (fakeROCmKVDescriptorTrimmedPage, error) {
+	if len(page) < rocmDeviceKVDescriptorPageBytes {
+		return fakeROCmKVDescriptorTrimmedPage{}, core.E("rocm.hip.FakeLaunch", "KV descriptor trim page is too short", nil)
+	}
+	tokenStart := int(binary.LittleEndian.Uint64(page[0:]))
+	tokenCount := int(binary.LittleEndian.Uint64(page[8:]))
+	pageEnd := tokenStart + tokenCount
+	if pageEnd <= trimStart {
+		return fakeROCmKVDescriptorTrimmedPage{}, nil
+	}
+	var retained fakeROCmKVDescriptorTrimmedPage
+	copy(retained.payload[:], page[:rocmDeviceKVDescriptorPageBytes])
+	retained.ok = true
+	if tokenStart >= trimStart {
+		binary.LittleEndian.PutUint64(retained.payload[0:], uint64(tokenStart-trimStart))
+		return retained, nil
+	}
+	keyWidth := int(binary.LittleEndian.Uint32(page[16:]))
+	valueWidth := int(binary.LittleEndian.Uint32(page[20:]))
+	keyEncoding := fakeROCmKVEncoding(binary.LittleEndian.Uint32(page[24:]))
+	valueEncoding := fakeROCmKVEncoding(binary.LittleEndian.Uint32(page[28:]))
+	keyStride, err := rocmKVInterleavedRowStride(keyEncoding, keyWidth)
+	if err != nil {
+		return fakeROCmKVDescriptorTrimmedPage{}, core.E("rocm.hip.FakeLaunch", "KV descriptor cannot trim key page", err)
+	}
+	valueStride, err := rocmKVInterleavedRowStride(valueEncoding, valueWidth)
+	if err != nil {
+		return fakeROCmKVDescriptorTrimmedPage{}, core.E("rocm.hip.FakeLaunch", "KV descriptor cannot trim value page", err)
+	}
+	keyBytes := binary.LittleEndian.Uint64(page[48:])
+	valueBytes := binary.LittleEndian.Uint64(page[56:])
+	if keyBytes != keyStride*uint64(tokenCount) || valueBytes != valueStride*uint64(tokenCount) {
+		return fakeROCmKVDescriptorTrimmedPage{}, core.E("rocm.hip.FakeLaunch", "KV descriptor trim page byte count mismatch", nil)
+	}
+	skipTokens := trimStart - tokenStart
+	retainedTokens := pageEnd - trimStart
+	binary.LittleEndian.PutUint64(retained.payload[0:], 0)
+	binary.LittleEndian.PutUint64(retained.payload[8:], uint64(retainedTokens))
+	binary.LittleEndian.PutUint64(retained.payload[32:], binary.LittleEndian.Uint64(page[32:])+keyStride*uint64(skipTokens))
+	binary.LittleEndian.PutUint64(retained.payload[40:], binary.LittleEndian.Uint64(page[40:])+valueStride*uint64(skipTokens))
+	binary.LittleEndian.PutUint64(retained.payload[48:], keyStride*uint64(retainedTokens))
+	binary.LittleEndian.PutUint64(retained.payload[56:], valueStride*uint64(retainedTokens))
+	return retained, nil
 }
 
 func (driver *fakeHIPDriver) readDeviceKVDescriptorForAttention(pointer nativeDevicePointer, sizeBytes, tokenCount, dim int) ([]float32, []float32, error) {

@@ -1296,7 +1296,7 @@ func hipGemma4Q4PrefillFinalizeRetainWindow(deviceKV *hipGemma4Q4PrefillDeviceKV
 		return nil
 	}
 	beforeTokens := deviceKV.Cache.TokenCount()
-	deviceKV.Cache = deviceKV.Cache.trimDeviceTokenWindow(deviceKV.RetainWindow)
+	deviceKV.Cache = deviceKV.Cache.trimDeviceTokenWindowForAppend(deviceKV.RetainWindow)
 	if deviceKV.Cache.TokenCount() == beforeTokens {
 		return nil
 	}
