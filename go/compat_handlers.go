@@ -4,6 +4,7 @@ package rocm
 
 import (
 	"encoding/json"
+	"iter"
 	"net/http"
 
 	core "dappco.re/go"
@@ -137,10 +138,7 @@ func (handler *ollamaCompatHandler) generate(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
-	text := ""
-	for token := range model.Generate(r.Context(), req.Prompt, ollama.GenerateOptions(req.Options)...) {
-		text += token.Text
-	}
+	text := collectROCmWireTokenText(model.Generate(r.Context(), req.Prompt, ollama.GenerateOptions(req.Options)...))
 	if err := model.Err(); err != nil {
 		writeROCmOpenAIError(w, http.StatusInternalServerError, err.Error(), "model")
 		return
@@ -183,15 +181,25 @@ func resolveROCmWireModel(w http.ResponseWriter, r *http.Request, resolver opena
 }
 
 func runROCmWireChat(w http.ResponseWriter, r *http.Request, model inference.TextModel, messages []inference.Message, opts ...inference.GenerateOption) (string, bool) {
-	text := ""
-	for token := range model.Chat(r.Context(), messages, opts...) {
-		text += token.Text
-	}
+	text := collectROCmWireTokenText(model.Chat(r.Context(), messages, opts...))
 	if err := model.Err(); err != nil {
 		writeROCmOpenAIError(w, http.StatusInternalServerError, err.Error(), "model")
 		return "", false
 	}
 	return text, true
+}
+
+// collectROCmWireTokenText accumulates streamed token text into a single
+// response string with a single growable buffer, avoiding the O(n²) string
+// re-allocation of `text += token.Text` on each decoded token.
+//
+//	text := collectROCmWireTokenText(model.Chat(ctx, messages))
+func collectROCmWireTokenText(tokens iter.Seq[inference.Token]) string {
+	var builder core.Builder
+	for token := range tokens {
+		builder.WriteString(token.Text)
+	}
+	return builder.String()
 }
 
 func hasROCmWireMessages(messages []inference.Message) bool {

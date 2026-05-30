@@ -103,10 +103,7 @@ func (handler *openAIResponsesHandler) ServeHTTP(w http.ResponseWriter, r *http.
 		writeROCmOpenAIError(w, http.StatusNotFound, err.Error(), "model")
 		return
 	}
-	text := ""
-	for token := range model.Chat(r.Context(), messages, opts...) {
-		text += token.Text
-	}
+	text := collectROCmWireTokenText(model.Chat(r.Context(), messages, opts...))
 	if err := model.Err(); err != nil {
 		writeROCmOpenAIError(w, http.StatusInternalServerError, err.Error(), "model")
 		return
