@@ -129,6 +129,26 @@ func TestHIPLoRAProjectionLaunch_Bad(t *testing.T) {
 	}).Binary()
 	core.AssertError(t, err)
 	core.AssertContains(t, err.Error(), "input byte count")
+
+	_, err = (hipLoRALaunchArgs{
+		InputPointer:      1,
+		BaseWeightPointer: 2,
+		LoRAAPointer:      3,
+		LoRABPointer:      4,
+		OutputPointer:     5,
+		InputCount:        2,
+		Rows:              2,
+		Cols:              2,
+		Rank:              1,
+		InputBytes:        8,
+		BaseWeightBytes:   16,
+		LoRAABytes:        8,
+		LoRABBytes:        8,
+		OutputBytes:       8,
+		Alpha:             1,
+	}).BinaryInto(make([]byte, hipLoRALaunchArgsBytes-1))
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "launch arg payload buffer is too small")
 }
 
 func TestHIPLoRAProjectionReadOutputValidation_Bad(t *testing.T) {
@@ -174,4 +194,93 @@ func TestHIPLoRAProjectionReadOutputValidation_Bad(t *testing.T) {
 	_, err = buffers.ReadOutput()
 	core.AssertError(t, err)
 	core.AssertContains(t, err.Error(), "copy LoRA output")
+}
+
+func BenchmarkHIPLoRAProjectionLaunch_Rows128Cols256Rank8(b *testing.B) {
+	req := loraBenchmarkProjectionRequest(128, 256, 8)
+	driver := &fakeHIPDriver{available: true}
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		got, err := hipRunLoRAProjectionKernel(context.Background(), driver, req)
+		if err != nil {
+			b.Fatalf("run LoRA fixture: %v", err)
+		}
+		if len(got) != req.Rows {
+			b.Fatalf("output rows = %d, want %d", len(got), req.Rows)
+		}
+	}
+}
+
+func BenchmarkHIPLoRAProjectionLaunchPrepared_Rows128Cols256Rank8(b *testing.B) {
+	req := loraBenchmarkProjectionRequest(128, 256, 8)
+	driver := &fakeHIPDriver{available: true, skipLaunchRecording: true, copies: make([]uint64, 0, 8)}
+	buffers, err := req.deviceBuffers(driver)
+	if err != nil {
+		b.Fatalf("prepare LoRA fixture buffers: %v", err)
+	}
+	defer buffers.Close()
+	launch, err := req.launchArgs(buffers)
+	if err != nil {
+		b.Fatalf("prepare LoRA fixture launch args: %v", err)
+	}
+	launchBytes, err := launch.BinaryInto(make([]byte, hipLoRALaunchArgsBytes))
+	if err != nil {
+		b.Fatalf("encode LoRA fixture launch args: %v", err)
+	}
+	config, err := hipOneDimensionalLaunchConfig(hipKernelNameLoRA, launchBytes, req.Rows)
+	if err != nil {
+		b.Fatalf("prepare LoRA fixture launch config: %v", err)
+	}
+	outputPayload := make([]byte, req.Rows*4)
+	outputValues := make([]float32, req.Rows)
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := hipLaunchKernel(driver, config); err != nil {
+			b.Fatalf("launch LoRA fixture: %v", err)
+		}
+		got, err := buffers.ReadOutputInto(outputValues, outputPayload)
+		if err != nil {
+			b.Fatalf("read LoRA fixture: %v", err)
+		}
+		if len(got) != req.Rows {
+			b.Fatalf("output rows = %d, want %d", len(got), req.Rows)
+		}
+		driver.copies = driver.copies[:0]
+	}
+}
+
+func loraBenchmarkProjectionRequest(rows, cols, rank int) hipLoRAProjectionRequest {
+	input := make([]float32, cols)
+	for i := range input {
+		input[i] = float32(math.Sin(float64(i)*0.017) + math.Cos(float64(i)*0.041))
+	}
+	baseWeight := make([]float32, rows*cols)
+	for i := range baseWeight {
+		baseWeight[i] = float32(math.Sin(float64(i)*0.003) * 0.02)
+	}
+	loraA := make([]float32, rank*cols)
+	for i := range loraA {
+		loraA[i] = float32(math.Cos(float64(i)*0.007) * 0.01)
+	}
+	loraB := make([]float32, rows*rank)
+	for i := range loraB {
+		loraB[i] = float32(math.Sin(float64(i)*0.011) * 0.01)
+	}
+	bias := make([]float32, rows)
+	for i := range bias {
+		bias[i] = float32(math.Cos(float64(i)*0.019) * 0.001)
+	}
+	return hipLoRAProjectionRequest{
+		Input:      input,
+		BaseWeight: baseWeight,
+		LoRAA:      loraA,
+		LoRAB:      loraB,
+		Rows:       rows,
+		Cols:       cols,
+		Rank:       rank,
+		Alpha:      8,
+		Bias:       bias,
+	}
 }

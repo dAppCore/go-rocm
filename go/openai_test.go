@@ -51,16 +51,29 @@ func TestOpenAI_NewOpenAIResponsesHandler_Good_NonStreaming(t *testing.T) {
 	}
 }
 
-func TestOpenAI_NewOpenAIResponsesHandler_Bad_RejectsStreaming(t *testing.T) {
-	model := &openAITestModel{tokens: []inference.Token{{Text: "ok"}}}
+func TestOpenAI_NewOpenAIResponsesHandler_Good_Streaming(t *testing.T) {
+	model := &openAITestModel{tokens: []inference.Token{{Text: "hel"}, {Text: "lo"}}}
 	handler := NewOpenAIResponsesHandler(openaicompat.NewStaticResolver(map[string]inference.TextModel{"qwen": model}))
 	req := httptest.NewRequest(http.MethodPost, openaicompat.DefaultResponsesPath, strings.NewReader(`{"model":"qwen","stream":true,"input":[{"role":"user","content":"hello"}]}`))
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusNotImplemented {
-		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("status = %d content-type=%q body=%s, want SSE stream", rec.Code, rec.Header().Get("Content-Type"), body)
+	}
+	for _, want := range []string{
+		`"type":"response.created"`,
+		`"type":"response.output_text.delta","delta":"hel"`,
+		`"type":"response.output_text.delta","delta":"lo"`,
+		`"type":"response.completed"`,
+		`"text":"hello"`,
+		"data: [DONE]\n\n",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("stream body missing %q:\n%s", want, body)
+		}
 	}
 }
 
@@ -187,6 +200,7 @@ type openAITestModel struct {
 	tokens []inference.Token
 	mu     sync.Mutex
 	metric inference.GenerateMetrics
+	info   inference.ModelInfo
 	err    error
 }
 
@@ -238,6 +252,9 @@ func (model *openAITestModel) BatchGenerate(context.Context, []string, ...infere
 
 func (model *openAITestModel) ModelType() string { return "test" }
 func (model *openAITestModel) Info() inference.ModelInfo {
+	if model.info.Architecture != "" {
+		return model.info
+	}
 	return inference.ModelInfo{Architecture: "test"}
 }
 func (model *openAITestModel) Metrics() inference.GenerateMetrics {

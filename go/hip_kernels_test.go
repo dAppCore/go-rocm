@@ -28,11 +28,23 @@ func TestHIPKernels_StatusLabels_Good(t *testing.T) {
 	core.AssertEqual(t, hipKernelStatusNotLinked, labels["embedding_kernel"])
 	core.AssertEqual(t, hipKernelStatusNotLinked, labels["grpo_kernel"])
 	core.AssertEqual(t, hipKernelStatusNotLinked, labels["lora_kernel"])
+	core.AssertEqual(t, hipKernelStatusNotLinked, labels["optimizer_kernel"])
 	core.AssertEqual(t, hipKernelStatusNotLinked, labels["prefill_kernel"])
 	core.AssertEqual(t, hipKernelStatusNotLinked, labels["projection_kernel"])
 	core.AssertEqual(t, hipKernelStatusNotLinked, labels["rerank_kernel"])
 	core.AssertEqual(t, hipKernelStatusPlanned, labels["kv_cache_kernel"])
 	core.AssertContains(t, labels["kernel_detail"], "not linked")
+}
+
+func TestHIPKernels_StatusLabelsOptimizerLinked_Good(t *testing.T) {
+	status := normalizeHIPKernelStatus(hipKernelStatus{Optimizer: hipKernelStatusLinked})
+	labels := status.Labels()
+
+	core.AssertEqual(t, hipKernelStatusLinked, status.Overall())
+	core.AssertEqual(t, hipKernelStatusLinked, labels["kernel_status"])
+	core.AssertEqual(t, hipKernelStatusLinked, labels["optimizer_kernel"])
+	core.AssertEqual(t, hipKernelStatusNotLinked, labels["decode_kernel"])
+	core.AssertEqual(t, hipKernelStatusNotLinked, labels["cross_entropy_kernel"])
 }
 
 func TestHIPKernels_NotLinkedErrors_Bad(t *testing.T) {
@@ -281,6 +293,7 @@ func TestHIPKernels_DeviceTokenBuffer_Good(t *testing.T) {
 	core.AssertNoError(t, err)
 	launchBytes, err := launch.Binary()
 	core.AssertNoError(t, err)
+	defer hipReleaseLaunchPacket(launchBytes)
 	core.AssertEqual(t, hipPrefillLaunchArgsBytes, len(launchBytes))
 	core.AssertEqual(t, hipPrefillLaunchArgsVersion, binary.LittleEndian.Uint32(launchBytes[0:]))
 	core.AssertEqual(t, uint32(hipPrefillLaunchArgsBytes), binary.LittleEndian.Uint32(launchBytes[4:]))
@@ -295,12 +308,24 @@ func TestHIPKernels_DeviceTokenBuffer_Good(t *testing.T) {
 	statusLaunch.StatusPointer = 1234
 	statusLaunchBytes, err := statusLaunch.Binary()
 	core.AssertNoError(t, err)
+	defer hipReleaseLaunchPacket(statusLaunchBytes)
 	core.AssertEqual(t, uint64(1234), binary.LittleEndian.Uint64(statusLaunchBytes[48:]))
 	core.AssertEqual(t, hipPrefillLaunchStatusOK, binary.LittleEndian.Uint32(statusLaunchBytes[56:]))
 	core.AssertNoError(t, buffer.Close())
 	core.AssertNoError(t, buffer.Close())
 	core.AssertEqual(t, 1, len(driver.frees))
 	core.AssertEqual(t, nativeDevicePointer(0), buffer.Pointer())
+
+	borrowed := &hipDeviceTokenBuffer{
+		driver:    driver,
+		pointer:   0xfeed,
+		count:     2,
+		sizeBytes: 8,
+		borrowed:  true,
+	}
+	core.AssertNoError(t, borrowed.Close())
+	core.AssertEqual(t, 1, len(driver.frees))
+	core.AssertEqual(t, nativeDevicePointer(0), borrowed.Pointer())
 }
 
 func TestHIPKernels_DeviceTokenBuffer_Bad(t *testing.T) {
@@ -602,6 +627,23 @@ func TestHIPKernels_MLXQ4ProjectionLaunchArgs_Good(t *testing.T) {
 	batchValues, err := hipReadFloat32DeviceOutput(batchOutput, "rocm.hip.MLXQ4ProjectionBatchLaunch", "MLX q4 projection batch output", req.Rows*2)
 	core.AssertNoError(t, err)
 	assertFloat32SlicesNear(t, []float32{28, 38, 56, 76}, batchValues, 0.0001)
+	reusedBatchOutput, err := hipAllocateByteBuffer(driver, "rocm.hip.MLXQ4ProjectionBatchLaunch", "reused MLX q4 projection batch output", uint64(req.Rows*2*4), req.Rows*2)
+	core.AssertNoError(t, err)
+	defer reusedBatchOutput.Close()
+	core.AssertNoError(t, hipRunMLXQ4ProjectionBatchKernelWithDeviceInputOutput(context.Background(), driver, batchInput, hipMLXQ4DeviceWeightConfig{
+		WeightPointer: buffers.Weight.Pointer(),
+		ScalePointer:  buffers.Scales.Pointer(),
+		BiasPointer:   buffers.Biases.Pointer(),
+		WeightBytes:   buffers.Weight.SizeBytes(),
+		ScaleBytes:    buffers.Scales.SizeBytes(),
+		BiasBytes:     buffers.Biases.SizeBytes(),
+		Rows:          req.Rows,
+		Cols:          req.Cols,
+		GroupSize:     req.GroupSize,
+	}, 2, reusedBatchOutput))
+	reusedBatchValues, err := hipReadFloat32DeviceOutput(reusedBatchOutput, "rocm.hip.MLXQ4ProjectionBatchLaunch", "reused MLX q4 projection batch output", req.Rows*2)
+	core.AssertNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{28, 38, 56, 76}, reusedBatchValues, 0.0001)
 	batchLaunch := driver.launches[len(driver.launches)-1]
 	core.AssertEqual(t, hipKernelNameMLXQ4ProjBatch, batchLaunch.Name)
 	core.AssertEqual(t, uint32(1), batchLaunch.GridX)
@@ -650,6 +692,524 @@ func TestHIPKernels_MLXQ4ProjectionLaunchArgs_Good(t *testing.T) {
 	core.AssertEqual(t, 0, candidates[1].TokenID)
 	assertFloat32Near(t, 28, candidates[1].Score)
 	core.AssertEqual(t, hipKernelNameMLXQ4ProjScores, driver.launches[len(driver.launches)-1].Name)
+
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	sampled, sampledDevice, err := hipRunMLXQ4ProjectionSoftcapSampleKernelWithDeviceInputBufferSuppress(context.Background(), driver, buffers.Input, hipMLXQ4DeviceWeightConfig{
+		WeightPointer: buffers.Weight.Pointer(),
+		ScalePointer:  buffers.Scales.Pointer(),
+		BiasPointer:   buffers.Biases.Pointer(),
+		WeightBytes:   buffers.Weight.SizeBytes(),
+		ScaleBytes:    buffers.Scales.SizeBytes(),
+		BiasBytes:     buffers.Biases.SizeBytes(),
+		Rows:          req.Rows,
+		Cols:          req.Cols,
+		GroupSize:     req.GroupSize,
+	}, 0, 2, 0, 0, 0, nil, nil, workspace)
+	core.AssertNoError(t, err)
+	core.AssertNotNil(t, sampledDevice)
+	defer sampledDevice.Close()
+	core.AssertEqual(t, 1, sampled.TokenID)
+	assertFloat32Near(t, 38, sampled.Score)
+	core.AssertEqual(t, hipKernelNamePackedTopKSample, driver.launches[len(driver.launches)-1].Name)
+	core.AssertEqual(t, uint32(2), binary.LittleEndian.Uint32(driver.launches[len(driver.launches)-1].Args[28:]))
+}
+
+func TestHIPKernels_MLXAffineQ6ProjectionLaunchArgs_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	req := hipMLXQ4ProjectionRequest{
+		Input: []float32{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+		Weight: hipPackMLXAffineValuesForTest([]uint32{
+			0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+			16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
+		}, 16, 6),
+		Scales:    []uint16{0x3f80, 0x3f80},
+		Biases:    []uint16{0, 0},
+		Rows:      2,
+		Cols:      16,
+		GroupSize: 16,
+		Bits:      6,
+	}
+	got, err := hipRunMLXQ4ProjectionKernel(context.Background(), driver, req)
+	core.AssertNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{120, 136}, got, 0.0001)
+	launch := driver.launches[len(driver.launches)-1]
+	core.AssertEqual(t, hipKernelNameMLXQ4Proj, launch.Name)
+	core.AssertEqual(t, uint32(6), binary.LittleEndian.Uint32(launch.Args[60:]))
+	core.AssertEqual(t, uint32(len(req.Weight)*4), binary.LittleEndian.Uint32(launch.Args[68:]))
+
+	group64Input := make([]float32, 64)
+	group64Values := make([]uint32, 64)
+	for index := range group64Input {
+		group64Input[index] = 1
+		group64Values[index] = uint32(index)
+	}
+	group64Req := hipMLXQ4ProjectionRequest{
+		Input:     group64Input,
+		Weight:    hipPackMLXAffineValuesForTest(group64Values, 64, 6),
+		Scales:    []uint16{0x3c00},
+		Biases:    []uint16{0},
+		Rows:      1,
+		Cols:      64,
+		GroupSize: 64,
+		Bits:      6,
+	}
+	group64Buffers, err := group64Req.deviceBuffers(driver)
+	core.AssertNoError(t, err)
+	defer group64Buffers.Close()
+	secondInput := make([]float32, len(group64Input))
+	for index := range secondInput {
+		secondInput[index] = 2
+	}
+	batchInputValues := append(append([]float32(nil), group64Req.Input...), secondInput...)
+	batchInputPayload, err := hipFloat32Payload(batchInputValues)
+	core.AssertNoError(t, err)
+	batchInput, err := hipUploadByteBuffer(driver, "rocm.hip.MLXQ4ProjectionBatchLaunch", "MLX q6 projection batch input", batchInputPayload, len(batchInputValues))
+	core.AssertNoError(t, err)
+	defer batchInput.Close()
+	group64Cfg := hipMLXQ4DeviceWeightConfig{
+		WeightPointer: group64Buffers.Weight.Pointer(),
+		ScalePointer:  group64Buffers.Scales.Pointer(),
+		BiasPointer:   group64Buffers.Biases.Pointer(),
+		WeightBytes:   group64Buffers.Weight.SizeBytes(),
+		ScaleBytes:    group64Buffers.Scales.SizeBytes(),
+		BiasBytes:     group64Buffers.Biases.SizeBytes(),
+		Rows:          group64Req.Rows,
+		Cols:          group64Req.Cols,
+		GroupSize:     group64Req.GroupSize,
+		Bits:          group64Req.Bits,
+	}
+	batchOutput, err := hipRunMLXQ4ProjectionBatchKernelWithDeviceInput(context.Background(), driver, batchInput, group64Cfg, 2)
+	core.AssertNoError(t, err)
+	defer batchOutput.Close()
+	batchValues, err := hipReadFloat32DeviceOutput(batchOutput, "rocm.hip.MLXQ4ProjectionBatchLaunch", "MLX q6 projection batch output", 2)
+	core.AssertNoError(t, err)
+	secondReq := group64Req
+	secondReq.Input = secondInput
+	wantFirst, err := hipReferenceMLXAffineProjection(group64Req.Input, group64Req.Weight, group64Req.Scales, group64Req.Biases, group64Req.Rows, group64Req.Cols, group64Req.GroupSize, group64Req.Bits)
+	core.AssertNoError(t, err)
+	wantSecond, err := hipReferenceMLXAffineProjection(secondReq.Input, secondReq.Weight, secondReq.Scales, secondReq.Biases, secondReq.Rows, secondReq.Cols, secondReq.GroupSize, secondReq.Bits)
+	core.AssertNoError(t, err)
+	assertFloat32SlicesNear(t, append(wantFirst, wantSecond...), batchValues, 0.0001)
+	batchLaunch := driver.launches[len(driver.launches)-1]
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjBatch, batchLaunch.Name)
+	core.AssertEqual(t, uint32(6), binary.LittleEndian.Uint32(batchLaunch.Args[64:]))
+
+	batchActivated, err := hipRunMLXQ4GELUTanhMultiplyBatchKernelWithDeviceInput(context.Background(), driver, batchInput, group64Cfg, group64Cfg, 2)
+	core.AssertNoError(t, err)
+	defer batchActivated.Close()
+	activatedValues, err := hipReadFloat32DeviceOutput(batchActivated, "rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "MLX q6 GELU tanh multiply batch output", 2)
+	core.AssertNoError(t, err)
+	wantActivated := append(
+		expectedGELUTanhMultiplyFromMLXAffine(t, group64Req, group64Req, 6),
+		expectedGELUTanhMultiplyFromMLXAffine(t, secondReq, secondReq, 6)...,
+	)
+	assertFloat32SlicesNear(t, wantActivated, activatedValues, 0.0001)
+	multiplyLaunch := driver.launches[len(driver.launches)-1]
+	core.AssertEqual(t, hipKernelNameMLXQ4GELUTanhMulBatch, multiplyLaunch.Name)
+	core.AssertEqual(t, uint32(6), binary.LittleEndian.Uint32(multiplyLaunch.Args[84:]))
+
+	multiplierPayload, err := hipFloat32Payload([]float32{0.5, 0.25})
+	core.AssertNoError(t, err)
+	multiplier, err := hipUploadByteBuffer(driver, "rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "MLX q6 GELU tanh projection batch multiplier", multiplierPayload, 2)
+	core.AssertNoError(t, err)
+	defer multiplier.Close()
+	batchProjected, err := hipRunMLXQ4GELUTanhProjectionBatchKernelWithDeviceMultiplier(context.Background(), driver, batchInput, multiplier, group64Cfg, 2)
+	core.AssertNoError(t, err)
+	defer batchProjected.Close()
+	projectedValues, err := hipReadFloat32DeviceOutput(batchProjected, "rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "MLX q6 GELU tanh projection batch output", 2)
+	core.AssertNoError(t, err)
+	wantProjected := append(
+		expectedGELUTanhProjectionFromMLXAffine(t, group64Req, []float32{0.5}, 6),
+		expectedGELUTanhProjectionFromMLXAffine(t, secondReq, []float32{0.25}, 6)...,
+	)
+	assertFloat32SlicesNear(t, wantProjected, projectedValues, 0.0001)
+	projectionLaunch := driver.launches[len(driver.launches)-1]
+	core.AssertEqual(t, hipKernelNameMLXQ4GELUTanhProjBatch, projectionLaunch.Name)
+	core.AssertEqual(t, uint32(6), binary.LittleEndian.Uint32(projectionLaunch.Args[72:]))
+}
+
+func TestHIPKernels_MLXAffineQ8ProjectionLaunchArgs_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	req := hipMLXQ4ProjectionRequest{
+		Input: []float32{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+		Weight: hipPackMLXAffineValuesForTest([]uint32{
+			0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+			16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
+		}, 16, 8),
+		Scales:    []uint16{0x3f80, 0x3f80},
+		Biases:    []uint16{0, 0},
+		Rows:      2,
+		Cols:      16,
+		GroupSize: 16,
+		Bits:      8,
+	}
+	got, err := hipRunMLXQ4ProjectionKernel(context.Background(), driver, req)
+	core.AssertNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{120, 136}, got, 0.0001)
+	launch := driver.launches[len(driver.launches)-1]
+	core.AssertEqual(t, hipKernelNameMLXQ4Proj, launch.Name)
+	core.AssertEqual(t, uint32(8), binary.LittleEndian.Uint32(launch.Args[60:]))
+	core.AssertEqual(t, uint32(len(req.Weight)*4), binary.LittleEndian.Uint32(launch.Args[68:]))
+
+	group64Input := make([]float32, 64)
+	group64Values := make([]uint32, 64)
+	for index := range group64Input {
+		group64Input[index] = 1
+		group64Values[index] = uint32(index)
+	}
+	group64Req := hipMLXQ4ProjectionRequest{
+		Input:     group64Input,
+		Weight:    hipPackMLXAffineValuesForTest(group64Values, 64, 8),
+		Scales:    []uint16{0x3c00},
+		Biases:    []uint16{0},
+		Rows:      1,
+		Cols:      64,
+		GroupSize: 64,
+		Bits:      8,
+	}
+	group64Buffers, err := group64Req.deviceBuffers(driver)
+	core.AssertNoError(t, err)
+	defer group64Buffers.Close()
+	secondInput := make([]float32, len(group64Input))
+	for index := range secondInput {
+		secondInput[index] = 2
+	}
+	batchInputValues := append(append([]float32(nil), group64Req.Input...), secondInput...)
+	batchInputPayload, err := hipFloat32Payload(batchInputValues)
+	core.AssertNoError(t, err)
+	batchInput, err := hipUploadByteBuffer(driver, "rocm.hip.MLXQ4ProjectionBatchLaunch", "MLX q8 projection batch input", batchInputPayload, len(batchInputValues))
+	core.AssertNoError(t, err)
+	defer batchInput.Close()
+	group64Cfg := hipMLXQ4DeviceWeightConfig{
+		WeightPointer: group64Buffers.Weight.Pointer(),
+		ScalePointer:  group64Buffers.Scales.Pointer(),
+		BiasPointer:   group64Buffers.Biases.Pointer(),
+		WeightBytes:   group64Buffers.Weight.SizeBytes(),
+		ScaleBytes:    group64Buffers.Scales.SizeBytes(),
+		BiasBytes:     group64Buffers.Biases.SizeBytes(),
+		Rows:          group64Req.Rows,
+		Cols:          group64Req.Cols,
+		GroupSize:     group64Req.GroupSize,
+		Bits:          group64Req.Bits,
+	}
+	batchOutput, err := hipRunMLXQ4ProjectionBatchKernelWithDeviceInput(context.Background(), driver, batchInput, group64Cfg, 2)
+	core.AssertNoError(t, err)
+	defer batchOutput.Close()
+	batchValues, err := hipReadFloat32DeviceOutput(batchOutput, "rocm.hip.MLXQ4ProjectionBatchLaunch", "MLX q8 projection batch output", 2)
+	core.AssertNoError(t, err)
+	secondReq := group64Req
+	secondReq.Input = secondInput
+	wantFirst, err := hipReferenceMLXAffineProjection(group64Req.Input, group64Req.Weight, group64Req.Scales, group64Req.Biases, group64Req.Rows, group64Req.Cols, group64Req.GroupSize, group64Req.Bits)
+	core.AssertNoError(t, err)
+	wantSecond, err := hipReferenceMLXAffineProjection(secondReq.Input, secondReq.Weight, secondReq.Scales, secondReq.Biases, secondReq.Rows, secondReq.Cols, secondReq.GroupSize, secondReq.Bits)
+	core.AssertNoError(t, err)
+	assertFloat32SlicesNear(t, append(wantFirst, wantSecond...), batchValues, 0.0001)
+	batchLaunch := driver.launches[len(driver.launches)-1]
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjBatch, batchLaunch.Name)
+	core.AssertEqual(t, uint32(8), binary.LittleEndian.Uint32(batchLaunch.Args[64:]))
+
+	batchActivated, err := hipRunMLXQ4GELUTanhMultiplyBatchKernelWithDeviceInput(context.Background(), driver, batchInput, group64Cfg, group64Cfg, 2)
+	core.AssertNoError(t, err)
+	defer batchActivated.Close()
+	activatedValues, err := hipReadFloat32DeviceOutput(batchActivated, "rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "MLX q8 GELU tanh multiply batch output", 2)
+	core.AssertNoError(t, err)
+	wantActivated := append(
+		expectedGELUTanhMultiplyFromMLXAffine(t, group64Req, group64Req, 8),
+		expectedGELUTanhMultiplyFromMLXAffine(t, secondReq, secondReq, 8)...,
+	)
+	assertFloat32SlicesNear(t, wantActivated, activatedValues, 0.0001)
+	multiplyLaunch := driver.launches[len(driver.launches)-1]
+	core.AssertEqual(t, hipKernelNameMLXQ4GELUTanhMulBatch, multiplyLaunch.Name)
+	core.AssertEqual(t, uint32(8), binary.LittleEndian.Uint32(multiplyLaunch.Args[84:]))
+
+	multiplierPayload, err := hipFloat32Payload([]float32{0.5, 0.25})
+	core.AssertNoError(t, err)
+	multiplier, err := hipUploadByteBuffer(driver, "rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "MLX q8 GELU tanh projection batch multiplier", multiplierPayload, 2)
+	core.AssertNoError(t, err)
+	defer multiplier.Close()
+	batchProjected, err := hipRunMLXQ4GELUTanhProjectionBatchKernelWithDeviceMultiplier(context.Background(), driver, batchInput, multiplier, group64Cfg, 2)
+	core.AssertNoError(t, err)
+	defer batchProjected.Close()
+	projectedValues, err := hipReadFloat32DeviceOutput(batchProjected, "rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "MLX q8 GELU tanh projection batch output", 2)
+	core.AssertNoError(t, err)
+	wantProjected := append(
+		expectedGELUTanhProjectionFromMLXAffine(t, group64Req, []float32{0.5}, 8),
+		expectedGELUTanhProjectionFromMLXAffine(t, secondReq, []float32{0.25}, 8)...,
+	)
+	assertFloat32SlicesNear(t, wantProjected, projectedValues, 0.0001)
+	projectionLaunch := driver.launches[len(driver.launches)-1]
+	core.AssertEqual(t, hipKernelNameMLXQ4GELUTanhProjBatch, projectionLaunch.Name)
+	core.AssertEqual(t, uint32(8), binary.LittleEndian.Uint32(projectionLaunch.Args[72:]))
+}
+
+func TestHIPKernels_MLXAffineQ6ProjectionCols256LaunchConfig_Good(t *testing.T) {
+	packet := hipBorrowLaunchPacket(hipMLXQ4ProjectionLaunchArgsBytes)
+	defer hipReleaseLaunchPacket(packet)
+
+	q6, err := hipMLXQ4ProjectionLaunchConfigForShape(packet, 1536, 256, 64, 6)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjCols256, q6.Name)
+	core.AssertEqual(t, uint32(48), q6.GridX)
+	core.AssertEqual(t, hipMLXQ4ProjectionBlockSize, q6.BlockX)
+
+	q8, err := hipMLXQ4ProjectionLaunchConfigForShape(packet, 1536, 256, 64, 8)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4Proj, q8.Name)
+	core.AssertEqual(t, uint32(192), q8.GridX)
+}
+
+func TestHIPKernels_MLXAffineQ6ProjectionRow64LaunchConfig_Good(t *testing.T) {
+	packet := hipBorrowLaunchPacket(hipMLXQ4ProjectionLaunchArgsBytes)
+	defer hipReleaseLaunchPacket(packet)
+
+	q6, err := hipMLXQ4ProjectionLaunchConfigForShape(packet, 1536, 2048, 64, 6)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjQ6Row64, q6.Name)
+	core.AssertEqual(t, uint32(24), q6.GridX)
+	core.AssertEqual(t, hipMLXQ4ProjectionBlockSize, q6.BlockX)
+
+	q6Wide, err := hipMLXQ4ProjectionLaunchConfigForShape(packet, 1536, 12288, 64, 6)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjQ6Row16, q6Wide.Name)
+	core.AssertEqual(t, uint32(96), q6Wide.GridX)
+
+	q4, err := hipMLXQ4ProjectionLaunchConfigForShape(packet, 1536, 2048, 64, 4)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4Proj, q4.Name)
+	core.AssertEqual(t, uint32(192), q4.GridX)
+
+	q6Cols256, err := hipMLXQ4ProjectionLaunchConfigForShape(packet, 1536, 256, 64, 6)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjCols256, q6Cols256.Name)
+}
+
+func TestHIPKernels_MLXAffineQ6TripleProjectionRow64LaunchConfig_Good(t *testing.T) {
+	packet := hipBorrowLaunchPacket(hipMLXQ4TripleProjLaunchArgsBytes)
+	defer hipReleaseLaunchPacket(packet)
+
+	q6, err := hipMLXQ4TripleProjectionLaunchConfigForShape(packet, 2560, 1536, 64, 6)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4TripleProjQ6Row64, q6.Name)
+	core.AssertEqual(t, uint32(40), q6.GridX)
+	core.AssertEqual(t, hipMLXQ4ProjectionBlockSize, q6.BlockX)
+
+	q6Wide, err := hipMLXQ4TripleProjectionLaunchConfigForShape(packet, 2560, 2048, 64, 6)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4TripleProjQ6Row16, q6Wide.Name)
+	core.AssertEqual(t, uint32(160), q6Wide.GridX)
+
+	q4, err := hipMLXQ4TripleProjectionLaunchConfigForShape(packet, 2560, 1536, 64, 4)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4TripleProj, q4.Name)
+	core.AssertEqual(t, uint32(320), q4.GridX)
+}
+
+func TestHIPKernels_MLXAffineQ6GELUTanhCols1536LaunchConfig_Good(t *testing.T) {
+	packet := hipBorrowLaunchPacket(hipMLXQ4GELUTanhMulLaunchArgsBytes)
+	defer hipReleaseLaunchPacket(packet)
+
+	q6, err := hipMLXQ4GELUTanhMultiplyLaunchConfigForShape(packet, 12288, 1536, 64, 6)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4GELUTanhMulQ6Cols1536, q6.Name)
+	core.AssertEqual(t, uint32(768), q6.GridX)
+	core.AssertEqual(t, hipMLXQ4ProjectionBlockSize, q6.BlockX)
+
+	q4, err := hipMLXQ4GELUTanhMultiplyLaunchConfigForShape(packet, 12288, 1536, 64, 4)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4GELUTanhMul, q4.Name)
+	core.AssertEqual(t, uint32(1536), q4.GridX)
+}
+
+func TestHIPKernels_MLXAffineQ6GELUTanhCols1536Row64SmallLaunchConfig_Good(t *testing.T) {
+	packet := hipBorrowLaunchPacket(hipMLXQ4GELUTanhMulLaunchArgsBytes)
+	defer hipReleaseLaunchPacket(packet)
+
+	q6Small, err := hipMLXQ4GELUTanhMultiplyLaunchConfigForShape(packet, 6144, 1536, 64, 6)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4GELUTanhMulQ6Cols1536Row64, q6Small.Name)
+	core.AssertEqual(t, uint32(96), q6Small.GridX)
+	core.AssertEqual(t, hipMLXQ4ProjectionBlockSize, q6Small.BlockX)
+
+	q6Large, err := hipMLXQ4GELUTanhMultiplyLaunchConfigForShape(packet, 12288, 1536, 64, 6)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4GELUTanhMulQ6Cols1536, q6Large.Name)
+	core.AssertEqual(t, uint32(768), q6Large.GridX)
+}
+
+func TestHIPKernels_MLXAffineQ6GELUTanhProjectionRow16LaunchConfig_Good(t *testing.T) {
+	packet := hipBorrowLaunchPacket(hipMLXQ4GELUTanhProjLaunchArgsBytes)
+	defer hipReleaseLaunchPacket(packet)
+
+	q6, err := hipMLXQ4GELUTanhProjectionLaunchConfigForShape(packet, 256, 1536, 64, 6)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4GELUTanhProjQ6Row16, q6.Name)
+	core.AssertEqual(t, uint32(16), q6.GridX)
+	core.AssertEqual(t, hipMLXQ4ProjectionBlockSize, q6.BlockX)
+
+	q4, err := hipMLXQ4GELUTanhProjectionLaunchConfigForShape(packet, 256, 1536, 64, 4)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4GELUTanhProj, q4.Name)
+	core.AssertEqual(t, uint32(32), q4.GridX)
+}
+
+func TestHIPKernels_MLXAffineQ6ProjectionGreedyRow64LaunchConfig_Good(t *testing.T) {
+	packet := hipBorrowLaunchPacket(hipMLXQ4ProjectionLaunchArgsBytes)
+	defer hipReleaseLaunchPacket(packet)
+
+	q6, err := hipMLXQ4ProjectionGreedyLaunchConfigForShape(packet, 262144, 1536, 64, 6)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjGreedyQ6Row64, q6.Name)
+	core.AssertEqual(t, uint32(4096), q6.GridX)
+	core.AssertEqual(t, hipMLXQ4ProjectionBlockSize, q6.BlockX)
+
+	q4, err := hipMLXQ4ProjectionGreedyLaunchConfigForShape(packet, 262144, 1536, 64, 4)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjGreedy, q4.Name)
+	core.AssertEqual(t, uint32(8192), q4.GridX)
+}
+
+func TestHIPKernels_MLXAffineQ6ProjectionSelectedGreedyRow64LaunchConfig_Good(t *testing.T) {
+	packet := hipBorrowLaunchPacket(hipMLXQ4ProjectionLaunchArgsBytes)
+	defer hipReleaseLaunchPacket(packet)
+
+	q6, err := hipMLXQ4ProjectionSelectedGreedyLaunchConfigForShape(packet, 4096, 1536, 64, 6)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjSelectedGreedyQ6Row64, q6.Name)
+	core.AssertEqual(t, uint32(64), q6.GridX)
+	core.AssertEqual(t, hipMLXQ4ProjectionBlockSize, q6.BlockX)
+
+	q4, err := hipMLXQ4ProjectionSelectedGreedyLaunchConfigForShape(packet, 4096, 1536, 64, 4)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjSelectedGreedy, q4.Name)
+	core.AssertEqual(t, uint32(128), q4.GridX)
+}
+
+func TestHIPKernels_MLXAffineQ6ProjectionGreedyBatchRow64LaunchConfig_Good(t *testing.T) {
+	packet := hipBorrowLaunchPacket(hipMLXQ4ProjectionGreedyBatchLaunchArgsBytes)
+	defer hipReleaseLaunchPacket(packet)
+
+	q6, err := hipMLXQ4ProjectionGreedyBatchLaunchConfigForShape(packet, 262144, 1536, 64, 6, 7)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjGreedyBatchQ6Row64, q6.Name)
+	core.AssertEqual(t, uint32(4096), q6.GridX)
+	core.AssertEqual(t, uint32(7), q6.GridY)
+	core.AssertEqual(t, hipMLXQ4ProjectionBlockSize, q6.BlockX)
+
+	q4, err := hipMLXQ4ProjectionGreedyBatchLaunchConfigForShape(packet, 262144, 1536, 64, 4, 7)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjGreedyBatch, q4.Name)
+	core.AssertEqual(t, uint32(8192), q4.GridX)
+	core.AssertEqual(t, uint32(7), q4.GridY)
+}
+
+func TestHIPKernels_MLXAffineQ6ProjectionScoresRow64LaunchConfig_Good(t *testing.T) {
+	packet := hipBorrowLaunchPacket(hipMLXQ4ProjectionLaunchArgsBytes)
+	defer hipReleaseLaunchPacket(packet)
+
+	q6, err := hipMLXQ4ProjectionScoresLaunchConfigForShape(packet, 262144, 1536, 64, 6)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjScoresQ6Row64, q6.Name)
+	core.AssertEqual(t, uint32(4096), q6.GridX)
+	core.AssertEqual(t, hipMLXQ4ProjectionBlockSize, q6.BlockX)
+
+	q4, err := hipMLXQ4ProjectionScoresLaunchConfigForShape(packet, 262144, 1536, 64, 4)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjScores, q4.Name)
+	core.AssertEqual(t, uint32(8192), q4.GridX)
+}
+
+func TestHIPKernels_MLXAffineQ6ProjectionBatchRow16LaunchConfig_Good(t *testing.T) {
+	packet := hipBorrowLaunchPacket(hipMLXQ4ProjectionBatchLaunchArgsBytes)
+	defer hipReleaseLaunchPacket(packet)
+
+	q6, err := hipMLXQ4ProjectionBatchLaunchConfigForShape(packet, 1536, 1536, 64, 6, 512)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjBatchQ6Row16, q6.Name)
+	core.AssertEqual(t, uint32(96), q6.GridX)
+	core.AssertEqual(t, uint32(64), q6.GridY)
+	core.AssertEqual(t, hipMLXQ4ProjectionBlockSize, q6.BlockX)
+
+	q6Small, err := hipMLXQ4ProjectionBatchLaunchConfigForShape(packet, 1, 64, 64, 6, 2)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjBatch, q6Small.Name)
+	core.AssertEqual(t, uint32(1), q6Small.GridX)
+	core.AssertEqual(t, uint32(1), q6Small.GridY)
+
+	q4, err := hipMLXQ4ProjectionBatchLaunchConfigForShape(packet, 1536, 1536, 64, 4, 512)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjBatch, q4.Name)
+	core.AssertEqual(t, uint32(192), q4.GridX)
+}
+
+func TestHIPKernels_MLXQ4ProjectionGreedyBatch_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	req := hipMLXQ4ProjectionRequest{
+		Input:     []float32{1, 1, 1, 1, 1, 1, 1, 1},
+		Weight:    []uint32{0x76543210, 0xfedcba98},
+		Scales:    []uint16{0x3f80, 0x3f00},
+		Biases:    []uint16{0x0000, 0xbf80},
+		Rows:      2,
+		Cols:      8,
+		GroupSize: 8,
+	}
+	buffers, err := req.deviceBuffers(driver)
+	core.RequireNoError(t, err)
+	defer buffers.Close()
+	batchInputPayload, err := hipFloat32Payload([]float32{
+		1, 1, 1, 1, 1, 1, 1, 1,
+		2, 2, 2, 2, 2, 2, 2, 2,
+	})
+	core.RequireNoError(t, err)
+	batchInput, err := hipUploadByteBuffer(driver, "rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", "MLX q4 projection greedy batch input", batchInputPayload, req.Cols*2)
+	core.RequireNoError(t, err)
+	defer batchInput.Close()
+	cfg := hipMLXQ4DeviceWeightConfig{
+		WeightPointer: buffers.Weight.Pointer(),
+		ScalePointer:  buffers.Scales.Pointer(),
+		BiasPointer:   buffers.Biases.Pointer(),
+		WeightBytes:   buffers.Weight.SizeBytes(),
+		ScaleBytes:    buffers.Scales.SizeBytes(),
+		BiasBytes:     buffers.Biases.SizeBytes(),
+		Rows:          req.Rows,
+		Cols:          req.Cols,
+		GroupSize:     req.GroupSize,
+	}
+
+	got, err := hipRunMLXQ4ProjectionSoftcapGreedyBatchKernelWithDeviceInput(context.Background(), driver, batchInput, cfg, 0, 2)
+	core.RequireNoError(t, err)
+	core.RequireTrue(t, len(got) == 2)
+	core.AssertEqual(t, 1, got[0].TokenID)
+	assertFloat32Near(t, 38, got[0].Score)
+	core.AssertEqual(t, 1, got[1].TokenID)
+	assertFloat32Near(t, 76, got[1].Score)
+	launch := driver.launches[len(driver.launches)-1]
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjGreedyBatch, launch.Name)
+	core.AssertEqual(t, uint32(1), launch.GridX)
+	core.AssertEqual(t, uint32(2), launch.GridY)
+	core.AssertEqual(t, hipMLXQ4ProjectionGreedyBatchLaunchArgsBytes, len(launch.Args))
+	core.AssertEqual(t, hipMLXQ4ProjectionGreedyBatchLaunchArgsVersion, binary.LittleEndian.Uint32(launch.Args[0:]))
+	core.AssertEqual(t, uint32(req.Rows), binary.LittleEndian.Uint32(launch.Args[56:]))
+	core.AssertEqual(t, uint32(req.Cols), binary.LittleEndian.Uint32(launch.Args[60:]))
+	core.AssertEqual(t, uint32(2), binary.LittleEndian.Uint32(launch.Args[64:]))
+	core.AssertEqual(t, uint32(req.GroupSize), binary.LittleEndian.Uint32(launch.Args[68:]))
+	core.AssertEqual(t, uint32(req.Cols*2*4), binary.LittleEndian.Uint32(launch.Args[76:]))
+	core.AssertEqual(t, uint32(2*hipMLXQ4ProjectionBestBytes), binary.LittleEndian.Uint32(launch.Args[92:]))
+	core.AssertEqual(t, uint32(0), binary.LittleEndian.Uint32(launch.Args[96:]))
+
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	suppressed, err := hipRunMLXQ4ProjectionSoftcapGreedyBatchKernelWithDeviceInputBufferSuppress(context.Background(), driver, batchInput, cfg, 0, 2, nil, []int32{1}, workspace)
+	core.RequireNoError(t, err)
+	core.RequireTrue(t, len(suppressed) == 2)
+	core.AssertEqual(t, 0, suppressed[0].TokenID)
+	assertFloat32Near(t, 28, suppressed[0].Score)
+	core.AssertEqual(t, 0, suppressed[1].TokenID)
+	assertFloat32Near(t, 56, suppressed[1].Score)
+	suppressedLaunch := driver.launches[len(driver.launches)-1]
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjGreedyBatch, suppressedLaunch.Name)
+	core.AssertEqual(t, uint32(1), binary.LittleEndian.Uint32(suppressedLaunch.Args[96:]))
+	core.AssertNotEqual(t, uint64(0), binary.LittleEndian.Uint64(suppressedLaunch.Args[48:]))
 }
 
 func TestHIPKernels_MLXQ4ProjectionGreedySuppressDevice_Good(t *testing.T) {
@@ -725,6 +1285,175 @@ func TestHIPKernels_MLXQ4ProjectionGreedySuppressDevice_Good(t *testing.T) {
 	core.AssertEqual(t, hipKernelNamePackedTopK, topKLaunch.Name)
 	core.AssertEqual(t, uint32(req.Rows), binary.LittleEndian.Uint32(topKLaunch.Args[24:]))
 	core.AssertEqual(t, uint32(1), binary.LittleEndian.Uint32(topKLaunch.Args[32:]))
+
+	selected, err := hipUploadTokenIDs(driver, []int32{1, 0})
+	core.RequireNoError(t, err)
+	defer selected.Close()
+	best, err := hipAllocateByteBuffer(driver, "rocm.hip.MLXQ4ProjectionSelectedGreedyLaunch", "selected greedy best", hipMLXQ4ProjectionBestBytes, 1)
+	core.RequireNoError(t, err)
+	defer best.Close()
+	core.AssertNoError(t, hipLaunchMLXQ4ProjectionSoftcapSelectedGreedyKernelWithDeviceInputBufferInitialized(
+		context.Background(),
+		driver,
+		buffers.Input,
+		hipMLXQ4DeviceWeightConfig{
+			WeightPointer: buffers.Weight.Pointer(),
+			ScalePointer:  buffers.Scales.Pointer(),
+			BiasPointer:   buffers.Biases.Pointer(),
+			WeightBytes:   buffers.Weight.SizeBytes(),
+			ScaleBytes:    buffers.Scales.SizeBytes(),
+			BiasBytes:     buffers.Biases.SizeBytes(),
+			Rows:          req.Rows,
+			Cols:          req.Cols,
+			GroupSize:     req.GroupSize,
+		},
+		0,
+		selected,
+		best,
+		true,
+	))
+	selectedLaunch := driver.launches[len(driver.launches)-1]
+	core.AssertEqual(t, hipKernelNameMLXQ4ProjSelectedGreedy, selectedLaunch.Name)
+	core.AssertEqual(t, uint32(len([]int32{1, 0})), binary.LittleEndian.Uint32(selectedLaunch.Args[84:]))
+	core.AssertEqual(t, uint64(selected.Pointer()), binary.LittleEndian.Uint64(selectedLaunch.Args[88:]))
+
+	topKPayload := make([]byte, 2*hipMLXQ4ProjectionBestBytes)
+	binary.LittleEndian.PutUint64(topKPayload[0:], hipPackGreedyBest(2, 1))
+	binary.LittleEndian.PutUint64(topKPayload[8:], hipPackGreedyBest(1, 0))
+	topK, err := hipUploadByteBuffer(driver, "rocm.hip.OrderedEmbeddingCandidatesLaunch", "ordered embedding top-k centroids", topKPayload, 2)
+	core.RequireNoError(t, err)
+	defer topK.Close()
+	orderingPayload := make([]byte, 6*8)
+	for index, token := range []int64{10, 11, 12, 20, 21, 22} {
+		binary.LittleEndian.PutUint64(orderingPayload[index*8:], uint64(token))
+	}
+	ordering, err := hipUploadByteBuffer(driver, "rocm.hip.OrderedEmbeddingCandidatesLaunch", "ordered embedding token ordering", orderingPayload, 6)
+	core.RequireNoError(t, err)
+	defer ordering.Close()
+	suppress, err := workspace.EnsureSuppressTokenBuffer(driver, []int32{21})
+	core.RequireNoError(t, err)
+	candidateTokens, err := hipRunOrderedEmbeddingCandidatesKernel(
+		context.Background(),
+		driver,
+		topK,
+		2,
+		ordering.Pointer(),
+		ordering.SizeBytes(),
+		8,
+		2,
+		3,
+		suppress,
+		workspace,
+	)
+	core.RequireNoError(t, err)
+	candidatePayload := make([]byte, candidateTokens.SizeBytes())
+	core.RequireNoError(t, driver.CopyDeviceToHost(candidateTokens.Pointer(), candidatePayload))
+	gotCandidates := make([]int32, candidateTokens.Count())
+	for index := range gotCandidates {
+		gotCandidates[index] = int32(binary.LittleEndian.Uint32(candidatePayload[index*4:]))
+	}
+	core.AssertEqual(t, []int32{20, -1, 22, 10, 11, 12}, gotCandidates)
+	candidateLaunch := driver.launches[len(driver.launches)-1]
+	core.AssertEqual(t, hipKernelNameOrderedEmbeddingCandidates, candidateLaunch.Name)
+	core.AssertEqual(t, uint32(2), binary.LittleEndian.Uint32(candidateLaunch.Args[40:]))
+	core.AssertEqual(t, uint32(3), binary.LittleEndian.Uint32(candidateLaunch.Args[48:]))
+	core.AssertEqual(t, uint32(8), binary.LittleEndian.Uint32(candidateLaunch.Args[52:]))
+	core.AssertEqual(t, uint32(6), binary.LittleEndian.Uint32(candidateLaunch.Args[60:]))
+	core.AssertEqual(t, uint32(1), binary.LittleEndian.Uint32(candidateLaunch.Args[64:]))
+}
+
+func TestHIPKernels_MLXQ4ProjectionGreedyWorkspaceBestResult_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	req := hipMLXQ4ProjectionRequest{
+		Input:     []float32{1, 1, 1, 1, 1, 1, 1, 1},
+		Weight:    []uint32{0x76543210, 0xfedcba98},
+		Scales:    []uint16{0x3f80, 0x3f00},
+		Biases:    []uint16{0x0000, 0xbf80},
+		Rows:      2,
+		Cols:      8,
+		GroupSize: 8,
+	}
+	buffers, err := req.deviceBuffers(driver)
+	core.RequireNoError(t, err)
+	defer buffers.Close()
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	cfg := hipMLXQ4DeviceWeightConfig{
+		WeightPointer: buffers.Weight.Pointer(),
+		ScalePointer:  buffers.Scales.Pointer(),
+		BiasPointer:   buffers.Biases.Pointer(),
+		WeightBytes:   buffers.Weight.SizeBytes(),
+		ScaleBytes:    buffers.Scales.SizeBytes(),
+		BiasBytes:     buffers.Biases.SizeBytes(),
+		Rows:          req.Rows,
+		Cols:          req.Cols,
+		GroupSize:     req.GroupSize,
+	}
+
+	first, firstDevice, err := hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressResult(context.Background(), driver, buffers.Input, cfg, 0, nil, nil, workspace)
+	core.RequireNoError(t, err)
+	firstPointer := firstDevice.Pointer()
+	second, secondDevice, err := hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressResult(context.Background(), driver, buffers.Input, cfg, 0, nil, nil, workspace)
+	core.RequireNoError(t, err)
+
+	core.AssertEqual(t, 1, first.TokenID)
+	assertFloat32Near(t, 38, first.Score)
+	core.AssertEqual(t, 1, second.TokenID)
+	assertFloat32Near(t, 38, second.Score)
+	if firstDevice == nil || secondDevice == nil {
+		t.Fatalf("workspace greedy device buffers = %v/%v, want both non-nil", firstDevice, secondDevice)
+	}
+	if secondDevice.Pointer() != firstPointer+nativeDevicePointer(hipMLXQ4ProjectionBestBytes) {
+		t.Fatalf("second greedy result pointer = %x, want first+%d", secondDevice.Pointer(), hipMLXQ4ProjectionBestBytes)
+	}
+	core.AssertEqual(t, []uint64{
+		uint64(hipProjectionGreedyBestWorkspaceSlots * hipMLXQ4ProjectionBestBytes),
+		hipMLXQ4ProjectionBestBytes,
+		hipMLXQ4ProjectionBestBytes,
+	}, driver.memsets)
+}
+
+func TestHIPKernels_MLXQ4ProjectionGreedyTokenOnlyReadsUint32_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	req := hipMLXQ4ProjectionRequest{
+		Input:     []float32{1, 1, 1, 1, 1, 1, 1, 1},
+		Weight:    []uint32{0x76543210, 0xfedcba98},
+		Scales:    []uint16{0x3f80, 0x3f00},
+		Biases:    []uint16{0x0000, 0xbf80},
+		Rows:      2,
+		Cols:      8,
+		GroupSize: 8,
+	}
+	buffers, err := req.deviceBuffers(driver)
+	core.RequireNoError(t, err)
+	defer buffers.Close()
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	cfg := hipMLXQ4DeviceWeightConfig{
+		WeightPointer: buffers.Weight.Pointer(),
+		ScalePointer:  buffers.Scales.Pointer(),
+		BiasPointer:   buffers.Biases.Pointer(),
+		WeightBytes:   buffers.Weight.SizeBytes(),
+		ScaleBytes:    buffers.Scales.SizeBytes(),
+		BiasBytes:     buffers.Biases.SizeBytes(),
+		Rows:          req.Rows,
+		Cols:          req.Cols,
+		GroupSize:     req.GroupSize,
+	}
+	copyStart := len(driver.copies)
+
+	got, device, err := hipRunMLXQ4ProjectionSoftcapGreedyTokenKernelWithDeviceInputBufferSuppressResult(context.Background(), driver, buffers.Input, cfg, 0, nil, nil, workspace)
+	core.RequireNoError(t, err)
+
+	core.AssertEqual(t, 1, got.TokenID)
+	assertFloat32Near(t, 0, got.Score)
+	if device == nil {
+		t.Fatalf("token-only greedy device buffer is nil")
+	}
+	if len(driver.copies) <= copyStart {
+		t.Fatalf("token-only greedy did not read device result")
+	}
+	core.AssertEqual(t, uint64(4), driver.copies[len(driver.copies)-1])
 }
 
 func TestHIPKernels_PackedTopKReduceWorkspace_Good(t *testing.T) {
@@ -750,8 +1479,8 @@ func TestHIPKernels_PackedTopKReduceWorkspace_Good(t *testing.T) {
 
 	output, outputCount, err := hipRunPackedTopKReduceKernelWithWorkspace(context.Background(), driver, input, inputCount, topK, workspace)
 	core.RequireNoError(t, err)
-	core.AssertEqual(t, 2, countLaunchName(driver.launches, hipKernelNamePackedTopK))
-	core.AssertEqual(t, 128, outputCount)
+	core.AssertEqual(t, expectedPackedTopKReduceRounds(inputCount, topK), countLaunchName(driver.launches, hipKernelNamePackedTopK))
+	core.AssertEqual(t, topK, outputCount)
 	outputPayload := make([]byte, outputCount*hipMLXQ4ProjectionBestBytes)
 	core.RequireNoError(t, driver.CopyDeviceToHost(output.Pointer(), outputPayload))
 	got := hipTopPackedScoresBytes(outputPayload, topK)
@@ -800,8 +1529,19 @@ func BenchmarkHIPPackedTopKReduceWorkspace_VocabTopK64(b *testing.B) {
 		benchmarkHIPTopPackedScoreSink ^= top[0]
 		benchmarkHIPTopPackedScoreSink ^= uint64(outputCount)
 	}
-	b.ReportMetric(3, "device_topk_rounds/op")
-	b.ReportMetric(float64(512*hipMLXQ4ProjectionBestBytes), "reduced_payload_bytes/op")
+	b.ReportMetric(float64(expectedPackedTopKReduceRounds(inputCount, topK)), "device_topk_rounds/op")
+	b.ReportMetric(float64(topK*hipMLXQ4ProjectionBestBytes), "reduced_payload_bytes/op")
+}
+
+func expectedPackedTopKReduceRounds(inputCount, topK int) int {
+	rounds := 0
+	current := inputCount
+	for current > topK {
+		chunks := (current + hipPackedTopKChunkSize - 1) / hipPackedTopKChunkSize
+		current = chunks * topK
+		rounds++
+	}
+	return rounds
 }
 
 func TestHIPKernels_MLXQ4TripleProjectionLaunchArgs_Good(t *testing.T) {
@@ -1500,6 +2240,15 @@ func TestHIPKernels_MLXQ4GELUTanhProjectionLaunchArgs_Good(t *testing.T) {
 	core.AssertEqual(t, uint32(req.Rows), binary.LittleEndian.Uint32(batchLaunch.Args[56:]))
 	core.AssertEqual(t, uint32(req.Cols), binary.LittleEndian.Uint32(batchLaunch.Args[60:]))
 	core.AssertEqual(t, uint32(2), binary.LittleEndian.Uint32(batchLaunch.Args[64:]))
+
+	reusedBatchActivated, err := hipAllocateByteBuffer(driver, "rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "reused MLX q4 GELU tanh projection batch output", uint64(req.Rows*2*4), req.Rows*2)
+	core.AssertNoError(t, err)
+	defer reusedBatchActivated.Close()
+	core.AssertNoError(t, hipRunMLXQ4GELUTanhProjectionBatchKernelWithDeviceMultiplierOutput(context.Background(), driver, batchInput, batchMultiplier, cfg, 2, reusedBatchActivated))
+	reusedBatchValues, err := hipReadFloat32DeviceOutput(reusedBatchActivated, "rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "reused MLX q4 GELU tanh projection batch output", req.Rows*2)
+	core.AssertNoError(t, err)
+	assertFloat32SlicesNear(t, batchWant, reusedBatchValues, 0.0001)
+	core.AssertEqual(t, hipKernelNameMLXQ4GELUTanhProjBatch, driver.launches[len(driver.launches)-1].Name)
 }
 
 func TestHIPKernels_MLXQ4GELUTanhProjectionLaunchArgs_Bad(t *testing.T) {
@@ -1649,7 +2398,7 @@ func TestHIPKernels_MLXQ4ProjectionLaunchArgs_Bad(t *testing.T) {
 		OutputBytes:   4,
 	}).Binary()
 	core.AssertError(t, err)
-	core.AssertContains(t, err.Error(), "4-bit")
+	core.AssertContains(t, err.Error(), "4-, 6-, and 8-bit")
 
 	_, err = (hipMLXQ4ProjectionLaunchArgs{
 		InputPointer:  1,
@@ -2707,6 +3456,89 @@ func TestHIPKernels_AttentionLaunchArgs_Good(t *testing.T) {
 	}
 }
 
+func TestHIPKernels_AttentionHeadsDeviceKVGQA_Good(t *testing.T) {
+	const (
+		dim        = 2
+		tokenCount = 3
+		headCount  = 4
+		keyHeads   = 2
+	)
+	queryValues := []float32{
+		1, 0,
+		0, 1,
+		1, 1,
+		-1, 0.5,
+	}
+	keyValues := []float32{
+		1, 0, 0, 1,
+		0, 1, 1, 0,
+		1, 1, -1, 1,
+	}
+	valueValues := []float32{
+		2, 0, 0, 4,
+		0, 6, 8, 0,
+		4, 4, -2, 2,
+	}
+	wantOutput := make([]float32, 0, len(queryValues))
+	for head := 0; head < headCount; head++ {
+		kvHead := head / (headCount / keyHeads)
+		keys := make([][]float32, 0, tokenCount)
+		values := make([][]float32, 0, tokenCount)
+		for token := 0; token < tokenCount; token++ {
+			base := (token*keyHeads + kvHead) * dim
+			keys = append(keys, keyValues[base:base+dim])
+			values = append(values, valueValues[base:base+dim])
+		}
+		queryBase := head * dim
+		headOutput, _, err := hipReferenceSingleHeadAttentionWithScale(queryValues[queryBase:queryBase+dim], keys, values, 1)
+		core.RequireNoError(t, err)
+		wantOutput = append(wantOutput, headOutput...)
+	}
+
+	for _, tc := range []struct {
+		name string
+		mode string
+	}{
+		{name: "fp16", mode: rocmKVCacheModeFP16},
+		{name: "q8", mode: rocmKVCacheModeQ8},
+		{name: "kq8-vq4", mode: rocmKVCacheModeKQ8VQ4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			driver := &fakeHIPDriver{available: true}
+			queryPayload, err := hipFloat32Payload(queryValues)
+			core.RequireNoError(t, err)
+			query, err := hipUploadByteBuffer(driver, "rocm.hip.AttentionHeadsLaunch", "GQA attention query", queryPayload, len(queryValues))
+			core.RequireNoError(t, err)
+			defer query.Close()
+			output, err := hipAllocateByteBuffer(driver, "rocm.hip.AttentionHeadsLaunch", "GQA attention output", uint64(len(queryValues)*4), len(queryValues))
+			core.RequireNoError(t, err)
+			defer output.Close()
+
+			cache, err := newROCmKVCache(tc.mode, defaultROCmKVBlockSize)
+			core.RequireNoError(t, err)
+			core.RequireNoError(t, cache.AppendVectors(0, keyHeads*dim, keyHeads*dim, keyValues, valueValues))
+			deviceKV, err := cache.MirrorToDevice(driver)
+			core.RequireNoError(t, err)
+			defer deviceKV.Close()
+			table, err := deviceKV.KernelDescriptorTable()
+			core.RequireNoError(t, err)
+			defer table.Close()
+
+			err = hipRunAttentionHeadsOutputFromDeviceQueryToDeviceKernel(context.Background(), driver, hipAttentionRequest{
+				QueryDim:        dim,
+				KeyHeads:        keyHeads,
+				DeviceKV:        deviceKV,
+				DescriptorTable: table,
+				Scale:           1,
+			}, query, headCount, output)
+			core.RequireNoError(t, err)
+			got, err := hipReadFloat32DeviceOutput(output, "rocm.hip.AttentionHeadsLaunch", "GQA attention output", len(queryValues))
+			core.RequireNoError(t, err)
+			assertFloat32SlicesNear(t, wantOutput, got, 0.2)
+		})
+	}
+}
+
 func TestHIPKernels_AttentionHeadsBatchCausalLaunchArgs_Good(t *testing.T) {
 	const (
 		dim             = 2
@@ -3000,7 +3832,7 @@ func TestHIPKernels_AttentionHeadsBatchChunkedLaunchArgs_Good(t *testing.T) {
 	core.AssertEqual(t, 2, len(launches))
 	core.AssertEqual(t, hipKernelNameAttentionHeadsBatchChunkedStage1, launches[0].Name)
 	core.AssertEqual(t, hipKernelNameAttentionHeadsBatchChunkedStage2, launches[1].Name)
-	chunkCount := (tokenCount + hipAttentionHeadsChunkSize - 1) / hipAttentionHeadsChunkSize
+	chunkStartToken, chunkCount := hipAttentionHeadsBatchChunkedActiveRange(queryStartToken, queryCount, tokenCount, 0, hipAttentionHeadsChunkSize)
 	core.AssertEqual(t, uint32(headCount*queryCount*chunkCount), launches[0].GridX)
 	core.AssertEqual(t, uint32(headCount*queryCount), launches[1].GridX)
 	core.AssertEqual(t, hipAttentionHeadsBatchChunkedLaunchArgsBytes, len(launches[0].Args))
@@ -3023,9 +3855,50 @@ func TestHIPKernels_AttentionHeadsBatchChunkedLaunchArgs_Good(t *testing.T) {
 	core.AssertEqual(t, uint32(len(queryValues)*4), binary.LittleEndian.Uint32(launches[0].Args[96:]))
 	core.AssertEqual(t, math.Float32bits(1), binary.LittleEndian.Uint32(launches[0].Args[100:]))
 	core.AssertEqual(t, uint32(0), binary.LittleEndian.Uint32(launches[0].Args[104:]))
+	core.AssertEqual(t, uint32(chunkStartToken), binary.LittleEndian.Uint32(launches[0].Args[108:]))
 	if workspace.BatchAttentionWeight != nil {
 		t.Fatalf("batch chunked attention allocated materialized weights")
 	}
+}
+
+func TestHIPKernels_AttentionHeadsBatchChunkedLaunchArgs_WindowStartsAtActiveChunk(t *testing.T) {
+	const (
+		dim             = 4
+		tokenCount      = 4096
+		headCount       = 2
+		queryCount      = 8
+		queryStartToken = tokenCount - queryCount
+		windowSize      = 512
+	)
+	chunkStartToken, chunkCount := hipAttentionHeadsBatchChunkedActiveRange(queryStartToken, queryCount, tokenCount, windowSize, hipAttentionHeadsChunkSize)
+	queryElements := dim * headCount * queryCount
+	args := hipAttentionHeadsBatchChunkedLaunchArgs{
+		QueryPointer:      1,
+		DescriptorPointer: 2,
+		PartialPointer:    3,
+		StatsPointer:      4,
+		OutputPointer:     5,
+		Dim:               dim,
+		TokenCount:        tokenCount,
+		HeadCount:         headCount,
+		QueryCount:        queryCount,
+		QueryStartToken:   queryStartToken,
+		ChunkSize:         hipAttentionHeadsChunkSize,
+		ChunkCount:        chunkCount,
+		QueryBytes:        uint64(queryElements * 4),
+		DescriptorBytes:   uint64(rocmDeviceKVDescriptorHeaderBytes + tokenCount*rocmDeviceKVDescriptorPageBytes),
+		PartialBytes:      uint64(queryElements * chunkCount * 4),
+		StatsBytes:        uint64(queryCount * headCount * chunkCount * 2 * 4),
+		OutputBytes:       uint64(queryElements * 4),
+		Scale:             1,
+		WindowSize:        windowSize,
+		ChunkStartToken:   chunkStartToken,
+	}
+	packet, err := args.Binary()
+	core.RequireNoError(t, err)
+	defer hipReleaseLaunchPacket(packet)
+	core.AssertEqual(t, uint32(3520), binary.LittleEndian.Uint32(packet[108:]))
+	core.AssertEqual(t, uint32(9), binary.LittleEndian.Uint32(packet[72:]))
 }
 
 func TestHIPKernels_AttentionHeadsBatchCausalLaunchArgs_Bad(t *testing.T) {
@@ -3315,6 +4188,90 @@ func BenchmarkHIPVectorAddScaledDeviceKernelOutput_Hot(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		if err := hipRunVectorAddScaledDeviceKernelOutput(context.Background(), driver, left, right, 2, output); err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkHIPVectorAddLaunchArgsBinaryInto_Hot(b *testing.B) {
+	args := hipVectorAddLaunchArgs{
+		LeftPointer:   0x1000,
+		RightPointer:  0x2000,
+		OutputPointer: 0x3000,
+		Count:         4096,
+		LeftBytes:     4096 * 4,
+		RightBytes:    4096 * 4,
+		OutputBytes:   4096 * 4,
+	}
+	var scratch [hipVectorAddLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipVectorAddLaunchArgsBytes {
+		b.Fatalf("vector add launch bytes len = %d, want %d", len(payload), hipVectorAddLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("vector add launch args: %v", err)
+		}
+		if len(payload) != hipVectorAddLaunchArgsBytes {
+			b.Fatalf("vector add launch bytes len = %d, want %d", len(payload), hipVectorAddLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPVectorAddScaledLaunchArgsBinaryInto_Hot(b *testing.B) {
+	args := hipVectorAddScaledLaunchArgs{
+		LeftPointer:   0x1000,
+		RightPointer:  0x2000,
+		OutputPointer: 0x3000,
+		Count:         4096,
+		LeftBytes:     4096 * 4,
+		RightBytes:    4096 * 4,
+		OutputBytes:   4096 * 4,
+		Scale:         0.75,
+	}
+	var scratch [hipVectorAddScaledLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipVectorAddScaledLaunchArgsBytes {
+		b.Fatalf("vector add scaled launch bytes len = %d, want %d", len(payload), hipVectorAddScaledLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("vector add scaled launch args: %v", err)
+		}
+		if len(payload) != hipVectorAddScaledLaunchArgsBytes {
+			b.Fatalf("vector add scaled launch bytes len = %d, want %d", len(payload), hipVectorAddScaledLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPVectorScaleLaunchArgsBinaryInto_Hot(b *testing.B) {
+	args := hipVectorScaleLaunchArgs{
+		InputPointer:  0x1000,
+		OutputPointer: 0x2000,
+		Count:         4096,
+		InputBytes:    4096 * 4,
+		OutputBytes:   4096 * 4,
+		Scale:         0.5,
+	}
+	var scratch [hipVectorScaleLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipVectorScaleLaunchArgsBytes {
+		b.Fatalf("vector scale launch bytes len = %d, want %d", len(payload), hipVectorScaleLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("vector scale launch args: %v", err)
+		}
+		if len(payload) != hipVectorScaleLaunchArgsBytes {
+			b.Fatalf("vector scale launch bytes len = %d, want %d", len(payload), hipVectorScaleLaunchArgsBytes)
 		}
 	}
 }
@@ -4418,9 +5375,11 @@ func TestHIPKernels_LoadedModelDispatchesKernelSet_Good(t *testing.T) {
 	core.AssertEqual(t, "64", prefill.Labels["prefill_launch_args_bytes"])
 	core.AssertEqual(t, "12", prefill.Labels["prefill_token_bytes"])
 	core.AssertEqual(t, "3", prefill.Labels["prefill_launch_tokens"])
-	core.AssertEqual(t, 2, len(driver.launches))
+	core.AssertEqual(t, 3, len(driver.launches))
 	core.AssertEqual(t, hipKernelNamePrefill, driver.launches[1].Name)
 	core.AssertEqual(t, hipPrefillLaunchArgsBytes, len(driver.launches[1].Args))
+	core.AssertEqual(t, hipKernelNameKVDescriptorAppend, driver.launches[2].Name)
+	core.AssertEqual(t, hipKVDescriptorAppendLaunchArgsBytes, len(driver.launches[2].Args))
 	prefillLaunch, err := (hipDecodeRequest{
 		TokenID:         7,
 		KV:              prefill.KV,
@@ -4493,9 +5452,9 @@ func TestHIPKernels_LoadedModelDispatchesKernelSet_Good(t *testing.T) {
 	core.AssertEqual(t, "96", decoded.Labels["decode_launch_args_bytes"])
 	core.AssertEqual(t, "7", decoded.Labels["decode_launch_token"])
 	core.AssertEqual(t, "3", decoded.Labels["decode_launch_position"])
-	core.AssertEqual(t, 3, len(driver.launches))
-	core.AssertEqual(t, hipKernelNameDecode, driver.launches[2].Name)
-	core.AssertEqual(t, hipDecodeLaunchArgsBytes, len(driver.launches[2].Args))
+	core.AssertEqual(t, 4, len(driver.launches))
+	core.AssertEqual(t, hipKernelNameDecode, driver.launches[3].Name)
+	core.AssertEqual(t, hipDecodeLaunchArgsBytes, len(driver.launches[3].Args))
 	decodedLaunch, err := (hipDecodeRequest{
 		TokenID:         8,
 		KV:              decoded.KV,
@@ -4649,6 +5608,965 @@ func TestHIPKernels_RequestValidation_Bad(t *testing.T) {
 	core.AssertContains(t, err.Error(), "descriptor table")
 }
 
+func BenchmarkHIPDecodeLaunchArgsBinaryInto_Hot(b *testing.B) {
+	args := hipDecodeLaunchArgs{
+		TokenID:  7,
+		Position: 1024,
+		KV: rocmDeviceKVLaunchDescriptor{
+			DescriptorPointer: 0x1000,
+			DescriptorBytes:   uint64(rocmDeviceKVDescriptorHeaderBytes + rocmDeviceKVHotPageCapacity*rocmDeviceKVDescriptorPageBytes),
+			DescriptorVersion: rocmDeviceKVDescriptorVersion,
+			Mode:              rocmKVCacheModeKQ8VQ4,
+			ModeCode:          rocmDeviceKVDescriptorModeKQ8VQ4,
+			BlockSize:         rocmGemma4Q4DeviceKVBlockSize,
+			PageCount:         rocmDeviceKVHotPageCapacity,
+			TokenCount:        1024,
+			KeyWidth:          128,
+			ValueWidth:        128,
+		},
+	}
+	var scratch [hipDecodeLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipDecodeLaunchArgsBytes {
+		b.Fatalf("decode launch bytes len = %d, want %d", len(payload), hipDecodeLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("decode launch args: %v", err)
+		}
+		if len(payload) != hipDecodeLaunchArgsBytes {
+			b.Fatalf("decode launch bytes len = %d, want %d", len(payload), hipDecodeLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPProjectionLaunchArgsBinaryInto_Hot(b *testing.B) {
+	args := hipProjectionLaunchArgs{
+		InputPointer:   0x1000,
+		InputCount:     2304,
+		InputBytes:     2304 * 4,
+		WeightPointer:  0x2000,
+		WeightBytes:    2304 * 2304 * 2,
+		OutputPointer:  0x3000,
+		OutputBytes:    2304 * 4,
+		Rows:           2304,
+		Cols:           2304,
+		WeightEncoding: hipProjectionWeightEncodingFP16,
+	}
+	var scratch [hipProjectionLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipProjectionLaunchArgsBytes {
+		b.Fatalf("projection launch bytes len = %d, want %d", len(payload), hipProjectionLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("projection launch args: %v", err)
+		}
+		if len(payload) != hipProjectionLaunchArgsBytes {
+			b.Fatalf("projection launch bytes len = %d, want %d", len(payload), hipProjectionLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPProjectionBatchLaunchArgsBinaryInto_Hot(b *testing.B) {
+	args := hipProjectionBatchLaunchArgs{
+		InputPointer:   0x1000,
+		InputBytes:     16 * 2304 * 4,
+		WeightPointer:  0x2000,
+		WeightBytes:    2304 * 2304 * 2,
+		OutputPointer:  0x3000,
+		OutputBytes:    16 * 2304 * 4,
+		Rows:           2304,
+		Cols:           2304,
+		Batch:          16,
+		WeightEncoding: hipProjectionWeightEncodingFP16,
+	}
+	var scratch [hipProjectionBatchLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipProjectionBatchLaunchArgsBytes {
+		b.Fatalf("projection batch launch bytes len = %d, want %d", len(payload), hipProjectionBatchLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("projection batch launch args: %v", err)
+		}
+		if len(payload) != hipProjectionBatchLaunchArgsBytes {
+			b.Fatalf("projection batch launch bytes len = %d, want %d", len(payload), hipProjectionBatchLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPMLXQ4ProjectionLaunchArgsBinaryInto_Hot(b *testing.B) {
+	args := benchmarkHIPMLXQ4ProjectionLaunchArgs(2304, 2304, 64, 4)
+	var scratch [hipMLXQ4ProjectionLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipMLXQ4ProjectionLaunchArgsBytes {
+		b.Fatalf("q4 projection launch bytes len = %d, want %d", len(payload), hipMLXQ4ProjectionLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("q4 projection launch args: %v", err)
+		}
+		if len(payload) != hipMLXQ4ProjectionLaunchArgsBytes {
+			b.Fatalf("q4 projection launch bytes len = %d, want %d", len(payload), hipMLXQ4ProjectionLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPMLXQ4ProjectionLaunchArgsGreedyBinaryInto_Hot(b *testing.B) {
+	args := benchmarkHIPMLXQ4ProjectionLaunchArgs(2304, 2304, 64, 4)
+	args.OutputBytes = hipMLXQ4ProjectionBestBytes
+	var scratch [hipMLXQ4ProjectionLaunchArgsBytes]byte
+	payload, err := args.GreedyBinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipMLXQ4ProjectionLaunchArgsBytes {
+		b.Fatalf("q4 projection greedy launch bytes len = %d, want %d", len(payload), hipMLXQ4ProjectionLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.GreedyBinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("q4 projection greedy launch args: %v", err)
+		}
+		if len(payload) != hipMLXQ4ProjectionLaunchArgsBytes {
+			b.Fatalf("q4 projection greedy launch bytes len = %d, want %d", len(payload), hipMLXQ4ProjectionLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPMLXQ4ProjectionLaunchArgsScoresBinaryInto_Hot(b *testing.B) {
+	args := benchmarkHIPMLXQ4ProjectionLaunchArgs(2304, 2304, 64, 4)
+	args.OutputBytes = uint64(args.Rows) * hipMLXQ4ProjectionBestBytes
+	var scratch [hipMLXQ4ProjectionLaunchArgsBytes]byte
+	payload, err := args.ScoresBinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipMLXQ4ProjectionLaunchArgsBytes {
+		b.Fatalf("q4 projection scores launch bytes len = %d, want %d", len(payload), hipMLXQ4ProjectionLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.ScoresBinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("q4 projection scores launch args: %v", err)
+		}
+		if len(payload) != hipMLXQ4ProjectionLaunchArgsBytes {
+			b.Fatalf("q4 projection scores launch bytes len = %d, want %d", len(payload), hipMLXQ4ProjectionLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPMLXQ4ProjectionBatchLaunchArgsBinaryInto_Hot(b *testing.B) {
+	args := benchmarkHIPMLXQ4ProjectionBatchLaunchArgs(2304, 2304, 16, 64, 4)
+	var scratch [hipMLXQ4ProjectionBatchLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipMLXQ4ProjectionBatchLaunchArgsBytes {
+		b.Fatalf("q4 projection batch launch bytes len = %d, want %d", len(payload), hipMLXQ4ProjectionBatchLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("q4 projection batch launch args: %v", err)
+		}
+		if len(payload) != hipMLXQ4ProjectionBatchLaunchArgsBytes {
+			b.Fatalf("q4 projection batch launch bytes len = %d, want %d", len(payload), hipMLXQ4ProjectionBatchLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPRMSNormHeadsLaunchArgsBinaryInto_GemmaHeadDim512(b *testing.B) {
+	args := benchmarkHIPRMSNormHeadsLaunchArgs(512, 8)
+	var scratch [hipRMSNormHeadsLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipRMSNormHeadsLaunchArgsBytes {
+		b.Fatalf("RMSNorm heads launch bytes len = %d, want %d", len(payload), hipRMSNormHeadsLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("RMSNorm heads launch args: %v", err)
+		}
+		if len(payload) != hipRMSNormHeadsLaunchArgsBytes {
+			b.Fatalf("RMSNorm heads launch bytes len = %d, want %d", len(payload), hipRMSNormHeadsLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPRMSNormLaunchArgsBinaryInto_Hidden4096(b *testing.B) {
+	args := benchmarkHIPRMSNormLaunchArgs(4096)
+	var scratch [hipRMSNormLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipRMSNormLaunchArgsBytes {
+		b.Fatalf("RMSNorm launch bytes len = %d, want %d", len(payload), hipRMSNormLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("RMSNorm launch args: %v", err)
+		}
+		if len(payload) != hipRMSNormLaunchArgsBytes {
+			b.Fatalf("RMSNorm launch bytes len = %d, want %d", len(payload), hipRMSNormLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPRMSNormResidualAddLaunchArgsBinaryInto_Hidden4096(b *testing.B) {
+	args := benchmarkHIPRMSNormResidualAddLaunchArgs(4096)
+	var scratch [hipRMSNormResidualAddArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipRMSNormResidualAddArgsBytes {
+		b.Fatalf("RMSNorm residual add launch bytes len = %d, want %d", len(payload), hipRMSNormResidualAddArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("RMSNorm residual add launch args: %v", err)
+		}
+		if len(payload) != hipRMSNormResidualAddArgsBytes {
+			b.Fatalf("RMSNorm residual add launch bytes len = %d, want %d", len(payload), hipRMSNormResidualAddArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPRMSNormResidualAddNormLaunchArgsBinaryInto_Hidden4096(b *testing.B) {
+	args := benchmarkHIPRMSNormResidualAddNormLaunchArgs(4096)
+	var scratch [hipRMSNormResAddNormArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipRMSNormResAddNormArgsBytes {
+		b.Fatalf("RMSNorm residual add norm launch bytes len = %d, want %d", len(payload), hipRMSNormResAddNormArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("RMSNorm residual add norm launch args: %v", err)
+		}
+		if len(payload) != hipRMSNormResAddNormArgsBytes {
+			b.Fatalf("RMSNorm residual add norm launch bytes len = %d, want %d", len(payload), hipRMSNormResAddNormArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPRoPELaunchArgsBinaryInto_GemmaHeadDim512(b *testing.B) {
+	args := benchmarkHIPRoPELaunchArgs(512)
+	var scratch [hipRoPELaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipRoPELaunchArgsBytes {
+		b.Fatalf("RoPE launch bytes len = %d, want %d", len(payload), hipRoPELaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("RoPE launch args: %v", err)
+		}
+		if len(payload) != hipRoPELaunchArgsBytes {
+			b.Fatalf("RoPE launch bytes len = %d, want %d", len(payload), hipRoPELaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPRoPEHeadsLaunchArgsBinaryInto_GemmaHeadDim512(b *testing.B) {
+	args := benchmarkHIPRoPEHeadsLaunchArgs(512, 8)
+	var scratch [hipRoPEHeadsLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipRoPEHeadsLaunchArgsBytes {
+		b.Fatalf("RoPE heads launch bytes len = %d, want %d", len(payload), hipRoPEHeadsLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("RoPE heads launch args: %v", err)
+		}
+		if len(payload) != hipRoPEHeadsLaunchArgsBytes {
+			b.Fatalf("RoPE heads launch bytes len = %d, want %d", len(payload), hipRoPEHeadsLaunchArgsBytes)
+		}
+	}
+}
+
+func benchmarkHIPRMSNormLaunchArgs(count int) hipRMSNormLaunchArgs {
+	return hipRMSNormLaunchArgs{
+		InputPointer:   0x1000,
+		WeightPointer:  0x2000,
+		OutputPointer:  0x3000,
+		Count:          count,
+		InputBytes:     uint64(count * 4),
+		WeightBytes:    uint64(count * 2),
+		OutputBytes:    uint64(count * 4),
+		Epsilon:        1e-6,
+		WeightEncoding: hipRMSNormWeightEncodingBF16,
+		Flags:          hipRMSNormLaunchFlagAddUnitWeight,
+	}
+}
+
+func benchmarkHIPRMSNormResidualAddLaunchArgs(count int) hipRMSNormResidualAddLaunchArgs {
+	return hipRMSNormResidualAddLaunchArgs{
+		InputPointer:    0x1000,
+		WeightPointer:   0x2000,
+		ResidualPointer: 0x3000,
+		OutputPointer:   0x4000,
+		Count:           count,
+		InputBytes:      uint64(count * 4),
+		WeightBytes:     uint64(count * 2),
+		ResidualBytes:   uint64(count * 4),
+		OutputBytes:     uint64(count * 4),
+		Epsilon:         1e-6,
+		WeightEncoding:  hipRMSNormWeightEncodingBF16,
+		Flags:           hipRMSNormLaunchFlagAddUnitWeight,
+		OutputScale:     0.5,
+	}
+}
+
+func benchmarkHIPRMSNormResidualAddNormLaunchArgs(count int) hipRMSNormResidualAddNormLaunchArgs {
+	return hipRMSNormResidualAddNormLaunchArgs{
+		InputPointer:          0x1000,
+		WeightPointer:         0x2000,
+		ResidualPointer:       0x3000,
+		ResidualOutputPointer: 0x4000,
+		NormWeightPointer:     0x5000,
+		NormOutputPointer:     0x6000,
+		Count:                 count,
+		InputBytes:            uint64(count * 4),
+		WeightBytes:           uint64(count * 2),
+		ResidualBytes:         uint64(count * 4),
+		ResidualOutputBytes:   uint64(count * 4),
+		NormWeightBytes:       uint64(count * 2),
+		NormOutputBytes:       uint64(count * 4),
+		Epsilon:               1e-6,
+		WeightEncoding:        hipRMSNormWeightEncodingBF16,
+		Flags:                 hipRMSNormLaunchFlagAddUnitWeight,
+		NormEpsilon:           1e-6,
+		NormWeightEncoding:    hipRMSNormWeightEncodingBF16,
+		NormFlags:             hipRMSNormLaunchFlagAddUnitWeight,
+		OutputScale:           0.5,
+	}
+}
+
+func benchmarkHIPRoPELaunchArgs(count int) hipRoPELaunchArgs {
+	return hipRoPELaunchArgs{
+		InputPointer:  0x1000,
+		OutputPointer: 0x2000,
+		Count:         count,
+		InputBytes:    uint64(count * 4),
+		OutputBytes:   uint64(count * 4),
+		Position:      4096,
+		Base:          1000000,
+		FrequencyDim:  count,
+		RotaryCount:   count,
+	}
+}
+
+func benchmarkHIPRoPEHeadsLaunchArgs(headDim, headCount int) hipRoPEHeadsLaunchArgs {
+	total := headDim * headCount
+	return hipRoPEHeadsLaunchArgs{
+		InputPointer:  0x1000,
+		OutputPointer: 0x2000,
+		HeadDim:       headDim,
+		HeadCount:     headCount,
+		InputBytes:    uint64(total * 4),
+		OutputBytes:   uint64(total * 4),
+		Position:      4096,
+		Base:          1000000,
+		FrequencyDim:  headDim,
+		RotaryCount:   headDim,
+	}
+}
+
+func BenchmarkHIPRMSNormRoPEHeadsLaunchArgsBinaryInto_GemmaHeadDim512(b *testing.B) {
+	args := benchmarkHIPRMSNormRoPEHeadsLaunchArgs(512, 8)
+	var scratch [hipRMSNormRoPEHeadsLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipRMSNormRoPEHeadsLaunchArgsBytes {
+		b.Fatalf("RMSNorm RoPE heads launch bytes len = %d, want %d", len(payload), hipRMSNormRoPEHeadsLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("RMSNorm RoPE heads launch args: %v", err)
+		}
+		if len(payload) != hipRMSNormRoPEHeadsLaunchArgsBytes {
+			b.Fatalf("RMSNorm RoPE heads launch bytes len = %d, want %d", len(payload), hipRMSNormRoPEHeadsLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPRMSNormRoPEHeadsBatchLaunchArgsBinaryInto_GemmaHeadDim512(b *testing.B) {
+	args := benchmarkHIPRMSNormRoPEHeadsBatchLaunchArgs(512, 8, 16)
+	var scratch [hipRMSNormRoPEHeadsBatchLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipRMSNormRoPEHeadsBatchLaunchArgsBytes {
+		b.Fatalf("RMSNorm RoPE heads batch launch bytes len = %d, want %d", len(payload), hipRMSNormRoPEHeadsBatchLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("RMSNorm RoPE heads batch launch args: %v", err)
+		}
+		if len(payload) != hipRMSNormRoPEHeadsBatchLaunchArgsBytes {
+			b.Fatalf("RMSNorm RoPE heads batch launch bytes len = %d, want %d", len(payload), hipRMSNormRoPEHeadsBatchLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPKVEncodeTokenLaunchArgsBinaryInto_GemmaQ4Rows(b *testing.B) {
+	args := benchmarkHIPKVEncodeTokenLaunchArgs(512, 512, 1)
+	var scratch [hipKVEncodeTokenLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipKVEncodeTokenLaunchArgsBytes {
+		b.Fatalf("KV encode token launch bytes len = %d, want %d", len(payload), hipKVEncodeTokenLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("KV encode token launch args: %v", err)
+		}
+		if len(payload) != hipKVEncodeTokenLaunchArgsBytes {
+			b.Fatalf("KV encode token launch bytes len = %d, want %d", len(payload), hipKVEncodeTokenLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPKVDescriptorAppendLaunchArgsBinaryInto_GemmaQ4Rows(b *testing.B) {
+	args := benchmarkHIPKVDescriptorAppendLaunchArgs(64, 32768)
+	var scratch [hipKVDescriptorAppendLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipKVDescriptorAppendLaunchArgsBytes {
+		b.Fatalf("KV descriptor append launch bytes len = %d, want %d", len(payload), hipKVDescriptorAppendLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("KV descriptor append launch args: %v", err)
+		}
+		if len(payload) != hipKVDescriptorAppendLaunchArgsBytes {
+			b.Fatalf("KV descriptor append launch bytes len = %d, want %d", len(payload), hipKVDescriptorAppendLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPAttentionLaunchArgsBinaryInto_DeviceKV2k(b *testing.B) {
+	args := benchmarkHIPAttentionLaunchArgs(512, 2048)
+	var scratch [hipAttentionLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipAttentionLaunchArgsBytes {
+		b.Fatalf("attention launch bytes len = %d, want %d", len(payload), hipAttentionLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("attention launch args: %v", err)
+		}
+		if len(payload) != hipAttentionLaunchArgsBytes {
+			b.Fatalf("attention launch bytes len = %d, want %d", len(payload), hipAttentionLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPAttentionHeadsLaunchArgsBinaryInto_GemmaDeviceKV2k(b *testing.B) {
+	args := benchmarkHIPAttentionHeadsLaunchArgs(512, 8, 2048)
+	var scratch [hipAttentionHeadsLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipAttentionHeadsLaunchArgsBytes {
+		b.Fatalf("attention heads launch bytes len = %d, want %d", len(payload), hipAttentionHeadsLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("attention heads launch args: %v", err)
+		}
+		if len(payload) != hipAttentionHeadsLaunchArgsBytes {
+			b.Fatalf("attention heads launch bytes len = %d, want %d", len(payload), hipAttentionHeadsLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPTinyPrefillLaunchArgsBinaryInto_Small(b *testing.B) {
+	args := benchmarkHIPTinyPrefillLaunchArgs(32, 2048, 512)
+	var scratch [hipTinyPrefillLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipTinyPrefillLaunchArgsBytes {
+		b.Fatalf("tiny prefill launch bytes len = %d, want %d", len(payload), hipTinyPrefillLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("tiny prefill launch args: %v", err)
+		}
+		if len(payload) != hipTinyPrefillLaunchArgsBytes {
+			b.Fatalf("tiny prefill launch bytes len = %d, want %d", len(payload), hipTinyPrefillLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPTinyDecodeLaunchArgsBinaryInto_Small(b *testing.B) {
+	args := benchmarkHIPTinyDecodeLaunchArgs(64, 2048, 512)
+	var scratch [hipTinyDecodeLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipTinyDecodeLaunchArgsBytes {
+		b.Fatalf("tiny decode launch bytes len = %d, want %d", len(payload), hipTinyDecodeLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("tiny decode launch args: %v", err)
+		}
+		if len(payload) != hipTinyDecodeLaunchArgsBytes {
+			b.Fatalf("tiny decode launch bytes len = %d, want %d", len(payload), hipTinyDecodeLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPPerLayerInputTransposeLaunchArgsBinaryInto_GemmaUBatch(b *testing.B) {
+	args := benchmarkHIPPerLayerInputTransposeLaunchArgs(16, 26, 4096)
+	var scratch [hipPerLayerInputTransposeLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipPerLayerInputTransposeLaunchArgsBytes {
+		b.Fatalf("per-layer input transpose launch bytes len = %d, want %d", len(payload), hipPerLayerInputTransposeLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("per-layer input transpose launch args: %v", err)
+		}
+		if len(payload) != hipPerLayerInputTransposeLaunchArgsBytes {
+			b.Fatalf("per-layer input transpose launch bytes len = %d, want %d", len(payload), hipPerLayerInputTransposeLaunchArgsBytes)
+		}
+	}
+}
+
+func benchmarkHIPKVEncodeTokenLaunchArgs(keyWidth, valueWidth, tokenCount int) hipKVEncodeTokenLaunchArgs {
+	keyCount := keyWidth * tokenCount
+	valueCount := valueWidth * tokenCount
+	keyOutputBytes, err := rocmKVTensorDeviceByteCountRows(rocmKVEncodingQ4Rows, keyCount, tokenCount)
+	if err != nil {
+		panic(err)
+	}
+	valueOutputBytes, err := rocmKVTensorDeviceByteCountRows(rocmKVEncodingQ4Rows, valueCount, tokenCount)
+	if err != nil {
+		panic(err)
+	}
+	return hipKVEncodeTokenLaunchArgs{
+		KeyInputPointer:    0x1000,
+		ValueInputPointer:  0x2000,
+		KeyOutputPointer:   0x3000,
+		ValueOutputPointer: 0x4000,
+		KeyCount:           keyCount,
+		ValueCount:         valueCount,
+		KeyInputBytes:      uint64(keyCount * 4),
+		ValueInputBytes:    uint64(valueCount * 4),
+		KeyOutputBytes:     keyOutputBytes,
+		ValueOutputBytes:   valueOutputBytes,
+		KeyEncoding:        rocmDeviceKVDescriptorEncodingQ4Rows,
+		ValueEncoding:      rocmDeviceKVDescriptorEncodingQ4Rows,
+		KeyWidth:           keyWidth,
+		ValueWidth:         valueWidth,
+		TokenCount:         tokenCount,
+	}
+}
+
+func benchmarkHIPKVDescriptorAppendLaunchArgs(outputPages, outputTokens int) hipKVDescriptorAppendLaunchArgs {
+	newBytes, err := rocmKVTensorDeviceByteCountRows(rocmKVEncodingQ4Rows, 512, 1)
+	if err != nil {
+		panic(err)
+	}
+	return hipKVDescriptorAppendLaunchArgs{
+		PreviousDescriptorPointer: 0x1000,
+		OutputDescriptorPointer:   0x2000,
+		NewKeyPointer:             0x3000,
+		NewValuePointer:           0x4000,
+		PreviousDescriptorBytes:   uint64(rocmDeviceKVDescriptorHeaderBytes + (outputPages-1)*rocmDeviceKVDescriptorPageBytes),
+		OutputDescriptorBytes:     uint64(rocmDeviceKVDescriptorHeaderBytes + outputPages*rocmDeviceKVDescriptorPageBytes),
+		NewKeyBytes:               newBytes,
+		NewValueBytes:             newBytes,
+		ModeCode:                  rocmDeviceKVDescriptorModeKQ8VQ4,
+		BlockSize:                 rocmGemma4Q4DeviceKVBlockSize,
+		OutputPageCount:           outputPages,
+		OutputTokenCount:          outputTokens,
+		KeyWidth:                  512,
+		ValueWidth:                512,
+		NewKeyEncoding:            rocmDeviceKVDescriptorEncodingQ4Rows,
+		NewValueEncoding:          rocmDeviceKVDescriptorEncodingQ4Rows,
+		Reserved0:                 rocmKVDescriptorAppendModeGrowLastPage,
+	}
+}
+
+func benchmarkHIPAttentionLaunchArgs(dim, tokenCount int) hipAttentionLaunchArgs {
+	return hipAttentionLaunchArgs{
+		QueryPointer:      0x1000,
+		OutputPointer:     0x2000,
+		WeightPointer:     0x3000,
+		Dim:               dim,
+		TokenCount:        tokenCount,
+		QueryBytes:        uint64(dim * 4),
+		OutputBytes:       uint64(dim * 4),
+		WeightBytes:       uint64(tokenCount * 4),
+		KVSource:          hipAttentionKVSourceDevice,
+		Scale:             0.044194174,
+		DescriptorPointer: 0x4000,
+		DescriptorBytes:   uint64(rocmDeviceKVDescriptorHeaderBytes + 4*rocmDeviceKVDescriptorPageBytes),
+	}
+}
+
+func benchmarkHIPAttentionHeadsLaunchArgs(headDim, headCount, tokenCount int) hipAttentionHeadsLaunchArgs {
+	return hipAttentionHeadsLaunchArgs{
+		QueryPointer:      0x1000,
+		OutputPointer:     0x2000,
+		WeightPointer:     0x3000,
+		Dim:               headDim,
+		TokenCount:        tokenCount,
+		HeadCount:         headCount,
+		QueryBytes:        uint64(headDim * headCount * 4),
+		OutputBytes:       uint64(headDim * headCount * 4),
+		WeightBytes:       uint64(tokenCount * headCount * 4),
+		KVSource:          hipAttentionKVSourceDevice,
+		Scale:             0.044194174,
+		DescriptorPointer: 0x4000,
+		DescriptorBytes:   uint64(rocmDeviceKVDescriptorHeaderBytes + 4*rocmDeviceKVDescriptorPageBytes),
+	}
+}
+
+func benchmarkHIPTinyPrefillLaunchArgs(tokenCount, vocabSize, hiddenSize int) hipTinyPrefillLaunchArgs {
+	tableCount := vocabSize * hiddenSize
+	stateCount := tokenCount * hiddenSize
+	return hipTinyPrefillLaunchArgs{
+		TokenPointer:         0x1000,
+		EmbeddingPointer:     0x2000,
+		OutputWeightPointer:  0x3000,
+		LogitPointer:         0x4000,
+		AttentionPointer:     0x5000,
+		ResultPointer:        0x6000,
+		KeyPointer:           0x7000,
+		ValuePointer:         0x8000,
+		TokenCount:           tokenCount,
+		VocabSize:            vocabSize,
+		HiddenSize:           hiddenSize,
+		TokenBytes:           uint64(tokenCount * 4),
+		EmbeddingBytes:       uint64(tableCount * 4),
+		OutputWeightBytes:    uint64(tableCount * 4),
+		LogitBytes:           uint64(vocabSize * 4),
+		AttentionBytes:       uint64(tokenCount * 4),
+		ResultBytes:          hipGreedyResultBytes,
+		KeyBytes:             uint64(stateCount * 4),
+		ValueBytes:           uint64(stateCount * 4),
+		OutputWeightEncoding: hipTinyOutputWeightEncodingFP32,
+	}
+}
+
+func benchmarkHIPTinyDecodeLaunchArgs(priorTokenCount, vocabSize, hiddenSize int) hipTinyDecodeLaunchArgs {
+	tableCount := vocabSize * hiddenSize
+	priorCount := priorTokenCount * hiddenSize
+	updatedCount := (priorTokenCount + 1) * hiddenSize
+	return hipTinyDecodeLaunchArgs{
+		PriorKeyPointer:      0x1000,
+		PriorValuePointer:    0x2000,
+		EmbeddingPointer:     0x3000,
+		OutputWeightPointer:  0x4000,
+		LogitPointer:         0x5000,
+		AttentionPointer:     0x6000,
+		UpdatedKeyPointer:    0x7000,
+		UpdatedValuePointer:  0x8000,
+		ResultPointer:        0x9000,
+		TokenID:              42,
+		PriorTokenCount:      priorTokenCount,
+		VocabSize:            vocabSize,
+		HiddenSize:           hiddenSize,
+		PriorKeyBytes:        uint64(priorCount * 4),
+		PriorValueBytes:      uint64(priorCount * 4),
+		EmbeddingBytes:       uint64(tableCount * 4),
+		OutputWeightBytes:    uint64(tableCount * 4),
+		LogitBytes:           uint64(vocabSize * 4),
+		AttentionBytes:       uint64((priorTokenCount + 1) * 4),
+		UpdatedKeyBytes:      uint64(updatedCount * 4),
+		UpdatedValueBytes:    uint64(updatedCount * 4),
+		ResultBytes:          hipGreedyResultBytes,
+		OutputWeightEncoding: hipTinyOutputWeightEncodingFP32,
+	}
+}
+
+func benchmarkHIPPerLayerInputTransposeLaunchArgs(batch, layerCount, inputSize int) hipPerLayerInputTransposeLaunchArgs {
+	sizeBytes := uint64(batch * layerCount * inputSize * 4)
+	return hipPerLayerInputTransposeLaunchArgs{
+		InputPointer:  0x1000,
+		OutputPointer: 0x2000,
+		InputBytes:    sizeBytes,
+		OutputBytes:   sizeBytes,
+		Batch:         batch,
+		LayerCount:    layerCount,
+		InputSize:     inputSize,
+	}
+}
+
+func BenchmarkHIPGreedySampleLaunchArgsBinaryInto_Vocab256k(b *testing.B) {
+	args := benchmarkHIPGreedySampleLaunchArgs(256000)
+	var scratch [hipGreedyLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipGreedyLaunchArgsBytes {
+		b.Fatalf("greedy launch bytes len = %d, want %d", len(payload), hipGreedyLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("greedy launch args: %v", err)
+		}
+		if len(payload) != hipGreedyLaunchArgsBytes {
+			b.Fatalf("greedy launch bytes len = %d, want %d", len(payload), hipGreedyLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPSoftcapGreedySampleLaunchArgsBinaryInto_Vocab256k(b *testing.B) {
+	args := benchmarkHIPSoftcapGreedySampleLaunchArgs(256000)
+	var scratch [hipSoftcapGreedyLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipSoftcapGreedyLaunchArgsBytes {
+		b.Fatalf("softcap greedy launch bytes len = %d, want %d", len(payload), hipSoftcapGreedyLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("softcap greedy launch args: %v", err)
+		}
+		if len(payload) != hipSoftcapGreedyLaunchArgsBytes {
+			b.Fatalf("softcap greedy launch bytes len = %d, want %d", len(payload), hipSoftcapGreedyLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPSwiGLULaunchArgsBinaryInto_Hidden16384(b *testing.B) {
+	args := benchmarkHIPSwiGLULaunchArgs(16384)
+	var scratch [hipSwiGLULaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipSwiGLULaunchArgsBytes {
+		b.Fatalf("SwiGLU launch bytes len = %d, want %d", len(payload), hipSwiGLULaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("SwiGLU launch args: %v", err)
+		}
+		if len(payload) != hipSwiGLULaunchArgsBytes {
+			b.Fatalf("SwiGLU launch bytes len = %d, want %d", len(payload), hipSwiGLULaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPGELUTanhMultiplyLaunchArgsBinaryInto_Hidden16384(b *testing.B) {
+	args := benchmarkHIPGELUTanhMultiplyLaunchArgs(16384)
+	var scratch [hipGELUTanhMulLaunchArgsBytes]byte
+	payload, err := args.BinaryInto(scratch[:])
+	core.RequireNoError(b, err)
+	if len(payload) != hipGELUTanhMulLaunchArgsBytes {
+		b.Fatalf("GELU tanh multiply launch bytes len = %d, want %d", len(payload), hipGELUTanhMulLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		payload, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatalf("GELU tanh multiply launch args: %v", err)
+		}
+		if len(payload) != hipGELUTanhMulLaunchArgsBytes {
+			b.Fatalf("GELU tanh multiply launch bytes len = %d, want %d", len(payload), hipGELUTanhMulLaunchArgsBytes)
+		}
+	}
+}
+
+func benchmarkHIPGreedySampleLaunchArgs(count int) hipGreedySampleLaunchArgs {
+	return hipGreedySampleLaunchArgs{
+		LogitsPointer: 0x1000,
+		OutputPointer: 0x2000,
+		Count:         count,
+		LogitsBytes:   uint64(count * 4),
+		OutputBytes:   hipGreedyResultBytes,
+	}
+}
+
+func benchmarkHIPSoftcapGreedySampleLaunchArgs(count int) hipSoftcapGreedySampleLaunchArgs {
+	return hipSoftcapGreedySampleLaunchArgs{
+		LogitsPointer: 0x1000,
+		OutputPointer: 0x2000,
+		Count:         count,
+		LogitsBytes:   uint64(count * 4),
+		OutputBytes:   hipGreedyResultBytes,
+		Softcap:       30,
+	}
+}
+
+func benchmarkHIPSwiGLULaunchArgs(count int) hipSwiGLULaunchArgs {
+	return hipSwiGLULaunchArgs{
+		GatePointer:   0x1000,
+		UpPointer:     0x2000,
+		OutputPointer: 0x3000,
+		Count:         count,
+		GateBytes:     uint64(count * 4),
+		UpBytes:       uint64(count * 4),
+		OutputBytes:   uint64(count * 4),
+	}
+}
+
+func benchmarkHIPGELUTanhMultiplyLaunchArgs(count int) hipGELUTanhMultiplyLaunchArgs {
+	return hipGELUTanhMultiplyLaunchArgs{
+		GatePointer:   0x1000,
+		UpPointer:     0x2000,
+		OutputPointer: 0x3000,
+		Count:         count,
+		GateBytes:     uint64(count * 4),
+		UpBytes:       uint64(count * 4),
+		OutputBytes:   uint64(count * 4),
+	}
+}
+
+func benchmarkHIPRMSNormHeadsLaunchArgs(headDim, headCount int) hipRMSNormHeadsLaunchArgs {
+	total := headDim * headCount
+	return hipRMSNormHeadsLaunchArgs{
+		InputPointer:   0x1000,
+		WeightPointer:  0x2000,
+		OutputPointer:  0x3000,
+		HeadDim:        headDim,
+		HeadCount:      headCount,
+		InputBytes:     uint64(total * 4),
+		WeightBytes:    uint64(headDim * 2),
+		OutputBytes:    uint64(total * 4),
+		Epsilon:        1e-6,
+		WeightEncoding: hipRMSNormWeightEncodingBF16,
+		Flags:          hipRMSNormLaunchFlagAddUnitWeight,
+	}
+}
+
+func benchmarkHIPRMSNormRoPEHeadsLaunchArgs(headDim, headCount int) hipRMSNormRoPEHeadsLaunchArgs {
+	total := headDim * headCount
+	return hipRMSNormRoPEHeadsLaunchArgs{
+		InputPointer:   0x1000,
+		WeightPointer:  0x2000,
+		OutputPointer:  0x3000,
+		HeadDim:        headDim,
+		HeadCount:      headCount,
+		InputBytes:     uint64(total * 4),
+		WeightBytes:    uint64(headDim * 2),
+		OutputBytes:    uint64(total * 4),
+		Epsilon:        1e-6,
+		WeightEncoding: hipRMSNormWeightEncodingBF16,
+		Flags:          hipRMSNormLaunchFlagAddUnitWeight,
+		Position:       4096,
+		Base:           1000000,
+		FrequencyScale: 8,
+		FrequencyDim:   headDim,
+		RotaryCount:    headDim,
+	}
+}
+
+func benchmarkHIPRMSNormRoPEHeadsBatchLaunchArgs(headDim, headCount, batch int) hipRMSNormRoPEHeadsBatchLaunchArgs {
+	total := headDim * headCount * batch
+	return hipRMSNormRoPEHeadsBatchLaunchArgs{
+		InputPointer:   0x1000,
+		WeightPointer:  0x2000,
+		OutputPointer:  0x3000,
+		HeadDim:        headDim,
+		HeadCount:      headCount,
+		Batch:          batch,
+		InputBytes:     uint64(total * 4),
+		WeightBytes:    uint64(headDim * 2),
+		OutputBytes:    uint64(total * 4),
+		Epsilon:        1e-6,
+		WeightEncoding: hipRMSNormWeightEncodingBF16,
+		Flags:          hipRMSNormLaunchFlagAddUnitWeight,
+		StartPosition:  4096,
+		Base:           1000000,
+		FrequencyScale: 8,
+		FrequencyDim:   headDim,
+		RotaryCount:    headDim,
+	}
+}
+
+func benchmarkHIPMLXQ4ProjectionLaunchArgs(rows, cols, groupSize, bits int) hipMLXQ4ProjectionLaunchArgs {
+	packedPerRow := (cols * bits) / 32
+	groupsPerRow := cols / groupSize
+	return hipMLXQ4ProjectionLaunchArgs{
+		InputPointer:  0x1000,
+		WeightPointer: 0x2000,
+		ScalePointer:  0x3000,
+		BiasPointer:   0x4000,
+		OutputPointer: 0x5000,
+		Rows:          rows,
+		Cols:          cols,
+		GroupSize:     groupSize,
+		Bits:          bits,
+		InputBytes:    uint64(cols * 4),
+		WeightBytes:   uint64(rows * packedPerRow * 4),
+		ScaleBytes:    uint64(rows * groupsPerRow * 2),
+		BiasBytes:     uint64(rows * groupsPerRow * 2),
+		OutputBytes:   uint64(rows * 4),
+	}
+}
+
+func benchmarkHIPMLXQ4ProjectionBatchLaunchArgs(rows, cols, batch, groupSize, bits int) hipMLXQ4ProjectionBatchLaunchArgs {
+	packedPerRow := (cols * bits) / 32
+	groupsPerRow := cols / groupSize
+	return hipMLXQ4ProjectionBatchLaunchArgs{
+		InputPointer:  0x1000,
+		WeightPointer: 0x2000,
+		ScalePointer:  0x3000,
+		BiasPointer:   0x4000,
+		OutputPointer: 0x5000,
+		Rows:          rows,
+		Cols:          cols,
+		Batch:         batch,
+		GroupSize:     groupSize,
+		Bits:          bits,
+		InputBytes:    uint64(batch * cols * 4),
+		WeightBytes:   uint64(rows * packedPerRow * 4),
+		ScaleBytes:    uint64(rows * groupsPerRow * 2),
+		BiasBytes:     uint64(rows * groupsPerRow * 2),
+		OutputBytes:   uint64(batch * rows * 4),
+	}
+}
+
 func TestHIPKernels_BadDecodeDeviceMirrorFailureKeepsOriginalKV(t *testing.T) {
 	driver := &fakeHIPDriver{available: true}
 	model := &hipLoadedModel{driver: driver, kernels: fakeLinkedHIPKernelSet{}}
@@ -4717,8 +6635,8 @@ func TestHIPKernels_BadDecodeDescriptorTableFailureKeepsOriginalKV(t *testing.T)
 	if prefill.DeviceKV.closed || prefill.DescriptorTable.closed {
 		t.Fatalf("prefill device resources were closed after failed descriptor table update")
 	}
-	if got := len(driver.frees) - freesBeforeDecode; got != 5 {
-		t.Fatalf("decode frees = %d (%+v), want failed descriptor table and updated mirror cleaned up", got, driver.frees[freesBeforeDecode:])
+	if got := len(driver.frees) - freesBeforeDecode; got != 4 {
+		t.Fatalf("decode frees = %d (%+v), want pooled failed descriptor table and updated mirror cleaned up", got, driver.frees[freesBeforeDecode:])
 	}
 }
 
@@ -5023,6 +6941,22 @@ func expectedGELUTanhMultiplyFromQ4(t *testing.T, gateReq, upReq hipMLXQ4Project
 func expectedGELUTanhProjectionFromQ4(t *testing.T, req hipMLXQ4ProjectionRequest, multiplier []float32) []float32 {
 	t.Helper()
 	projected, err := hipReferenceMLXQ4Projection(req.Input, req.Weight, req.Scales, req.Biases, req.Rows, req.Cols, req.GroupSize)
+	core.RequireNoError(t, err)
+	return expectedGELUTanhMultiply(projected, multiplier)
+}
+
+func expectedGELUTanhMultiplyFromMLXAffine(t *testing.T, gateReq, upReq hipMLXQ4ProjectionRequest, bits int) []float32 {
+	t.Helper()
+	gate, err := hipReferenceMLXAffineProjection(gateReq.Input, gateReq.Weight, gateReq.Scales, gateReq.Biases, gateReq.Rows, gateReq.Cols, gateReq.GroupSize, bits)
+	core.RequireNoError(t, err)
+	up, err := hipReferenceMLXAffineProjection(upReq.Input, upReq.Weight, upReq.Scales, upReq.Biases, upReq.Rows, upReq.Cols, upReq.GroupSize, bits)
+	core.RequireNoError(t, err)
+	return expectedGELUTanhMultiply(gate, up)
+}
+
+func expectedGELUTanhProjectionFromMLXAffine(t *testing.T, req hipMLXQ4ProjectionRequest, multiplier []float32, bits int) []float32 {
+	t.Helper()
+	projected, err := hipReferenceMLXAffineProjection(req.Input, req.Weight, req.Scales, req.Biases, req.Rows, req.Cols, req.GroupSize, bits)
 	core.RequireNoError(t, err)
 	return expectedGELUTanhMultiply(projected, multiplier)
 }

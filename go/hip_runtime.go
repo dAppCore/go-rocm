@@ -8,6 +8,7 @@ import (
 	"context"
 	"io"
 	"iter"
+	"sort"
 	"sync"
 	"time"
 
@@ -32,8 +33,20 @@ type nativeHIPAsyncHostToDevice interface {
 	CopyHostToDeviceAsync(pointer nativeDevicePointer, data []byte) error
 }
 
+type nativeHIPLabeledHostToDevice interface {
+	CopyHostToDeviceLabeled(pointer nativeDevicePointer, data []byte, operation, label string) error
+}
+
 type nativeHIPDeviceMemset interface {
 	MemsetAsync(pointer nativeDevicePointer, value byte, size uint64) error
+}
+
+type nativeHIPKernelFunctionPrewarmer interface {
+	PrewarmKernelFunctions(kernelNames []string)
+}
+
+type nativeHIPDriverUnwrapper interface {
+	rocmUnwrapNativeHIPDriver() nativeHIPDriver
 }
 
 func hipCopyHostToDevice(driver nativeHIPDriver, pointer nativeDevicePointer, data []byte) error {
@@ -41,6 +54,13 @@ func hipCopyHostToDevice(driver nativeHIPDriver, pointer nativeDevicePointer, da
 		return async.CopyHostToDeviceAsync(pointer, data)
 	}
 	return driver.CopyHostToDevice(pointer, data)
+}
+
+func hipCopyHostToDeviceLabeled(driver nativeHIPDriver, pointer nativeDevicePointer, data []byte, operation, label string) error {
+	if labeled, ok := driver.(nativeHIPLabeledHostToDevice); ok {
+		return labeled.CopyHostToDeviceLabeled(pointer, data, operation, label)
+	}
+	return hipCopyHostToDevice(driver, pointer, data)
 }
 
 func hipMemsetDevice(driver nativeHIPDriver, pointer nativeDevicePointer, value byte, size uint64) error {
@@ -102,23 +122,64 @@ func (runtime *hipRuntime) LoadModel(path string, cfg nativeLoadConfig) (nativeM
 	if !runtime.driver.Available() {
 		return nil, core.E("rocm.hip.LoadModel", "HIP driver is not available", nil)
 	}
+	architecture := rocmNativeModelLoaderArchitecture(cfg)
+	if route, ok := ROCmModelLoaderRouteForArchitecture(architecture); ok {
+		if route.AttachedOnly {
+			if cfg.AllowAttachedOnly && route.NativeRuntime && route.Runtime == rocmModelLoaderRuntimeHIP && !route.MetadataOnly {
+				return loadHIPDefaultNativeModel(runtime, path, cfg)
+			}
+			return nil, core.E("rocm.hip.LoadModel", architecture+" is an attached drafter, not a standalone model; load it beside its target via LoadAttachedDrafterPairAsTextModel", nil)
+		}
+		if !rocmNativeModelLoaderRouteHasStandaloneLoader(route) {
+			return nil, core.E("rocm.hip.LoadModel", architecture+" has no standalone HIP model loader; route status is "+string(route.Status), nil)
+		}
+		if loader, ok := lookupROCmNativeModelLoader(architecture); ok {
+			return loader.load(runtime, path, cfg)
+		}
+		return nil, core.E("rocm.hip.LoadModel", "no native model loader registered for "+architecture, nil)
+	}
+	if loader, ok := lookupROCmNativeModelLoader(architecture); ok {
+		return loader.load(runtime, path, cfg)
+	}
+	return loadHIPDefaultNativeModel(runtime, path, cfg)
+}
+
+func loadHIPDefaultNativeModel(runtime *hipRuntime, path string, cfg nativeLoadConfig) (nativeModel, error) {
 	if err := validateHIPLoadConfig(cfg); err != nil {
 		return nil, core.E("rocm.hip.LoadModel", "validate tensor plan", err)
 	}
 	if err := validateHIPTensorFileRanges(path, cfg); err != nil {
 		return nil, core.E("rocm.hip.LoadModel", "validate tensor file ranges", err)
 	}
-	model := &hipLoadedModel{
-		driver:           runtime.driver,
-		kernels:          newHIPRuntimeKernelSet(runtime.driver),
-		modelInfo:        cfg.ModelInfo,
-		modelLabels:      cloneStringMap(cfg.ModelLabels),
-		contextSize:      cfg.ContextSize,
-		gemma4TextConfig: cloneNativeGemma4TextConfig(cfg.Gemma4TextConfig),
-		tensors:          make(map[string]hipTensor, len(cfg.Tensors)),
-		tokenText:        loadHIPTokenTextDecoderIfPresent(cfg.TokenizerPath),
-		createdAt:        time.Now(),
+	engineConfig := defaultHIPGemma4Q4EngineConfig()
+	if cfg.DeviceKVMode != "" {
+		engineConfig.DeviceKVMode = cfg.DeviceKVMode
 	}
+	if _, err := engineConfig.deviceKVMode(); err != nil {
+		return nil, core.E("rocm.hip.LoadModel", "validate Gemma4 engine config", err)
+	}
+	modelLabels := cloneStringMap(cfg.ModelLabels)
+	if isROCmGemma4Architecture(cfg.ModelInfo.Architecture) {
+		modelLabels = rocmApplyGemma4NativeConfigFeatureLabels(modelLabels, cfg.Gemma4TextConfig)
+	}
+	model := &hipLoadedModel{
+		driver:            runtime.driver,
+		kernels:           newHIPRuntimeKernelSet(runtime.driver),
+		modelPath:         path,
+		modelInfo:         cfg.ModelInfo,
+		modelLabels:       modelLabels,
+		engineProfile:     cfg.EngineProfile.clone(),
+		gemma4Q4Config:    engineConfig,
+		sequenceMixerPlan: cloneSequenceMixerLoadPlan(cfg.SequenceMixerPlan),
+		contextSize:       cfg.ContextSize,
+		gemma4TextConfig:  cloneNativeGemma4TextConfig(cfg.Gemma4TextConfig),
+		tensors:           make(map[string]hipTensor, len(cfg.Tensors)),
+		tokenText:         loadHIPTokenTextDecoderIfPresent(cfg.TokenizerPath),
+		createdAt:         time.Now(),
+	}
+	var tensorCopyBuffer []byte
+	tensorFiles := map[string]*core.OSFile{}
+	defer closeTensorSourceFiles(tensorFiles)
 	for _, tensor := range cfg.Tensors {
 		if tensor.ByteSize == 0 {
 			continue
@@ -130,12 +191,371 @@ func (runtime *hipRuntime) LoadModel(path string, cfg nativeLoadConfig) (nativeM
 		}
 		loaded := hipTensor{info: tensor, pointer: pointer}
 		model.tensors[tensor.Name] = loaded
-		if err := copyTensorToDevice(runtime.driver, path, cfg.DataOffset, loaded); err != nil {
+		tensorCopyBuffer, err = copyTensorToDevice(runtime.driver, path, cfg.DataOffset, loaded, tensorCopyBuffer, tensorFiles)
+		if err != nil {
 			model.Close()
 			return nil, core.E("rocm.hip.LoadModel", "copy tensor "+tensor.Name, err)
 		}
 	}
+	if model.sequenceMixerPlan != nil {
+		if err := model.bindSequenceMixerPlan(); err != nil {
+			model.Close()
+			return nil, core.E("rocm.hip.LoadModel", "bind sequence mixer plan", err)
+		}
+	}
+	hipPrewarmGemma4Q4TokenFilters(model)
+	hipPrewarmGemma4Q4KernelFunctions(model.driver)
+	hipPrewarmGemma4Q4LaunchPacketPools()
+	hipPrewarmGemma4Q4DeviceByteBuffers(model)
+	hipPrewarmGemma4Q4DeviceDecodeStates(model)
+	hipPrewarmGemma4Q4PrefillForwardLayerBatches(model)
+	rocmPrewarmDeviceKVHostPools()
+	hipPrewarmGemma4Q4DeviceKVDescriptorPointers(model)
+	hipPrewarmGemma4Q4DeviceKVTensorPointers(model)
+	hipPrewarmAttentionHeadsChunkedWorkspacePool()
+	hipPrewarmGemma4Q4AttentionWorkspaceDeviceBuffersForModel(model)
+	hipPrewarmGemma4Q4DefaultSuppressTokenBufferForModel(model)
 	return model, nil
+}
+
+var hipGemma4Q4WarmKernelNames = []string{
+	hipKernelNameKVEncodeToken,
+	hipKernelNameKVDescriptorAppend,
+	hipKernelNameProjection,
+	hipKernelNameProjectionBatch,
+	hipKernelNameMLXQ4Proj,
+	hipKernelNameMLXQ4ProjCols256,
+	hipKernelNameMLXQ4ProjQ6Row16,
+	hipKernelNameMLXQ4ProjQ6Row64,
+	hipKernelNameMLXQ4ProjBatch,
+	hipKernelNameMLXQ4ProjBatchQ6Row16,
+	hipKernelNameMLXQ4ProjGreedy,
+	hipKernelNameMLXQ4ProjGreedyQ6Row64,
+	hipKernelNameMLXQ4ProjGreedyBatch,
+	hipKernelNameMLXQ4ProjGreedyBatchQ6Row64,
+	hipKernelNameMLXQ4ProjScores,
+	hipKernelNameMLXQ4ProjScoresQ6Row64,
+	hipKernelNameMLXQ4ProjSelectedGreedy,
+	hipKernelNameMLXQ4ProjSelectedGreedyQ6Row64,
+	hipKernelNameOrderedEmbeddingCandidates,
+	hipKernelNamePackedTopK,
+	hipKernelNamePackedTopKSample,
+	hipKernelNameMLXQ4TripleProj,
+	hipKernelNameMLXQ4TripleProjQ6Row64,
+	hipKernelNameMLXQ4GELUTanhMul,
+	hipKernelNameMLXQ4GELUTanhMulQ6Cols1536,
+	hipKernelNameMLXQ4GELUTanhMulQ6Cols1536Row64,
+	hipKernelNameMLXQ4GELUTanhMulBatch,
+	hipKernelNameMLXQ4GELUTanhProj,
+	hipKernelNameMLXQ4GELUTanhProjQ6Row16,
+	hipKernelNameMLXQ4GELUTanhProjBatch,
+	hipKernelNameRMSNorm,
+	hipKernelNameRMSNormResidualAdd,
+	hipKernelNameRMSNormResAddNorm,
+	hipKernelNameRMSNormHeads,
+	hipKernelNameRMSNormRoPEHeads,
+	hipKernelNameRMSNormRoPEHeadsBatch,
+	hipKernelNameAttentionHeads,
+	hipKernelNameAttentionHeadsBatchCausal,
+	hipKernelNameAttentionHeadsChunkedStage1,
+	hipKernelNameAttentionHeadsChunkedStage2,
+	hipKernelNameAttentionHeadsBatchChunkedStage1,
+	hipKernelNameAttentionHeadsBatchChunkedStage2,
+	hipKernelNameVectorAddScaled,
+	hipKernelNameVectorScale,
+	hipKernelNamePerLayerInputTranspose,
+	hipKernelNameEmbedLookup,
+	hipKernelNameEmbedLookupGreedyToken,
+}
+
+func hipPrewarmGemma4Q4KernelFunctions(driver nativeHIPDriver) {
+	for driver != nil {
+		if prewarmer, ok := driver.(nativeHIPKernelFunctionPrewarmer); ok {
+			prewarmer.PrewarmKernelFunctions(hipGemma4Q4WarmKernelNames)
+			return
+		}
+		unwrapper, ok := driver.(nativeHIPDriverUnwrapper)
+		if !ok {
+			return
+		}
+		unwrapped := unwrapper.rocmUnwrapNativeHIPDriver()
+		if unwrapped == driver {
+			return
+		}
+		driver = unwrapped
+	}
+}
+
+var hipGemma4Q4WarmLaunchPacketSizes = []int{
+	hipKVEncodeTokenLaunchArgsBytes,
+	hipKVDescriptorAppendLaunchArgsBytes,
+	hipMLXQ4ProjectionLaunchArgsBytes,
+	hipMLXQ4ProjectionBatchLaunchArgsBytes,
+	hipMLXQ4TripleProjLaunchArgsBytes,
+	hipMLXQ4GELUTanhMulLaunchArgsBytes,
+	hipMLXQ4GELUTanhMulBatchLaunchArgsBytes,
+	hipMLXQ4GELUTanhProjLaunchArgsBytes,
+	hipMLXQ4GELUTanhProjBatchLaunchArgsBytes,
+	hipRMSNormLaunchArgsBytes,
+	hipRMSNormResidualAddArgsBytes,
+	hipRMSNormResAddNormArgsBytes,
+	hipRMSNormHeadsLaunchArgsBytes,
+	hipRMSNormRoPEHeadsLaunchArgsBytes,
+	hipRMSNormRoPEHeadsBatchLaunchArgsBytes,
+	hipAttentionHeadsLaunchArgsBytes,
+	hipAttentionHeadsBatchCausalLaunchArgsBytes,
+	hipAttentionHeadsChunkedLaunchArgsBytes,
+	hipAttentionHeadsBatchChunkedLaunchArgsBytes,
+	hipVectorAddScaledLaunchArgsBytes,
+	hipVectorScaleLaunchArgsBytes,
+	hipPerLayerInputTransposeLaunchArgsBytes,
+	hipEmbeddingLookupLaunchArgsBytes,
+	hipSoftcapGreedyLaunchArgsBytes,
+}
+
+func hipPrewarmGemma4Q4LaunchPacketPools() {
+	hipPrewarmLaunchPacketPools(hipGemma4Q4WarmLaunchPacketSizes, 4)
+}
+
+func hipPrewarmGemma4Q4DeviceByteBuffers(model *hipLoadedModel) {
+	if model == nil ||
+		!hipLoadedGemma4Q4GenerateLinked(model) {
+		return
+	}
+	hipPrewarmDeviceByteBufferPool(model.driver, hipMLXQ4ProjectionBestBytes, 4)
+}
+
+func hipPrewarmGemma4Q4DeviceDecodeStates(model *hipLoadedModel) {
+	if model == nil ||
+		!hipLoadedGemma4Q4GenerateLinked(model) ||
+		model.modelInfo.NumLayers <= 0 {
+		return
+	}
+	hipPrewarmGemma4Q4DeviceDecodeStatePool(model.modelInfo.NumLayers, 4)
+	hipPrewarmGemma4Q4DeviceLayerStatePool(model.modelInfo.NumLayers, 1)
+}
+
+func hipPrewarmGemma4Q4PrefillForwardLayerBatches(model *hipLoadedModel) {
+	if model == nil ||
+		!hipLoadedGemma4Q4GenerateLinked(model) ||
+		model.modelInfo.NumLayers <= 0 {
+		return
+	}
+	hipPrewarmGemma4Q4PrefillForwardLayerBatchPool(model.modelInfo.NumLayers, 4)
+}
+
+func hipPrewarmGemma4Q4DeviceKVDescriptorPointers(model *hipLoadedModel) {
+	if model == nil || model.driver == nil ||
+		!rocmDeviceKVTensorPoolDefaultDriverEnabled(model.driver) ||
+		!hipLoadedGemma4Q4GenerateLinked(model) ||
+		model.modelInfo.NumLayers <= 0 {
+		return
+	}
+	layerCount := model.modelInfo.NumLayers
+	rocmPrewarmDeviceKVDescriptorPointerPool(model.driver, layerCount*2, layerCount)
+}
+
+func hipPrewarmGemma4Q4DeviceKVTensorPointers(model *hipLoadedModel) {
+	if model == nil || model.driver == nil ||
+		!rocmDeviceKVTensorPoolDefaultDriverEnabled(model.driver) ||
+		!hipLoadedGemma4Q4GenerateLinked(model) ||
+		model.modelInfo.NumLayers <= 0 {
+		return
+	}
+	cfg, err := model.cachedGemma4Q4ForwardConfig(model.modelInfo.NumLayers)
+	if err != nil {
+		return
+	}
+	engineConfig := model.gemma4Q4EngineConfig()
+	mode, err := engineConfig.deviceKVMode()
+	if err != nil {
+		return
+	}
+	counts := hipGemma4Q4DeviceKVTensorPrewarmCountsForContextWithEngineConfig(cfg, mode, model.contextSize, engineConfig)
+	sizes := make([]uint64, 0, len(counts))
+	for sizeBytes, count := range counts {
+		if count > 0 {
+			sizes = append(sizes, sizeBytes)
+		}
+	}
+	sort.Slice(sizes, func(i, j int) bool { return sizes[i] < sizes[j] })
+	for _, sizeBytes := range sizes {
+		count := counts[sizeBytes]
+		rocmPrewarmDeviceKVTensorPool(model.driver, sizeBytes, count)
+	}
+}
+
+func hipPrewarmGemma4Q4AttentionWorkspaceDeviceBuffersForModel(model *hipLoadedModel) {
+	if model == nil || model.driver == nil ||
+		!hipLoadedGemma4Q4GenerateLinked(model) ||
+		model.modelInfo.NumLayers <= 0 {
+		return
+	}
+	cfg, err := model.cachedGemma4Q4ForwardConfig(model.modelInfo.NumLayers)
+	if err != nil {
+		return
+	}
+	_ = hipPrewarmGemma4Q4AttentionWorkspaceDeviceBuffers(model.driver, cfg, model.contextSize)
+}
+
+func hipPrewarmGemma4Q4AttentionWorkspaceModelHiddenBuffers(driver nativeHIPDriver, hiddenSize int) error {
+	if driver == nil || !driver.Available() || hiddenSize <= 0 {
+		return nil
+	}
+	workspace := hipBorrowAttentionHeadsChunkedWorkspace()
+	if _, err := workspace.EnsureScaledEmbedding(driver, hiddenSize); err != nil {
+		_ = hipRecycleAttentionHeadsChunkedWorkspace(workspace)
+		return err
+	}
+	if _, err := workspace.EnsurePrefillInputNormOutput(driver, hiddenSize); err != nil {
+		_ = hipRecycleAttentionHeadsChunkedWorkspace(workspace)
+		return err
+	}
+	if _, err := workspace.EnsureIntermediateOutput(driver, hiddenSize); err != nil {
+		_ = hipRecycleAttentionHeadsChunkedWorkspace(workspace)
+		return err
+	}
+	if _, err := workspace.EnsureFinalHiddenOutput(driver, hiddenSize, 0); err != nil {
+		_ = hipRecycleAttentionHeadsChunkedWorkspace(workspace)
+		return err
+	}
+	if _, err := workspace.EnsureNextInputOutput(driver, hiddenSize, 0); err != nil {
+		_ = hipRecycleAttentionHeadsChunkedWorkspace(workspace)
+		return err
+	}
+	workspace.resetBorrowedViews()
+	if hipReleaseAttentionHeadsChunkedWorkspace(workspace) {
+		return nil
+	}
+	return hipRecycleAttentionHeadsChunkedWorkspace(workspace)
+}
+
+func hipPrewarmGemma4Q4DefaultSuppressTokenBufferForModel(model *hipLoadedModel) {
+	if model == nil || model.driver == nil ||
+		!hipLoadedGemma4Q4GenerateLinked(model) ||
+		model.tokenText == nil {
+		return
+	}
+	tokens := hipGemma4Q4GenerationSuppressTokenIDs(model, nil)
+	if len(tokens) == 0 {
+		return
+	}
+	workspace := hipBorrowAttentionHeadsChunkedWorkspace()
+	if _, err := workspace.EnsureSuppressTokenBuffer(model.driver, tokens); err != nil {
+		_ = hipRecycleAttentionHeadsChunkedWorkspace(workspace)
+		return
+	}
+	if !hipReleaseAttentionHeadsChunkedWorkspace(workspace) {
+		_ = hipRecycleAttentionHeadsChunkedWorkspace(workspace)
+	}
+}
+
+func hipGemma4Q4DeviceKVTensorPrewarmCounts(cfg hipGemma4Q4ForwardConfig, mode string) map[uint64]int {
+	return hipGemma4Q4DeviceKVTensorPrewarmCountsForContext(cfg, mode, 0)
+}
+
+func hipGemma4Q4DeviceKVTensorPrewarmCountsForContext(cfg hipGemma4Q4ForwardConfig, mode string, contextSize int) map[uint64]int {
+	return hipGemma4Q4DeviceKVTensorPrewarmCountsForContextWithEngineConfig(cfg, mode, contextSize, defaultHIPGemma4Q4EngineConfig())
+}
+
+func hipGemma4Q4DeviceKVTensorPrewarmCountsForContextWithEngineConfig(cfg hipGemma4Q4ForwardConfig, mode string, contextSize int, engineConfig hipGemma4Q4EngineConfig) map[uint64]int {
+	keyEncoding, valueEncoding, ok := rocmKVInterleavedEncodingsForMode(mode)
+	if !ok || len(cfg.Layers) == 0 {
+		return nil
+	}
+	counts := make(map[uint64]int, 2)
+	var globalSizeBytes uint64
+	for _, layer := range cfg.Layers {
+		blockSize := engineConfig.deviceKVBlockSizeForSlidingWindow(layer.SlidingWindow)
+		if blockSize <= 0 {
+			continue
+		}
+		keyStride, err := rocmKVInterleavedRowStride(keyEncoding, layer.HeadDim)
+		if err != nil {
+			continue
+		}
+		valueStride, err := rocmKVInterleavedRowStride(valueEncoding, layer.HeadDim)
+		if err != nil {
+			continue
+		}
+		sizeBytes := (keyStride + valueStride) * uint64(blockSize)
+		if sizeBytes <= rocmDeviceKVTensorPoolDefaultBytes {
+			counts[sizeBytes]++
+			if layer.SlidingWindow <= 0 {
+				globalSizeBytes = sizeBytes
+			}
+		}
+	}
+	if globalSizeBytes > 0 && cfg.KVSharedLayers > 0 {
+		counts[globalSizeBytes] += cfg.KVSharedLayers
+	}
+	hipAddGemma4Q4DeviceKVAppendTokenPrewarmCounts(counts, cfg, mode)
+	if contextSize <= 0 {
+		return counts
+	}
+
+	sources := hipGemma4Q4SharedKVSourceByLayer(cfg)
+	contextCounts := make(map[uint64]int, len(counts))
+	ownerSlack := make(map[uint64]int, len(counts))
+	for index, layer := range cfg.Layers {
+		if index < len(sources) && sources[index] != index {
+			continue
+		}
+		blockSize := engineConfig.deviceKVBlockSizeForSlidingWindow(layer.SlidingWindow)
+		if blockSize <= 0 {
+			continue
+		}
+		keyStride, err := rocmKVInterleavedRowStride(keyEncoding, layer.HeadDim)
+		if err != nil {
+			continue
+		}
+		valueStride, err := rocmKVInterleavedRowStride(valueEncoding, layer.HeadDim)
+		if err != nil {
+			continue
+		}
+		sizeBytes := (keyStride + valueStride) * uint64(blockSize)
+		if sizeBytes > rocmDeviceKVTensorPoolDefaultBytes {
+			continue
+		}
+		tokenCount := contextSize
+		if layer.SlidingWindow > 0 && tokenCount > layer.SlidingWindow {
+			tokenCount = layer.SlidingWindow
+		}
+		pageCount := (tokenCount + blockSize - 1) / blockSize
+		contextCounts[sizeBytes] += pageCount
+		if layer.SlidingWindow > 0 && contextSize >= layer.SlidingWindow {
+			ownerSlack[sizeBytes]++
+		}
+	}
+	for sizeBytes, count := range contextCounts {
+		if count > counts[sizeBytes] {
+			counts[sizeBytes] = count
+		}
+	}
+	for sizeBytes, count := range ownerSlack {
+		counts[sizeBytes] += count
+	}
+	return counts
+}
+
+func hipAddGemma4Q4DeviceKVAppendTokenPrewarmCounts(counts map[uint64]int, cfg hipGemma4Q4ForwardConfig, mode string) {
+	if counts == nil || len(cfg.Layers) == 0 {
+		return
+	}
+	keyEncoding, valueEncoding := rocmKVEncodingsForMode(mode)
+	for _, layer := range cfg.Layers {
+		if layer.HeadDim <= 0 {
+			continue
+		}
+		keyBytes, err := rocmKVTensorDeviceByteCount(keyEncoding, layer.HeadDim)
+		if err == nil && keyBytes <= rocmDeviceKVTensorPoolDefaultBytes {
+			counts[keyBytes]++
+		}
+		valueBytes, err := rocmKVTensorDeviceByteCount(valueEncoding, layer.HeadDim)
+		if err == nil && valueBytes <= rocmDeviceKVTensorPoolDefaultBytes {
+			counts[valueBytes]++
+		}
+	}
 }
 
 type hipTensor struct {
@@ -144,26 +564,110 @@ type hipTensor struct {
 }
 
 type hipLoadedModel struct {
-	driver           nativeHIPDriver
-	kernels          hipKernelSet
-	modelInfo        inference.ModelInfo
-	modelLabels      map[string]string
-	contextSize      int
-	gemma4TextConfig nativeGemma4TextConfig
-	tensors          map[string]hipTensor
-	adapter          inference.AdapterIdentity
-	tinyLoRA         *hipLoadedTinyLoRAAdapter
-	smallLoRA        *hipLoadedSmallLoRAAdapter
-	classLoRA        *hipLoadedClassifierLoRAAdapter
-	tokenText        *hipTokenTextDecoder
-	q4ConfigMu       sync.Mutex
-	q4Config         hipGemma4Q4ForwardConfig
-	q4Layers         int
-	q4ConfigOK       bool
-	q4Suppress       []int32
-	q4Stop           []int32
-	createdAt        time.Time
-	closed           bool
+	driver                nativeHIPDriver
+	kernels               hipKernelSet
+	modelPath             string
+	modelInfo             inference.ModelInfo
+	modelLabels           map[string]string
+	engineProfile         ROCmModelProfile
+	gemma4Q4Config        hipGemma4Q4EngineConfig
+	sequenceMixerPlan     *SequenceMixerLoadPlan
+	sequenceMixerBindings *hipSequenceMixerBindings
+	contextSize           int
+	gemma4TextConfig      nativeGemma4TextConfig
+	tensors               map[string]hipTensor
+	adapter               inference.AdapterIdentity
+	tinyLoRA              *hipLoadedTinyLoRAAdapter
+	smallLoRA             *hipLoadedSmallLoRAAdapter
+	classLoRA             *hipLoadedClassifierLoRAAdapter
+	tokenText             *hipTokenTextDecoder
+	q4ConfigMu            sync.Mutex
+	q4Config              hipGemma4Q4ForwardConfig
+	q4Layers              int
+	q4ConfigOK            bool
+	q4Suppress            []int32
+	q4Stop                []int32
+	q4SuppressStop        []int32
+	q4SuppressStopOK      bool
+	attachedDrafterMu     sync.Mutex
+	attachedDrafter       *hipAttachedDrafterRuntime
+	smallPriorKeys        []float32
+	smallPriorValues      []float32
+	tinyPriorKeys         []float32
+	tinyPriorValues       []float32
+	createdAt             time.Time
+	closed                bool
+}
+
+func (model *hipLoadedModel) gemma4Q4EngineConfig() hipGemma4Q4EngineConfig {
+	cfg := defaultHIPGemma4Q4EngineConfig()
+	if model == nil || model.gemma4Q4Config.DeviceKVMode == "" {
+		return cfg
+	}
+	cfg.DeviceKVMode = model.gemma4Q4Config.DeviceKVMode
+	return cfg
+}
+
+func (model *hipLoadedModel) modelIdentity() inference.ModelIdentity {
+	if model == nil {
+		return inference.ModelIdentity{}
+	}
+	info := model.modelInfo
+	identity := inference.ModelIdentity{
+		Path:          model.modelPath,
+		Architecture:  firstNonEmptyString(info.Architecture, model.engineProfile.Architecture),
+		VocabSize:     info.VocabSize,
+		NumLayers:     info.NumLayers,
+		HiddenSize:    info.HiddenSize,
+		QuantBits:     info.QuantBits,
+		QuantGroup:    info.QuantGroup,
+		ContextLength: model.contextSize,
+		Labels:        cloneStringMap(model.modelLabels),
+	}
+	if len(identity.Labels) > 0 && identity.QuantType == "" {
+		identity.QuantType = identity.Labels["quant_type"]
+	}
+	if len(identity.Labels) > 0 && identity.QuantType == "" && rocmIsGemma4SizeQuantIdentity(identity.Architecture) {
+		identity.QuantType = identity.Labels["gemma4_quant_mode"]
+	}
+	return rocmGemma4ModelWithInferredPathQuant(identity)
+}
+
+func (model *hipLoadedModel) ModelProfile() ROCmModelProfile {
+	if model == nil {
+		return ROCmModelProfile{}
+	}
+	identity := model.modelIdentity()
+	profile := model.engineProfile
+	if !profile.Matched() {
+		var ok bool
+		profile, ok = ResolveROCmModelProfile(identity.Path, identity)
+		if !ok {
+			return ROCmModelProfile{}
+		}
+	}
+	profile.Model = identity
+	return profile.clone()
+}
+
+func (model *hipLoadedModel) ROCmEngineFeatures() ROCmEngineFeatures {
+	profile := model.ModelProfile()
+	if !profile.Matched() {
+		return ROCmEngineFeatures{}
+	}
+	features := profile.EngineFeatures
+	if features.empty() {
+		features = ROCmEngineFeaturesForProfile(profile)
+	}
+	return features.clone()
+}
+
+func (model *hipLoadedModel) ModelRoutePlan() ROCmModelRoutePlan {
+	profile := model.ModelProfile()
+	if !profile.Matched() {
+		return ROCmModelRoutePlan{}
+	}
+	return ROCmModelRoutePlanForProfile(profile)
 }
 
 func (model *hipLoadedModel) Generate(ctx context.Context, prompt string, cfg inference.GenerateConfig) (iter.Seq[inference.Token], func() error) {
@@ -194,6 +698,149 @@ func (model *hipLoadedModel) DecodeToken(ctx context.Context, req hipDecodeReque
 	return model.kernelSet().Decode(ctx, model, req)
 }
 
+func hipAttachedDrafterTargetRetainedDecodeStatus(model *hipLoadedModel) string {
+	if model == nil ||
+		!isROCmGemma4Architecture(model.modelInfo.Architecture) ||
+		!hipLoadedGemma4Q4GenerateLinked(model) ||
+		model.modelInfo.NumLayers <= 0 {
+		return hipKernelStatusNotLinked
+	}
+	if _, err := model.cachedGemma4Q4ForwardConfig(model.modelInfo.NumLayers); err != nil {
+		return hipKernelStatusNotLinked
+	}
+	return hipKernelStatusLinked
+}
+
+func (model *hipLoadedModel) AttachAttachedDrafter(draft nativeModel, plan AttachedDrafterPlan) (AttachedDrafterAttachment, error) {
+	if model == nil {
+		return AttachedDrafterAttachment{}, core.E("rocm.hip.AttachAttachedDrafter", "target model is nil", nil)
+	}
+	draftModel, ok := draft.(*hipLoadedModel)
+	if !ok || draftModel == nil {
+		return AttachedDrafterAttachment{}, core.E("rocm.hip.AttachAttachedDrafter", "draft model must be a loaded HIP Gemma4 assistant", nil)
+	}
+	if err := validateProductionMTPAttachedDrafterPlan(plan); err != nil {
+		return AttachedDrafterAttachment{}, core.E("rocm.hip.AttachAttachedDrafter", "validate plan", err)
+	}
+	if !isROCmGemma4Architecture(model.modelInfo.Architecture) {
+		return AttachedDrafterAttachment{}, core.E("rocm.hip.AttachAttachedDrafter", "target model must be a Gemma4 text model", nil)
+	}
+	if !isROCmGemma4AssistantArchitecture(draftModel.modelInfo.Architecture) {
+		return AttachedDrafterAttachment{}, core.E("rocm.hip.AttachAttachedDrafter", "draft model must be a Gemma4 assistant attached MTP drafter", nil)
+	}
+	if model.modelInfo.HiddenSize > 0 && draftModel.modelInfo.HiddenSize > 0 && model.modelInfo.HiddenSize != draftModel.modelInfo.HiddenSize {
+		targetIdentity := rocmGemma4ModelWithInferredPathQuant(model.modelIdentity())
+		draftIdentity := rocmGemma4ModelWithInferredPathQuant(draftModel.modelIdentity())
+		backboneHidden, backboneOK := hipAttachedDrafterAssistantIntLabelValue([]map[string]string{
+			draftIdentity.Labels,
+			draftModel.modelLabels,
+			targetIdentity.Labels,
+			plan.Labels,
+		},
+			"attached_drafter_assistant_backbone_hidden_size",
+			"attached.drafter.assistant.backbone_hidden_size",
+			"engine_attached_drafter_assistant_backbone_hidden_size",
+		)
+		if !backboneOK {
+			return AttachedDrafterAttachment{}, core.E("rocm.hip.AttachAttachedDrafter", core.Sprintf("draft hidden size %d differs from target hidden size %d and assistant backbone hidden size is missing", draftModel.modelInfo.HiddenSize, model.modelInfo.HiddenSize), nil)
+		}
+		if backboneHidden != model.modelInfo.HiddenSize {
+			return AttachedDrafterAttachment{}, core.E("rocm.hip.AttachAttachedDrafter", core.Sprintf("assistant backbone hidden size %d does not match target hidden size %d", backboneHidden, model.modelInfo.HiddenSize), nil)
+		}
+	}
+	if model.modelInfo.VocabSize > 0 && draftModel.modelInfo.VocabSize > 0 && model.modelInfo.VocabSize != draftModel.modelInfo.VocabSize {
+		return AttachedDrafterAttachment{}, core.E("rocm.hip.AttachAttachedDrafter", core.Sprintf("draft vocab size %d does not match target vocab size %d", draftModel.modelInfo.VocabSize, model.modelInfo.VocabSize), nil)
+	}
+	labels := cloneStringMap(plan.Labels)
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	targetRetainedDecode := hipAttachedDrafterTargetRetainedDecodeStatus(model)
+	nativeHandoff := attachedDrafterNativeHandoffPendingTargetDecode
+	if targetRetainedDecode == hipKernelStatusLinked {
+		nativeHandoff = attachedDrafterNativeHandoffTargetDecodeOnly
+	}
+	assistantVerify := hipKernelStatusNotLinked
+	assistantPreflight := hipAttachedDrafterAssistantVerifierPreflightFor(model, draftModel, plan.Labels)
+	for key, value := range assistantPreflight.Labels() {
+		labels[key] = value
+	}
+	assistantPlan, assistantPlanErr := hipAttachedDrafterAssistantVerifierPlanFor(model, draftModel, plan.Labels)
+	assistantPlanStatus := assistantPlan.Status
+	inputPlan := hipAttachedDrafterAssistantDraftStepInputPlan{}
+	softcap := draftModel.loadedGemma4Q4FinalLogitSoftcap()
+	if assistantPlanErr != nil {
+		assistantPlanStatus = attachedDrafterAssistantVerifierPlanUnsupported
+		labels["attached_drafter_assistant_verifier_plan"] = assistantPlanStatus
+		labels["attached_drafter_assistant_verifier_plan_reason"] = assistantPlanErr.Error()
+		labels["attached_drafter_assistant_verifier_kernel"] = "not_linked"
+	} else {
+		for key, value := range assistantPlan.Labels() {
+			labels[key] = value
+		}
+		for key, value := range hipAttachedDrafterAssistantLayerRuntimeLabels(assistantPlan) {
+			labels[key] = value
+		}
+		if targetRetainedDecode == hipKernelStatusLinked && assistantPlan.Status == attachedDrafterAssistantVerifierPlanTensorBound {
+			inputPlan = hipAttachedDrafterAssistantDraftStepInputPlanForModel(model, assistantPlan)
+			for key, value := range inputPlan.Labels() {
+				labels[key] = value
+			}
+			for key, value := range hipAttachedDrafterAssistantDraftStepHiddenRuntimeLabels(assistantPlan, inputPlan) {
+				labels[key] = value
+			}
+			for key, value := range hipAttachedDrafterAssistantDraftStepProposalRuntimeLabels(assistantPlan, inputPlan, softcap) {
+				labels[key] = value
+			}
+		}
+	}
+	linked := targetRetainedDecode == hipKernelStatusLinked &&
+		assistantPlanErr == nil &&
+		assistantPlan.Status == attachedDrafterAssistantVerifierPlanTensorBound &&
+		inputPlan.Status == attachedDrafterAssistantDraftStepInputLinked &&
+		hipAttachedDrafterAssistantDraftStepProposalPlanInvalidReason(assistantPlan, softcap) == nil
+	if linked {
+		nativeHandoff = attachedDrafterNativeHandoffRetainedStateVerifier
+		assistantVerify = hipKernelStatusLinked
+	}
+	nativeAttachment := hipKernelStatusNotLinked
+	var linkedRuntime *hipAttachedDrafterRuntime
+	if linked {
+		nativeAttachment = hipKernelStatusLinked
+		linkedRuntime = &hipAttachedDrafterRuntime{
+			draft:         draftModel,
+			assistantPlan: assistantPlan,
+			inputPlan:     inputPlan,
+			softcap:       softcap,
+		}
+	}
+	labels["attached_drafter_native_attachment"] = nativeAttachment
+	labels["attached_drafter_native_handoff"] = nativeHandoff
+	labels["attached_drafter_prompt_replay_fallback"] = "forbidden"
+	labels["attached_drafter_retained_state_entrypoint"] = hipKernelStatusLinked
+	labels["attached_drafter_retained_state_required"] = "true"
+	labels["attached_drafter_runtime"] = "hip"
+	labels["attached_drafter_state_source"] = "rocm_state_session_runtime_kv"
+	labels["attached_drafter_target_retained_decode"] = targetRetainedDecode
+	labels["attached_drafter_target_retained_state_decode"] = targetRetainedDecode
+	labels["attached_drafter_assistant_verify"] = assistantVerify
+	labels["attached_drafter_assistant_state_verify"] = assistantVerify
+	attachment := AttachedDrafterAttachment{
+		Plan:             plan,
+		Target:           rocmNormalizeModelInfo(model.modelInfo),
+		Draft:            rocmNormalizeModelInfo(draftModel.modelInfo),
+		NativeAttachment: nativeAttachment,
+		Labels:           labels,
+	}
+	if linkedRuntime != nil {
+		linkedRuntime.attachment = cloneAttachedDrafterAttachment(attachment)
+		model.storeAttachedDrafterRuntime(linkedRuntime)
+	} else {
+		model.storeAttachedDrafterRuntime(nil)
+	}
+	return attachment, attachedDrafterAttachError(linked, targetRetainedDecode, assistantVerify, assistantPreflight.Status, assistantPlanStatus)
+}
+
 func (model *hipLoadedModel) Encode(text string) []int32 {
 	if model != nil && model.tokenText != nil {
 		return model.tokenText.Encode(text)
@@ -214,6 +861,13 @@ func (model *hipLoadedModel) Decode(ids []int32) string {
 func (model *hipLoadedModel) ApplyChatTemplate(messages []inference.Message) (string, error) {
 	if model != nil && isROCmGemma4Architecture(model.modelInfo.Architecture) {
 		return formatGemma4ChatTemplate(messages), nil
+	}
+	return formatFallbackChatTemplate(messages), nil
+}
+
+func (model *hipLoadedModel) applyChatTemplateWithGenerateConfig(messages []inference.Message, cfg inference.GenerateConfig) (string, error) {
+	if model != nil && isROCmGemma4Architecture(model.modelInfo.Architecture) {
+		return formatGemma4ChatTemplateWithConfig(messages, model.gemma4ChatTemplateConfig(cfg, false)), nil
 	}
 	return formatFallbackChatTemplate(messages), nil
 }
@@ -276,6 +930,9 @@ func (model *hipLoadedModel) UnloadAdapter() error {
 func validateHIPLoadConfig(cfg nativeLoadConfig) error {
 	if !hipSupportedModelQuantization(cfg.ModelInfo) {
 		return core.E("rocm.hip.Validate", "unsupported quantization", nil)
+	}
+	if cfg.DeviceKVMode != "" && !isROCmKVCacheMode(cfg.DeviceKVMode) {
+		return core.E("rocm.hip.Validate", core.Sprintf("unsupported device KV cache mode %q", cfg.DeviceKVMode), nil)
 	}
 	if cfg.DataOffset < 0 {
 		return core.E("rocm.hip.Validate", "data offset must be non-negative", nil)
@@ -520,9 +1177,13 @@ func hipTensorDimensionsContainLogical(tensor nativeTensorInfo, value uint64, in
 	if hipDimensionsContain(tensor.Dimensions, value) {
 		return true
 	}
-	if info.QuantBits == 4 && (tensor.Type == 26 || core.Upper(tensor.TypeName) == "U32") {
+	if hipMLXAffineSupportedBits(info.QuantBits) && (tensor.Type == 26 || core.Upper(tensor.TypeName) == "U32") {
 		for _, dimension := range tensor.Dimensions {
-			if dimension <= ^uint64(0)/8 && dimension*8 == value {
+			if dimension > uint64(int(^uint(0)>>1)) {
+				continue
+			}
+			cols, err := hipMLXAffineColsFromPackedCols(int(dimension), info.QuantBits)
+			if err == nil && uint64(cols) == value {
 				return true
 			}
 		}
@@ -602,6 +1263,7 @@ func (model *hipLoadedModel) Close() error {
 	model.tinyLoRA = nil
 	model.smallLoRA = nil
 	model.classLoRA = nil
+	model.storeAttachedDrafterRuntime(nil)
 	model.closed = true
 	return lastErr
 }
@@ -614,7 +1276,14 @@ func (model *hipLoadedModel) deviceBytes() uint64 {
 	return total
 }
 
-func copyTensorToDevice(driver nativeHIPDriver, path string, dataOffset int64, tensor hipTensor) error {
+func closeTensorSourceFiles(files map[string]*core.OSFile) {
+	for path, file := range files {
+		_ = file.Close()
+		delete(files, path)
+	}
+}
+
+func copyTensorToDevice(driver nativeHIPDriver, path string, dataOffset int64, tensor hipTensor, buffer []byte, fileCache map[string]*core.OSFile) ([]byte, error) {
 	sourcePath := tensor.info.SourcePath
 	if sourcePath == "" {
 		sourcePath = path
@@ -624,31 +1293,47 @@ func copyTensorToDevice(driver nativeHIPDriver, path string, dataOffset int64, t
 	if tensor.info.SourcePath == "" && tensor.info.DataOffset != 0 {
 		dataOffset = tensor.info.DataOffset
 	}
-	fileResult := core.Open(sourcePath)
-	if !fileResult.OK {
-		return fileResult.Value.(error)
+	file := fileCache[sourcePath]
+	closeFile := false
+	if file == nil {
+		fileResult := core.Open(sourcePath)
+		if !fileResult.OK {
+			return buffer, fileResult.Value.(error)
+		}
+		file = fileResult.Value.(*core.OSFile)
+		if fileCache != nil {
+			fileCache[sourcePath] = file
+		} else {
+			closeFile = true
+		}
 	}
-	file := fileResult.Value.(*core.OSFile)
-	defer file.Close()
+	if closeFile {
+		defer file.Close()
+	}
 
 	start := dataOffset + int64(tensor.info.Offset)
 	if _, err := file.Seek(start, io.SeekStart); err != nil {
-		return err
+		return buffer, err
 	}
 
 	remaining := tensor.info.ByteSize
-	buffer := make([]byte, min(uint64(nativeTensorCopyChunkBytes), remaining))
+	bufferBytes := int(min(uint64(nativeTensorCopyChunkBytes), remaining))
+	if cap(buffer) < bufferBytes {
+		buffer = make([]byte, bufferBytes)
+	} else {
+		buffer = buffer[:bufferBytes]
+	}
 	var copied uint64
 	for remaining > 0 {
 		chunk := int(min(uint64(len(buffer)), remaining))
 		if _, err := io.ReadFull(file, buffer[:chunk]); err != nil {
-			return err
+			return buffer, err
 		}
 		if err := hipCopyPinnedHostToDevice(driver, tensor.pointer+nativeDevicePointer(copied), buffer[:chunk]); err != nil {
-			return err
+			return buffer, err
 		}
 		copied += uint64(chunk)
 		remaining -= uint64(chunk)
 	}
-	return nil
+	return buffer, nil
 }

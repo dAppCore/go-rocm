@@ -9,9 +9,11 @@ import (
 	"encoding/binary"
 	"math"
 	"testing"
+	"unsafe"
 
 	core "dappco.re/go"
 	"dappco.re/go/inference"
+	inferdecode "dappco.re/go/inference/decode"
 )
 
 func TestHIPSmallDecode_Good_QwenGemmaSmoke(t *testing.T) {
@@ -312,6 +314,10 @@ func TestHIPGemma4Q4Layer0_Good(t *testing.T) {
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, true, tokenPrompt)
 	core.AssertEqual(t, []int32{1, 0}, parsedTokens)
+	parsedTokens, tokenPrompt, err = hipGemma4Q4TokenPromptIDs(" TOKENS:1, 0", cfg.VocabSize)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, true, tokenPrompt)
+	core.AssertEqual(t, []int32{1, 0}, parsedTokens)
 	_, tokenPrompt, err = hipGemma4Q4TokenPromptIDs("hello", cfg.VocabSize)
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, false, tokenPrompt)
@@ -328,12 +334,23 @@ func TestHIPGemma4Q4Layer0_Good(t *testing.T) {
 	}
 
 	launchStart := len(driver.launches)
-	stream, streamErr := hipGemma4Q4GenerateTokenSeq(context.Background(), &hipLoadedModel{driver: driver}, decodeCfg, []int32{1, 0}, inference.GenerateConfig{MaxTokens: 2})
+	var retainedState *hipGemma4Q4DeviceDecodeState
+	stream, streamErr := hipGemma4Q4GenerateTokenSeqWithState(context.Background(), &hipLoadedModel{driver: driver}, decodeCfg, []int32{1, 0}, inference.GenerateConfig{MaxTokens: 2}, defaultHIPGemma4Q4EngineConfig(), nil, func(state *hipGemma4Q4DeviceDecodeState) error {
+		retainedState = state
+		return nil
+	})
 	var generated []inference.Token
 	for token := range stream {
 		generated = append(generated, token)
 	}
 	core.RequireNoError(t, streamErr())
+	if retainedState == nil {
+		t.Fatal("Gemma4 q4 generate did not retain device state")
+	}
+	core.AssertEqual(t, false, retainedState.closed)
+	core.AssertEqual(t, len(decodeCfg.Layers), retainedState.LayerCount())
+	core.AssertGreater(t, retainedState.maxLayerTokenCount(), 0)
+	core.RequireNoError(t, retainedState.Close())
 	core.AssertEqual(t, 2, len(generated))
 	core.AssertEqual(t, 3, countEmbeddingLaunches(launchStart))
 	core.AssertEqual(t, 6, countKVEncodeTokenLaunches(driver.launches[launchStart:]))
@@ -344,6 +361,20 @@ func TestHIPGemma4Q4Layer0_Good(t *testing.T) {
 		core.AssertEqual(t, int32(0), token.ID)
 		core.AssertEqual(t, "<token:0>", token.Text)
 	}
+
+	statefulModel := &rocmModel{}
+	stream, streamErr = statefulModel.hipGemma4Q4GenerateTokenSeq(context.Background(), nil, &hipLoadedModel{driver: driver}, decodeCfg, []int32{1, 0}, inference.GenerateConfig{MaxTokens: 1})
+	generated = nil
+	for token := range stream {
+		generated = append(generated, token)
+	}
+	core.RequireNoError(t, streamErr())
+	core.AssertEqual(t, 1, len(generated))
+	statefulRuntime, ok := statefulModel.state.runtime.(*hipGemma4Q4DeviceDecodeState)
+	core.RequireTrue(t, ok)
+	core.AssertEqual(t, false, statefulRuntime.closed)
+	core.AssertEqual(t, len(decodeCfg.Layers), statefulRuntime.LayerCount())
+	core.RequireNoError(t, statefulModel.Close())
 
 	tokenText := &hipTokenTextDecoder{
 		vocab: map[string]int32{
@@ -403,30 +434,43 @@ func TestHIPGemma4Q4Layer0_Good(t *testing.T) {
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, true, textPrompt)
 	core.AssertEqual(t, []int32{12, 15}, textPromptTokens)
+	textPromptTokens, textPrompt, err = hipGemma4Q4TextPromptIDs(" TEXT:he z", &hipLoadedModel{tokenText: tokenText})
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, true, textPrompt)
+	core.AssertEqual(t, []int32{12, 15}, textPromptTokens)
 	_, textPrompt, err = hipGemma4Q4TextPromptIDs("he z", &hipLoadedModel{
-		modelInfo: inference.ModelInfo{Architecture: "gemma4", QuantBits: 4},
+		modelInfo:   inference.ModelInfo{Architecture: "gemma4", QuantBits: 4},
+		modelLabels: linkedGemma4TestLabels("E2B", "q4"),
+		tokenText:   tokenText,
+	})
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, true, textPrompt)
+	_, textPrompt, err = hipGemma4Q4TextPromptIDs("he z", &hipLoadedModel{
+		modelInfo: inference.ModelInfo{Architecture: "gemma4", QuantBits: 16},
 		tokenText: tokenText,
 	})
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, false, textPrompt)
-	t.Setenv("GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE", "1")
 	textPromptTokens, textPrompt, err = hipGemma4Q4TextPromptIDs("he z", &hipLoadedModel{
-		modelInfo: inference.ModelInfo{Architecture: "gemma4", QuantBits: 4},
-		tokenText: tokenText,
+		modelInfo:   inference.ModelInfo{Architecture: "gemma4", QuantBits: 4},
+		modelLabels: linkedGemma4TestLabels("E2B", "q4"),
+		tokenText:   tokenText,
 	})
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, true, textPrompt)
 	core.AssertEqual(t, []int32{12, 15}, textPromptTokens)
 	textPromptTokens, textPrompt, err = hipGemma4Q4TextPromptIDs(" z", &hipLoadedModel{
-		modelInfo: inference.ModelInfo{Architecture: "gemma4", QuantBits: 4},
-		tokenText: tokenText,
+		modelInfo:   inference.ModelInfo{Architecture: "gemma4", QuantBits: 4},
+		modelLabels: linkedGemma4TestLabels("E2B", "q4"),
+		tokenText:   tokenText,
 	})
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, true, textPrompt)
 	core.AssertEqual(t, []int32{15}, textPromptTokens)
 	textPromptTokens, textPrompt, err = hipGemma4Q4TextPromptIDs("he", &hipLoadedModel{
-		modelInfo: inference.ModelInfo{Architecture: "gemma4_text", QuantBits: 4},
-		tokenText: tokenText,
+		modelInfo:   inference.ModelInfo{Architecture: "gemma4_text", QuantBits: 4},
+		modelLabels: linkedGemma4TestLabels("E2B", "q4"),
+		tokenText:   tokenText,
 	})
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, true, textPrompt)
@@ -465,6 +509,7 @@ func TestHIPGemma4Q4Layer0_Good(t *testing.T) {
 }
 
 func TestHIPGemma4Q4GenerateTokenSeq_UsesBatchedPrefill_Good(t *testing.T) {
+	hipDrainAttentionHeadsChunkedWorkspacePoolForTest(t)
 	driver := &fakeHIPDriver{available: true}
 	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
 	defer cleanup0()
@@ -501,10 +546,12 @@ func TestHIPGemma4Q4GenerateTokenSeq_UsesBatchedPrefill_Good(t *testing.T) {
 	defer cleanupPerLayer()
 	cfg := hipGemma4Q4ForwardConfig{Layers: layers}
 	core.AssertEqual(t, true, hipGemma4Q4CanUseBatchedGeneratePrefill(cfg))
-	t.Setenv(hipGemma4Q4PrefillUBatchEnv, "2")
+	engineConfig := defaultHIPGemma4Q4EngineConfig()
+	engineConfig.PrefillUBatchTokens = 2
 
 	start := len(driver.launches)
-	stream, streamErr := hipGemma4Q4GenerateTokenSeq(context.Background(), &hipLoadedModel{driver: driver}, cfg, []int32{0, 1, 0}, inference.GenerateConfig{MaxTokens: 1})
+	allocStart := len(driver.allocations)
+	stream, streamErr := hipGemma4Q4GenerateTokenSeqWithEngineConfig(context.Background(), &hipLoadedModel{driver: driver}, cfg, []int32{0, 1, 0}, inference.GenerateConfig{MaxTokens: 1}, engineConfig)
 	var generated []inference.Token
 	for token := range stream {
 		generated = append(generated, token)
@@ -521,6 +568,64 @@ func TestHIPGemma4Q4GenerateTokenSeq_UsesBatchedPrefill_Good(t *testing.T) {
 	if batchProjectionLaunches == 0 || batchAttentionLaunches == 0 || finalGreedyLaunches == 0 {
 		t.Fatalf("Gemma4 q4 generate batched prefill launches projection_batch=%d attention_batch=%d final_greedy=%d, want all nonzero", batchProjectionLaunches, batchAttentionLaunches, finalGreedyLaunches)
 	}
+	wantGreedySlots := hipProjectionGreedyRoundFirstSlabSlots(hipProjectionGreedyReserveSlots + 3)
+	core.AssertEqual(t, 1, countUint64Value(driver.allocations[allocStart:], uint64(wantGreedySlots*hipMLXQ4ProjectionBestBytes)))
+}
+
+func TestHIPAttachedDrafterTargetPrefillUsesBatchedPath_Good(t *testing.T) {
+	hipDrainAttentionHeadsChunkedWorkspacePoolForTest(t)
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup0()
+	layer1, cleanup1 := hipGemma4Q4FixtureConfig(t, driver, 1, 4, 2, 8)
+	defer cleanup1()
+	hipGemma4Q4InstallNonzeroEmbeddingFixture(t, driver, &layer0, "attached target batched prefill")
+	layers, cleanupPerLayer := hipGemma4Q4GlobalPerLayerInputFixture(t, driver, []hipGemma4Q4Layer0Config{layer0, layer1})
+	defer cleanupPerLayer()
+	cfg := hipGemma4Q4ForwardConfig{Layers: layers}
+	core.AssertEqual(t, true, hipGemma4Q4CanUseBatchedGeneratePrefill(cfg))
+	engineConfig := defaultHIPGemma4Q4EngineConfig()
+	engineConfig.PrefillUBatchTokens = 2
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	workspace.EnsureProjectionGreedyBestCapacity(4)
+	greedyBuffer, err := workspace.BorrowProjectionGreedyBest(driver)
+	core.RequireNoError(t, err)
+
+	start := len(driver.launches)
+	result, err := hipRunAttachedDrafterTargetPrefill(context.Background(), driver, hipAttachedDrafterTargetPrefillRequest{
+		TargetForward: cfg,
+		DeviceKVMode:  rocmKVCacheModeKQ8VQ4,
+		EngineConfig:  engineConfig,
+		InputTokenIDs: []int32{0, 1, 0},
+		Position:      0,
+		Epsilon:       1e-6,
+		GreedyBuffer:  greedyBuffer,
+		Workspace:     workspace,
+	})
+	core.RequireNoError(t, err)
+	defer result.DeviceState.Close()
+	defer hipReleaseForwardDeviceFinalHidden(&result.Current)
+
+	core.AssertEqual(t, int32(0), result.LastToken)
+	core.AssertEqual(t, 3, result.Position)
+	core.AssertEqual(t, 2, result.TargetCalls)
+	core.AssertEqual(t, []int{3, 3}, result.DeviceState.LayerTokenCounts())
+	if result.Current.DeviceFinalHidden == nil || result.Current.DeviceFinalHidden.Pointer() == 0 {
+		t.Fatalf("attached target prefill hidden = %#v, want cloned final hidden", result.Current.DeviceFinalHidden)
+	}
+	launches := driver.launches[start:]
+	core.AssertEqual(t, 0, countLaunchName(launches, hipKernelNameEmbedLookupGreedyToken))
+	core.AssertEqual(t, 0, countLaunchName(launches, hipKernelNameMLXQ4Proj))
+	if batchProjectionLaunches := countLaunchName(launches, hipKernelNameMLXQ4ProjBatch); batchProjectionLaunches == 0 {
+		t.Fatalf("attached target prefill launched projection_batch=%d, want batched projection", batchProjectionLaunches)
+	}
+	if batchAttentionLaunches := countLaunchName(launches, hipKernelNameAttentionHeadsBatchCausal); batchAttentionLaunches == 0 {
+		t.Fatalf("attached target prefill launched attention_batch=%d, want batched attention", batchAttentionLaunches)
+	}
+	if finalGreedyLaunches := countLaunchName(launches, hipKernelNameMLXQ4ProjGreedy); finalGreedyLaunches == 0 {
+		t.Fatalf("attached target prefill launched final_greedy=%d, want final greedy projection", finalGreedyLaunches)
+	}
 }
 
 func TestHIPGemma4Q4EffectiveSlidingWindow_Good(t *testing.T) {
@@ -531,60 +636,177 @@ func TestHIPGemma4Q4EffectiveSlidingWindow_Good(t *testing.T) {
 }
 
 func TestHIPGemma4Q4ChunkedAttentionEnabled_Good(t *testing.T) {
-	t.Setenv("GO_ROCM_GEMMA4_Q4_CHUNKED_ATTENTION", "")
 	core.AssertEqual(t, true, hipGemma4Q4ChunkedAttentionEnabled(1))
 	core.AssertEqual(t, true, hipGemma4Q4ChunkedAttentionEnabled(4000))
+}
 
-	t.Setenv("GO_ROCM_GEMMA4_Q4_CHUNKED_ATTENTION", "auto")
-	core.AssertEqual(t, false, hipGemma4Q4ChunkedAttentionEnabled(2000))
-	core.AssertEqual(t, true, hipGemma4Q4ChunkedAttentionEnabled(4000))
+func TestHIPGemma4Q4AttentionWorkspaceNeeded_Good(t *testing.T) {
+	greedy := inference.GenerateConfig{}
+	sampled := inference.GenerateConfig{Temperature: 1, TopK: 64, TopP: 0.95, RepeatPenalty: 1}
+	repeatPenalty := inference.GenerateConfig{Temperature: 1, TopK: 64, TopP: 0.95, RepeatPenalty: 2}
 
-	t.Setenv("GO_ROCM_GEMMA4_Q4_CHUNKED_ATTENTION", "0")
-	core.AssertEqual(t, false, hipGemma4Q4ChunkedAttentionEnabled(48000))
-
-	t.Setenv("GO_ROCM_GEMMA4_Q4_CHUNKED_ATTENTION", "1")
-	core.AssertEqual(t, true, hipGemma4Q4ChunkedAttentionEnabled(1))
+	core.AssertEqual(t, true, hipGemma4Q4AttentionWorkspaceNeeded(128, greedy))
+	core.AssertEqual(t, true, hipGemma4Q4AttentionWorkspaceNeeded(4000, greedy))
+	core.AssertEqual(t, true, hipGemma4Q4AttentionWorkspaceNeeded(128, sampled))
+	core.AssertEqual(t, true, hipGemma4Q4AttentionWorkspaceNeeded(128, repeatPenalty))
 }
 
 func TestHIPGemma4Q4DeviceKVBlockSize_Good(t *testing.T) {
-	t.Setenv("GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE", "")
-	t.Setenv("GO_ROCM_GEMMA4_Q4_GLOBAL_DEVICE_KV_BLOCK_SIZE", "")
 	core.AssertEqual(t, rocmGemma4Q4DeviceKVBlockSize, hipGemma4Q4DeviceKVBlockSize())
 
-	t.Setenv("GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE", "16")
-	core.AssertEqual(t, 16, hipGemma4Q4DeviceKVBlockSize())
+	cfg := defaultHIPGemma4Q4EngineConfig()
+	cfg.DeviceKVBlockSize = 16
+	core.AssertEqual(t, 16, cfg.deviceKVBlockSize())
 
-	t.Setenv("GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE", "bad")
-	core.AssertEqual(t, rocmGemma4Q4DeviceKVBlockSize, hipGemma4Q4DeviceKVBlockSize())
+	cfg.DeviceKVBlockSize = 0
+	core.AssertEqual(t, rocmGemma4Q4DeviceKVBlockSize, cfg.deviceKVBlockSize())
 }
 
 func TestHIPGemma4Q4DeviceKVBlockSizeForSlidingWindow_Good(t *testing.T) {
-	t.Setenv("GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE", "")
-	t.Setenv("GO_ROCM_GEMMA4_Q4_GLOBAL_DEVICE_KV_BLOCK_SIZE", "")
 	core.AssertEqual(t, rocmGemma4Q4DeviceKVBlockSize, hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(512))
 	core.AssertEqual(t, rocmGemma4Q4GlobalDeviceKVBlockSize, hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(0))
 
-	t.Setenv("GO_ROCM_GEMMA4_Q4_GLOBAL_DEVICE_KV_BLOCK_SIZE", "256")
-	core.AssertEqual(t, 256, hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(0))
-	core.AssertEqual(t, rocmGemma4Q4DeviceKVBlockSize, hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(1024))
+	cfg := defaultHIPGemma4Q4EngineConfig()
+	cfg.GlobalDeviceKVBlockSize = 256
+	core.AssertEqual(t, 256, cfg.deviceKVBlockSizeForSlidingWindow(0))
+	core.AssertEqual(t, rocmGemma4Q4DeviceKVBlockSize, cfg.deviceKVBlockSizeForSlidingWindow(1024))
 
-	t.Setenv("GO_ROCM_GEMMA4_Q4_GLOBAL_DEVICE_KV_BLOCK_SIZE", "")
-	t.Setenv("GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE", "16")
-	core.AssertEqual(t, 16, hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(0))
-	core.AssertEqual(t, rocmGemma4Q4DeviceKVBlockSize, hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(512))
+	cfg = defaultHIPGemma4Q4EngineConfig()
+	cfg.DeviceKVBlockSize = 16
+	cfg.GlobalDeviceKVBlockSize = 0
+	core.AssertEqual(t, 16, cfg.deviceKVBlockSizeForSlidingWindow(0))
+	core.AssertEqual(t, 16, cfg.deviceKVBlockSizeForSlidingWindow(512))
 
-	t.Setenv("GO_ROCM_GEMMA4_Q4_INTERLEAVED_ROW_PAGES", "1")
-	core.AssertEqual(t, 16, hipGemma4Q4DeviceKVBlockSizeForSlidingWindow(512))
+	cfg.DisableInterleavedRowPages = true
+	core.AssertEqual(t, rocmGemma4Q4DeviceKVBlockSize, cfg.deviceKVBlockSizeForSlidingWindow(512))
+
+	cfg.DisableInterleavedRowPages = false
+	core.AssertEqual(t, 16, cfg.deviceKVBlockSizeForSlidingWindow(512))
+}
+
+func TestHIPAttachedDrafterResolveDraftTokensCapsSlidingWindow_Good(t *testing.T) {
+	full := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{
+		{SlidingWindow: 0},
+		{SlidingWindow: 0},
+	}}
+	core.AssertEqual(t, 4, hipAttachedDrafterResolveDraftTokensForTarget(full, 4, 8))
+	core.AssertEqual(t, ProductionMTPDefaultDraftTokens, hipAttachedDrafterResolveDraftTokensForTarget(full, 0, 8))
+
+	hybrid := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{
+		{SlidingWindow: 0},
+		{SlidingWindow: 5},
+		{SlidingWindow: 3},
+	}}
+	core.AssertEqual(t, 2, hipAttachedDrafterMaxDraftProposalsForTarget(hybrid))
+	core.AssertEqual(t, 2, hipAttachedDrafterResolveDraftTokensForTarget(hybrid, 8, 8))
+	core.AssertEqual(t, 1, hipAttachedDrafterResolveDraftTokensForTarget(hybrid, 8, 1))
+
+	tiny := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{
+		{SlidingWindow: 1},
+		{SlidingWindow: 2},
+	}}
+	core.AssertEqual(t, 1, hipAttachedDrafterResolveDraftTokensForTarget(tiny, 4, 8))
+}
+
+func TestHIPAttachedDrafterAdaptDraftTokensFallsBackOnLowAcceptance_Good(t *testing.T) {
+	core.AssertEqual(t, ProductionMTPFallbackDraftTokens, hipAttachedDrafterAdaptDraftTokens(ProductionMTPDefaultDraftTokens, 4, 1))
+	core.AssertEqual(t, ProductionMTPDefaultDraftTokens, hipAttachedDrafterAdaptDraftTokens(ProductionMTPDefaultDraftTokens, 4, 2))
+	core.AssertEqual(t, ProductionMTPFallbackDraftTokens, hipAttachedDrafterAdaptDraftTokens(ProductionMTPFallbackDraftTokens, 2, 0))
+	core.AssertEqual(t, 1, hipAttachedDrafterAdaptDraftTokens(1, 1, 0))
+}
+
+func TestHIPGemma4Q4DeviceKVTensorPrewarmCounts_Good(t *testing.T) {
+	cfg := hipGemma4Q4ForwardConfig{
+		Layers: []hipGemma4Q4Layer0Config{
+			{HeadDim: 256, SlidingWindow: 512},
+			{HeadDim: 256, SlidingWindow: 512},
+			{HeadDim: 512, SlidingWindow: 0},
+			{HeadDim: 512, SlidingWindow: 0},
+		},
+		KVSharedLayers:  2,
+		SharedKVSources: []int{0, 0, 2, 2},
+	}
+
+	counts := hipGemma4Q4DeviceKVTensorPrewarmCounts(cfg, rocmKVCacheModeKQ8VQ4)
+	keyEncoding, valueEncoding, ok := rocmKVInterleavedEncodingsForMode(rocmKVCacheModeKQ8VQ4)
+	core.RequireTrue(t, ok, "KQ8VQ4 interleaved encodings should be available")
+	localKeyStride, err := rocmKVInterleavedRowStride(keyEncoding, 256)
+	core.RequireNoError(t, err)
+	localValueStride, err := rocmKVInterleavedRowStride(valueEncoding, 256)
+	core.RequireNoError(t, err)
+	globalKeyStride, err := rocmKVInterleavedRowStride(keyEncoding, 512)
+	core.RequireNoError(t, err)
+	globalValueStride, err := rocmKVInterleavedRowStride(valueEncoding, 512)
+	core.RequireNoError(t, err)
+	keyTokenEncoding, valueTokenEncoding := rocmKVEncodingsForMode(rocmKVCacheModeKQ8VQ4)
+	localKeyTokenBytes, err := rocmKVTensorDeviceByteCount(keyTokenEncoding, 256)
+	core.RequireNoError(t, err)
+	localValueTokenBytes, err := rocmKVTensorDeviceByteCount(valueTokenEncoding, 256)
+	core.RequireNoError(t, err)
+	globalKeyTokenBytes, err := rocmKVTensorDeviceByteCount(keyTokenEncoding, 512)
+	core.RequireNoError(t, err)
+	globalValueTokenBytes, err := rocmKVTensorDeviceByteCount(valueTokenEncoding, 512)
+	core.RequireNoError(t, err)
+
+	core.AssertEqual(t, 2, counts[(localKeyStride+localValueStride)*uint64(rocmGemma4Q4DeviceKVBlockSize)])
+	core.AssertEqual(t, 4, counts[(globalKeyStride+globalValueStride)*uint64(rocmGemma4Q4GlobalDeviceKVBlockSize)])
+	core.AssertEqual(t, 4, counts[localKeyTokenBytes])
+	core.AssertEqual(t, 2, counts[localValueTokenBytes])
+	core.AssertEqual(t, 2, counts[globalKeyTokenBytes])
+	core.AssertEqual(t, localKeyTokenBytes, globalValueTokenBytes)
+	core.AssertEqual(t, 5, len(counts))
+}
+
+func TestHIPGemma4Q4DeviceKVTensorPrewarmCountsForContext_UsesSharedOwners(t *testing.T) {
+	cfg := hipGemma4Q4ForwardConfig{
+		Layers: []hipGemma4Q4Layer0Config{
+			{HeadDim: 256, SlidingWindow: 512},
+			{HeadDim: 256, SlidingWindow: 512},
+			{HeadDim: 512, SlidingWindow: 0},
+			{HeadDim: 512, SlidingWindow: 0},
+		},
+		KVSharedLayers:  2,
+		SharedKVSources: []int{0, 0, 2, 2},
+	}
+
+	counts := hipGemma4Q4DeviceKVTensorPrewarmCountsForContext(cfg, rocmKVCacheModeKQ8VQ4, 2560)
+	keyEncoding, valueEncoding, ok := rocmKVInterleavedEncodingsForMode(rocmKVCacheModeKQ8VQ4)
+	core.RequireTrue(t, ok, "KQ8VQ4 interleaved encodings should be available")
+	localKeyStride, err := rocmKVInterleavedRowStride(keyEncoding, 256)
+	core.RequireNoError(t, err)
+	localValueStride, err := rocmKVInterleavedRowStride(valueEncoding, 256)
+	core.RequireNoError(t, err)
+	globalKeyStride, err := rocmKVInterleavedRowStride(keyEncoding, 512)
+	core.RequireNoError(t, err)
+	globalValueStride, err := rocmKVInterleavedRowStride(valueEncoding, 512)
+	core.RequireNoError(t, err)
+	keyTokenEncoding, valueTokenEncoding := rocmKVEncodingsForMode(rocmKVCacheModeKQ8VQ4)
+	localKeyTokenBytes, err := rocmKVTensorDeviceByteCount(keyTokenEncoding, 256)
+	core.RequireNoError(t, err)
+	localValueTokenBytes, err := rocmKVTensorDeviceByteCount(valueTokenEncoding, 256)
+	core.RequireNoError(t, err)
+	globalKeyTokenBytes, err := rocmKVTensorDeviceByteCount(keyTokenEncoding, 512)
+	core.RequireNoError(t, err)
+	globalValueTokenBytes, err := rocmKVTensorDeviceByteCount(valueTokenEncoding, 512)
+	core.RequireNoError(t, err)
+
+	core.AssertEqual(t, 3, counts[(localKeyStride+localValueStride)*uint64(rocmGemma4Q4DeviceKVBlockSize)])
+	core.AssertEqual(t, 5, counts[(globalKeyStride+globalValueStride)*uint64(rocmGemma4Q4GlobalDeviceKVBlockSize)])
+	core.AssertEqual(t, 4, counts[localKeyTokenBytes])
+	core.AssertEqual(t, 2, counts[localValueTokenBytes])
+	core.AssertEqual(t, 2, counts[globalKeyTokenBytes])
+	core.AssertEqual(t, localKeyTokenBytes, globalValueTokenBytes)
+	core.AssertEqual(t, 5, len(counts))
 }
 
 func TestHIPGemma4Q4PrefillPlan_Good(t *testing.T) {
-	t.Setenv(hipGemma4Q4PrefillUBatchEnv, "")
 	ubatchTokens, err := hipGemma4Q4PrefillUBatchTokens()
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, hipGemma4Q4PrefillDefaultUBatchTokens, ubatchTokens)
 
-	t.Setenv(hipGemma4Q4PrefillUBatchEnv, "2")
-	ubatchTokens, err = hipGemma4Q4PrefillUBatchTokens()
+	engineConfig := defaultHIPGemma4Q4EngineConfig()
+	engineConfig.PrefillUBatchTokens = 2
+	ubatchTokens, err = engineConfig.prefillUBatchTokens()
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, 2, ubatchTokens)
 
@@ -598,16 +820,51 @@ func TestHIPGemma4Q4PrefillPlan_Good(t *testing.T) {
 	core.AssertEqual(t, 3, len(plan.Batches))
 	core.AssertEqual(t, []int32{2, 10979}, plan.Batches[0].Tokens)
 	core.AssertEqual(t, 0, len(plan.Batches[0].OutputTokens))
+	core.AssertEqual(t, -1, plan.Batches[0].OutputRow)
 	core.AssertEqual(t, false, plan.Batches[0].OutputToken(0))
 	core.AssertEqual(t, 0, plan.Batches[0].Start)
 	core.AssertEqual(t, 2, plan.Batches[0].End)
 	core.AssertEqual(t, 7, plan.Batches[0].Position)
 	core.AssertEqual(t, []int32{2}, plan.Batches[2].Tokens)
-	core.AssertEqual(t, []bool{true}, plan.Batches[2].OutputTokens)
+	core.AssertEqual(t, 0, len(plan.Batches[2].OutputTokens))
+	core.AssertEqual(t, 0, plan.Batches[2].OutputRow)
 	core.AssertEqual(t, true, plan.Batches[2].OutputToken(0))
 	core.AssertEqual(t, 4, plan.Batches[2].Start)
 	core.AssertEqual(t, 5, plan.Batches[2].End)
 	core.AssertEqual(t, 11, plan.Batches[2].Position)
+}
+
+func TestHIPGemma4Q4PrefillPlan_Good_SingleBatchInline(t *testing.T) {
+	plan, err := hipGemma4Q4PlanPromptPrefill([]int32{2, 10979}, 7, 512)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 1, plan.LenBatches())
+	core.AssertEqual(t, 0, len(plan.Batches))
+	batch := plan.Batch(0)
+	core.AssertEqual(t, []int32{2, 10979}, batch.Tokens)
+	core.AssertEqual(t, 1, batch.OutputRow)
+	core.AssertEqual(t, false, batch.OutputToken(0))
+	core.AssertEqual(t, true, batch.OutputToken(1))
+	core.AssertEqual(t, 7, batch.Position)
+}
+
+func TestHIPGemma4Q4PrefillPlanInto_ReusesScratch_Good(t *testing.T) {
+	tokens := []int32{2, 10979, 2, 10979, 2}
+	scratch := make([]hipGemma4Q4PrefillUBatch, 0, 4)
+	plan, reused, err := hipGemma4Q4PlanPromptPrefillInto(tokens, 7, 2, scratch)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 3, len(plan.Batches))
+	core.AssertEqual(t, 3, len(reused))
+	if cap(reused) != cap(scratch) {
+		t.Fatalf("reused scratch cap = %d, want original cap %d", cap(reused), cap(scratch))
+	}
+	core.AssertEqual(t, []int32{2, 10979}, plan.Batches[0].Tokens)
+	core.AssertEqual(t, []int32{2}, plan.Batches[2].Tokens)
+
+	single, returned, err := hipGemma4Q4PlanPromptPrefillInto(tokens[:1], 12, 512, reused)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 1, single.LenBatches())
+	core.AssertEqual(t, 0, len(single.Batches))
+	core.AssertEqual(t, 0, len(returned))
 }
 
 func BenchmarkHIPGemma4Q4PlanPromptPrefill_29K(b *testing.B) {
@@ -615,14 +872,98 @@ func BenchmarkHIPGemma4Q4PlanPromptPrefill_29K(b *testing.B) {
 	for index := range tokens {
 		tokens[index] = int32(index%32000 + 1)
 	}
+	wantBatches := (len(tokens) + hipGemma4Q4PrefillDefaultUBatchTokens - 1) / hipGemma4Q4PrefillDefaultUBatchTokens
 	b.ReportAllocs()
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		plan, err := hipGemma4Q4PlanPromptPrefill(tokens, 0, hipGemma4Q4PrefillDefaultUBatchTokens)
 		if err != nil {
 			b.Fatalf("hipGemma4Q4PlanPromptPrefill: %v", err)
 		}
-		if plan.PromptTokens != len(tokens) || len(plan.Batches) != 1813 {
-			b.Fatalf("plan = tokens %d batches %d, want 29000/1813", plan.PromptTokens, len(plan.Batches))
+		if plan.PromptTokens != len(tokens) || len(plan.Batches) != wantBatches {
+			b.Fatalf("plan = tokens %d batches %d, want 29000/%d", plan.PromptTokens, len(plan.Batches), wantBatches)
+		}
+	}
+}
+
+func BenchmarkHIPGemma4Q4PlanPromptPrefillInto_29K_Reused(b *testing.B) {
+	tokens := make([]int32, 29000)
+	for index := range tokens {
+		tokens[index] = int32(index%32000 + 1)
+	}
+	wantBatches := (len(tokens) + hipGemma4Q4PrefillDefaultUBatchTokens - 1) / hipGemma4Q4PrefillDefaultUBatchTokens
+	var scratch []hipGemma4Q4PrefillUBatch
+	plan, reused, err := hipGemma4Q4PlanPromptPrefillInto(tokens, 0, hipGemma4Q4PrefillDefaultUBatchTokens, scratch)
+	if err != nil {
+		b.Fatalf("hipGemma4Q4PlanPromptPrefillInto warmup: %v", err)
+	}
+	if plan.PromptTokens != len(tokens) || len(plan.Batches) != wantBatches {
+		b.Fatalf("warmup plan = tokens %d batches %d, want 29000/%d", plan.PromptTokens, len(plan.Batches), wantBatches)
+	}
+	scratch = reused
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		plan, scratch, err = hipGemma4Q4PlanPromptPrefillInto(tokens, 0, hipGemma4Q4PrefillDefaultUBatchTokens, scratch)
+		if err != nil {
+			b.Fatalf("hipGemma4Q4PlanPromptPrefillInto: %v", err)
+		}
+		if plan.PromptTokens != len(tokens) || len(plan.Batches) != wantBatches {
+			b.Fatalf("plan = tokens %d batches %d, want 29000/%d", plan.PromptTokens, len(plan.Batches), wantBatches)
+		}
+	}
+}
+
+func BenchmarkHIPGemma4Q4PlanPromptPrefillInto_29K_Pooled(b *testing.B) {
+	tokens := make([]int32, 29000)
+	for index := range tokens {
+		tokens[index] = int32(index%32000 + 1)
+	}
+	wantBatches := (len(tokens) + hipGemma4Q4PrefillDefaultUBatchTokens - 1) / hipGemma4Q4PrefillDefaultUBatchTokens
+	scratch := hipBorrowGemma4Q4PrefillUBatches(wantBatches)
+	hipReleaseGemma4Q4PrefillUBatches(scratch)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		scratch = hipBorrowGemma4Q4PrefillUBatches(wantBatches)
+		plan, reused, err := hipGemma4Q4PlanPromptPrefillInto(tokens, 0, hipGemma4Q4PrefillDefaultUBatchTokens, scratch)
+		if err != nil {
+			hipReleaseGemma4Q4PrefillUBatches(reused)
+			b.Fatalf("hipGemma4Q4PlanPromptPrefillInto: %v", err)
+		}
+		if plan.PromptTokens != len(tokens) || len(plan.Batches) != wantBatches {
+			hipReleaseGemma4Q4PrefillUBatches(reused)
+			b.Fatalf("plan = tokens %d batches %d, want 29000/%d", plan.PromptTokens, len(plan.Batches), wantBatches)
+		}
+		hipReleaseGemma4Q4PrefillUBatches(reused)
+	}
+}
+
+func BenchmarkHIPGemma4Q4PlanPromptPrefill_SingleBatch(b *testing.B) {
+	tokens := []int32{2, 10979}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		plan, err := hipGemma4Q4PlanPromptPrefill(tokens, 0, hipGemma4Q4PrefillDefaultUBatchTokens)
+		if err != nil {
+			b.Fatalf("hipGemma4Q4PlanPromptPrefill: %v", err)
+		}
+		if plan.PromptTokens != len(tokens) || plan.LenBatches() != 1 || len(plan.Batches) != 0 {
+			b.Fatalf("plan = tokens %d batches %d/%d, want 2 1/0", plan.PromptTokens, plan.LenBatches(), len(plan.Batches))
+		}
+	}
+}
+
+func BenchmarkHIPGemma4Q4TokenPromptIDs_2K(b *testing.B) {
+	prompt := inferenceBenchmarkTokenPrompt(2048, []int{2, 10979})
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		tokens, matched, err := hipGemma4Q4TokenPromptIDs(prompt, 32000)
+		if err != nil {
+			b.Fatalf("hipGemma4Q4TokenPromptIDs: %v", err)
+		}
+		if !matched || len(tokens) != 2048 {
+			b.Fatalf("tokens matched=%t len=%d, want true/2048", matched, len(tokens))
 		}
 	}
 }
@@ -642,10 +983,26 @@ func BenchmarkHIPGemma4Q4DeviceLayerCaches_Reused(b *testing.B) {
 	}
 }
 
+func BenchmarkHIPGemma4Q4DeviceLayerDescriptorTables_Reused(b *testing.B) {
+	state := &hipGemma4Q4DeviceDecodeState{layers: make([]hipGemma4Q4DeviceLayerKVState, 35)}
+	for index := range state.layers {
+		state.layers[index].descriptorTable = &rocmDeviceKVDescriptorTable{}
+	}
+	scratch := make([]*rocmDeviceKVDescriptorTable, 0, len(state.layers))
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		scratch = hipGemma4Q4DeviceLayerDescriptorTables(state, scratch, len(state.layers))
+		if len(scratch) != len(state.layers) || scratch[0] == nil {
+			b.Fatalf("layer descriptor scratch len=%d first=%v", len(scratch), scratch[0])
+		}
+	}
+}
+
 func TestHIPGemma4Q4PrefillPlan_Bad(t *testing.T) {
-	t.Setenv(hipGemma4Q4PrefillUBatchEnv, "nope")
-	if _, err := hipGemma4Q4PrefillUBatchTokens(); err == nil {
-		t.Fatalf("hipGemma4Q4PrefillUBatchTokens succeeded, want invalid env error")
+	engineConfig := defaultHIPGemma4Q4EngineConfig()
+	engineConfig.PrefillUBatchTokens = 0
+	if _, err := engineConfig.prefillUBatchTokens(); err == nil {
+		t.Fatalf("prefillUBatchTokens succeeded, want invalid engine config error")
 	}
 	if _, err := hipGemma4Q4PlanPromptPrefill(nil, 0, 512); err == nil {
 		t.Fatalf("hipGemma4Q4PlanPromptPrefill succeeded with empty prompt")
@@ -691,6 +1048,63 @@ func TestHIPGemma4Q4PrefillEmbeddingBatch_Good(t *testing.T) {
 	}
 }
 
+func TestHIPGemma4Q4PrefillEmbeddingBatchWorkspace_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4Layer0FixtureConfig(t, driver)
+	defer cleanup()
+
+	tokens := []int32{1, 0, 1}
+	tokenBuffer, err := hipUploadTokenIDs(driver, tokens)
+	core.RequireNoError(t, err)
+	defer tokenBuffer.Close()
+
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	start := len(driver.launches)
+	output, err := hipRunGemma4Q4PrefillEmbeddingBatchTokenBufferWorkspace(context.Background(), driver, cfg, tokens, tokenBuffer, workspace)
+	core.RequireNoError(t, err)
+	defer output.Close()
+
+	wantCount := len(tokens) * cfg.HiddenSize
+	core.AssertEqual(t, wantCount, output.Count())
+	core.AssertEqual(t, uint64(wantCount*4), output.SizeBytes())
+	core.AssertEqual(t, true, output.borrowed)
+	core.AssertEqual(t, output.Pointer(), workspace.ScaledEmbeddingView.Pointer())
+
+	launches := driver.launches[start:]
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameEmbedLookup))
+	core.AssertEqual(t, 0, countLaunchName(launches, hipKernelNameVectorScale))
+	for _, launch := range launches {
+		if launch.Name != hipKernelNameEmbedLookup {
+			continue
+		}
+		core.AssertEqual(t, uint32(len(tokens)), binary.LittleEndian.Uint32(launch.Args[32:]))
+		core.AssertEqual(t, uint32(cfg.HiddenSize), binary.LittleEndian.Uint32(launch.Args[40:]))
+		core.AssertEqual(t, uint64(wantCount*4), binary.LittleEndian.Uint64(launch.Args[56:]))
+		assertFloat32Near(t, float32(math.Sqrt(float64(cfg.HiddenSize))), math.Float32frombits(binary.LittleEndian.Uint32(launch.Args[96:])))
+	}
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_ScaledEmbeddingReusesLarger_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	large, err := workspace.EnsureScaledEmbedding(driver, 3072)
+	core.RequireNoError(t, err)
+	small, err := workspace.EnsureScaledEmbedding(driver, 1536)
+	core.RequireNoError(t, err)
+
+	core.AssertEqual(t, 1, len(driver.allocations))
+	core.AssertEqual(t, large.Pointer(), small.Pointer())
+	core.AssertEqual(t, 1536, small.Count())
+	core.AssertEqual(t, uint64(1536*4), small.SizeBytes())
+	core.AssertEqual(t, true, small.borrowed)
+	if _, ok := workspace.ScaledEmbeddings[1536]; ok {
+		t.Fatalf("smaller scaled embedding got a dedicated allocation")
+	}
+}
+
 func TestHIPGemma4Q4PrefillEmbeddingBatch_Bad(t *testing.T) {
 	driver := &fakeHIPDriver{available: true}
 	cfg, cleanup := hipGemma4Q4Layer0FixtureConfig(t, driver)
@@ -724,14 +1138,18 @@ func TestHIPGemma4Q4PrefillInputNormBatch_Good(t *testing.T) {
 	core.RequireNoError(t, err)
 	defer input.Close()
 
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
 	start := len(driver.launches)
-	output, err := hipRunGemma4Q4PrefillInputNormBatch(context.Background(), driver, cfg, input, tokenCount)
+	output, err := hipRunGemma4Q4PrefillInputNormBatchWorkspace(context.Background(), driver, cfg, input, tokenCount, workspace)
 	core.RequireNoError(t, err)
 	defer output.Close()
 
 	wantCount := tokenCount * cfg.HiddenSize
 	core.AssertEqual(t, wantCount, output.Count())
 	core.AssertEqual(t, uint64(wantCount*4), output.SizeBytes())
+	core.AssertEqual(t, true, output.borrowed)
+	core.AssertEqual(t, output.Pointer(), workspace.PrefillInputNormView.Pointer())
 
 	launches := driver.launches[start:]
 	core.AssertEqual(t, 1, len(launches))
@@ -826,16 +1244,21 @@ func TestHIPGemma4Q4PrefillQKVProjectionBatch_AttentionKEqVBorrowsKeyProjection_
 	core.RequireNoError(t, err)
 	defer input.Close()
 
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
 	start := len(driver.launches)
-	qkv, err := hipRunGemma4Q4PrefillQKVProjectionBatch(context.Background(), driver, cfg, input, tokenCount)
+	qkv, err := hipRunGemma4Q4PrefillQKVProjectionBatchWorkspace(context.Background(), driver, cfg, input, tokenCount, workspace)
 	core.RequireNoError(t, err)
 	defer qkv.Close()
 
 	core.AssertEqual(t, tokenCount*cfg.QueryProjection.Rows, qkv.Query.Count())
 	core.AssertEqual(t, tokenCount*cfg.KeyProjection.Rows, qkv.Key.Count())
 	core.AssertEqual(t, tokenCount*cfg.ValueProjection.Rows, qkv.Value.Count())
+	core.AssertEqual(t, true, qkv.Query.borrowed)
+	core.AssertEqual(t, false, qkv.Key.borrowed)
 	core.AssertEqual(t, qkv.Key.Pointer(), qkv.Value.Pointer())
 	core.AssertEqual(t, true, qkv.Value.borrowed)
+	core.AssertEqual(t, qkv.Query.Pointer(), workspace.ProjectionOutputFixed.Pointer())
 	launches := driver.launches[start:]
 	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameMLXQ4ProjBatch))
 	wantRows := []int{cfg.QueryProjection.Rows, cfg.KeyProjection.Rows}
@@ -898,13 +1321,18 @@ func TestHIPGemma4Q4PrefillQKNormRoPEBatch_Good(t *testing.T) {
 	defer key.Close()
 	qkv := &hipGemma4Q4PrefillQKVBatch{Query: query, Key: key}
 
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
 	start := len(driver.launches)
-	output, err := hipRunGemma4Q4PrefillQKNormRoPEBatch(context.Background(), driver, cfg, qkv, tokenCount, 5, 1e-6)
+	output, err := hipRunGemma4Q4PrefillQKNormRoPEBatchWorkspace(context.Background(), driver, cfg, qkv, tokenCount, 5, 1e-6, workspace)
 	core.RequireNoError(t, err)
 	defer output.Close()
 
 	core.AssertEqual(t, tokenCount*cfg.QueryHeads*cfg.HeadDim, output.Query.Count())
 	core.AssertEqual(t, tokenCount*cfg.HeadDim, output.Key.Count())
+	core.AssertEqual(t, true, output.Query.borrowed)
+	core.AssertEqual(t, false, output.Key.borrowed)
+	core.AssertEqual(t, output.Query.Pointer(), workspace.RMSRoPEOutputView.Pointer())
 	launches := driver.launches[start:]
 	core.AssertEqual(t, 2, len(launches))
 	core.AssertEqual(t, hipKernelNameRMSNormRoPEHeadsBatch, launches[0].Name)
@@ -1084,8 +1512,6 @@ func TestHIPGemma4Q4PrefillDeviceKVBatch_Good(t *testing.T) {
 }
 
 func TestHIPGemma4Q4PrefillDeviceKVBatchFullAttentionUsesGlobalBlockSize_Good(t *testing.T) {
-	t.Setenv("GO_ROCM_GEMMA4_Q4_DEVICE_KV_BLOCK_SIZE", "")
-	t.Setenv("GO_ROCM_GEMMA4_Q4_GLOBAL_DEVICE_KV_BLOCK_SIZE", "")
 	driver := &fakeHIPDriver{available: true}
 	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
 	defer cleanup()
@@ -1128,6 +1554,44 @@ func TestHIPGemma4Q4PrefillDeviceKVBatchFullAttentionUsesGlobalBlockSize_Good(t 
 	core.RequireNoError(t, driver.CopyDeviceToHost(deviceKV.DescriptorTable.Pointer(), descriptorPayload))
 	core.AssertEqual(t, uint32(wantBlockSize), binary.LittleEndian.Uint32(descriptorPayload[20:]))
 	core.AssertEqual(t, uint64(tokenCount), binary.LittleEndian.Uint64(descriptorPayload[24:]))
+}
+
+func TestHIPGemma4Q4PrefillDeviceKVBatch_UsesEngineConfigGlobalBlockSize_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup()
+	cfg.LayerType = "full_attention"
+	cfg.SlidingWindow = 0
+	tokenCount := 6
+	keyRows := make([]float32, tokenCount*cfg.HeadDim)
+	valueRows := make([]float32, tokenCount*cfg.HeadDim)
+	for index := range keyRows {
+		keyRows[index] = float32(index%11) - 5
+		valueRows[index] = float32(index%7) - 3
+	}
+	keyPayload, err := hipFloat32Payload(keyRows)
+	core.RequireNoError(t, err)
+	key, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill config device KV key fixture", keyPayload, len(keyRows))
+	core.RequireNoError(t, err)
+	defer key.Close()
+	valuePayload, err := hipFloat32Payload(valueRows)
+	core.RequireNoError(t, err)
+	value, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill config device KV value fixture", valuePayload, len(valueRows))
+	core.RequireNoError(t, err)
+	defer value.Close()
+	qk := &hipGemma4Q4PrefillRoPEQKBatch{Key: key}
+	engineConfig := defaultHIPGemma4Q4EngineConfig()
+	engineConfig.GlobalDeviceKVBlockSize = 4
+
+	deviceKV, err := hipRunGemma4Q4PrefillDeviceKVBatchWithPriorDescriptorIntoWithEngineConfig(context.Background(), driver, cfg, nil, nil, qk, value, tokenCount, rocmKVCacheModeKQ8VQ4, nil, engineConfig)
+	core.RequireNoError(t, err)
+	defer deviceKV.Close()
+
+	core.AssertEqual(t, 4, deviceKV.Cache.blockSize)
+	core.AssertEqual(t, tokenCount, deviceKV.Cache.TokenCount())
+	core.AssertEqual(t, 2, deviceKV.Cache.PageCount())
+	core.AssertEqual(t, 4, deviceKV.Cache.pages[0].tokenCount)
+	core.AssertEqual(t, 2, deviceKV.Cache.pages[1].tokenCount)
 }
 
 func TestHIPGemma4Q4PrefillDeviceKVBatch_Bad(t *testing.T) {
@@ -1219,12 +1683,18 @@ func TestHIPGemma4Q4PrefillAttentionBatch_Good(t *testing.T) {
 	layer, err := hipRunGemma4Q4PrefillLayerKVBatch(context.Background(), driver, cfg, input, tokenCount, 0, 1e-6, rocmKVCacheModeKQ8VQ4)
 	core.RequireNoError(t, err)
 	defer layer.Close()
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
 	start := len(driver.launches)
-	output, err := hipRunGemma4Q4PrefillAttentionBatch(context.Background(), driver, cfg, layer, tokenCount, 0)
+	output, err := hipRunGemma4Q4PrefillAttentionBatchWorkspace(context.Background(), driver, cfg, layer, tokenCount, 0, workspace)
 	core.RequireNoError(t, err)
 	defer output.Close()
 
 	core.AssertEqual(t, tokenCount*cfg.QueryHeads*cfg.HeadDim, output.Count())
+	core.AssertEqual(t, true, output.borrowed)
+	attentionOutput := &workspace.AttentionOutputFixed
+	core.RequireTrue(t, attentionOutput.Pointer() != 0, "attention workspace output should exist")
+	core.AssertEqual(t, output.Pointer(), attentionOutput.Pointer())
 	launches := driver.launches[start:]
 	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameAttentionHeadsBatchCausal))
 	core.AssertEqual(t, uint32(cfg.QueryHeads), launches[0].GridX)
@@ -1243,9 +1713,11 @@ func TestHIPGemma4Q4PrefillAttentionBatch_Good(t *testing.T) {
 		SharedVal: layer.Value,
 	}
 	start = len(driver.launches)
-	sharedOutput, err := hipRunGemma4Q4PrefillAttentionBatch(context.Background(), driver, cfg, sharedLayer, tokenCount, 0)
+	sharedOutput, err := hipRunGemma4Q4PrefillAttentionBatchWorkspace(context.Background(), driver, cfg, sharedLayer, tokenCount, 0, workspace)
 	core.RequireNoError(t, err)
 	defer sharedOutput.Close()
+	core.AssertEqual(t, true, sharedOutput.borrowed)
+	core.AssertEqual(t, sharedOutput.Pointer(), attentionOutput.Pointer())
 	sharedLaunches := driver.launches[start:]
 	core.AssertEqual(t, 1, countLaunchName(sharedLaunches, hipKernelNameAttentionHeadsBatchCausal))
 	core.AssertEqual(t, hipAttentionKVSourceContiguous, binary.LittleEndian.Uint32(sharedLaunches[0].Args[88:]))
@@ -1365,6 +1837,147 @@ func TestHIPGemma4Q4PrefillLayerBodyBatchWithPerLayerInput_Good(t *testing.T) {
 	core.AssertEqual(t, 0, countLaunchName(launches, hipKernelNameVectorScale))
 }
 
+func TestHIPGemma4Q4PrefillLayerBodyBatchWorkspaceReusesProjectionOutput_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup()
+	cfg.RoPERotaryDim = 2
+
+	tokenCount := 2
+	inputValues := make([]float32, tokenCount*cfg.HiddenSize)
+	for index := range inputValues {
+		inputValues[index] = float32(index%cfg.HiddenSize + 1)
+	}
+	payload, err := hipFloat32Payload(inputValues)
+	core.RequireNoError(t, err)
+	input, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill layer body workspace input fixture", payload, len(inputValues))
+	core.RequireNoError(t, err)
+	defer input.Close()
+
+	perLayerValues := make([]float32, tokenCount*cfg.PerLayerInput.InputSize)
+	for index := range perLayerValues {
+		perLayerValues[index] = float32(index%cfg.PerLayerInput.InputSize + 1)
+	}
+	perLayerPayload, err := hipFloat32Payload(perLayerValues)
+	core.RequireNoError(t, err)
+	perLayerInput, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill layer body workspace per-layer input", perLayerPayload, len(perLayerValues))
+	core.RequireNoError(t, err)
+	defer perLayerInput.Close()
+
+	layer, err := hipRunGemma4Q4PrefillLayerKVBatch(context.Background(), driver, cfg, input, tokenCount, 0, 1e-6, rocmKVCacheModeKQ8VQ4)
+	core.RequireNoError(t, err)
+	defer layer.Close()
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	start := len(driver.launches)
+	body, err := hipRunGemma4Q4PrefillLayerBodyBatchWithPerLayerInputWorkspace(context.Background(), driver, cfg, input, layer, perLayerInput, tokenCount, 0, 1e-6, workspace)
+	core.RequireNoError(t, err)
+	defer body.Close()
+
+	count := tokenCount * cfg.HiddenSize
+	core.AssertEqual(t, count, body.AttentionProjection.Count())
+	core.AssertEqual(t, count, body.MLPOutput.Count())
+	core.AssertEqual(t, count, body.PerLayerProjection.Count())
+	core.AssertEqual(t, count, body.PostFeedForward.Count())
+	core.AssertEqual(t, count, body.FinalHidden.Count())
+	core.AssertEqual(t, true, body.AttentionProjection.borrowed)
+	core.AssertEqual(t, true, body.MLPOutput.borrowed)
+	core.AssertEqual(t, true, body.PerLayerProjection.borrowed)
+	core.AssertEqual(t, true, body.PostFeedForward.borrowed)
+	core.AssertEqual(t, true, body.FinalHidden.borrowed)
+	core.AssertEqual(t, body.AttentionProjection.Pointer(), body.MLPOutput.Pointer())
+	core.AssertEqual(t, body.AttentionProjection.Pointer(), body.PerLayerProjection.Pointer())
+	core.AssertEqual(t, body.AttentionProjection.Pointer(), workspace.ProjectionOutputFixed.Pointer())
+	core.AssertEqual(t, body.PostFeedForward.Pointer(), workspace.IntermediateOutputView.Pointer())
+	finalHiddenPair := &workspace.FinalHiddenPairFixed
+	if finalHiddenPair.Pointer() == 0 {
+		t.Fatalf("final hidden pair workspace was not allocated")
+	}
+	core.AssertEqual(t, body.FinalHidden.Pointer(), finalHiddenPair.Pointer()+nativeDevicePointer((cfg.Layer&1)*workspace.FinalHiddenPairFixedCap*4))
+	core.AssertNotEqual(t, body.PostFeedForward.Pointer(), body.FinalHidden.Pointer())
+	activationCount := tokenCount * cfg.GateProjection.Rows
+	perLayerActivationCount := tokenCount * cfg.PerLayerInput.InputGate.Rows
+	activationOutput := &workspace.ActivationOutputFixed
+	if activationOutput.Pointer() == 0 || workspace.ActivationOutputCap < activationCount {
+		t.Fatalf("MLP activation workspace was not allocated")
+	}
+	if perLayerActivationCount < activationCount {
+		core.AssertEqual(t, activationOutput.Pointer(), workspace.ActivationOutputView.Pointer())
+		core.AssertEqual(t, perLayerActivationCount, workspace.ActivationOutputView.Count())
+		if _, ok := workspace.ActivationOutputs[hipAttentionHeadsChunkedWorkspaceCapacityCount(perLayerActivationCount)]; ok && hipAttentionHeadsChunkedWorkspaceCapacityCount(perLayerActivationCount) != hipAttentionHeadsChunkedWorkspaceCapacityCount(activationCount) {
+			t.Fatalf("per-layer GELU projection activation got its own workspace allocation")
+		}
+	} else {
+		perLayerActivationOutput := &workspace.ActivationOutputFixed
+		if perLayerActivationOutput.Pointer() == 0 || workspace.ActivationOutputCap < perLayerActivationCount {
+			t.Fatalf("per-layer GELU projection activation workspace was not allocated")
+		}
+		core.AssertEqual(t, activationOutput.Pointer(), perLayerActivationOutput.Pointer())
+	}
+	finalHidden, err := hipReadFloat32DeviceOutput(body.FinalHidden, hipGemma4Q4Layer0Operation, "prefill layer body workspace final hidden", len(inputValues))
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, inputValues, finalHidden, 0.0001)
+
+	launches := driver.launches[start:]
+	core.AssertEqual(t, 3, countLaunchName(launches, hipKernelNameMLXQ4ProjBatch))
+	core.AssertEqual(t, 0, countLaunchName(launches, hipKernelNameVectorAdd))
+}
+
+func TestHIPGemma4Q4PrefillResidualSmallBatchUsesFusedKernels_Good(t *testing.T) {
+	for _, tokenCount := range []int{1, 2} {
+		t.Run(core.Sprintf("tokens_%d", tokenCount), func(t *testing.T) {
+			driver := &fakeHIPDriver{available: true}
+			cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+			defer cleanup()
+
+			count := tokenCount * cfg.HiddenSize
+			inputValues := make([]float32, count)
+			residualValues := make([]float32, count)
+			for index := range inputValues {
+				inputValues[index] = float32(index%cfg.HiddenSize + 1)
+				residualValues[index] = float32(cfg.HiddenSize - index%cfg.HiddenSize)
+			}
+			inputPayload, err := hipFloat32Payload(inputValues)
+			core.RequireNoError(t, err)
+			input, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill residual small-batch input", inputPayload, len(inputValues))
+			core.RequireNoError(t, err)
+			defer input.Close()
+			residualPayload, err := hipFloat32Payload(residualValues)
+			core.RequireNoError(t, err)
+			residual, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill residual small-batch residual", residualPayload, len(residualValues))
+			core.RequireNoError(t, err)
+			defer residual.Close()
+
+			workspace := &hipAttentionHeadsChunkedWorkspace{}
+			defer workspace.Close()
+			start := len(driver.launches)
+			residualOutput, normOutput, err := hipRunGemma4Q4PrefillResidualAddNormBatchWorkspace(context.Background(), driver, input, residual, cfg.PostAttentionNorm, cfg.PreFeedForwardNorm, tokenCount, 1, workspace)
+			core.RequireNoError(t, err)
+			defer residualOutput.Close()
+			defer normOutput.Close()
+			postFeedForward, err := hipRunGemma4Q4PrefillResidualAddBatch(context.Background(), driver, input, residual, cfg.PostFeedForwardNorm, tokenCount, 1)
+			core.RequireNoError(t, err)
+			defer postFeedForward.Close()
+
+			core.AssertEqual(t, count, residualOutput.Count())
+			core.AssertEqual(t, count, normOutput.Count())
+			core.AssertEqual(t, count, postFeedForward.Count())
+			core.AssertEqual(t, true, residualOutput.borrowed)
+			core.AssertEqual(t, true, normOutput.borrowed)
+			rmsPair := &workspace.RMSResidualNormFixed
+			core.RequireTrue(t, rmsPair.Pointer() != 0, "RMS residual/norm pair workspace should exist")
+			core.AssertEqual(t, residualOutput.Pointer(), rmsPair.Pointer())
+			core.AssertEqual(t, normOutput.Pointer(), rmsPair.Pointer()+nativeDevicePointer(count*4))
+			launches := driver.launches[start:]
+			core.AssertEqual(t, tokenCount, countLaunchName(launches, hipKernelNameRMSNormResAddNorm))
+			core.AssertEqual(t, tokenCount, countLaunchName(launches, hipKernelNameRMSNormResidualAdd))
+			core.AssertEqual(t, 0, countLaunchName(launches, hipKernelNameRMSNormHeads))
+			core.AssertEqual(t, 0, countLaunchName(launches, hipKernelNameVectorAdd))
+			core.AssertEqual(t, 0, countLaunchName(launches, hipKernelNameVectorScale))
+		})
+	}
+}
+
 func TestHIPGemma4Q4PrefillFinalGreedyForRow_Good(t *testing.T) {
 	driver := &fakeHIPDriver{available: true}
 	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
@@ -1389,6 +2002,104 @@ func TestHIPGemma4Q4PrefillFinalGreedyForRow_Good(t *testing.T) {
 	launches := driver.launches[start:]
 	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameRMSNorm))
 	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameMLXQ4ProjGreedy))
+}
+
+func TestHIPGemma4Q4PrefillFinalGreedyForRowWorkspaceReusesRMSNormOutput_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup()
+
+	tokenCount := 3
+	hiddenValues := make([]float32, tokenCount*cfg.HiddenSize)
+	for index := range hiddenValues {
+		hiddenValues[index] = float32(index%cfg.HiddenSize + 1)
+	}
+	payload, err := hipFloat32Payload(hiddenValues)
+	core.RequireNoError(t, err)
+	hidden, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill final greedy workspace hidden fixture", payload, len(hiddenValues))
+	core.RequireNoError(t, err)
+	defer hidden.Close()
+	best, err := hipAllocateByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill final greedy workspace best fixture", hipMLXQ4ProjectionBestBytes, 1)
+	core.RequireNoError(t, err)
+	defer best.Close()
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	normOutput, err := workspace.EnsureRMSNormOutput(driver, cfg.HiddenSize)
+	core.RequireNoError(t, err)
+	allocStart := len(driver.allocations)
+	start := len(driver.launches)
+
+	greedy, err := hipRunGemma4Q4PrefillFinalGreedyForRowSuppressWorkspace(context.Background(), driver, cfg, hidden, tokenCount, tokenCount-1, 1e-6, best, nil, workspace)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 0, greedy.TokenID)
+	core.AssertEqual(t, allocStart, len(driver.allocations))
+	rmsPair := &workspace.RMSResidualNormFixed
+	core.RequireTrue(t, rmsPair.Pointer() != 0, "RMS residual/norm pair workspace should exist")
+	core.AssertEqual(t, normOutput.Pointer(), rmsPair.Pointer()+nativeDevicePointer(cfg.HiddenSize*4))
+
+	launches := driver.launches[start:]
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameRMSNorm))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameMLXQ4ProjGreedy))
+}
+
+func TestHIPGemma4Q4PrefillFinalGreedyForRowBorrowedBestInitializesBest_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup()
+
+	tokenCount := 3
+	hiddenValues := make([]float32, tokenCount*cfg.HiddenSize)
+	for index := range hiddenValues {
+		hiddenValues[index] = float32(index%cfg.HiddenSize + 1)
+	}
+	payload, err := hipFloat32Payload(hiddenValues)
+	core.RequireNoError(t, err)
+	hidden, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill final greedy borrowed hidden fixture", payload, len(hiddenValues))
+	core.RequireNoError(t, err)
+	defer hidden.Close()
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	best, err := workspace.BorrowProjectionGreedyBest(driver)
+	core.RequireNoError(t, err)
+	memsetStart := len(driver.memsets)
+
+	greedy, err := hipRunGemma4Q4PrefillFinalGreedyForRowSuppressWorkspace(context.Background(), driver, cfg, hidden, tokenCount, tokenCount-1, 1e-6, best, nil, workspace)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 0, greedy.TokenID)
+	core.AssertEqual(t, memsetStart+1, len(driver.memsets))
+	core.AssertEqual(t, best.SizeBytes(), driver.memsets[len(driver.memsets)-1])
+}
+
+func TestHIPGemma4Q4PrefillFinalGreedyTokenForRowReadsUint32_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup()
+
+	tokenCount := 3
+	hiddenValues := make([]float32, tokenCount*cfg.HiddenSize)
+	for index := range hiddenValues {
+		hiddenValues[index] = float32(index%cfg.HiddenSize + 1)
+	}
+	payload, err := hipFloat32Payload(hiddenValues)
+	core.RequireNoError(t, err)
+	hidden, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill final greedy token hidden fixture", payload, len(hiddenValues))
+	core.RequireNoError(t, err)
+	defer hidden.Close()
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	best, err := workspace.BorrowProjectionGreedyBest(driver)
+	core.RequireNoError(t, err)
+	copyStart := len(driver.copies)
+
+	greedy, err := hipRunGemma4Q4PrefillFinalGreedyTokenForRowWorkspace(context.Background(), driver, cfg, hidden, tokenCount, tokenCount-1, 1e-6, best, workspace)
+	core.RequireNoError(t, err)
+
+	core.AssertEqual(t, 0, greedy.TokenID)
+	assertFloat32Near(t, 0, greedy.Score)
+	if len(driver.copies) != copyStart+1 {
+		t.Fatalf("device copies = %d, want one token read after %d", len(driver.copies), copyStart)
+	}
+	core.AssertEqual(t, uint64(4), driver.copies[len(driver.copies)-1])
 }
 
 func TestHIPGemma4Q4PrefillForwardBatch_Good(t *testing.T) {
@@ -1561,6 +2272,154 @@ func TestHIPGemma4Q4PrefillForwardBatchWithPrior_Good(t *testing.T) {
 	core.AssertEqual(t, len(cfg.Layers)*gemma4Q4DeviceKVPagesForTokens(len(tokens)), countLaunchName(launches, hipKernelNameKVEncodeToken))
 }
 
+func TestHIPGemma4Q4PrefillLayerKVBatchWithPriorWorkspaceReusesValueNorm_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup()
+	hipGemma4Q4InstallNonzeroEmbeddingFixture(t, driver, &cfg, "prefill value norm workspace")
+	tokens := []int32{0, 1}
+	inputValues := make([]float32, len(tokens)*cfg.HiddenSize)
+	for index := range inputValues {
+		inputValues[index] = float32(index%cfg.HiddenSize + 1)
+	}
+	payload, err := hipFloat32Payload(inputValues)
+	core.RequireNoError(t, err)
+	input, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill value norm workspace input", payload, len(inputValues))
+	core.RequireNoError(t, err)
+	defer input.Close()
+
+	first, err := hipRunGemma4Q4PrefillLayerKVBatch(context.Background(), driver, cfg, input, len(tokens), 0, 1e-6, rocmKVCacheModeKQ8VQ4)
+	core.RequireNoError(t, err)
+	defer first.Close()
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	second, err := hipRunGemma4Q4PrefillLayerKVBatchWithPriorWorkspaceTransient(context.Background(), driver, cfg, input, first.DeviceKV.Cache, len(tokens), len(tokens), 1e-6, rocmKVCacheModeKQ8VQ4, workspace, true, true)
+	core.RequireNoError(t, err)
+	defer second.Close()
+
+	valueCount := len(tokens) * cfg.HeadDim
+	output := &workspace.KeyValueNormFixed
+	if output.Pointer() == 0 || workspace.KeyValueNormCap < valueCount {
+		t.Fatalf("value norm workspace for %d floats was not allocated", valueCount)
+	}
+	core.AssertEqual(t, true, second.Value.borrowed)
+	core.AssertEqual(t, output.Pointer()+nativeDevicePointer(valueCount*4), second.Value.Pointer())
+	core.AssertEqual(t, valueCount, second.Value.Count())
+	core.AssertEqual(t, len(tokens)*2, second.DeviceKV.Cache.TokenCount())
+}
+
+func TestHIPGemma4Q4PrefillForwardWorkspaceBorrowsTransientKVForNonSharedLayers_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup0()
+	layer1, cleanup1 := hipGemma4Q4FixtureConfig(t, driver, 1, 4, 2, 8)
+	defer cleanup1()
+	hipGemma4Q4InstallNonzeroEmbeddingFixture(t, driver, &layer0, "prefill transient KV workspace")
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0, layer1}}
+	tokens := []int32{0, 1}
+	perLayerInputs := hipGemma4Q4PrefillForwardTestPerLayerInputs(t, driver, cfg, tokens, "prefill transient KV workspace per-layer input")
+	best, err := hipAllocateByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill transient KV workspace best fixture", hipMLXQ4ProjectionBestBytes, 1)
+	core.RequireNoError(t, err)
+	defer best.Close()
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	forward, err := hipRunGemma4Q4PrefillForwardBatchWithPriorWorkspace(context.Background(), driver, cfg, tokens, 0, 1e-6, rocmKVCacheModeKQ8VQ4, nil, perLayerInputs, []bool{false, true}, best, workspace)
+	core.RequireNoError(t, err)
+	defer forward.Close()
+	core.AssertEqual(t, 1, len(forward.Greedy))
+
+	lastLayer := cfg.Layers[len(cfg.Layers)-1]
+	lastKV := forward.Layers[len(forward.Layers)-1].KV
+	keyCount := len(tokens) * lastLayer.KeyProjection.Rows
+	core.AssertEqual(t, true, lastKV.QKV.Key.borrowed)
+	core.AssertEqual(t, true, lastKV.QKV.Value.borrowed)
+	core.AssertEqual(t, true, lastKV.QK.Key.borrowed)
+	core.AssertEqual(t, true, lastKV.Value.borrowed)
+	kvProjectionCap := keyCount
+	kvProjectionPair := &workspace.KVProjectionPairFixed
+	if kvProjectionPair.Pointer() == 0 || workspace.KVProjectionPairCap < kvProjectionCap {
+		t.Fatalf("KV projection pair workspace missing for cap %d", kvProjectionCap)
+	}
+	core.AssertEqual(t, kvProjectionPair.Pointer(), lastKV.QKV.Key.Pointer())
+	core.AssertEqual(t, kvProjectionPair.Pointer()+nativeDevicePointer(kvProjectionCap*4), lastKV.QKV.Value.Pointer())
+	keyValueNormPair := &workspace.KeyValueNormFixed
+	core.RequireTrue(t, keyValueNormPair.Pointer() != 0, "key/value norm pair workspace should exist")
+	core.AssertEqual(t, keyValueNormPair.Pointer(), lastKV.QK.Key.Pointer())
+	core.AssertEqual(t, keyValueNormPair.Pointer()+nativeDevicePointer(len(tokens)*lastLayer.HeadDim*4), lastKV.Value.Pointer())
+	core.AssertEqual(t, layer0.HiddenSize, workspace.RMSNormOutputView.Count())
+	rmsPair := &workspace.RMSResidualNormFixed
+	core.RequireTrue(t, rmsPair.Pointer() != 0, "RMS residual/norm pair workspace should exist")
+	core.AssertEqual(t, rmsPair.Pointer()+nativeDevicePointer(len(tokens)*layer0.HiddenSize*4), workspace.RMSNormOutputView.Pointer())
+}
+
+func TestHIPGemma4Q4PrefillForwardWorkspaceBorrowsSharedSourceRawKVRetainsSharedOutputs_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup0()
+	layer1, cleanup1 := hipGemma4Q4FixtureConfig(t, driver, 1, 4, 2, 8)
+	defer cleanup1()
+	hipGemma4Q4InstallNonzeroEmbeddingFixture(t, driver, &layer0, "prefill shared source KV ownership")
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0, layer1}, KVSharedLayers: 1}
+	sources := hipGemma4Q4SharedKVSourceByLayer(cfg)
+	core.AssertEqual(t, 0, sources[1])
+	tokens := []int32{0, 1}
+	perLayerInputs := hipGemma4Q4PrefillForwardTestPerLayerInputs(t, driver, cfg, tokens, "prefill shared source KV ownership per-layer input")
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	forward, err := hipRunGemma4Q4PrefillForwardBatchWithPriorWorkspace(context.Background(), driver, cfg, tokens, 0, 1e-6, rocmKVCacheModeKQ8VQ4, nil, perLayerInputs, nil, nil, workspace)
+	core.RequireNoError(t, err)
+	defer forward.Close()
+
+	sourceKV := forward.Layers[0].KV
+	sharedKV := forward.Layers[1].KV
+	keyCount := len(tokens) * layer0.KeyProjection.Rows
+	core.AssertEqual(t, true, sourceKV.QKV.Key.borrowed)
+	core.AssertEqual(t, true, sourceKV.QKV.Value.borrowed)
+	core.AssertEqual(t, true, sourceKV.QK.Key.borrowed)
+	core.AssertEqual(t, true, sourceKV.Value.borrowed)
+	kvProjectionCap := keyCount
+	kvProjectionPair := &workspace.KVProjectionPairFixed
+	if kvProjectionPair.Pointer() == 0 || workspace.KVProjectionPairCap < kvProjectionCap {
+		t.Fatalf("KV projection pair workspace missing for cap %d", kvProjectionCap)
+	}
+	core.AssertEqual(t, kvProjectionPair.Pointer(), sourceKV.QKV.Key.Pointer())
+	core.AssertEqual(t, kvProjectionPair.Pointer()+nativeDevicePointer(kvProjectionCap*4), sourceKV.QKV.Value.Pointer())
+	keyValueNormPair := &workspace.KeyValueNormFixed
+	core.RequireTrue(t, keyValueNormPair.Pointer() != 0, "key/value norm pair workspace should exist")
+	core.AssertEqual(t, keyValueNormPair.Pointer(), sourceKV.QK.Key.Pointer())
+	core.AssertEqual(t, keyValueNormPair.Pointer()+nativeDevicePointer(len(tokens)*layer0.HeadDim*4), sourceKV.Value.Pointer())
+	if sharedKV.SharedKey != nil || sharedKV.SharedVal != nil {
+		t.Fatalf("shared layer retained borrowed raw KV pointers: key=%#v value=%#v", sharedKV.SharedKey, sharedKV.SharedVal)
+	}
+	if sharedKV.DeviceKV == nil || sharedKV.DeviceKV.Cache == nil || sharedKV.DeviceKV.DescriptorTable == nil {
+		t.Fatalf("shared layer did not retain descriptor-backed device KV")
+	}
+}
+
+func hipGemma4Q4PrefillForwardTestPerLayerInputs(t *testing.T, driver nativeHIPDriver, cfg hipGemma4Q4ForwardConfig, tokens []int32, label string) []*hipDeviceByteBuffer {
+	t.Helper()
+	perLayerInputs := make([]*hipDeviceByteBuffer, len(cfg.Layers))
+	for layerIndex, layer := range cfg.Layers {
+		values := make([]float32, len(tokens)*layer.PerLayerInput.InputSize)
+		for index := range values {
+			values[index] = float32(layerIndex + 1)
+		}
+		payload, err := hipFloat32Payload(values)
+		core.RequireNoError(t, err)
+		buffer, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, label, payload, len(values))
+		core.RequireNoError(t, err)
+		buf := buffer
+		t.Cleanup(func() {
+			_ = buf.Close()
+		})
+		perLayerInputs[layerIndex] = buffer
+	}
+	return perLayerInputs
+}
+
 func TestHIPGemma4Q4PrefillDecodeStateTrimsSlidingWindow_Good(t *testing.T) {
 	driver := &fakeHIPDriver{available: true}
 	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
@@ -1618,6 +2477,55 @@ func TestHIPGemma4Q4PrefillDecodeStateTrimsSlidingWindow_Good(t *testing.T) {
 	core.AssertEqual(t, uint32(len(tokens)), binary.LittleEndian.Uint32(attentionLaunches[1].Args[64:]))
 }
 
+func TestHIPGemma4Q4PrefillForwardWithPriorDescriptorUsesAppend_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup0()
+	hipGemma4Q4InstallNonzeroEmbeddingFixture(t, driver, &layer0, "prefill prior descriptor append")
+	layer0.LayerType = "full_attention"
+	layer0.SlidingWindow = 0
+	layer0.PerLayerInput = hipGemma4Q4PerLayerInputConfig{}
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0}}
+
+	firstForward, err := hipRunGemma4Q4PrefillForwardBatch(context.Background(), driver, cfg, []int32{0}, 0, 1e-6, rocmKVCacheModeKQ8VQ4, nil, nil, nil)
+	core.RequireNoError(t, err)
+	firstState, err := hipGemma4Q4DeviceDecodeStateFromPrefillForward(firstForward, rocmKVCacheModeKQ8VQ4)
+	core.RequireNoError(t, err)
+	closeErr := firstForward.Close()
+	core.RequireNoError(t, closeErr)
+	defer firstState.Close()
+
+	priorDescriptor := firstState.layerDescriptorTable(0)
+	priorPointer := priorDescriptor.Pointer()
+	priorLayerKV := hipGemma4Q4DeviceLayerCaches(firstState, nil, len(cfg.Layers))
+	priorLayerDescriptors := hipGemma4Q4DeviceLayerDescriptorTables(firstState, nil, len(cfg.Layers))
+	startLaunches := len(driver.launches)
+	secondForward, err := hipRunGemma4Q4PrefillForwardBatchWithPriorDescriptorWorkspace(context.Background(), driver, cfg, []int32{1}, 1, 1e-6, rocmKVCacheModeKQ8VQ4, priorLayerKV, priorLayerDescriptors, nil, nil, nil, nil)
+	core.RequireNoError(t, err)
+	appendLaunches := make([]hipKernelLaunchConfig, 0, 1)
+	for _, launch := range driver.launches[startLaunches:] {
+		if launch.Name == hipKernelNameKVDescriptorAppend {
+			appendLaunches = append(appendLaunches, launch)
+		}
+	}
+	core.AssertEqual(t, 1, len(appendLaunches))
+	secondDeviceKV := secondForward.Layers[0].KV.DeviceKV
+	core.AssertTrue(t, secondDeviceKV.DescriptorTable.Pointer() != 0, "second descriptor table should be device-backed")
+	core.AssertEqual(t, uint64(priorPointer), binary.LittleEndian.Uint64(appendLaunches[0].Args[8:]))
+	core.AssertEqual(t, uint64(secondDeviceKV.DescriptorTable.Pointer()), binary.LittleEndian.Uint64(appendLaunches[0].Args[16:]))
+	core.AssertEqual(t, 2, secondDeviceKV.Cache.TokenCount())
+
+	secondState, err := hipGemma4Q4DeviceDecodeStateFromPrefillForward(secondForward, rocmKVCacheModeKQ8VQ4)
+	closeErr = secondForward.Close()
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, closeErr)
+	defer secondState.Close()
+	core.RequireNoError(t, hipFinalizeGemma4Q4ForwardDeviceState(firstState, secondState))
+	hipReleaseClosedGemma4Q4DeviceDecodeState(firstState)
+	firstState = nil
+	core.AssertEqual(t, []int{2}, secondState.LayerTokenCounts())
+}
+
 func TestHIPGemma4Q4PrefillDecodeStateSharedAliasesFollowTrimmedSource_Good(t *testing.T) {
 	driver := &fakeHIPDriver{available: true}
 	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 8, 1, 8)
@@ -1659,6 +2567,10 @@ func TestHIPGemma4Q4PrefillDecodeStateSharedAliasesFollowTrimmedSource_Good(t *t
 	core.AssertEqual(t, true, state.layers[2].borrowedDescriptorTable)
 	core.AssertEqual(t, true, state.layers[3].borrowedCache)
 	core.AssertEqual(t, true, state.layers[3].borrowedDescriptorTable)
+	core.AssertEqual(t, state.layers[0].cache, state.layers[2].cache)
+	core.AssertEqual(t, state.layers[0].descriptorTable, state.layers[2].descriptorTable)
+	core.AssertEqual(t, state.layers[1].cache, state.layers[3].cache)
+	core.AssertEqual(t, state.layers[1].descriptorTable, state.layers[3].descriptorTable)
 	core.AssertEqual(t, state.layers[0].cache.TokenCount(), state.layers[2].cache.TokenCount())
 	core.AssertEqual(t, state.layers[1].cache.TokenCount(), state.layers[3].cache.TokenCount())
 }
@@ -1842,6 +2754,8 @@ func TestHIPGemma4Q4PrefillForwardBatchWithGeneratedPerLayerInput_Good(t *testin
 	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0, layer1}}
 	tokens := []int32{0, 1}
 	start := len(driver.launches)
+	allocStart := len(driver.allocations)
+	copyStart := len(driver.copies)
 	forward, err := hipRunGemma4Q4PrefillForwardBatch(context.Background(), driver, cfg, tokens, 0, 1e-6, rocmKVCacheModeKQ8VQ4, nil, nil, nil)
 	core.RequireNoError(t, err)
 	defer forward.Close()
@@ -1851,6 +2765,47 @@ func TestHIPGemma4Q4PrefillForwardBatchWithGeneratedPerLayerInput_Good(t *testin
 	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameProjectionBatch))
 	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNamePerLayerInputTranspose))
 	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameMLXQ4GELUTanhProjBatch))
+	core.AssertEqual(t, 1, countUint64Value(driver.allocations[allocStart:], uint64(len(tokens)*4)))
+	core.AssertEqual(t, 1, countUint64Value(driver.copies[copyStart:], uint64(len(tokens)*4)))
+}
+
+func TestHIPGemma4Q4PrefillPerLayerInputDeviceSetBatchWorkspaceReusesFinalBacking_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup0()
+	layer1, cleanup1 := hipGemma4Q4FixtureConfig(t, driver, 1, 4, 2, 8)
+	defer cleanup1()
+	layers, cleanupPerLayer := hipGemma4Q4GlobalPerLayerInputFixture(t, driver, []hipGemma4Q4Layer0Config{layer0, layer1})
+	defer cleanupPerLayer()
+
+	tokens := []int32{0, 1}
+	hiddenValues := make([]float32, len(tokens)*layer0.HiddenSize)
+	payload, err := hipFloat32Payload(hiddenValues)
+	core.RequireNoError(t, err)
+	hidden, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill per-layer workspace hidden", payload, len(hiddenValues))
+	core.RequireNoError(t, err)
+	defer hidden.Close()
+
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	cfg := hipGemma4Q4ForwardConfig{Layers: layers}
+	allocStart := len(driver.allocations)
+	set, err := hipRunGemma4Q4PrefillPerLayerInputDeviceSetBatchWorkspace(context.Background(), driver, cfg, tokens, hidden, 1e-6, workspace)
+	core.RequireNoError(t, err)
+	defer set.Close()
+	core.AssertEqual(t, len(layers), set.LayerCount())
+	core.AssertEqual(t, len(tokens)*layer0.HiddenSize, set.Layer(0).Count())
+	core.AssertEqual(t, 3, len(driver.allocations)-allocStart)
+	if workspace.PerLayerScaled != nil {
+		t.Fatalf("per-layer scaled workspace allocated: %+v", workspace.PerLayerScaled)
+	}
+
+	set, err = hipRunGemma4Q4PrefillPerLayerInputDeviceSetBatchWorkspace(context.Background(), driver, cfg, tokens, hidden, 1e-6, workspace)
+	core.RequireNoError(t, err)
+	defer set.Close()
+	core.AssertEqual(t, len(layers), set.LayerCount())
+	core.AssertEqual(t, len(tokens)*layer0.HiddenSize, set.Layer(1).Count())
+	core.AssertEqual(t, 4, len(driver.allocations)-allocStart)
 }
 
 func TestHIPGemma4Q4PrefillLayerBodyBatch_Bad(t *testing.T) {
@@ -1971,6 +2926,39 @@ func TestHIPGemma4Q4PrefillMLPBatch_Good(t *testing.T) {
 	}
 }
 
+func TestHIPGemma4Q4PrefillMLPBatchWorkspaceReused_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4Layer0FixtureConfig(t, driver)
+	defer cleanup()
+
+	tokenCount := 2
+	inputValues := make([]float32, tokenCount*cfg.HiddenSize)
+	for index := range inputValues {
+		inputValues[index] = float32(index%cfg.HiddenSize + 1)
+	}
+	payload, err := hipFloat32Payload(inputValues)
+	core.RequireNoError(t, err)
+	input, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "prefill MLP workspace fixture", payload, len(inputValues))
+	core.RequireNoError(t, err)
+	defer input.Close()
+
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	allocStart := len(driver.allocations)
+	output, err := hipRunGemma4Q4PrefillMLPBatchWorkspace(context.Background(), driver, cfg, input, tokenCount, workspace)
+	core.RequireNoError(t, err)
+	defer output.Close()
+	core.AssertEqual(t, tokenCount*cfg.DownProjection.Rows, output.Count())
+	core.AssertEqual(t, allocStart+2, len(driver.allocations))
+
+	output, err = hipRunGemma4Q4PrefillMLPBatchWorkspace(context.Background(), driver, cfg, input, tokenCount, workspace)
+	core.RequireNoError(t, err)
+	defer output.Close()
+	core.AssertEqual(t, tokenCount*cfg.DownProjection.Rows, output.Count())
+	core.AssertEqual(t, allocStart+2, len(driver.allocations))
+}
+
 func TestHIPGemma4Q4PrefillMLPBatch_Bad(t *testing.T) {
 	driver := &fakeHIPDriver{available: true}
 	cfg, cleanup := hipGemma4Q4Layer0FixtureConfig(t, driver)
@@ -1996,21 +2984,22 @@ func TestHIPGemma4Q4PrefillMLPBatch_Bad(t *testing.T) {
 	core.AssertEqual(t, start, len(driver.launches))
 }
 
-func TestHIPGemma4Q4GenerateTokenSeq_BadPrefillUBatchEnv(t *testing.T) {
+func TestHIPGemma4Q4GenerateTokenSeq_BadPrefillUBatchConfig(t *testing.T) {
 	driver := &fakeHIPDriver{available: true}
 	cfg, cleanup := hipGemma4Q4Layer0FixtureConfig(t, driver)
 	defer cleanup()
 
-	t.Setenv(hipGemma4Q4PrefillUBatchEnv, "nope")
-	stream, streamErr := hipGemma4Q4GenerateTokenSeq(context.Background(), &hipLoadedModel{driver: driver}, hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{cfg}}, []int32{1}, inference.GenerateConfig{MaxTokens: 1})
+	engineConfig := defaultHIPGemma4Q4EngineConfig()
+	engineConfig.PrefillUBatchTokens = 0
+	stream, streamErr := hipGemma4Q4GenerateTokenSeqWithEngineConfig(context.Background(), &hipLoadedModel{driver: driver}, hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{cfg}}, []int32{1}, inference.GenerateConfig{MaxTokens: 1}, engineConfig)
 	for range stream {
-		t.Fatalf("hipGemma4Q4GenerateTokenSeq yielded token, want prefill ubatch env error")
+		t.Fatalf("hipGemma4Q4GenerateTokenSeq yielded token, want prefill ubatch config error")
 	}
 	err := streamErr()
 	if err == nil {
-		t.Fatalf("hipGemma4Q4GenerateTokenSeq succeeded, want prefill ubatch env error")
+		t.Fatalf("hipGemma4Q4GenerateTokenSeq succeeded, want prefill ubatch config error")
 	}
-	core.AssertContains(t, err.Error(), hipGemma4Q4PrefillUBatchEnv)
+	core.AssertContains(t, err.Error(), "prefill ubatch tokens")
 	core.AssertEqual(t, 0, len(driver.launches))
 }
 
@@ -2100,6 +3089,43 @@ func TestHIPGemma4Q4PerLayerInputConfigScalesCached_Good(t *testing.T) {
 	cfg.finalizeScales()
 	core.AssertEqual(t, float32(0), cfg.EmbeddingScale)
 	core.AssertEqual(t, float32(0), cfg.ModelProjectionScale)
+}
+
+func TestHIPGemma4Q4PerLayerInputConfigDeviceSetWorkspaceScalesProjectionInPlace_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup0()
+	layer1, cleanup1 := hipGemma4Q4FixtureConfig(t, driver, 1, 4, 2, 8)
+	defer cleanup1()
+	layers, cleanupPerLayer := hipGemma4Q4GlobalPerLayerInputFixture(t, driver, []hipGemma4Q4Layer0Config{layer0, layer1})
+	defer cleanupPerLayer()
+
+	hiddenValues := make([]float32, layer0.HiddenSize)
+	payload, err := hipFloat32Payload(hiddenValues)
+	core.RequireNoError(t, err)
+	hidden, err := hipUploadByteBuffer(driver, hipGemma4Q4Layer0Operation, "per-layer single-token hidden", payload, len(hiddenValues))
+	core.RequireNoError(t, err)
+	defer hidden.Close()
+
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	allocStart := len(driver.allocations)
+	set, err := hipRunGemma4Q4PerLayerInputConfigDeviceSet(context.Background(), driver, layers[0].PerLayerInput, 0, nil, hidden, 1e-6, workspace)
+	core.RequireNoError(t, err)
+	defer set.Close()
+
+	core.AssertEqual(t, len(layers), set.LayerCount())
+	core.AssertEqual(t, layer0.HiddenSize, set.Layer(0).Count())
+	if workspace.PerLayerProjScaled != nil {
+		t.Fatalf("per-layer projected scaled workspace allocated: %+v", workspace.PerLayerProjScaled)
+	}
+	if workspace.PerLayerNorm != nil {
+		t.Fatalf("per-layer norm workspace allocated: %+v", workspace.PerLayerNorm)
+	}
+	if len(workspace.PerLayerOutput) > 0 {
+		t.Fatalf("per-layer output workspace allocated: %+v", workspace.PerLayerOutput)
+	}
+	core.AssertEqual(t, 3, len(driver.allocations)-allocStart)
 }
 
 func TestHIPGemma4Q4SharedKV_Good(t *testing.T) {
@@ -2215,6 +3241,7 @@ func TestHIPGemma4Q4LoadedConfigAttentionKEqVSkipsVProjection_Good(t *testing.T)
 			QuantBits:    4,
 			QuantGroup:   groupSize,
 		},
+		modelLabels: linkedGemma4TestLabels("E2B", "q4"),
 		gemma4TextConfig: nativeGemma4TextConfig{
 			AttentionKEqV: true,
 			LayerTypes:    []string{"full_attention"},
@@ -2512,9 +3539,52 @@ func TestHIPGemma4Q4DecoderLayerAttentionKEqVUsesPairProjection_Good(t *testing.
 	core.AssertEqual(t, 0, countLaunchName(launches, hipKernelNameMLXQ4TripleProj))
 	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameMLXQ4Proj))
 	core.AssertEqual(t, 1, countKVEncodeTokenLaunches(launches))
+	queryRoPE := &workspace.RMSRoPEOutputView
+	if queryRoPE.Pointer() == 0 || queryRoPE.Count() != cfg.QueryProjection.Rows {
+		t.Fatalf("query RMS RoPE workspace = %#v, want %d rows", queryRoPE, cfg.QueryProjection.Rows)
+	}
+	keyValueNormPair := &workspace.KeyValueNormFixed
+	if keyValueNormPair.Pointer() == 0 || keyValueNormPair.Count() != cfg.HeadDim*2 {
+		t.Fatalf("key/value norm workspace = %#v, want %d rows", keyValueNormPair, cfg.HeadDim*2)
+	}
+	if queryRoPE.Pointer() == keyValueNormPair.Pointer() {
+		t.Fatalf("query and key/value norm workspaces aliased at %x", queryRoPE.Pointer())
+	}
+	if _, ok := workspace.RMSRoPEOutputs[cfg.HeadDim]; ok {
+		t.Fatalf("decode key RoPE used shared query RMS RoPE workspace")
+	}
 	if countDeviceAttentionLaunches(launches) == 0 {
 		t.Fatalf("Gemma4 q4 K=V decoder layer launched no descriptor-backed attention kernels")
 	}
+}
+
+func TestHIPGemma4Q4DecoderLayerOmitHostKVRejectsHostSharedFallback_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	cfg, cleanup := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup()
+	cfg.LayerType = "full_attention"
+	cfg.SlidingWindow = 0
+	input, err := hipUploadGemma4Q4Float32Input(driver, "Gemma4 q4 no host KV fallback input", []float32{1, 2, 3, 4, 5, 6, 7, 8})
+	core.RequireNoError(t, err)
+	defer input.Close()
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	_, err = hipRunGemma4Q4DecoderLayerInternalWithDeviceInput(context.Background(), driver, cfg, nil, input, hipGemma4Q4DecoderLayerRequest{
+		Position:           0,
+		Epsilon:            1e-6,
+		SharedKeys:         []float32{0.1, 0.2, 0.3, 0.4},
+		SharedValues:       []float32{0.5, 0.6, 0.7, 0.8},
+		DeviceKVAttention:  true,
+		DeviceKVMode:       rocmKVCacheModeKQ8VQ4,
+		KeepDeviceKV:       true,
+		OmitHostKV:         true,
+		OmitDebugTensors:   true,
+		ReturnDeviceHidden: true,
+		AttentionWorkspace: workspace,
+	}, true)
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "device-only KV path requires device token buffers or shared device KV")
 }
 
 func TestHIPGemma4Q4PackagePrefillDecode_Good(t *testing.T) {
@@ -2524,7 +3594,7 @@ func TestHIPGemma4Q4PackagePrefillDecode_Good(t *testing.T) {
 	layer1, cleanup1 := hipGemma4Q4FixtureConfig(t, driver, 1, 4, 2, 16)
 	defer cleanup1()
 	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0, layer1}}
-	model := &hipLoadedModel{driver: driver}
+	model := &hipLoadedModel{driver: driver, modelLabels: linkedGemma4TestLabels("E2B", "q4")}
 
 	launchStart := len(driver.launches)
 	prefill, err := hipRunGemma4Q4PackagePrefill(context.Background(), model, cfg, hipPrefillRequest{
@@ -2598,6 +3668,7 @@ func TestHIPGemma4Q4PackagePrefillDecode_Good(t *testing.T) {
 	}
 
 	model.modelInfo = inference.ModelInfo{Architecture: "gemma4", QuantBits: 4, VocabSize: layer0.VocabSize}
+	model.modelLabels = linkedGemma4TestLabels("E2B", "q4")
 	model.tokenText = &hipTokenTextDecoder{
 		vocab: map[string]int32{
 			"a": 1,
@@ -2608,7 +3679,6 @@ func TestHIPGemma4Q4PackagePrefillDecode_Good(t *testing.T) {
 			1: "a",
 		},
 	}
-	t.Setenv("GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE", "1")
 	launchStart = len(driver.launches)
 	textBatch := hipGemma4Q4BatchGenerate(context.Background(), model, cfg, []string{"text:a", "a"}, inference.GenerateConfig{MaxTokens: 1})
 	core.AssertEqual(t, 2, len(textBatch))
@@ -2731,6 +3801,1220 @@ func TestHIPGemma4Q4SkipFinalSample_Good(t *testing.T) {
 	}
 }
 
+func TestHIPGemma4Q4ForwardReturnsDeviceFinalHiddenForMTP_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 8, 1, 8)
+	defer cleanup0()
+	layer1, cleanup1 := hipGemma4Q4FixtureConfig(t, driver, 1, 4, 2, 8)
+	defer cleanup1()
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0, layer1}}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	forward, state, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(context.Background(), driver, cfg, hipGemma4Q4DecodeState{}, hipGemma4Q4ForwardRequest{
+		TokenID:                 1,
+		Position:                0,
+		Epsilon:                 1e-6,
+		DeviceKVAttention:       true,
+		DeviceKVMode:            rocmKVCacheModeKQ8VQ4,
+		ReturnDeviceState:       true,
+		ReturnDeviceFinalHidden: true,
+		SkipFinalSample:         true,
+		OmitDebugTensors:        true,
+		AttentionWorkspace:      workspace,
+	}, false)
+	core.RequireNoError(t, err)
+	defer forward.DeviceState.Close()
+
+	if forward.DeviceFinalHidden == nil || forward.DeviceFinalHidden.Pointer() == 0 {
+		t.Fatalf("device final hidden = %#v, want workspace-backed target hidden for MTP handoff", forward.DeviceFinalHidden)
+	}
+	core.AssertEqual(t, layer0.HiddenSize, forward.DeviceFinalHidden.Count())
+	core.AssertEqual(t, uint64(layer0.HiddenSize*4), forward.DeviceFinalHidden.SizeBytes())
+	core.AssertEqual(t, true, forward.DeviceFinalHiddenBorrowed)
+	core.AssertEqual(t, workspace.FinalHiddenOutputViews[1].Pointer(), forward.DeviceFinalHidden.Pointer())
+	core.AssertEqual(t, "returned", forward.Labels["gemma4_q4_device_final_hidden"])
+	core.AssertEqual(t, "true", forward.Labels["gemma4_q4_device_final_hidden_borrowed"])
+	core.AssertEqual(t, "skipped", forward.Labels["gemma4_q4_final_sample"])
+	core.AssertEqual(t, 0, len(forward.FinalHidden))
+	core.AssertEqual(t, 0, len(forward.Logits))
+	core.AssertEqual(t, []int{1, 1}, forward.DeviceState.LayerTokenCounts())
+	for index, layer := range state.Layers {
+		if len(layer.Keys) != 0 || len(layer.Values) != 0 {
+			t.Fatalf("state layer %d retained host KV in device-hidden MTP handoff path", index)
+		}
+	}
+}
+
+func TestHIPAttachedDrafterAssistantDraftStepInputBridge_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 8, 1, 8)
+	defer cleanup0()
+	layer1, cleanup1 := hipGemma4Q4FixtureConfig(t, driver, 1, 4, 2, 8)
+	defer cleanup1()
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0, layer1}}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	forward, _, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(context.Background(), driver, cfg, hipGemma4Q4DecodeState{}, hipGemma4Q4ForwardRequest{
+		TokenID:                 1,
+		Position:                0,
+		Epsilon:                 1e-6,
+		DeviceKVAttention:       true,
+		DeviceKVMode:            rocmKVCacheModeKQ8VQ4,
+		ReturnDeviceState:       true,
+		ReturnDeviceFinalHidden: true,
+		SkipFinalSample:         true,
+		OmitDebugTensors:        true,
+		AttentionWorkspace:      workspace,
+	}, false)
+	core.RequireNoError(t, err)
+	defer forward.DeviceState.Close()
+
+	preProjectionPayload, err := hipUint16Payload(make([]uint16, layer0.HiddenSize*layer0.HiddenSize*2))
+	core.RequireNoError(t, err)
+	preProjection, err := hipUploadByteBuffer(driver, "rocm.hip.AttachedDrafterAssistantDraftStep", "assistant pre-projection fixture", preProjectionPayload, layer0.HiddenSize*layer0.HiddenSize*2)
+	core.RequireNoError(t, err)
+	defer preProjection.Close()
+
+	plan := hipAttachedDrafterAssistantDraftStepInputPlan{
+		Status:               attachedDrafterAssistantDraftStepInputLinked,
+		HiddenSize:           layer0.HiddenSize,
+		VocabSize:            layer0.VocabSize,
+		TargetHiddenSize:     layer0.HiddenSize,
+		CombinedInputSize:    layer0.HiddenSize * 2,
+		ProjectionEncoding:   "bf16",
+		TargetEmbedding:      layer0.Embedding,
+		TargetEmbeddingScale: layer0.embeddingScale(),
+		PreProjection: hipAttachedDrafterAssistantProjectionPlan{
+			Encoding: "bf16",
+			Rows:     layer0.HiddenSize,
+			Cols:     layer0.HiddenSize * 2,
+			BF16: hipBF16DeviceWeightConfig{
+				WeightPointer: preProjection.Pointer(),
+				WeightBytes:   preProjection.SizeBytes(),
+				Rows:          layer0.HiddenSize,
+				Cols:          layer0.HiddenSize * 2,
+			},
+		},
+		KernelFamilies: []string{hipKernelNameEmbedLookup, hipKernelNameVectorScale, hipKernelNameProjection},
+	}
+
+	launchStart := len(driver.launches)
+	result, err := hipRunAttachedDrafterAssistantDraftStepInputBridge(context.Background(), driver, hipAttachedDrafterAssistantDraftStepInputRequest{
+		LastToken:         1,
+		TargetHidden:      forward.DeviceFinalHidden,
+		TargetDeviceState: forward.DeviceState,
+		Plan:              plan,
+		Workspace:         workspace,
+	})
+	core.RequireNoError(t, err)
+	defer result.Close()
+
+	if result.Hidden == nil || result.Hidden.Pointer() == 0 {
+		t.Fatalf("assistant draft-step hidden = %#v, want device pre-projection output", result.Hidden)
+	}
+	core.AssertEqual(t, layer0.HiddenSize, result.Hidden.Count())
+	core.AssertEqual(t, uint64(layer0.HiddenSize*4), result.Hidden.SizeBytes())
+	core.AssertEqual(t, attachedDrafterAssistantDraftStepInputLinked, result.Labels["attached_drafter_assistant_draft_step_input_bridge"])
+	core.AssertEqual(t, "device", result.Labels["attached_drafter_assistant_draft_step_target_hidden_source"])
+	core.AssertEqual(t, "device_combined_token_hidden", result.Labels["attached_drafter_assistant_draft_step_input_buffer"])
+	core.AssertEqual(t, "workspace", result.Labels["attached_drafter_assistant_draft_step_input_buffer_reuse"])
+	core.AssertEqual(t, "bf16", result.Labels["attached_drafter_assistant_draft_step_pre_projection_encoding"])
+
+	launches := driver.launches[launchStart:]
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameEmbedLookup))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameVectorScale))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameProjection))
+	core.RequireNoError(t, result.Close())
+
+	allocationCount := len(driver.allocations)
+	second, err := hipRunAttachedDrafterAssistantDraftStepInputBridge(context.Background(), driver, hipAttachedDrafterAssistantDraftStepInputRequest{
+		LastToken:         1,
+		TargetHidden:      forward.DeviceFinalHidden,
+		TargetDeviceState: forward.DeviceState,
+		Plan:              plan,
+		Workspace:         workspace,
+	})
+	core.RequireNoError(t, err)
+	defer second.Close()
+	core.AssertEqual(t, allocationCount, len(driver.allocations))
+}
+
+func TestHIPAttachedDrafterAssistantDraftStepInputPlanAcceptsAsymmetricAssistantHidden_Good(t *testing.T) {
+	plan := hipAttachedDrafterAssistantDraftStepInputPlan{
+		Status:             attachedDrafterAssistantDraftStepInputLinked,
+		HiddenSize:         256,
+		VocabSize:          262144,
+		TargetHiddenSize:   1536,
+		CombinedInputSize:  3072,
+		ProjectionEncoding: "bf16",
+		TargetEmbedding: hipDeviceEmbeddingLookupConfig{
+			EmbeddingPointer: 1,
+			EmbeddingBytes:   uint64(262144 * 1536 * 2),
+			TableEncoding:    hipEmbeddingTableEncodingBF16,
+			VocabSize:        262144,
+			HiddenSize:       1536,
+		},
+		TargetEmbeddingScale: 1,
+		PreProjection: hipAttachedDrafterAssistantProjectionPlan{
+			Encoding: "bf16",
+			Rows:     256,
+			Cols:     3072,
+			BF16: hipBF16DeviceWeightConfig{
+				WeightPointer: 2,
+				WeightBytes:   uint64(256 * 3072 * 2),
+				Rows:          256,
+				Cols:          3072,
+			},
+		},
+	}
+	if reason := hipAttachedDrafterAssistantDraftStepInputPlanInvalidReason(plan); reason != "" {
+		t.Fatalf("asymmetric assistant input plan invalid: %s", reason)
+	}
+	labels := plan.Labels()
+	core.AssertEqual(t, "256", labels["attached_drafter_assistant_draft_step_hidden_size"])
+	core.AssertEqual(t, "1536", labels["attached_drafter_assistant_draft_step_target_hidden_size"])
+	core.AssertEqual(t, "1536", labels["attached_drafter_assistant_draft_step_target_embedding_hidden_size"])
+	core.AssertEqual(t, "3072", labels["attached_drafter_assistant_draft_step_combined_input_size"])
+
+	wrong := plan
+	wrong.CombinedInputSize = wrong.TargetHiddenSize + wrong.HiddenSize
+	if reason := hipAttachedDrafterAssistantDraftStepInputPlanInvalidReason(wrong); reason != "combined input size must equal target token embedding plus target hidden" {
+		t.Fatalf("wrong asymmetric assistant input plan reason = %q", reason)
+	}
+}
+
+func TestHIPAttachedDrafterAssistantDraftStepInputBridge_MLXAffineQAT_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 8, 1, 8)
+	defer cleanup0()
+	layer1, cleanup1 := hipGemma4Q4FixtureConfig(t, driver, 1, 4, 2, 8)
+	defer cleanup1()
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0, layer1}}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	forward, _, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(context.Background(), driver, cfg, hipGemma4Q4DecodeState{}, hipGemma4Q4ForwardRequest{
+		TokenID:                 1,
+		Position:                0,
+		Epsilon:                 1e-6,
+		DeviceKVAttention:       true,
+		DeviceKVMode:            rocmKVCacheModeKQ8VQ4,
+		ReturnDeviceState:       true,
+		ReturnDeviceFinalHidden: true,
+		SkipFinalSample:         true,
+		OmitDebugTensors:        true,
+		AttentionWorkspace:      workspace,
+	}, false)
+	core.RequireNoError(t, err)
+	defer forward.DeviceState.Close()
+
+	combinedInput := layer0.HiddenSize * 2
+	packedCols, err := hipMLXAffinePackedCols(combinedInput, 4)
+	core.RequireNoError(t, err)
+	weightsPayload, err := hipUint32Payload(make([]uint32, layer0.HiddenSize*packedCols))
+	core.RequireNoError(t, err)
+	weights, err := hipUploadByteBuffer(driver, "rocm.hip.AttachedDrafterAssistantDraftStep", "assistant q4 pre-projection weights", weightsPayload, layer0.HiddenSize*packedCols)
+	core.RequireNoError(t, err)
+	defer weights.Close()
+	scaleCount := layer0.HiddenSize * (combinedInput / layer0.GroupSize)
+	scalesPayload, err := hipUint16Payload(make([]uint16, scaleCount))
+	core.RequireNoError(t, err)
+	scales, err := hipUploadByteBuffer(driver, "rocm.hip.AttachedDrafterAssistantDraftStep", "assistant q4 pre-projection scales", scalesPayload, scaleCount)
+	core.RequireNoError(t, err)
+	defer scales.Close()
+	biasesPayload, err := hipUint16Payload(make([]uint16, scaleCount))
+	core.RequireNoError(t, err)
+	biases, err := hipUploadByteBuffer(driver, "rocm.hip.AttachedDrafterAssistantDraftStep", "assistant q4 pre-projection biases", biasesPayload, scaleCount)
+	core.RequireNoError(t, err)
+	defer biases.Close()
+
+	plan := hipAttachedDrafterAssistantDraftStepInputPlan{
+		Status:               attachedDrafterAssistantDraftStepInputLinked,
+		HiddenSize:           layer0.HiddenSize,
+		VocabSize:            layer0.VocabSize,
+		TargetHiddenSize:     layer0.HiddenSize,
+		CombinedInputSize:    combinedInput,
+		ProjectionEncoding:   "mlx_affine",
+		TargetEmbedding:      layer0.Embedding,
+		TargetEmbeddingScale: layer0.embeddingScale(),
+		PreProjection: hipAttachedDrafterAssistantProjectionPlan{
+			Encoding: "mlx_affine",
+			Rows:     layer0.HiddenSize,
+			Cols:     combinedInput,
+			MLXAffine: hipMLXQ4DeviceWeightConfig{
+				WeightPointer: weights.Pointer(),
+				ScalePointer:  scales.Pointer(),
+				BiasPointer:   biases.Pointer(),
+				WeightBytes:   weights.SizeBytes(),
+				ScaleBytes:    scales.SizeBytes(),
+				BiasBytes:     biases.SizeBytes(),
+				Rows:          layer0.HiddenSize,
+				Cols:          combinedInput,
+				GroupSize:     layer0.GroupSize,
+				Bits:          4,
+			},
+		},
+		KernelFamilies: []string{hipKernelNameEmbedLookup, hipKernelNameVectorScale, hipKernelNameMLXQ4Proj},
+	}
+
+	launchStart := len(driver.launches)
+	result, err := hipRunAttachedDrafterAssistantDraftStepInputBridge(context.Background(), driver, hipAttachedDrafterAssistantDraftStepInputRequest{
+		LastToken:         1,
+		TargetHidden:      forward.DeviceFinalHidden,
+		TargetDeviceState: forward.DeviceState,
+		Plan:              plan,
+		Workspace:         workspace,
+	})
+	core.RequireNoError(t, err)
+	defer result.Close()
+
+	core.AssertEqual(t, layer0.HiddenSize, result.Hidden.Count())
+	core.AssertEqual(t, "mlx_affine", result.Labels["attached_drafter_assistant_draft_step_pre_projection_encoding"])
+	core.AssertEqual(t, "workspace", result.Labels["attached_drafter_assistant_draft_step_input_buffer_reuse"])
+	launches := driver.launches[launchStart:]
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameEmbedLookup))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameVectorScale))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameMLXQ4Proj))
+}
+
+func TestHIPAttachedDrafterAssistantLayerUsesTargetDeviceKV_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 8, 1, 8)
+	defer cleanup0()
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0}}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	forward, _, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(context.Background(), driver, cfg, hipGemma4Q4DecodeState{}, hipGemma4Q4ForwardRequest{
+		TokenID:                 1,
+		Position:                0,
+		Epsilon:                 1e-6,
+		DeviceKVAttention:       true,
+		DeviceKVMode:            rocmKVCacheModeKQ8VQ4,
+		ReturnDeviceState:       true,
+		ReturnDeviceFinalHidden: true,
+		SkipFinalSample:         true,
+		OmitDebugTensors:        true,
+		AttentionWorkspace:      workspace,
+	}, false)
+	core.RequireNoError(t, err)
+	defer forward.DeviceState.Close()
+
+	targetLayer, targetLayerConfig, targetLayerIndex, err := hipAttachedDrafterAssistantTargetLayerFor(layer0.LayerType, cfg, forward.DeviceState)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 0, targetLayerIndex)
+
+	plan := hipAttachedDrafterAssistantVerifierLayerPlan{
+		Layer:              0,
+		LayerType:          layer0.LayerType,
+		HiddenSize:         layer0.HiddenSize,
+		HeadDim:            layer0.HeadDim,
+		QueryHeads:         layer0.QueryHeads,
+		RoPEBase:           layer0.RoPEBase,
+		RoPERotaryDim:      layer0.RoPERotaryDim,
+		RoPEFrequencyScale: layer0.RoPEFrequencyScale,
+		SlidingWindow:      layer0.SlidingWindow,
+		LayerScalar:        layer0.effectiveLayerScalar(),
+		InputNorm:          layer0.InputNorm,
+		PostAttentionNorm:  layer0.PostAttentionNorm,
+		PreFeedforward:     layer0.PreFeedForwardNorm,
+		PostFeedforward:    layer0.PostFeedForwardNorm,
+		QueryNorm:          layer0.QueryNorm,
+		QueryProjection: hipAttachedDrafterAssistantProjectionPlan{
+			Encoding:  "mlx_affine",
+			Rows:      layer0.QueryProjection.Rows,
+			Cols:      layer0.QueryProjection.Cols,
+			MLXAffine: layer0.QueryProjection,
+		},
+		OutputProjection: hipAttachedDrafterAssistantProjectionPlan{
+			Encoding:  "mlx_affine",
+			Rows:      layer0.OutputProjection.Rows,
+			Cols:      layer0.OutputProjection.Cols,
+			MLXAffine: layer0.OutputProjection,
+		},
+		GateProjection: hipAttachedDrafterAssistantProjectionPlan{
+			Encoding:  "mlx_affine",
+			Rows:      layer0.GateProjection.Rows,
+			Cols:      layer0.GateProjection.Cols,
+			MLXAffine: layer0.GateProjection,
+		},
+		UpProjection: hipAttachedDrafterAssistantProjectionPlan{
+			Encoding:  "mlx_affine",
+			Rows:      layer0.UpProjection.Rows,
+			Cols:      layer0.UpProjection.Cols,
+			MLXAffine: layer0.UpProjection,
+		},
+		DownProjection: hipAttachedDrafterAssistantProjectionPlan{
+			Encoding:  "mlx_affine",
+			Rows:      layer0.DownProjection.Rows,
+			Cols:      layer0.DownProjection.Cols,
+			MLXAffine: layer0.DownProjection,
+		},
+	}
+
+	launchStart := len(driver.launches)
+	result, err := hipRunAttachedDrafterAssistantLayer(context.Background(), driver, hipAttachedDrafterAssistantLayerRequest{
+		Hidden:            forward.DeviceFinalHidden,
+		TargetLayer:       targetLayer,
+		TargetLayerConfig: targetLayerConfig,
+		Plan:              plan,
+		Position:          0,
+		Epsilon:           1e-6,
+		Workspace:         workspace,
+	})
+	core.RequireNoError(t, err)
+	defer result.Close()
+
+	if result.Hidden == nil || result.Hidden.Pointer() == 0 {
+		t.Fatalf("assistant layer hidden = %#v, want device output", result.Hidden)
+	}
+	core.AssertEqual(t, layer0.HiddenSize, result.Hidden.Count())
+	core.AssertEqual(t, attachedDrafterAssistantLayerRuntimeLinked, result.Labels["attached_drafter_assistant_layer_runtime"])
+	core.AssertEqual(t, "device", result.Labels["attached_drafter_assistant_layer_target_kv"])
+	core.AssertEqual(t, "1", result.Labels["attached_drafter_assistant_layer_target_key_heads"])
+	core.AssertEqual(t, "8", result.Labels["attached_drafter_assistant_layer_target_kv_width"])
+	core.AssertEqual(t, "mlx_affine", result.Labels["attached_drafter_assistant_layer_projection_mode"])
+
+	launches := driver.launches[launchStart:]
+	core.AssertEqual(t, 1, countDeviceAttentionLaunches(launches))
+	core.AssertEqual(t, 3, countLaunchName(launches, hipKernelNameMLXQ4Proj))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameMLXQ4GELUTanhMul))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameVectorAdd))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameVectorAddScaled))
+}
+
+func TestHIPAttachedDrafterAssistantTargetAttentionGeometrySupportsGQA_Good(t *testing.T) {
+	target := hipGemma4Q4Layer0Config{
+		HeadDim:    256,
+		QueryHeads: 16,
+		KeyHeads:   8,
+	}
+	plan := hipAttachedDrafterAssistantVerifierLayerPlan{
+		HeadDim:    256,
+		QueryHeads: 16,
+	}
+
+	keyHeads, kvWidth, err := hipAttachedDrafterAssistantTargetAttentionGeometry(target, plan)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 8, keyHeads)
+	core.AssertEqual(t, 2048, kvWidth)
+}
+
+func TestHIPAttachedDrafterAssistantDraftStepHiddenRunsLayerChain_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layers := make([]hipGemma4Q4Layer0Config, 0, 4)
+	cleanups := make([]func(), 0, 4)
+	for index := 0; index < 4; index++ {
+		layer, cleanup := hipGemma4Q4FixtureConfig(t, driver, index, 8, 1, 8)
+		layers = append(layers, layer)
+		cleanups = append(cleanups, cleanup)
+	}
+	defer func() {
+		for index := len(cleanups) - 1; index >= 0; index-- {
+			cleanups[index]()
+		}
+	}()
+	cfg := hipGemma4Q4ForwardConfig{Layers: layers}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	forward, _, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(context.Background(), driver, cfg, hipGemma4Q4DecodeState{}, hipGemma4Q4ForwardRequest{
+		TokenID:                 1,
+		Position:                0,
+		Epsilon:                 1e-6,
+		DeviceKVAttention:       true,
+		DeviceKVMode:            rocmKVCacheModeKQ8VQ4,
+		ReturnDeviceState:       true,
+		ReturnDeviceFinalHidden: true,
+		SkipFinalSample:         true,
+		OmitDebugTensors:        true,
+		AttentionWorkspace:      workspace,
+	}, false)
+	core.RequireNoError(t, err)
+	defer forward.DeviceState.Close()
+
+	preProjection, closePre := hipAssistantBF16ProjectionPlanFixture(t, driver, "assistant chain pre_projection", layers[0].HiddenSize, layers[0].HiddenSize*2)
+	defer closePre()
+	postProjection, closePost := hipAssistantBF16ProjectionPlanFixture(t, driver, "assistant chain post_projection", layers[0].HiddenSize, layers[0].HiddenSize)
+	defer closePost()
+	assistantLayers := make([]hipAttachedDrafterAssistantVerifierLayerPlan, 0, len(layers))
+	for _, layer := range layers {
+		assistantLayers = append(assistantLayers, hipAssistantLayerPlanFromGemma4Q4Fixture(layer))
+	}
+	inputPlan := hipAttachedDrafterAssistantDraftStepInputPlan{
+		Status:               attachedDrafterAssistantDraftStepInputLinked,
+		HiddenSize:           layers[0].HiddenSize,
+		VocabSize:            layers[0].VocabSize,
+		TargetHiddenSize:     layers[0].HiddenSize,
+		CombinedInputSize:    layers[0].HiddenSize * 2,
+		ProjectionEncoding:   "bf16",
+		TargetEmbedding:      layers[0].Embedding,
+		TargetEmbeddingScale: layers[0].embeddingScale(),
+		PreProjection:        preProjection,
+		KernelFamilies:       []string{hipKernelNameEmbedLookup, hipKernelNameVectorScale, hipKernelNameProjection},
+	}
+	plan := hipAttachedDrafterAssistantVerifierPlan{
+		Status:             attachedDrafterAssistantVerifierPlanTensorBound,
+		HiddenSize:         layers[0].HiddenSize,
+		VocabSize:          layers[0].VocabSize,
+		LayerCount:         len(assistantLayers),
+		ProjectionEncoding: "mlx_affine",
+		Norm:               layers[0].FinalNorm,
+		PreProjection:      preProjection,
+		PostProjection:     postProjection,
+		Layers:             assistantLayers,
+	}
+
+	launchStart := len(driver.launches)
+	result, err := hipRunAttachedDrafterAssistantDraftStepHidden(context.Background(), driver, hipAttachedDrafterAssistantDraftStepHiddenRequest{
+		LastToken:         1,
+		TargetHidden:      forward.DeviceFinalHidden,
+		TargetForward:     cfg,
+		TargetDeviceState: forward.DeviceState,
+		Plan:              plan,
+		InputPlan:         inputPlan,
+		Position:          0,
+		Epsilon:           1e-6,
+		Workspace:         workspace,
+	})
+	core.RequireNoError(t, err)
+	defer result.Close()
+
+	if result.Normed == nil || result.Normed.Pointer() == 0 {
+		t.Fatalf("assistant normed = %#v, want device final assistant norm", result.Normed)
+	}
+	if result.Hidden == nil || result.Hidden.Pointer() == 0 {
+		t.Fatalf("assistant hidden = %#v, want device post-projection target hidden", result.Hidden)
+	}
+	core.AssertEqual(t, layers[0].HiddenSize, result.Normed.Count())
+	core.AssertEqual(t, layers[0].HiddenSize, result.Hidden.Count())
+	core.AssertEqual(t, attachedDrafterAssistantLayerRuntimeLinked, result.Labels["attached_drafter_assistant_draft_step_hidden_runtime"])
+	core.AssertEqual(t, "4", result.Labels["attached_drafter_assistant_draft_step_hidden_layers_executed"])
+	core.AssertEqual(t, "bf16", result.Labels["attached_drafter_assistant_draft_step_post_projection_encoding"])
+	core.AssertEqual(t, "assistant_post_projection", result.Labels["attached_drafter_assistant_draft_step_hidden_source"])
+
+	launches := driver.launches[launchStart:]
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameEmbedLookup))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameVectorScale))
+	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameProjection))
+	core.AssertEqual(t, 4, countDeviceAttentionLaunches(launches))
+	core.AssertEqual(t, 12, countLaunchName(launches, hipKernelNameMLXQ4Proj))
+	core.AssertEqual(t, 4, countLaunchName(launches, hipKernelNameMLXQ4GELUTanhMul))
+	core.AssertEqual(t, 4, countLaunchName(launches, hipKernelNameVectorAdd))
+	core.AssertEqual(t, 4, countLaunchName(launches, hipKernelNameVectorAddScaled))
+}
+
+func TestHIPAttachedDrafterAssistantDraftStepProposalBF16DenseLogits_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 8, 1, 8)
+	defer cleanup0()
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0}}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	forward, _, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(context.Background(), driver, cfg, hipGemma4Q4DecodeState{}, hipGemma4Q4ForwardRequest{
+		TokenID:                 1,
+		Position:                0,
+		Epsilon:                 1e-6,
+		DeviceKVAttention:       true,
+		DeviceKVMode:            rocmKVCacheModeKQ8VQ4,
+		ReturnDeviceState:       true,
+		ReturnDeviceFinalHidden: true,
+		SkipFinalSample:         true,
+		OmitDebugTensors:        true,
+		AttentionWorkspace:      workspace,
+	}, false)
+	core.RequireNoError(t, err)
+	defer forward.DeviceState.Close()
+
+	preProjection, closePre := hipAssistantBF16ProjectionPlanFixture(t, driver, "assistant proposal bf16 pre_projection", layer0.HiddenSize, layer0.HiddenSize*2)
+	defer closePre()
+	postProjection, closePost := hipAssistantBF16ProjectionPlanFixture(t, driver, "assistant proposal bf16 post_projection", layer0.HiddenSize, layer0.HiddenSize)
+	defer closePost()
+	embeddingPayload, err := hipUint16Payload(make([]uint16, layer0.VocabSize*layer0.HiddenSize))
+	core.RequireNoError(t, err)
+	embedding, err := hipUploadByteBuffer(driver, "rocm.hip.AttachedDrafterAssistantDraftStepProposal", "assistant proposal bf16 embedding", embeddingPayload, layer0.VocabSize*layer0.HiddenSize)
+	core.RequireNoError(t, err)
+	defer embedding.Close()
+
+	inputPlan := hipAttachedDrafterAssistantDraftStepInputPlan{
+		Status:               attachedDrafterAssistantDraftStepInputLinked,
+		HiddenSize:           layer0.HiddenSize,
+		VocabSize:            layer0.VocabSize,
+		TargetHiddenSize:     layer0.HiddenSize,
+		CombinedInputSize:    layer0.HiddenSize * 2,
+		ProjectionEncoding:   "bf16",
+		TargetEmbedding:      layer0.Embedding,
+		TargetEmbeddingScale: layer0.embeddingScale(),
+		PreProjection:        preProjection,
+		KernelFamilies:       []string{hipKernelNameEmbedLookup, hipKernelNameVectorScale, hipKernelNameProjection},
+	}
+	plan := hipAttachedDrafterAssistantVerifierPlan{
+		Status:             attachedDrafterAssistantVerifierPlanTensorBound,
+		HiddenSize:         layer0.HiddenSize,
+		VocabSize:          layer0.VocabSize,
+		LayerCount:         1,
+		ProjectionEncoding: "bf16",
+		Embedding: hipDeviceEmbeddingLookupConfig{
+			EmbeddingPointer: embedding.Pointer(),
+			EmbeddingBytes:   embedding.SizeBytes(),
+			TableEncoding:    hipEmbeddingTableEncodingBF16,
+			VocabSize:        layer0.VocabSize,
+			HiddenSize:       layer0.HiddenSize,
+		},
+		Norm:           layer0.FinalNorm,
+		PreProjection:  preProjection,
+		PostProjection: postProjection,
+		Layers:         []hipAttachedDrafterAssistantVerifierLayerPlan{hipAssistantLayerPlanFromGemma4Q4Fixture(layer0)},
+	}
+
+	launchStart := len(driver.launches)
+	result, err := hipRunAttachedDrafterAssistantDraftStepProposal(context.Background(), driver, hipAttachedDrafterAssistantDraftStepProposalRequest{
+		LastToken:         1,
+		TargetHidden:      forward.DeviceFinalHidden,
+		TargetForward:     cfg,
+		TargetDeviceState: forward.DeviceState,
+		Plan:              plan,
+		InputPlan:         inputPlan,
+		Position:          0,
+		Epsilon:           1e-6,
+		Workspace:         workspace,
+	})
+	core.RequireNoError(t, err)
+	defer result.Close()
+
+	core.AssertEqual(t, 0, result.Token.TokenID)
+	assertFloat32Near(t, 0, result.Token.Score)
+	if result.Logits == nil || result.Logits.Pointer() == 0 {
+		t.Fatalf("assistant proposal logits = %#v, want retained dense logits for BF16 path", result.Logits)
+	}
+	if result.Hidden == nil || result.Hidden.Pointer() == 0 {
+		t.Fatalf("assistant proposal hidden = %#v, want next target hidden", result.Hidden)
+	}
+	core.AssertEqual(t, layer0.VocabSize, result.Logits.Count())
+	core.AssertEqual(t, layer0.HiddenSize, result.Hidden.Count())
+	core.AssertEqual(t, attachedDrafterAssistantDraftStepProposalLinked, result.Labels["attached_drafter_assistant_draft_step_proposal_runtime"])
+	core.AssertEqual(t, "bf16", result.Labels["attached_drafter_assistant_draft_step_proposal_embedding_encoding"])
+	core.AssertEqual(t, "dense_retained", result.Labels["attached_drafter_assistant_draft_step_logits"])
+	core.AssertEqual(t, "dense_logits_greedy", result.Labels["attached_drafter_assistant_draft_step_token_source"])
+	core.AssertEqual(t, "0", result.Labels["attached_drafter_assistant_draft_step_token_id"])
+
+	launches := driver.launches[launchStart:]
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameEmbedLookup))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameVectorScale))
+	core.AssertEqual(t, 3, countLaunchName(launches, hipKernelNameProjection))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameGreedy))
+	core.AssertEqual(t, 1, countDeviceAttentionLaunches(launches))
+	core.AssertEqual(t, 3, countLaunchName(launches, hipKernelNameMLXQ4Proj))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameMLXQ4GELUTanhMul))
+}
+
+func TestHIPAttachedDrafterAssistantDraftStepProposalMLXAffineQATGreedy_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 8, 1, 8)
+	defer cleanup0()
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0}}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	forward, _, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(context.Background(), driver, cfg, hipGemma4Q4DecodeState{}, hipGemma4Q4ForwardRequest{
+		TokenID:                 1,
+		Position:                0,
+		Epsilon:                 1e-6,
+		DeviceKVAttention:       true,
+		DeviceKVMode:            rocmKVCacheModeKQ8VQ4,
+		ReturnDeviceState:       true,
+		ReturnDeviceFinalHidden: true,
+		SkipFinalSample:         true,
+		OmitDebugTensors:        true,
+		AttentionWorkspace:      workspace,
+	}, false)
+	core.RequireNoError(t, err)
+	defer forward.DeviceState.Close()
+
+	preProjection, closePre := hipAssistantBF16ProjectionPlanFixture(t, driver, "assistant proposal q4 pre_projection", layer0.HiddenSize, layer0.HiddenSize*2)
+	defer closePre()
+	postProjection, closePost := hipAssistantBF16ProjectionPlanFixture(t, driver, "assistant proposal q4 post_projection", layer0.HiddenSize, layer0.HiddenSize)
+	defer closePost()
+	inputPlan := hipAttachedDrafterAssistantDraftStepInputPlan{
+		Status:               attachedDrafterAssistantDraftStepInputLinked,
+		HiddenSize:           layer0.HiddenSize,
+		VocabSize:            layer0.VocabSize,
+		TargetHiddenSize:     layer0.HiddenSize,
+		CombinedInputSize:    layer0.HiddenSize * 2,
+		ProjectionEncoding:   "bf16",
+		TargetEmbedding:      layer0.Embedding,
+		TargetEmbeddingScale: layer0.embeddingScale(),
+		PreProjection:        preProjection,
+		KernelFamilies:       []string{hipKernelNameEmbedLookup, hipKernelNameVectorScale, hipKernelNameProjection},
+	}
+	plan := hipAttachedDrafterAssistantVerifierPlan{
+		Status:             attachedDrafterAssistantVerifierPlanTensorBound,
+		HiddenSize:         layer0.HiddenSize,
+		VocabSize:          layer0.VocabSize,
+		LayerCount:         1,
+		ProjectionEncoding: "mlx_affine",
+		Embedding:          layer0.Embedding,
+		Norm:               layer0.FinalNorm,
+		PreProjection:      preProjection,
+		PostProjection:     postProjection,
+		Layers:             []hipAttachedDrafterAssistantVerifierLayerPlan{hipAssistantLayerPlanFromGemma4Q4Fixture(layer0)},
+	}
+
+	launchStart := len(driver.launches)
+	copyStart := len(driver.copies)
+	result, err := hipRunAttachedDrafterAssistantDraftStepProposal(context.Background(), driver, hipAttachedDrafterAssistantDraftStepProposalRequest{
+		LastToken:         1,
+		TargetHidden:      forward.DeviceFinalHidden,
+		TargetForward:     cfg,
+		TargetDeviceState: forward.DeviceState,
+		Plan:              plan,
+		InputPlan:         inputPlan,
+		Position:          0,
+		Epsilon:           1e-6,
+		Softcap:           30,
+		Workspace:         workspace,
+	})
+	core.RequireNoError(t, err)
+	defer result.Close()
+
+	core.AssertEqual(t, 0, result.Token.TokenID)
+	if result.Logits != nil {
+		t.Fatalf("assistant proposal q4 logits = %#v, want fused projection-greedy without dense logits", result.Logits)
+	}
+	if result.Hidden == nil || result.Hidden.Pointer() == 0 {
+		t.Fatalf("assistant proposal q4 hidden = %#v, want next target hidden", result.Hidden)
+	}
+	core.AssertEqual(t, layer0.HiddenSize, result.Hidden.Count())
+	core.AssertEqual(t, attachedDrafterAssistantDraftStepProposalLinked, result.Labels["attached_drafter_assistant_draft_step_proposal_runtime"])
+	core.AssertEqual(t, "mlx_affine", result.Labels["attached_drafter_assistant_draft_step_proposal_embedding_encoding"])
+	core.AssertEqual(t, "30", result.Labels["attached_drafter_assistant_draft_step_proposal_softcap"])
+	core.AssertEqual(t, "not_retained", result.Labels["attached_drafter_assistant_draft_step_logits"])
+	core.AssertEqual(t, "projection_greedy", result.Labels["attached_drafter_assistant_draft_step_token_source"])
+
+	launches := driver.launches[launchStart:]
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameEmbedLookup))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameVectorScale))
+	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameProjection))
+	core.AssertEqual(t, 0, countLaunchName(launches, hipKernelNameGreedy))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameMLXQ4ProjGreedy))
+	core.AssertEqual(t, 3, countLaunchName(launches, hipKernelNameMLXQ4Proj))
+	core.AssertEqual(t, 1, countDeviceAttentionLaunches(launches))
+	if len(driver.copies) <= copyStart {
+		t.Fatalf("assistant proposal q4 did not read the device greedy token")
+	}
+	core.AssertEqual(t, uint64(4), driver.copies[len(driver.copies)-1])
+}
+
+func TestHIPAttachedDrafterAssistantDraftBlockMLXAffineQATGreedy_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 8, 1, 8)
+	defer cleanup0()
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0}}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	forward, _, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(context.Background(), driver, cfg, hipGemma4Q4DecodeState{}, hipGemma4Q4ForwardRequest{
+		TokenID:                 1,
+		Position:                0,
+		Epsilon:                 1e-6,
+		DeviceKVAttention:       true,
+		DeviceKVMode:            rocmKVCacheModeKQ8VQ4,
+		ReturnDeviceState:       true,
+		ReturnDeviceFinalHidden: true,
+		SkipFinalSample:         true,
+		OmitDebugTensors:        true,
+		AttentionWorkspace:      workspace,
+	}, false)
+	core.RequireNoError(t, err)
+	defer forward.DeviceState.Close()
+
+	preProjection, closePre := hipAssistantBF16ProjectionPlanFixture(t, driver, "assistant block q4 pre_projection", layer0.HiddenSize, layer0.HiddenSize*2)
+	defer closePre()
+	postProjection, closePost := hipAssistantBF16ProjectionPlanFixture(t, driver, "assistant block q4 post_projection", layer0.HiddenSize, layer0.HiddenSize)
+	defer closePost()
+	inputPlan := hipAttachedDrafterAssistantDraftStepInputPlan{
+		Status:               attachedDrafterAssistantDraftStepInputLinked,
+		HiddenSize:           layer0.HiddenSize,
+		VocabSize:            layer0.VocabSize,
+		TargetHiddenSize:     layer0.HiddenSize,
+		CombinedInputSize:    layer0.HiddenSize * 2,
+		ProjectionEncoding:   "bf16",
+		TargetEmbedding:      layer0.Embedding,
+		TargetEmbeddingScale: layer0.embeddingScale(),
+		PreProjection:        preProjection,
+		KernelFamilies:       []string{hipKernelNameEmbedLookup, hipKernelNameVectorScale, hipKernelNameProjection},
+	}
+	plan := hipAttachedDrafterAssistantVerifierPlan{
+		Status:             attachedDrafterAssistantVerifierPlanTensorBound,
+		HiddenSize:         layer0.HiddenSize,
+		VocabSize:          layer0.VocabSize,
+		LayerCount:         1,
+		ProjectionEncoding: "mlx_affine",
+		Embedding:          layer0.Embedding,
+		Norm:               layer0.FinalNorm,
+		PreProjection:      preProjection,
+		PostProjection:     postProjection,
+		Layers:             []hipAttachedDrafterAssistantVerifierLayerPlan{hipAssistantLayerPlanFromGemma4Q4Fixture(layer0)},
+	}
+
+	launchStart := len(driver.launches)
+	copyStart := len(driver.copies)
+	result, err := hipRunAttachedDrafterAssistantDraftBlock(context.Background(), driver, hipAttachedDrafterAssistantDraftBlockRequest{
+		LastToken:         1,
+		TargetHidden:      forward.DeviceFinalHidden,
+		TargetForward:     cfg,
+		TargetDeviceState: forward.DeviceState,
+		Plan:              plan,
+		InputPlan:         inputPlan,
+		Position:          0,
+		Epsilon:           1e-6,
+		Softcap:           30,
+		MaxDraftTokens:    2,
+		Workspace:         workspace,
+	})
+	core.RequireNoError(t, err)
+	defer result.Close()
+
+	core.AssertEqual(t, []int32{0, 0}, result.Tokens)
+	if result.Hidden == nil || result.Hidden.Pointer() == 0 {
+		t.Fatalf("assistant draft block hidden = %#v, want final draft hidden", result.Hidden)
+	}
+	core.AssertEqual(t, layer0.HiddenSize, result.Hidden.Count())
+
+	launches := driver.launches[launchStart:]
+	if len(launches) == 0 {
+		t.Fatalf("assistant draft block launched no kernels")
+	}
+	core.AssertEqual(t, hipKernelNameRMSNorm, launches[0].Name)
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameEmbedLookup))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameEmbedLookupGreedyToken))
+	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameVectorScale))
+	core.AssertEqual(t, 4, countLaunchName(launches, hipKernelNameProjection))
+	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameMLXQ4ProjGreedy))
+	core.AssertEqual(t, 2, countDeviceAttentionLaunches(launches))
+	core.AssertEqual(t, []uint64{uint64(2 * hipMLXQ4ProjectionBestBytes)}, driver.copies[copyStart:])
+}
+
+func TestHIPAttachedDrafterTargetVerifyBlockLeadAcceptCompactsWithoutRetainingDraftBatch_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 8, 1, 8)
+	defer cleanup0()
+	hipGemma4Q4InstallNonzeroEmbeddingFixture(t, driver, &layer0, "attached verify partial")
+	layer0.PerLayerInput = hipGemma4Q4PerLayerInputConfig{}
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0}}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	initialForward, _, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(context.Background(), driver, cfg, hipGemma4Q4DecodeState{}, hipGemma4Q4ForwardRequest{
+		TokenID:            1,
+		Position:           0,
+		Epsilon:            1e-6,
+		DeviceKVAttention:  true,
+		DeviceKVMode:       rocmKVCacheModeKQ8VQ4,
+		ReturnDeviceState:  true,
+		SkipFinalSample:    true,
+		OmitDebugTensors:   true,
+		AttentionWorkspace: workspace,
+	}, false)
+	core.RequireNoError(t, err)
+	initialState := initialForward.DeviceState
+	initialForward.DeviceState = nil
+	defer initialState.Close()
+
+	workspace.EnsureProjectionGreedyBestCapacity(2)
+	greedyBuffer, err := workspace.BorrowProjectionGreedyBest(driver)
+	core.RequireNoError(t, err)
+
+	launchStart := len(driver.launches)
+	result, err := hipRunAttachedDrafterTargetVerifyBlock(context.Background(), driver, hipAttachedDrafterTargetVerifyBlockRequest{
+		TargetForward:     cfg,
+		DeviceKVMode:      rocmKVCacheModeKQ8VQ4,
+		EngineConfig:      defaultHIPGemma4Q4EngineConfig(),
+		TargetDeviceState: initialState,
+		CurrentGreedy:     hipGreedySampleResult{TokenID: 0},
+		DraftTokens:       []int32{0, 1},
+		Position:          1,
+		Epsilon:           1e-6,
+		GreedyBuffer:      greedyBuffer,
+		Workspace:         workspace,
+	})
+	core.RequireNoError(t, err)
+	defer result.Close()
+	launches := driver.launches[launchStart:]
+
+	core.AssertEqual(t, 1, result.AcceptedCount)
+	core.AssertEqual(t, 1, result.RejectedCount)
+	core.AssertEqual(t, false, result.AllAccepted)
+	core.AssertEqual(t, 2, result.TargetCalls)
+	core.AssertEqual(t, 2, countLaunchName(launches, hipKernelNameMLXQ4ProjGreedy))
+	core.AssertEqual(t, 0, countLaunchName(launches, hipKernelNameMLXQ4ProjGreedyBatch))
+	core.AssertEqual(t, 0, result.Replacement.TokenID)
+	core.AssertEqual(t, true, result.PriorDeviceStateFinalized)
+	if result.DeviceHidden == nil || result.DeviceHidden.Pointer() == 0 {
+		t.Fatalf("partial verify hidden = %#v, want accepted-prefix hidden", result.DeviceHidden)
+	}
+	if result.DeviceState == nil || result.DeviceState.closed {
+		t.Fatalf("partial verify state = %#v, want live accepted-prefix device state", result.DeviceState)
+	}
+	core.AssertEqual(t, []int{2}, result.DeviceState.LayerTokenCounts())
+}
+
+func TestHIPAttachedDrafterTargetVerifyBlockSingleAcceptUsesCompactForward_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 8, 1, 8)
+	defer cleanup0()
+	hipGemma4Q4InstallNonzeroEmbeddingFixture(t, driver, &layer0, "attached verify single accept")
+	layer0.PerLayerInput = hipGemma4Q4PerLayerInputConfig{}
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0}}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	initialForward, _, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(context.Background(), driver, cfg, hipGemma4Q4DecodeState{}, hipGemma4Q4ForwardRequest{
+		TokenID:            1,
+		Position:           0,
+		Epsilon:            1e-6,
+		DeviceKVAttention:  true,
+		DeviceKVMode:       rocmKVCacheModeKQ8VQ4,
+		ReturnDeviceState:  true,
+		SkipFinalSample:    true,
+		OmitDebugTensors:   true,
+		AttentionWorkspace: workspace,
+	}, false)
+	core.RequireNoError(t, err)
+	initialState := initialForward.DeviceState
+	initialForward.DeviceState = nil
+	defer initialState.Close()
+
+	workspace.EnsureProjectionGreedyBestCapacity(1)
+	greedyBuffer, err := workspace.BorrowProjectionGreedyBest(driver)
+	core.RequireNoError(t, err)
+
+	launchStart := len(driver.launches)
+	result, err := hipRunAttachedDrafterTargetVerifyBlock(context.Background(), driver, hipAttachedDrafterTargetVerifyBlockRequest{
+		TargetForward:     cfg,
+		DeviceKVMode:      rocmKVCacheModeKQ8VQ4,
+		EngineConfig:      defaultHIPGemma4Q4EngineConfig(),
+		TargetDeviceState: initialState,
+		CurrentGreedy:     hipGreedySampleResult{TokenID: 0},
+		DraftTokens:       []int32{0},
+		Position:          1,
+		Epsilon:           1e-6,
+		GreedyBuffer:      greedyBuffer,
+		Workspace:         workspace,
+	})
+	core.RequireNoError(t, err)
+	defer result.Close()
+	launches := driver.launches[launchStart:]
+
+	core.AssertEqual(t, 1, result.AcceptedCount)
+	core.AssertEqual(t, 0, result.RejectedCount)
+	core.AssertEqual(t, true, result.AllAccepted)
+	core.AssertEqual(t, 1, result.TargetCalls)
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameMLXQ4ProjGreedy))
+	core.AssertEqual(t, 0, countLaunchName(launches, hipKernelNameMLXQ4ProjGreedyBatch))
+	core.AssertEqual(t, true, result.PriorDeviceStateFinalized)
+	if result.DeviceHidden == nil || result.DeviceHidden.Pointer() == 0 {
+		t.Fatalf("single accept verify hidden = %#v, want compact accepted-token hidden", result.DeviceHidden)
+	}
+	if result.DeviceState == nil || result.DeviceState.closed {
+		t.Fatalf("single accept verify state = %#v, want live compact device state", result.DeviceState)
+	}
+	core.AssertEqual(t, []int{2}, result.DeviceState.LayerTokenCounts())
+}
+
+func TestHIPAttachedDrafterTargetVerifyBlockAcceptedPrefixBatchesSuffix_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 8, 1, 8)
+	defer cleanup0()
+	hipGemma4Q4InstallNonzeroEmbeddingFixture(t, driver, &layer0, "attached verify prefix batch")
+	layer0.PerLayerInput = hipGemma4Q4PerLayerInputConfig{}
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0}}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	initialForward, _, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(context.Background(), driver, cfg, hipGemma4Q4DecodeState{}, hipGemma4Q4ForwardRequest{
+		TokenID:            1,
+		Position:           0,
+		Epsilon:            1e-6,
+		DeviceKVAttention:  true,
+		DeviceKVMode:       rocmKVCacheModeKQ8VQ4,
+		ReturnDeviceState:  true,
+		SkipFinalSample:    true,
+		OmitDebugTensors:   true,
+		AttentionWorkspace: workspace,
+	}, false)
+	core.RequireNoError(t, err)
+	initialState := initialForward.DeviceState
+	initialForward.DeviceState = nil
+	defer initialState.Close()
+
+	workspace.EnsureProjectionGreedyBestCapacity(3)
+	greedyBuffer, err := workspace.BorrowProjectionGreedyBest(driver)
+	core.RequireNoError(t, err)
+
+	launchStart := len(driver.launches)
+	result, err := hipRunAttachedDrafterTargetVerifyBlock(context.Background(), driver, hipAttachedDrafterTargetVerifyBlockRequest{
+		TargetForward:     cfg,
+		DeviceKVMode:      rocmKVCacheModeKQ8VQ4,
+		EngineConfig:      defaultHIPGemma4Q4EngineConfig(),
+		TargetDeviceState: initialState,
+		CurrentGreedy:     hipGreedySampleResult{TokenID: 0},
+		DraftTokens:       []int32{0, 0, 1},
+		Position:          1,
+		Epsilon:           1e-6,
+		GreedyBuffer:      greedyBuffer,
+		Workspace:         workspace,
+	})
+	core.RequireNoError(t, err)
+	defer result.Close()
+	launches := driver.launches[launchStart:]
+
+	core.AssertEqual(t, 2, result.AcceptedCount)
+	core.AssertEqual(t, 1, result.RejectedCount)
+	core.AssertEqual(t, false, result.AllAccepted)
+	core.AssertEqual(t, 1, result.TargetCalls)
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameMLXQ4ProjGreedy))
+	core.AssertEqual(t, 1, countLaunchName(launches, hipKernelNameMLXQ4ProjGreedyBatch))
+	core.AssertEqual(t, 0, result.Replacement.TokenID)
+	if result.DeviceHidden == nil || result.DeviceHidden.Pointer() == 0 {
+		t.Fatalf("prefix-batch verify hidden = %#v, want accepted-prefix hidden", result.DeviceHidden)
+	}
+	if result.DeviceState == nil || result.DeviceState.closed {
+		t.Fatalf("prefix-batch verify state = %#v, want live accepted-prefix device state", result.DeviceState)
+	}
+	core.AssertEqual(t, []int{3}, result.DeviceState.LayerTokenCounts())
+}
+
+func TestHIPAttachedDrafterTargetVerifyBlockFirstMismatchSkipsGreedyBatch_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 8, 1, 8)
+	defer cleanup0()
+	hipGemma4Q4InstallNonzeroEmbeddingFixture(t, driver, &layer0, "attached verify first mismatch")
+	layer0.PerLayerInput = hipGemma4Q4PerLayerInputConfig{}
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0}}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	initialForward, _, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(context.Background(), driver, cfg, hipGemma4Q4DecodeState{}, hipGemma4Q4ForwardRequest{
+		TokenID:            1,
+		Position:           0,
+		Epsilon:            1e-6,
+		DeviceKVAttention:  true,
+		DeviceKVMode:       rocmKVCacheModeKQ8VQ4,
+		ReturnDeviceState:  true,
+		SkipFinalSample:    true,
+		OmitDebugTensors:   true,
+		AttentionWorkspace: workspace,
+	}, false)
+	core.RequireNoError(t, err)
+	initialState := initialForward.DeviceState
+	initialForward.DeviceState = nil
+	defer initialState.Close()
+
+	launchStart := len(driver.launches)
+	result, err := hipRunAttachedDrafterTargetVerifyBlock(context.Background(), driver, hipAttachedDrafterTargetVerifyBlockRequest{
+		TargetForward:     cfg,
+		DeviceKVMode:      rocmKVCacheModeKQ8VQ4,
+		EngineConfig:      defaultHIPGemma4Q4EngineConfig(),
+		TargetDeviceState: initialState,
+		CurrentGreedy:     hipGreedySampleResult{TokenID: 1},
+		DraftTokens:       []int32{0, 1},
+		Position:          1,
+		Epsilon:           1e-6,
+		Workspace:         workspace,
+	})
+	core.RequireNoError(t, err)
+	defer result.Close()
+	launches := driver.launches[launchStart:]
+
+	core.AssertEqual(t, 0, result.AcceptedCount)
+	core.AssertEqual(t, 2, result.RejectedCount)
+	core.AssertEqual(t, false, result.AllAccepted)
+	core.AssertEqual(t, 0, result.TargetCalls)
+	core.AssertEqual(t, 0, countLaunchName(launches, hipKernelNameMLXQ4ProjGreedy))
+	core.AssertEqual(t, 0, countLaunchName(launches, hipKernelNameMLXQ4ProjGreedyBatch))
+	core.AssertEqual(t, 1, result.Replacement.TokenID)
+	if result.DeviceState != nil {
+		t.Fatalf("first-mismatch verify state = %#v, want no accepted-prefix state", result.DeviceState)
+	}
+}
+
+func TestHIPAttachedDrafterGenerateFromStateRetainsGeneratedToken_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 8, 1, 8)
+	defer cleanup0()
+	hipGemma4Q4InstallNonzeroEmbeddingFixture(t, driver, &layer0, "attached retained generate")
+	layer0.PerLayerInput = hipGemma4Q4PerLayerInputConfig{}
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0}}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	initialForward, _, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(context.Background(), driver, cfg, hipGemma4Q4DecodeState{}, hipGemma4Q4ForwardRequest{
+		TokenID:            1,
+		Position:           0,
+		Epsilon:            1e-6,
+		DeviceKVAttention:  true,
+		DeviceKVMode:       rocmKVCacheModeKQ8VQ4,
+		ReturnDeviceState:  true,
+		SkipFinalSample:    true,
+		OmitDebugTensors:   true,
+		AttentionWorkspace: workspace,
+	}, false)
+	core.RequireNoError(t, err)
+	initialState := initialForward.DeviceState
+	initialForward.DeviceState = nil
+	session := newStateSessionWithRuntime(inference.ModelIdentity{}, inference.TokenizerIdentity{}, nil, initialState)
+	defer session.Close()
+
+	preProjection, closePre := hipAssistantBF16ProjectionPlanFixture(t, driver, "assistant retained generate pre_projection", layer0.HiddenSize, layer0.HiddenSize*2)
+	defer closePre()
+	postProjection, closePost := hipAssistantBF16ProjectionPlanFixture(t, driver, "assistant retained generate post_projection", layer0.HiddenSize, layer0.HiddenSize)
+	defer closePost()
+	embeddingPayload, err := hipUint16Payload(make([]uint16, layer0.VocabSize*layer0.HiddenSize))
+	core.RequireNoError(t, err)
+	embedding, err := hipUploadByteBuffer(driver, "rocm.hip.AttachedDrafterGenerate", "assistant retained generate embedding", embeddingPayload, layer0.VocabSize*layer0.HiddenSize)
+	core.RequireNoError(t, err)
+	defer embedding.Close()
+
+	target := &hipLoadedModel{
+		driver: driver,
+		modelInfo: inference.ModelInfo{
+			Architecture: "gemma4_text",
+			NumLayers:    1,
+			HiddenSize:   layer0.HiddenSize,
+			VocabSize:    layer0.VocabSize,
+			QuantBits:    4,
+			QuantGroup:   64,
+		},
+		q4Config:   cfg,
+		q4Layers:   1,
+		q4ConfigOK: true,
+	}
+	inputPlan := hipAttachedDrafterAssistantDraftStepInputPlan{
+		Status:               attachedDrafterAssistantDraftStepInputLinked,
+		HiddenSize:           layer0.HiddenSize,
+		VocabSize:            layer0.VocabSize,
+		TargetHiddenSize:     layer0.HiddenSize,
+		CombinedInputSize:    layer0.HiddenSize * 2,
+		ProjectionEncoding:   "bf16",
+		TargetEmbedding:      layer0.Embedding,
+		TargetEmbeddingScale: layer0.embeddingScale(),
+		PreProjection:        preProjection,
+		KernelFamilies:       []string{hipKernelNameEmbedLookup, hipKernelNameVectorScale, hipKernelNameProjection},
+	}
+	assistantPlan := hipAttachedDrafterAssistantVerifierPlan{
+		Status:             attachedDrafterAssistantVerifierPlanTensorBound,
+		HiddenSize:         layer0.HiddenSize,
+		VocabSize:          layer0.VocabSize,
+		LayerCount:         1,
+		ProjectionEncoding: "bf16",
+		Embedding: hipDeviceEmbeddingLookupConfig{
+			EmbeddingPointer: embedding.Pointer(),
+			EmbeddingBytes:   embedding.SizeBytes(),
+			TableEncoding:    hipEmbeddingTableEncodingBF16,
+			VocabSize:        layer0.VocabSize,
+			HiddenSize:       layer0.HiddenSize,
+		},
+		Norm:           layer0.FinalNorm,
+		PreProjection:  preProjection,
+		PostProjection: postProjection,
+		Layers:         []hipAttachedDrafterAssistantVerifierLayerPlan{hipAssistantLayerPlanFromGemma4Q4Fixture(layer0)},
+	}
+	target.storeAttachedDrafterRuntime(&hipAttachedDrafterRuntime{
+		attachment: AttachedDrafterAttachment{
+			NativeAttachment: hipKernelStatusLinked,
+			Labels: map[string]string{
+				"attached_drafter_native_attachment": hipKernelStatusLinked,
+			},
+		},
+		assistantPlan: assistantPlan,
+		inputPlan:     inputPlan,
+	})
+
+	launchStart := len(driver.launches)
+	result, err := target.GenerateAttachedDrafterFromState(context.Background(), AttachedDrafterAttachment{NativeAttachment: hipKernelStatusLinked}, AttachedDrafterStateGenerateRequest{
+		State:       session,
+		Input:       "tokens:0",
+		MaxTokens:   2,
+		DraftTokens: 2,
+	})
+	core.RequireNoError(t, err)
+
+	core.AssertEqual(t, inferdecode.ModeSpeculative, result.Mode)
+	core.AssertEqual(t, "tokens:0", result.Prompt)
+	core.AssertEqual(t, 2, len(result.Tokens))
+	core.AssertEqual(t, 2, result.Metrics.EmittedTokens)
+	core.AssertEqual(t, 2, result.Metrics.DraftTokens)
+	core.AssertEqual(t, 1, result.Metrics.DraftCalls)
+	core.AssertEqual(t, 2, result.Metrics.TargetCalls)
+	core.AssertEqual(t, 2, result.Metrics.AcceptedTokens)
+	core.AssertEqual(t, 0, result.Metrics.RejectedTokens)
+	retained, ok := session.runtime.(*hipGemma4Q4DeviceDecodeState)
+	if !ok || retained == nil || retained.closed {
+		t.Fatalf("retained runtime = %#v ok=%v, want live Gemma4 q4 device state", session.runtime, ok)
+	}
+	core.AssertEqual(t, []int{4}, retained.LayerTokenCounts())
+	if countDeviceAttentionLaunches(driver.launches[launchStart:]) == 0 {
+		t.Fatalf("attached retained generate launched no descriptor-backed attention kernels")
+	}
+}
+
+func hipAssistantBF16ProjectionPlanFixture(t *testing.T, driver nativeHIPDriver, label string, rows, cols int) (hipAttachedDrafterAssistantProjectionPlan, func()) {
+	t.Helper()
+	payload, err := hipUint16Payload(make([]uint16, rows*cols))
+	core.RequireNoError(t, err)
+	buffer, err := hipUploadByteBuffer(driver, "rocm.hip.AttachedDrafterAssistantDraftStep", label, payload, rows*cols)
+	core.RequireNoError(t, err)
+	plan := hipAttachedDrafterAssistantProjectionPlan{
+		Encoding: "bf16",
+		Rows:     rows,
+		Cols:     cols,
+		BF16: hipBF16DeviceWeightConfig{
+			WeightPointer: buffer.Pointer(),
+			WeightBytes:   buffer.SizeBytes(),
+			Rows:          rows,
+			Cols:          cols,
+		},
+	}
+	return plan, func() { _ = buffer.Close() }
+}
+
+func hipAssistantLayerPlanFromGemma4Q4Fixture(layer hipGemma4Q4Layer0Config) hipAttachedDrafterAssistantVerifierLayerPlan {
+	q4 := func(cfg hipMLXQ4DeviceWeightConfig) hipAttachedDrafterAssistantProjectionPlan {
+		return hipAttachedDrafterAssistantProjectionPlan{
+			Encoding:  "mlx_affine",
+			Rows:      cfg.Rows,
+			Cols:      cfg.Cols,
+			MLXAffine: cfg,
+		}
+	}
+	return hipAttachedDrafterAssistantVerifierLayerPlan{
+		Layer:              layer.Layer,
+		LayerType:          layer.LayerType,
+		HiddenSize:         layer.HiddenSize,
+		HeadDim:            layer.HeadDim,
+		QueryHeads:         layer.QueryHeads,
+		RoPEBase:           layer.RoPEBase,
+		RoPERotaryDim:      layer.RoPERotaryDim,
+		RoPEFrequencyScale: layer.RoPEFrequencyScale,
+		SlidingWindow:      layer.SlidingWindow,
+		LayerScalar:        layer.effectiveLayerScalar(),
+		InputNorm:          layer.InputNorm,
+		PostAttentionNorm:  layer.PostAttentionNorm,
+		PreFeedforward:     layer.PreFeedForwardNorm,
+		PostFeedforward:    layer.PostFeedForwardNorm,
+		QueryNorm:          layer.QueryNorm,
+		QueryProjection:    q4(layer.QueryProjection),
+		OutputProjection:   q4(layer.OutputProjection),
+		GateProjection:     q4(layer.GateProjection),
+		UpProjection:       q4(layer.UpProjection),
+		DownProjection:     q4(layer.DownProjection),
+	}
+}
+
 func countDeviceAttentionLaunches(launches []hipKernelLaunchConfig) int {
 	var count int
 	for _, launch := range launches {
@@ -2752,6 +5036,16 @@ func countLaunchName(launches []hipKernelLaunchConfig, name string) int {
 	var count int
 	for _, launch := range launches {
 		if launch.Name == name {
+			count++
+		}
+	}
+	return count
+}
+
+func countUint64Value(values []uint64, want uint64) int {
+	var count int
+	for _, value := range values {
+		if value == want {
 			count++
 		}
 	}
@@ -2904,6 +5198,7 @@ func BenchmarkHIPDeviceByteBufferPool_ReusedSize(b *testing.B) {
 	const sizeBytes uint64 = 4096
 	const pointer nativeDevicePointer = 42
 	hipDeviceByteBufferPool.Lock()
+	hipDeviceByteBufferPool.single = [hipDeviceByteBufferPoolSingleSlots]hipDeviceByteBufferPoolSingleSlot{}
 	hipDeviceByteBufferPool.entries = make(map[uint64][]hipDeviceByteBufferPoolEntry)
 	hipDeviceByteBufferPool.bytes = 0
 	hipDeviceByteBufferPool.Unlock()
@@ -2918,6 +5213,81 @@ func BenchmarkHIPDeviceByteBufferPool_ReusedSize(b *testing.B) {
 		}
 		if !hipDeviceByteBufferPoolPut(driver, got, sizeBytes) {
 			b.Fatal("return device buffer to pool")
+		}
+	}
+}
+
+func TestHIPDeviceByteBufferPool_Good_PrewarmSeedsExactSize(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	const sizeBytes uint64 = hipMLXQ4ProjectionBestBytes
+	hipDeviceByteBufferPool.Lock()
+	hipDeviceByteBufferPool.single = [hipDeviceByteBufferPoolSingleSlots]hipDeviceByteBufferPoolSingleSlot{}
+	hipDeviceByteBufferPool.entries = make(map[uint64][]hipDeviceByteBufferPoolEntry)
+	hipDeviceByteBufferPool.bytes = 0
+	hipDeviceByteBufferPool.Unlock()
+
+	hipPrewarmDeviceByteBufferPool(driver, sizeBytes, 2)
+	core.AssertEqual(t, 2, len(driver.allocations))
+	core.AssertEqual(t, sizeBytes, driver.allocations[0])
+	core.AssertEqual(t, sizeBytes, driver.allocations[1])
+
+	before := len(driver.allocations)
+	first, err := hipAllocateByteBuffer(driver, "rocm.hip.Test", "first prewarmed greedy result", sizeBytes, 1)
+	if err != nil {
+		t.Fatalf("allocate first prewarmed buffer: %v", err)
+	}
+	second, err := hipAllocateByteBuffer(driver, "rocm.hip.Test", "second prewarmed greedy result", sizeBytes, 1)
+	if err != nil {
+		t.Fatalf("allocate second prewarmed buffer: %v", err)
+	}
+	core.AssertEqual(t, before, len(driver.allocations))
+	core.AssertTrue(t, first.Pointer() != 0, "first pointer should be non-zero")
+	core.AssertTrue(t, second.Pointer() != 0, "second pointer should be non-zero")
+	if first.Pointer() == second.Pointer() {
+		t.Fatal("prewarmed buffers should be distinct while both are borrowed")
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("close first: %v", err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatalf("close second: %v", err)
+	}
+}
+
+func TestHIPDeviceByteBufferPool_Good_SingleSlotAvoidsSliceEntry(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	const sizeBytes uint64 = 4096
+	pointers := [...]nativeDevicePointer{42, 43, 44}
+	hipDeviceByteBufferPool.Lock()
+	hipDeviceByteBufferPool.single = [hipDeviceByteBufferPoolSingleSlots]hipDeviceByteBufferPoolSingleSlot{}
+	hipDeviceByteBufferPool.entries = make(map[uint64][]hipDeviceByteBufferPoolEntry)
+	hipDeviceByteBufferPool.bytes = 0
+	hipDeviceByteBufferPool.Unlock()
+
+	for _, pointer := range pointers {
+		if !hipDeviceByteBufferPoolPut(driver, pointer, sizeBytes) {
+			t.Fatalf("put single-slot pointer %d", pointer)
+		}
+	}
+	hipDeviceByteBufferPool.Lock()
+	entries := len(hipDeviceByteBufferPool.entries[sizeBytes])
+	hipDeviceByteBufferPool.Unlock()
+	core.AssertEqual(t, 0, entries)
+
+	for range pointers {
+		got, ok := hipDeviceByteBufferPoolTake(driver, sizeBytes)
+		if !ok {
+			t.Fatal("take = false; want true")
+		}
+		found := false
+		for _, pointer := range pointers {
+			if got == pointer {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("take = %d; want one of %v", got, pointers)
 		}
 	}
 }
@@ -3022,6 +5392,101 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_AttentionOutputReused(b *testing
 		}
 		if output.Count() != 2048 || output.SizeBytes() != 8192 {
 			b.Fatalf("attention output shape = %d/%d, want 2048/8192", output.Count(), output.SizeBytes())
+		}
+	}
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_AttentionOutputReusesLarger_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	large, err := workspace.EnsureBatchAttentionOutput(driver, 8192)
+	core.RequireNoError(t, err)
+	largePointer := large.Pointer()
+	smallBatch, err := workspace.EnsureBatchAttentionOutput(driver, 4096)
+	core.RequireNoError(t, err)
+	smallBatchPointer := smallBatch.Pointer()
+	smallBatchCount := smallBatch.Count()
+	smallConcat, err := workspace.EnsureAttentionOutput(driver, 8, 256)
+	core.RequireNoError(t, err)
+
+	if smallBatchPointer != largePointer || smallBatchCount != 4096 {
+		t.Fatalf("small batch attention view = %x/%d, want borrowed view of %x", smallBatchPointer, smallBatchCount, largePointer)
+	}
+	if smallConcat.Pointer() != largePointer || smallConcat.Count() != 2048 {
+		t.Fatalf("small concat attention view = %#v, want borrowed view of %x", smallConcat, largePointer)
+	}
+	core.AssertEqual(t, 1, len(driver.allocations))
+	if _, ok := workspace.AttentionOutputs[4096]; ok {
+		t.Fatalf("smaller batch attention output got its own allocation")
+	}
+	if _, ok := workspace.AttentionOutputs[2048]; ok {
+		t.Fatalf("smaller concat attention output got its own allocation")
+	}
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_EnsureCapacityRoundsChunkCounts_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	core.RequireNoError(t, workspace.Ensure(driver, 8, 512, 1793, hipAttentionHeadsChunkSize))
+	core.AssertEqual(t, 2, len(driver.allocations))
+	core.AssertEqual(t, 131072, workspace.partialCap)
+	core.AssertEqual(t, 512, workspace.statsCap)
+	core.AssertEqual(t, uint64(131072*4), workspace.Partial.SizeBytes())
+	core.AssertEqual(t, uint64(512*4), workspace.Stats.SizeBytes())
+
+	allocationCount := len(driver.allocations)
+	core.RequireNoError(t, workspace.Ensure(driver, 8, 512, 2048, hipAttentionHeadsChunkSize))
+	core.AssertEqual(t, allocationCount, len(driver.allocations))
+	core.AssertEqual(t, 131072, workspace.partialCap)
+	core.AssertEqual(t, 512, workspace.statsCap)
+
+	core.RequireNoError(t, workspace.Ensure(driver, 8, 512, 2049, hipAttentionHeadsChunkSize))
+	core.AssertEqual(t, allocationCount+2, len(driver.allocations))
+	core.AssertEqual(t, 262144, workspace.partialCap)
+	core.AssertEqual(t, 1024, workspace.statsCap)
+}
+
+func TestHIPGemma4Q4AttentionWorkspaceDecodeCapacity_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	cfg := hipGemma4Q4ForwardConfig{
+		Layers: []hipGemma4Q4Layer0Config{
+			{QueryHeads: 4, HeadDim: 256},
+			{QueryHeads: 8, HeadDim: hipAttentionHeadsChunkedBlockSize},
+		},
+	}
+
+	core.RequireNoError(t, hipGemma4Q4EnsureAttentionWorkspaceDecodeCapacity(driver, workspace, cfg, 2050))
+	core.AssertEqual(t, 2, len(driver.allocations))
+	core.AssertEqual(t, 262144, workspace.partialCap)
+	core.AssertEqual(t, 1024, workspace.statsCap)
+
+	allocationCount := len(driver.allocations)
+	core.RequireNoError(t, workspace.Ensure(driver, 8, hipAttentionHeadsChunkedBlockSize, 2048, hipAttentionHeadsChunkSize))
+	core.AssertEqual(t, allocationCount, len(driver.allocations))
+}
+
+func BenchmarkHIPAttentionHeadsChunkedWorkspace_EnsureCapacityReuse(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	if err := workspace.Ensure(driver, 8, 512, 2049, hipAttentionHeadsChunkSize); err != nil {
+		b.Fatal(err)
+	}
+	allocationCount := len(driver.allocations)
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := workspace.Ensure(driver, 8, 512, 2048, hipAttentionHeadsChunkSize); err != nil {
+			b.Fatal(err)
+		}
+		if len(driver.allocations) != allocationCount {
+			b.Fatalf("workspace ensure allocated after warmup: got %d allocations, want %d", len(driver.allocations), allocationCount)
 		}
 	}
 }
@@ -3171,6 +5636,145 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_BatchAttentionWeightsReused(b *t
 }
 
 func BenchmarkHIPAttentionHeadsBatchChunkedLaunchArgs_FullWindow(b *testing.B) {
+	args := benchmarkHIPAttentionHeadsBatchChunkedLaunchArgs()
+	packet, err := args.Binary()
+	if err != nil {
+		b.Fatal(err)
+	}
+	hipReleaseLaunchPacket(packet)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		packet, err = args.Binary()
+		if err != nil {
+			b.Fatal(err)
+		}
+		hipReleaseLaunchPacket(packet)
+	}
+}
+
+func BenchmarkHIPAttentionHeadsBatchCausalLaunchArgsBinaryInto_FullWindow(b *testing.B) {
+	args := benchmarkHIPAttentionHeadsBatchCausalLaunchArgs()
+	var scratch [hipAttentionHeadsBatchCausalLaunchArgsBytes]byte
+	packet, err := args.BinaryInto(scratch[:])
+	if err != nil {
+		b.Fatal(err)
+	}
+	if len(packet) != hipAttentionHeadsBatchCausalLaunchArgsBytes {
+		b.Fatalf("packet len = %d, want %d", len(packet), hipAttentionHeadsBatchCausalLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		packet, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(packet) != hipAttentionHeadsBatchCausalLaunchArgsBytes {
+			b.Fatalf("packet len = %d, want %d", len(packet), hipAttentionHeadsBatchCausalLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPAttentionHeadsChunkedLaunchArgsBinaryInto_FullWindow(b *testing.B) {
+	args := benchmarkHIPAttentionHeadsChunkedLaunchArgs()
+	var scratch [hipAttentionHeadsChunkedLaunchArgsBytes]byte
+	packet, err := args.BinaryInto(scratch[:])
+	if err != nil {
+		b.Fatal(err)
+	}
+	if len(packet) != hipAttentionHeadsChunkedLaunchArgsBytes {
+		b.Fatalf("packet len = %d, want %d", len(packet), hipAttentionHeadsChunkedLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		packet, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(packet) != hipAttentionHeadsChunkedLaunchArgsBytes {
+			b.Fatalf("packet len = %d, want %d", len(packet), hipAttentionHeadsChunkedLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPAttentionHeadsBatchChunkedLaunchArgsBinaryInto_FullWindow(b *testing.B) {
+	args := benchmarkHIPAttentionHeadsBatchChunkedLaunchArgs()
+	var scratch [hipAttentionHeadsBatchChunkedLaunchArgsBytes]byte
+	packet, err := args.BinaryInto(scratch[:])
+	if err != nil {
+		b.Fatal(err)
+	}
+	if len(packet) != hipAttentionHeadsBatchChunkedLaunchArgsBytes {
+		b.Fatalf("packet len = %d, want %d", len(packet), hipAttentionHeadsBatchChunkedLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		packet, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(packet) != hipAttentionHeadsBatchChunkedLaunchArgsBytes {
+			b.Fatalf("packet len = %d, want %d", len(packet), hipAttentionHeadsBatchChunkedLaunchArgsBytes)
+		}
+	}
+}
+
+func benchmarkHIPAttentionHeadsBatchCausalLaunchArgs() hipAttentionHeadsBatchCausalLaunchArgs {
+	const (
+		dim        = 256
+		tokenCount = 4096
+		headCount  = 8
+		queryCount = 16
+	)
+	queryElements := dim * headCount * queryCount
+	return hipAttentionHeadsBatchCausalLaunchArgs{
+		QueryPointer:      1,
+		DescriptorPointer: 2,
+		OutputPointer:     3,
+		WeightPointer:     4,
+		Dim:               dim,
+		TokenCount:        tokenCount,
+		HeadCount:         headCount,
+		QueryCount:        queryCount,
+		QueryStartToken:   tokenCount - queryCount,
+		QueryBytes:        uint64(queryElements * 4),
+		DescriptorBytes:   uint64(rocmDeviceKVDescriptorHeaderBytes + tokenCount*rocmDeviceKVDescriptorPageBytes),
+		OutputBytes:       uint64(queryElements * 4),
+		WeightBytes:       uint64(queryCount * headCount * tokenCount * 4),
+		KVSource:          hipAttentionKVSourceDevice,
+		Scale:             1,
+	}
+}
+
+func benchmarkHIPAttentionHeadsChunkedLaunchArgs() hipAttentionHeadsChunkedLaunchArgs {
+	const (
+		dim        = 256
+		tokenCount = 4096
+		headCount  = 8
+		chunkSize  = hipAttentionHeadsChunkSize
+	)
+	chunkCount := (tokenCount + chunkSize - 1) / chunkSize
+	queryElements := dim * headCount
+	return hipAttentionHeadsChunkedLaunchArgs{
+		QueryPointer:      1,
+		DescriptorPointer: 2,
+		PartialPointer:    3,
+		StatsPointer:      4,
+		OutputPointer:     5,
+		Dim:               dim,
+		TokenCount:        tokenCount,
+		HeadCount:         headCount,
+		ChunkSize:         chunkSize,
+		ChunkCount:        chunkCount,
+		QueryBytes:        uint64(queryElements * 4),
+		DescriptorBytes:   uint64(rocmDeviceKVDescriptorHeaderBytes + tokenCount*rocmDeviceKVDescriptorPageBytes),
+		PartialBytes:      uint64(queryElements * chunkCount * 4),
+		StatsBytes:        uint64(headCount * chunkCount * 2 * 4),
+		OutputBytes:       uint64(queryElements * 4),
+		Scale:             1,
+	}
+}
+
+func benchmarkHIPAttentionHeadsBatchChunkedLaunchArgs() hipAttentionHeadsBatchChunkedLaunchArgs {
 	const (
 		dim        = 256
 		tokenCount = 4096
@@ -3180,7 +5784,7 @@ func BenchmarkHIPAttentionHeadsBatchChunkedLaunchArgs_FullWindow(b *testing.B) {
 	)
 	chunkCount := (tokenCount + chunkSize - 1) / chunkSize
 	queryElements := dim * headCount * queryCount
-	args := hipAttentionHeadsBatchChunkedLaunchArgs{
+	return hipAttentionHeadsBatchChunkedLaunchArgs{
 		QueryPointer:      1,
 		DescriptorPointer: 2,
 		PartialPointer:    3,
@@ -3199,19 +5803,6 @@ func BenchmarkHIPAttentionHeadsBatchChunkedLaunchArgs_FullWindow(b *testing.B) {
 		StatsBytes:        uint64(queryCount * headCount * chunkCount * 2 * 4),
 		OutputBytes:       uint64(queryElements * 4),
 		Scale:             1,
-	}
-	packet, err := args.Binary()
-	if err != nil {
-		b.Fatal(err)
-	}
-	hipReleaseLaunchPacket(packet)
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		packet, err = args.Binary()
-		if err != nil {
-			b.Fatal(err)
-		}
-		hipReleaseLaunchPacket(packet)
 	}
 }
 
@@ -3234,6 +5825,245 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_ProjectionOutputReused(b *testin
 		}
 		if output.Count() != 2304 || output.SizeBytes() != 9216 {
 			b.Fatalf("projection output shape = %d/%d, want 2304/9216", output.Count(), output.SizeBytes())
+		}
+	}
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_ProjectionOutputReusesLarger_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	large, err := workspace.EnsureProjectionOutput(driver, 8192)
+	core.RequireNoError(t, err)
+	largePointer := large.Pointer()
+	largeCount := large.Count()
+	largeSize := large.SizeBytes()
+	small, err := workspace.EnsureProjectionOutput(driver, 4096)
+	core.RequireNoError(t, err)
+
+	if large == nil || largeCount != 8192 || largeSize != uint64(8192*4) {
+		t.Fatalf("large projection output shape = %#v, want 8192 floats", large)
+	}
+	if small == nil || small.Count() != 4096 || small.SizeBytes() != uint64(4096*4) {
+		t.Fatalf("small projection output shape = %#v, want exact borrowed view", small)
+	}
+	if small.Pointer() != largePointer {
+		t.Fatalf("small projection output pointer = %x, want reuse of %x", small.Pointer(), largePointer)
+	}
+	core.AssertEqual(t, 1, len(driver.allocations))
+	if _, ok := workspace.ProjectionOutputs[4096]; ok {
+		t.Fatalf("smaller projection output got its own allocation")
+	}
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_ProjectionScoreOutputReused_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	first, err := workspace.EnsureProjectionScoreOutput(driver, 262144)
+	core.RequireNoError(t, err)
+	if first == nil || first.Count() != 262144 || first.SizeBytes() != uint64(262144*hipMLXQ4ProjectionBestBytes) {
+		t.Fatalf("projection score output = %#v, want vocab-sized packed score buffer", first)
+	}
+	firstPointer := first.Pointer()
+	core.AssertEqual(t, 1, len(driver.allocations))
+
+	second, err := workspace.EnsureProjectionScoreOutput(driver, 262144)
+	core.RequireNoError(t, err)
+	if second.Pointer() != firstPointer {
+		t.Fatalf("projection score pointer = %x, want reused %x", second.Pointer(), firstPointer)
+	}
+	core.AssertEqual(t, 1, len(driver.allocations))
+	core.AssertEqual(t, 0, len(driver.frees))
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_ProjectionGreedyBestSlots_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	first, err := workspace.BorrowProjectionGreedyBest(driver)
+	core.RequireNoError(t, err)
+	firstPointer := first.Pointer()
+	second, err := workspace.BorrowProjectionGreedyBest(driver)
+	core.RequireNoError(t, err)
+	secondPointer := second.Pointer()
+	third, err := workspace.BorrowProjectionGreedyBest(driver)
+	core.RequireNoError(t, err)
+	if first == nil || first.Count() != 1 || first.SizeBytes() != hipMLXQ4ProjectionBestBytes {
+		t.Fatalf("first greedy best slot = %#v, want one packed result", first)
+	}
+	if second == nil || second.Count() != 1 || second.SizeBytes() != hipMLXQ4ProjectionBestBytes {
+		t.Fatalf("second greedy best slot = %#v, want one packed result", second)
+	}
+	if third == nil || third.Count() != 1 || third.SizeBytes() != hipMLXQ4ProjectionBestBytes {
+		t.Fatalf("third greedy best slot = %#v, want one packed result", third)
+	}
+	if secondPointer != firstPointer+nativeDevicePointer(hipMLXQ4ProjectionBestBytes) {
+		t.Fatalf("second greedy best slot pointer = %x, want first+%d", secondPointer, hipMLXQ4ProjectionBestBytes)
+	}
+	if third.Pointer() != secondPointer+nativeDevicePointer(hipMLXQ4ProjectionBestBytes) {
+		t.Fatalf("third greedy best slot pointer = %x, want second+%d", third.Pointer(), hipMLXQ4ProjectionBestBytes)
+	}
+	core.AssertEqual(t, 1, len(driver.allocations))
+	core.AssertEqual(t, []uint64{uint64(hipProjectionGreedyBestWorkspaceSlots * hipMLXQ4ProjectionBestBytes)}, driver.memsets)
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_ProjectionGreedyBestBatchSlots_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	batch, err := workspace.BorrowProjectionGreedyBestBatch(driver, 3)
+	core.RequireNoError(t, err)
+	batchView := hipCloneDeviceByteBufferView(batch)
+	next, err := workspace.BorrowProjectionGreedyBest(driver)
+	core.RequireNoError(t, err)
+
+	if batchView.Count() != 3 || batchView.SizeBytes() != uint64(3*hipMLXQ4ProjectionBestBytes) {
+		t.Fatalf("batch greedy best slots = %#v, want three packed results", batchView)
+	}
+	if next.Pointer() != batchView.Pointer()+nativeDevicePointer(3*hipMLXQ4ProjectionBestBytes) {
+		t.Fatalf("next greedy best slot pointer = %x, want batch+%d", next.Pointer(), 3*hipMLXQ4ProjectionBestBytes)
+	}
+	core.AssertEqual(t, 1, len(driver.allocations))
+	core.AssertEqual(t, []uint64{uint64(hipProjectionGreedyBestWorkspaceSlots * hipMLXQ4ProjectionBestBytes)}, driver.memsets)
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_ProjectionGreedyBestClonePreservesBorrowedSlot_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	first, err := workspace.BorrowProjectionGreedyBest(driver)
+	core.RequireNoError(t, err)
+	firstPointer := first.Pointer()
+	firstClone := hipCloneDeviceByteBufferView(first)
+	second, err := workspace.BorrowProjectionGreedyBest(driver)
+	core.RequireNoError(t, err)
+
+	if first.Pointer() != second.Pointer() {
+		t.Fatalf("borrowed greedy view pointer = %x, want reused latest view %x", first.Pointer(), second.Pointer())
+	}
+	if firstClone.Pointer() != firstPointer {
+		t.Fatalf("cloned greedy view pointer = %x, want original slot %x", firstClone.Pointer(), firstPointer)
+	}
+	if firstClone.Pointer() == second.Pointer() {
+		t.Fatalf("cloned greedy view aliased second borrow pointer %x", second.Pointer())
+	}
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_ProjectionGreedyBestUsesFullLaterSlabs_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	var lastFirstSlab *hipDeviceByteBuffer
+	for index := 0; index < hipProjectionGreedyBestWorkspaceUseSlots; index++ {
+		var err error
+		lastFirstSlab, err = workspace.BorrowProjectionGreedyBest(driver)
+		core.RequireNoError(t, err)
+	}
+	firstSlab := workspace.ProjectionGreedyBest[0]
+	core.AssertEqual(t, firstSlab.Pointer()+nativeDevicePointer((hipProjectionGreedyBestWorkspaceUseSlots-1)*hipMLXQ4ProjectionBestBytes), lastFirstSlab.Pointer())
+	if lastFirstSlab.Pointer()+nativeDevicePointer(lastFirstSlab.SizeBytes()) > firstSlab.Pointer()+nativeDevicePointer(hipProjectionGreedyPrefillReserveOffsetBytes) {
+		t.Fatalf("first slab greedy slots overlapped reserve tail")
+	}
+
+	next, err := workspace.BorrowProjectionGreedyBest(driver)
+	core.RequireNoError(t, err)
+	if len(workspace.ProjectionGreedyBest) != 2 {
+		t.Fatalf("greedy slabs = %d, want second slab after first reserved region fills", len(workspace.ProjectionGreedyBest))
+	}
+	core.AssertEqual(t, workspace.ProjectionGreedyBest[1].Pointer(), next.Pointer())
+	core.AssertEqual(t, 2, len(driver.allocations))
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_ProjectionGreedyBestDynamicFirstSlab_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	workspace.EnsureProjectionGreedyBestCapacity(2049)
+	wantSlots := hipProjectionGreedyRoundFirstSlabSlots(hipProjectionGreedyReserveSlots + 2049)
+	wantUseSlots := wantSlots - hipProjectionGreedyReserveSlots
+
+	var lastFirstSlab *hipDeviceByteBuffer
+	for index := 0; index < wantUseSlots; index++ {
+		var err error
+		lastFirstSlab, err = workspace.BorrowProjectionGreedyBest(driver)
+		core.RequireNoError(t, err)
+	}
+	firstSlab := workspace.ProjectionGreedyBest[0]
+	core.AssertEqual(t, uint64(wantSlots*hipMLXQ4ProjectionBestBytes), driver.allocations[0])
+	core.AssertEqual(t, firstSlab.Pointer()+nativeDevicePointer((wantUseSlots-1)*hipMLXQ4ProjectionBestBytes), lastFirstSlab.Pointer())
+	if lastFirstSlab.Pointer()+nativeDevicePointer(lastFirstSlab.SizeBytes()) > firstSlab.Pointer()+nativeDevicePointer(workspace.projectionGreedyPrefillReserveOffsetBytes()) {
+		t.Fatalf("dynamic first slab greedy slots overlapped reserve tail")
+	}
+
+	next, err := workspace.BorrowProjectionGreedyBest(driver)
+	core.RequireNoError(t, err)
+	if len(workspace.ProjectionGreedyBest) != 2 {
+		t.Fatalf("greedy slabs = %d, want second slab after dynamic first slab fills", len(workspace.ProjectionGreedyBest))
+	}
+	core.AssertEqual(t, workspace.ProjectionGreedyBest[1].Pointer(), next.Pointer())
+	core.AssertEqual(t, uint64(hipProjectionGreedyBestWorkspaceSlots*hipMLXQ4ProjectionBestBytes), driver.allocations[1])
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_ProjectionGreedyBestReusedDynamicFirstSlabKeepsReserveOffsets_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	workspace.EnsureProjectionGreedyBestCapacity(18)
+	_, err := workspace.BorrowProjectionGreedyBest(driver)
+	core.RequireNoError(t, err)
+	firstSlab := workspace.ProjectionGreedyBest[0]
+	firstSlabSlots := int(firstSlab.SizeBytes() / hipMLXQ4ProjectionBestBytes)
+	if firstSlabSlots >= hipProjectionGreedyBestWorkspaceSlots {
+		t.Fatalf("first slab slots = %d, want dynamic slab smaller than default %d", firstSlabSlots, hipProjectionGreedyBestWorkspaceSlots)
+	}
+
+	workspace.GreedyFirstSlabSlots = 0
+	workspace.ProjectionGreedyView = hipDeviceByteBuffer{}
+	workspace.ProjectionGreedyNext = 0
+	suppress, err := workspace.EnsureSuppressTokenBuffer(driver, []int32{0, 2, 105, 106})
+	core.RequireNoError(t, err)
+	wantSuppress := firstSlab.Pointer() + nativeDevicePointer((firstSlabSlots-hipProjectionGreedySuppressReserveSlots)*hipMLXQ4ProjectionBestBytes)
+	core.AssertEqual(t, wantSuppress, suppress.Pointer())
+	if _, _, ok := driver.memoryForPointer(suppress.Pointer(), int(suppress.SizeBytes())); !ok {
+		t.Fatalf("reused dynamic slab suppress pointer %x/%d fell outside first slab %x/%d", suppress.Pointer(), suppress.SizeBytes(), firstSlab.Pointer(), firstSlab.SizeBytes())
+	}
+
+	prefill, err := workspace.EnsurePrefillTokenBuffer(driver, []int32{11, 12, 13, 14})
+	core.RequireNoError(t, err)
+	wantPrefill := firstSlab.Pointer() + nativeDevicePointer((firstSlabSlots-hipProjectionGreedyReserveSlots)*hipMLXQ4ProjectionBestBytes)
+	core.AssertEqual(t, wantPrefill, prefill.Pointer())
+	if prefill.Pointer()+nativeDevicePointer(prefill.SizeBytes()) > suppress.Pointer() {
+		t.Fatalf("reused dynamic slab prefill reserve overlapped suppress reserve: prefill=%x/%d suppress=%x", prefill.Pointer(), prefill.SizeBytes(), suppress.Pointer())
+	}
+}
+
+func BenchmarkHIPAttentionHeadsChunkedWorkspace_ProjectionScoreOutputReused(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	output, err := workspace.EnsureProjectionScoreOutput(driver, 262144)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if output.Count() != 262144 || output.SizeBytes() != uint64(262144*hipMLXQ4ProjectionBestBytes) {
+		b.Fatalf("projection score output shape = %d/%d, want 262144/%d", output.Count(), output.SizeBytes(), 262144*hipMLXQ4ProjectionBestBytes)
+	}
+	pointer := output.Pointer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		output, err = workspace.EnsureProjectionScoreOutput(driver, 262144)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if output.Pointer() != pointer || output.Count() != 262144 || output.SizeBytes() != uint64(262144*hipMLXQ4ProjectionBestBytes) {
+			b.Fatalf("projection score output shape = %x %d/%d, want %x 262144/%d", output.Pointer(), output.Count(), output.SizeBytes(), pointer, 262144*hipMLXQ4ProjectionBestBytes)
 		}
 	}
 }
@@ -3306,7 +6136,7 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_RMSRoPEOutputsReused(b *testing.
 	if err != nil {
 		b.Fatal(err)
 	}
-	keyOutput, err := workspace.EnsureRMSRoPEOutput(driver, 256)
+	keyOutput, err := workspace.EnsureKeyRMSRoPEOutput(driver, 256)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -3329,7 +6159,7 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_RMSRoPEOutputsReused(b *testing.
 		if err != nil {
 			b.Fatal(err)
 		}
-		keyOutput, err = workspace.EnsureRMSRoPEOutput(driver, 256)
+		keyOutput, err = workspace.EnsureKeyRMSRoPEOutput(driver, 256)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -3346,6 +6176,25 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_RMSRoPEOutputsReused(b *testing.
 		if noScaleOutput.Count() != 256 || noScaleOutput.SizeBytes() != 1024 {
 			b.Fatalf("RMS no-scale output shape = %d/%d, want 256/1024", noScaleOutput.Count(), noScaleOutput.SizeBytes())
 		}
+	}
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_RMSRoPEOutputReusesLarger_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	large, err := workspace.EnsureRMSRoPEOutput(driver, 2048)
+	core.RequireNoError(t, err)
+	small, err := workspace.EnsureRMSRoPEOutput(driver, 1024)
+	core.RequireNoError(t, err)
+
+	if small.Pointer() != large.Pointer() || small.Count() != 1024 {
+		t.Fatalf("small RMS RoPE view = %#v, want borrowed view of %x", small, large.Pointer())
+	}
+	core.AssertEqual(t, 1, len(driver.allocations))
+	if _, ok := workspace.RMSRoPEOutputs[1024]; ok {
+		t.Fatalf("smaller RMS RoPE output got its own allocation")
 	}
 }
 
@@ -3372,6 +6221,25 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_IntermediateOutputReused(b *test
 	}
 }
 
+func TestHIPAttentionHeadsChunkedWorkspace_IntermediateOutputReusesLarger_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	large, err := workspace.EnsureIntermediateOutput(driver, 3072)
+	core.RequireNoError(t, err)
+	small, err := workspace.EnsureIntermediateOutput(driver, 1536)
+	core.RequireNoError(t, err)
+
+	if small.Pointer() != large.Pointer() || small.Count() != 1536 || small.SizeBytes() != uint64(1536*4) {
+		t.Fatalf("small intermediate view = %#v, want borrowed view of %x", small, large.Pointer())
+	}
+	core.AssertEqual(t, 1, len(driver.allocations))
+	if _, ok := workspace.IntermediateOutputs[1536]; ok {
+		t.Fatalf("smaller intermediate output got its own allocation")
+	}
+}
+
 func BenchmarkHIPAttentionHeadsChunkedWorkspace_QKVOutputReused(b *testing.B) {
 	driver := &fakeHIPDriver{available: true}
 	workspace := &hipAttentionHeadsChunkedWorkspace{}
@@ -3392,6 +6260,582 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_QKVOutputReused(b *testing.B) {
 		if output.Count() != 2560 || output.SizeBytes() != 10240 {
 			b.Fatalf("QKV output shape = %d/%d, want 2560/10240", output.Count(), output.SizeBytes())
 		}
+	}
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_QKVOutputReusesLarger_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	large, err := workspace.EnsureQKVOutput(driver, 5120)
+	core.RequireNoError(t, err)
+	largePointer := large.Pointer()
+	largeCount := large.Count()
+	largeSize := large.SizeBytes()
+	small, err := workspace.EnsureQKVOutput(driver, 2560)
+	core.RequireNoError(t, err)
+
+	if large == nil || largeCount != 5120 || largeSize != uint64(5120*4) {
+		t.Fatalf("large QKV output shape = %#v, want 5120 floats", large)
+	}
+	if small == nil || small.Count() != 2560 || small.SizeBytes() != uint64(2560*4) {
+		t.Fatalf("small QKV output shape = %#v, want exact borrowed view", small)
+	}
+	if small.Pointer() != largePointer {
+		t.Fatalf("small QKV output pointer = %x, want reuse of %x", small.Pointer(), largePointer)
+	}
+	core.AssertEqual(t, 1, len(driver.allocations))
+	if _, ok := workspace.QKVOutputs[2560]; ok {
+		t.Fatalf("smaller QKV output got its own allocation")
+	}
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_ActivationOutputReusesLarger_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	large, err := workspace.EnsureActivationOutput(driver, 24576)
+	core.RequireNoError(t, err)
+	largePointer := large.Pointer()
+	largeCount := large.Count()
+	largeSize := large.SizeBytes()
+	small, err := workspace.EnsureActivationOutput(driver, 12288)
+	core.RequireNoError(t, err)
+
+	if large == nil || largeCount != 24576 || largeSize != uint64(24576*4) {
+		t.Fatalf("large activation output shape = %#v, want 24576 floats", large)
+	}
+	if small == nil || small.Count() != 12288 || small.SizeBytes() != uint64(12288*4) {
+		t.Fatalf("small activation output shape = %#v, want exact borrowed view", small)
+	}
+	if small.Pointer() != largePointer {
+		t.Fatalf("small activation output pointer = %x, want reuse of %x", small.Pointer(), largePointer)
+	}
+	core.AssertEqual(t, 1, len(driver.allocations))
+	if _, ok := workspace.ActivationOutputs[12288]; ok {
+		t.Fatalf("smaller activation output got its own allocation")
+	}
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_RMSOutputsReuseLarger_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	largeResidual, err := workspace.EnsureRMSResidualOutput(driver, 3072)
+	core.RequireNoError(t, err)
+	largeResidualPointer := largeResidual.Pointer()
+	smallResidual, err := workspace.EnsureRMSResidualOutput(driver, 1536)
+	core.RequireNoError(t, err)
+	largeNorm, err := workspace.EnsureRMSNormOutput(driver, 3072)
+	core.RequireNoError(t, err)
+	largeNormPointer := largeNorm.Pointer()
+	smallNorm, err := workspace.EnsureRMSNormOutput(driver, 1536)
+	core.RequireNoError(t, err)
+
+	if smallResidual.Pointer() != largeResidualPointer || smallResidual.Count() != 1536 {
+		t.Fatalf("small RMS residual view = %#v, want borrowed view of %x", smallResidual, largeResidualPointer)
+	}
+	if smallNorm.Pointer() != largeNormPointer || smallNorm.Count() != 1536 {
+		t.Fatalf("small RMS norm view = %#v, want borrowed view of %x", smallNorm, largeNormPointer)
+	}
+	rmsCapCount := 4096
+	if largeNormPointer != largeResidualPointer+nativeDevicePointer(rmsCapCount*4) {
+		t.Fatalf("RMS norm pointer = %x, want residual+%d", largeNormPointer, rmsCapCount*4)
+	}
+	core.AssertEqual(t, 1, len(driver.allocations))
+	if _, ok := workspace.RMSResidualOutputs[1536]; ok {
+		t.Fatalf("smaller RMS residual output got its own allocation")
+	}
+	if _, ok := workspace.RMSNormOutputs[1536]; ok {
+		t.Fatalf("smaller RMS norm output got its own allocation")
+	}
+	if output := &workspace.RMSResidualNormFixed; output.Pointer() == 0 || output.Count() != rmsCapCount*2 {
+		t.Fatalf("RMS residual/norm pair output = %#v, want %d rows", output, rmsCapCount*2)
+	}
+}
+
+func TestHIPAttentionHeadsChunkedWorkspacePool_ReusesWorkspace_Good(t *testing.T) {
+	workspace := hipBorrowAttentionHeadsChunkedWorkspace()
+	if workspace == nil {
+		t.Fatalf("borrowed workspace = %#v, want workspace", workspace)
+	}
+	workspacePointer := uintptr(unsafe.Pointer(workspace))
+	hipReleaseAttentionHeadsChunkedWorkspace(workspace)
+
+	reused := hipBorrowAttentionHeadsChunkedWorkspace()
+	defer hipReleaseAttentionHeadsChunkedWorkspace(reused)
+	if reused == nil || uintptr(unsafe.Pointer(reused)) != workspacePointer {
+		t.Fatalf("reused workspace = %#v, want original workspace pointer %x", reused, workspacePointer)
+	}
+}
+
+func TestHIPAttentionHeadsChunkedWorkspacePool_RecycleKeepsGreedySlab_Good(t *testing.T) {
+	t.Setenv("GO_ROCM_DISABLE_DEVICE_BUFFER_POOL", "1")
+	driver := &fakeHIPDriver{available: true}
+	hipDrainAttentionHeadsChunkedWorkspacePoolForTest(t)
+
+	workspace := hipBorrowAttentionHeadsChunkedWorkspace()
+	first, err := workspace.BorrowProjectionGreedyBest(driver)
+	core.RequireNoError(t, err)
+	firstPointer := first.Pointer()
+	core.AssertEqual(t, 1, len(driver.allocations))
+
+	core.RequireNoError(t, hipRecycleAttentionHeadsChunkedWorkspace(workspace))
+	core.AssertEqual(t, 0, len(driver.frees))
+
+	reused := hipBorrowAttentionHeadsChunkedWorkspace()
+	if reused == nil {
+		t.Fatalf("borrowed nil workspace")
+	}
+	next, err := reused.BorrowProjectionGreedyBest(driver)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, firstPointer, next.Pointer())
+	core.AssertEqual(t, 1, len(driver.allocations))
+	core.AssertEqual(t, 0, len(driver.frees))
+
+	core.RequireNoError(t, reused.Close())
+	core.AssertEqual(t, 1, len(driver.frees))
+	core.AssertEqual(t, firstPointer, driver.frees[0])
+}
+
+func TestHIPAttentionHeadsChunkedWorkspacePool_Good_PrewarmDeviceBuffers(t *testing.T) {
+	t.Setenv("GO_ROCM_DISABLE_DEVICE_BUFFER_POOL", "1")
+	driver := &fakeHIPDriver{available: true}
+	hipDrainAttentionHeadsChunkedWorkspacePoolForTest(t)
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 8, 512, 512)
+	defer cleanup0()
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0}}
+
+	core.RequireNoError(t, hipPrewarmGemma4Q4AttentionWorkspaceDeviceBuffers(driver, cfg, 128))
+
+	workspace := hipBorrowAttentionHeadsChunkedWorkspace()
+	defer func() {
+		core.RequireNoError(t, hipRecycleAttentionHeadsChunkedWorkspace(workspace))
+	}()
+	if workspace.Partial == nil || workspace.Partial.Pointer() == 0 {
+		t.Fatal("prewarmed workspace partial buffer is missing")
+	}
+	if workspace.Stats == nil || workspace.Stats.Pointer() == 0 {
+		t.Fatal("prewarmed workspace stats buffer is missing")
+	}
+	if len(workspace.ProjectionGreedyBest) == 0 || workspace.ProjectionGreedyBest[0] == nil || workspace.ProjectionGreedyBest[0].Pointer() == 0 {
+		t.Fatal("prewarmed workspace greedy slab is missing")
+	}
+	if workspace.ProjectionGreedyNext != 0 || workspace.ProjectionGreedyView.Pointer() != 0 {
+		t.Fatalf("prewarmed workspace retained borrowed greedy view state: next=%d view=%x", workspace.ProjectionGreedyNext, workspace.ProjectionGreedyView.Pointer())
+	}
+	if workspace.ActivationOutputFixed.Pointer() == 0 {
+		t.Fatal("prewarmed workspace activation buffer is missing")
+	}
+	if workspace.TokenID == nil || workspace.TokenID.Pointer() == 0 {
+		t.Fatal("prewarmed workspace token ID buffer is missing")
+	}
+	if workspace.ProjectionTopK == nil || workspace.ProjectionTopK.Pointer() == 0 {
+		t.Fatal("prewarmed workspace projection top-k buffer is missing")
+	}
+	wantTopKCap := hipPackedTopKOutputCount(layer0.VocabSize, hipGemma4Q4AttentionWorkspacePrewarmTopK)
+	wantTopKWorkCap := 0
+	if wantTopKCap > hipGemma4Q4AttentionWorkspacePrewarmTopK {
+		wantTopKWorkCap = hipPackedTopKOutputCount(wantTopKCap, hipGemma4Q4AttentionWorkspacePrewarmTopK)
+	}
+	if wantTopKWorkCap > 0 && (workspace.ProjectionTopKWork == nil || workspace.ProjectionTopKWork.Pointer() == 0) {
+		t.Fatal("prewarmed workspace projection top-k work buffer is missing")
+	}
+	if workspace.ActivationOutputView.Pointer() != 0 ||
+		workspace.ScaledEmbeddingView.Pointer() != 0 ||
+		workspace.PrefillInputNormView.Pointer() != 0 ||
+		workspace.IntermediateOutputView.Pointer() != 0 ||
+		workspace.FinalHiddenOutputViews[0].Pointer() != 0 ||
+		workspace.NextInputOutputViews[0].Pointer() != 0 {
+		t.Fatal("prewarmed workspace retained borrowed fixed-buffer views")
+	}
+	if workspace.ScaledEmbeddingFixed.Pointer() == 0 ||
+		workspace.PrefillInputNormFixed.Pointer() == 0 ||
+		workspace.IntermediateFixed.Pointer() == 0 ||
+		workspace.FinalHiddenPairFixed.Pointer() == 0 ||
+		workspace.NextInputPairFixed.Pointer() == 0 {
+		t.Fatal("prewarmed workspace decode hot buffers are missing")
+	}
+	if layer0.PerLayerInput.hasGlobalPrecompute() && workspace.PerLayerScaledFixed.Pointer() == 0 {
+		t.Fatal("prewarmed workspace per-layer scaled buffer is missing")
+	}
+	chunkCount := (hipGemma4Q4AttentionWorkspacePrewarmTokenCount(128) + hipAttentionHeadsChunkSize - 1) / hipAttentionHeadsChunkSize
+	minPartialCap := layer0.QueryHeads * chunkCount * layer0.HeadDim
+	minStatsCap := layer0.QueryHeads * chunkCount * 2
+	core.AssertTrue(t, workspace.partialCap >= minPartialCap, "partial cap should cover decode prewarm floor")
+	core.AssertTrue(t, workspace.statsCap >= minStatsCap, "stats cap should cover decode prewarm floor")
+	core.AssertEqual(t, uint64(24704), workspace.ProjectionGreedyBest[0].SizeBytes())
+	core.AssertEqual(t, wantTopKCap, workspace.ProjectionTopKCap)
+	core.AssertEqual(t, wantTopKWorkCap, workspace.ProjectionTopKWorkCap)
+	core.AssertEqual(t, hipGemma4Q4PrefillDefaultUBatchTokens*layer0.GateProjection.Rows, workspace.ActivationOutputFixed.Count())
+	core.AssertEqual(t, hipGemma4Q4PrefillDefaultUBatchTokens*layer0.HiddenSize, workspace.ScaledEmbeddingFixed.Count())
+	core.AssertEqual(t, hipGemma4Q4PrefillDefaultUBatchTokens*layer0.HiddenSize*2, workspace.FinalHiddenPairFixed.Count())
+	if layer0.PerLayerInput.hasGlobalPrecompute() {
+		core.AssertEqual(t, layer0.PerLayerInput.ModelProjection.Rows, workspace.PerLayerScaledFixed.Count())
+	}
+	allocationsAfterPrewarm := len(driver.allocations)
+	core.RequireNoError(t, hipGemma4Q4EnsureAttentionWorkspaceDecodeHotCapacity(driver, workspace, cfg))
+	core.RequireNoError(t, hipGemma4Q4EnsureAttentionWorkspaceSamplingCapacity(driver, workspace, cfg, hipGemma4Q4AttentionWorkspacePrewarmTopK))
+	core.AssertEqual(t, allocationsAfterPrewarm, len(driver.allocations))
+}
+
+func TestHIPAttentionHeadsChunkedWorkspacePool_Good_PrewarmRetainedPrefillContext(t *testing.T) {
+	t.Setenv("GO_ROCM_DISABLE_DEVICE_BUFFER_POOL", "1")
+	driver := &fakeHIPDriver{available: true}
+	hipDrainAttentionHeadsChunkedWorkspacePoolForTest(t)
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 8, 512, 512)
+	defer cleanup0()
+	layer0.SlidingWindow = 0
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0}}
+
+	const contextSize = 4096
+	core.RequireNoError(t, hipPrewarmGemma4Q4AttentionWorkspaceDeviceBuffers(driver, cfg, contextSize))
+
+	workspace := hipBorrowAttentionHeadsChunkedWorkspace()
+	defer func() {
+		core.RequireNoError(t, hipRecycleAttentionHeadsChunkedWorkspace(workspace))
+	}()
+	queryTokens := hipGemma4Q4PrefillDefaultUBatchTokens
+	if attentionQueryTokens := hipGemma4Q4PrefillAttentionQueryChunkTokens(); attentionQueryTokens > 0 && queryTokens > attentionQueryTokens {
+		queryTokens = attentionQueryTokens
+	}
+	chunkCount := (contextSize + hipGemma4Q4PrefillDefaultUBatchTokens + hipAttentionHeadsChunkSize - 1) / hipAttentionHeadsChunkSize
+	minPartialCap := layer0.QueryHeads * queryTokens * chunkCount * layer0.HeadDim
+	minStatsCap := layer0.QueryHeads * queryTokens * chunkCount * 2
+	core.AssertTrue(t, workspace.partialCap >= minPartialCap, "partial cap should cover retained prefill context")
+	core.AssertTrue(t, workspace.statsCap >= minStatsCap, "stats cap should cover retained prefill context")
+}
+
+func TestHIPAttentionHeadsChunkedWorkspacePool_Good_PrewarmDecodeHotUsesNormWidth(t *testing.T) {
+	t.Setenv("GO_ROCM_DISABLE_DEVICE_BUFFER_POOL", "1")
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 8, 512, 512)
+	defer cleanup0()
+	layer0.PostFeedForwardNorm.Count = 16
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0}}
+	workspace := hipBorrowAttentionHeadsChunkedWorkspace()
+	defer func() {
+		core.RequireNoError(t, hipRecycleAttentionHeadsChunkedWorkspace(workspace))
+	}()
+
+	core.RequireNoError(t, hipGemma4Q4EnsureAttentionWorkspaceDecodeHotCapacity(driver, workspace, cfg))
+
+	core.AssertEqual(t, 32, workspace.ScaledEmbeddingFixed.Count())
+	core.AssertEqual(t, 32, workspace.PrefillInputNormFixed.Count())
+	core.AssertEqual(t, 32, workspace.IntermediateFixed.Count())
+	core.AssertEqual(t, 64, workspace.FinalHiddenPairFixed.Count())
+	core.AssertEqual(t, 64, workspace.NextInputPairFixed.Count())
+}
+
+func TestHIPAttentionHeadsChunkedWorkspacePool_Good_PrewarmModelHiddenBuffers(t *testing.T) {
+	t.Setenv("GO_ROCM_DISABLE_DEVICE_BUFFER_POOL", "1")
+	driver := &fakeHIPDriver{available: true}
+	hipDrainAttentionHeadsChunkedWorkspacePoolForTest(t)
+
+	core.RequireNoError(t, hipPrewarmGemma4Q4AttentionWorkspaceModelHiddenBuffers(driver, 16))
+
+	workspace := hipBorrowAttentionHeadsChunkedWorkspace()
+	defer func() {
+		core.RequireNoError(t, hipRecycleAttentionHeadsChunkedWorkspace(workspace))
+	}()
+	core.AssertEqual(t, 16, workspace.ScaledEmbeddingFixed.Count())
+	core.AssertEqual(t, 16, workspace.PrefillInputNormFixed.Count())
+	core.AssertEqual(t, 16, workspace.IntermediateFixed.Count())
+	core.AssertEqual(t, 32, workspace.FinalHiddenPairFixed.Count())
+	core.AssertEqual(t, 32, workspace.NextInputPairFixed.Count())
+	allocationsAfterPrewarm := len(driver.allocations)
+	_, err := workspace.EnsureScaledEmbedding(driver, 16)
+	core.RequireNoError(t, err)
+	_, err = workspace.EnsurePrefillInputNormOutput(driver, 16)
+	core.RequireNoError(t, err)
+	_, err = workspace.EnsureIntermediateOutput(driver, 16)
+	core.RequireNoError(t, err)
+	_, err = workspace.EnsureFinalHiddenOutput(driver, 16, 0)
+	core.RequireNoError(t, err)
+	_, err = workspace.EnsureNextInputOutput(driver, 16, 0)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, allocationsAfterPrewarm, len(driver.allocations))
+}
+
+func TestHIPAttentionHeadsChunkedWorkspacePool_Good_PrewarmDefaultSuppressBuffer(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	hipDrainAttentionHeadsChunkedWorkspacePoolForTest(t)
+	model := &hipLoadedModel{
+		driver: driver,
+		modelInfo: inference.ModelInfo{
+			Architecture: "gemma4",
+			QuantBits:    4,
+		},
+		modelLabels: linkedGemma4TestLabels("E2B", "q4"),
+		tokenText: &hipTokenTextDecoder{
+			specialText: map[string]int32{
+				"<pad>":   0,
+				"<bos>":   2,
+				"<|turn>": 105,
+				"<turn|>": 106,
+			},
+		},
+	}
+	tokens := hipGemma4Q4GenerationSuppressTokenIDs(model, nil)
+	core.RequireTrue(t, len(tokens) > 0, "default suppress tokens should be present")
+
+	hipPrewarmGemma4Q4DefaultSuppressTokenBufferForModel(model)
+	copiesAfterPrewarm := len(driver.copies)
+	core.RequireTrue(t, copiesAfterPrewarm > 0, "suppress prewarm should copy token IDs once")
+
+	workspace := hipBorrowAttentionHeadsChunkedWorkspace()
+	defer func() {
+		core.RequireNoError(t, hipRecycleAttentionHeadsChunkedWorkspace(workspace))
+	}()
+	buffer, err := workspace.EnsureSuppressTokenBuffer(driver, tokens)
+	core.RequireNoError(t, err)
+
+	if buffer == nil || buffer.Pointer() == 0 {
+		t.Fatalf("prewarmed suppress token buffer = %#v, want device buffer", buffer)
+	}
+	core.AssertEqual(t, copiesAfterPrewarm, len(driver.copies))
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_FixedReusableOutputCapacity_Good(t *testing.T) {
+	t.Setenv("GO_ROCM_DISABLE_DEVICE_BUFFER_POOL", "1")
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	first, err := workspace.EnsureScaledEmbedding(driver, 2049)
+	core.RequireNoError(t, err)
+	firstPointer := first.Pointer()
+	if first == nil || first.Count() != 2049 || first.SizeBytes() != 2049*4 {
+		t.Fatalf("scaled embedding view = %#v, want 2049 float32 values", first)
+	}
+	core.AssertEqual(t, 4096, workspace.ScaledEmbeddingFixedCap)
+	core.AssertEqual(t, 1, len(driver.allocations))
+
+	smaller, err := workspace.EnsureScaledEmbedding(driver, 1536)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, firstPointer, smaller.Pointer())
+	core.AssertEqual(t, 1536, smaller.Count())
+	core.AssertEqual(t, 1, len(driver.allocations))
+	core.AssertEqual(t, 0, len(driver.frees))
+
+	core.RequireNoError(t, workspace.Close())
+	core.AssertEqual(t, 1, len(driver.frees))
+	core.AssertEqual(t, firstPointer, driver.frees[0])
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_FixedReusableOutputDriverMismatch_Good(t *testing.T) {
+	t.Setenv("GO_ROCM_DISABLE_DEVICE_BUFFER_POOL", "1")
+	firstDriver := &fakeHIPDriver{available: true}
+	nextDriver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	first, err := workspace.EnsureScaledEmbedding(firstDriver, 8)
+	core.RequireNoError(t, err)
+	firstPointer := first.Pointer()
+	core.AssertEqual(t, 1, len(firstDriver.allocations))
+
+	next, err := workspace.EnsureScaledEmbedding(nextDriver, 8)
+	core.RequireNoError(t, err)
+	core.AssertTrue(t, next.driver == nextDriver, "driver mismatch must allocate a fresh fixed buffer owned by the next driver")
+	core.AssertEqual(t, 1, len(firstDriver.frees))
+	core.AssertEqual(t, firstPointer, firstDriver.frees[0])
+	core.AssertEqual(t, 1, len(nextDriver.allocations))
+}
+
+func hipDrainAttentionHeadsChunkedWorkspacePoolForTest(t *testing.T) {
+	t.Helper()
+	hipAttentionHeadsChunkedWorkspacePool.Lock()
+	pooled := append([]*hipAttentionHeadsChunkedWorkspace(nil), hipAttentionHeadsChunkedWorkspacePool.workspaces...)
+	clear(hipAttentionHeadsChunkedWorkspacePool.workspaces)
+	hipAttentionHeadsChunkedWorkspacePool.workspaces = hipAttentionHeadsChunkedWorkspacePool.workspaces[:0]
+	hipAttentionHeadsChunkedWorkspacePool.Unlock()
+	for _, workspace := range pooled {
+		core.RequireNoError(t, workspace.Close())
+	}
+}
+
+func TestHIPGemma4Q4PrefillForwardLayerBatchPool_ReusesCapacity_Good(t *testing.T) {
+	hipPrewarmGemma4Q4PrefillForwardLayerBatchPool(35, 2)
+	batch := hipBorrowGemma4Q4PrefillForwardBatch(35)
+	if batch == nil || len(batch.Layers) != 0 || cap(batch.Layers) < 35 || len(batch.Greedy) != 0 || cap(batch.Greedy) != 1 {
+		t.Fatalf("borrowed prefill forward batch = %#v, want empty layers with >=35 capacity and one greedy slot", batch)
+	}
+	batchPointer := uintptr(unsafe.Pointer(batch))
+	batch.Greedy = append(batch.Greedy, hipGemma4Q4PrefillGreedyBatchOutput{Row: 7})
+	core.RequireNoError(t, batch.Close())
+
+	reusedBatch := hipBorrowGemma4Q4PrefillForwardBatch(35)
+	defer reusedBatch.Close()
+	if reusedBatch == nil || uintptr(unsafe.Pointer(reusedBatch)) != batchPointer {
+		t.Fatalf("reused prefill forward batch = %#v, want original batch pointer %x", reusedBatch, batchPointer)
+	}
+	if len(reusedBatch.Layers) != 0 || cap(reusedBatch.Layers) < 35 || len(reusedBatch.Greedy) != 0 || cap(reusedBatch.Greedy) != 1 || reusedBatch.closed {
+		t.Fatalf("reused prefill forward batch = %#v, want cleared open batch", reusedBatch)
+	}
+
+	layers := hipBorrowGemma4Q4PrefillForwardLayerBatches(35)
+	if len(layers) != 0 || cap(layers) < 35 {
+		t.Fatalf("borrowed prefill forward layer slice len/cap = %d/%d, want empty slice with capacity >= 35", len(layers), cap(layers))
+	}
+	layers = append(layers, hipGemma4Q4PrefillForwardLayerBatch{
+		KV:   &hipGemma4Q4PrefillLayerKVBatch{},
+		Body: &hipGemma4Q4PrefillLayerBodyBatch{},
+	})
+	hipReleaseGemma4Q4PrefillForwardLayerBatches(layers)
+
+	reused := hipBorrowGemma4Q4PrefillForwardLayerBatches(35)
+	defer hipReleaseGemma4Q4PrefillForwardLayerBatches(reused)
+	if len(reused) != 0 || cap(reused) < 35 {
+		t.Fatalf("reused prefill forward layer slice len/cap = %d/%d, want empty slice with capacity >= 35", len(reused), cap(reused))
+	}
+	reused = append(reused, hipGemma4Q4PrefillForwardLayerBatch{})
+	if reused[0].KV != nil || reused[0].Body != nil {
+		t.Fatalf("reused prefill forward layer slice kept stale pointers: %#v", reused[0])
+	}
+}
+
+func TestHIPGemma4Q4EnsureAttentionWorkspacePrefillCapacity_HotPathOutputsGood(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	layer0, cleanup0 := hipGemma4Q4FixtureConfig(t, driver, 0, 4, 2, 8)
+	defer cleanup0()
+	layer1, cleanup1 := hipGemma4Q4FixtureConfig(t, driver, 1, 4, 2, 8)
+	defer cleanup1()
+	cfg := hipGemma4Q4ForwardConfig{Layers: []hipGemma4Q4Layer0Config{layer0, layer1}}
+	plan := hipGemma4Q4PrefillPlan{
+		Batches: []hipGemma4Q4PrefillUBatch{
+			{Tokens: []int32{0}},
+			{Tokens: []int32{0, 1}},
+		},
+	}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	allocStart := len(driver.allocations)
+	core.RequireNoError(t, hipGemma4Q4EnsureAttentionWorkspacePrefillCapacity(driver, workspace, cfg, plan, true))
+	activationRows := 2 * layer0.GateProjection.Rows
+	large := &workspace.ActivationOutputFixed
+	if large.Pointer() == 0 || large.Count() < activationRows {
+		t.Fatalf("prefill activation workspace = %#v, want largest prefill batch", large)
+	}
+	hiddenRows := 2 * layer0.HiddenSize
+	rmsCap := hiddenRows
+	rmsOutput := &workspace.RMSResidualNormFixed
+	if rmsOutput.Pointer() == 0 || rmsOutput.Count() != rmsCap*2 {
+		t.Fatalf("RMS residual/norm workspace = %#v, want %d rows", rmsOutput, rmsCap*2)
+	}
+	projectionRows := 2 * hipGemma4Q4ProjectionWorkspaceRows(layer0)
+	projectionOutput := &workspace.ProjectionOutputFixed
+	if projectionOutput.Pointer() == 0 || projectionOutput.Count() != projectionRows {
+		t.Fatalf("projection workspace = %#v, want %d rows", projectionOutput, projectionRows)
+	}
+	keyRows := 2 * layer0.KeyProjection.Rows
+	kvProjectionCap := keyRows
+	kvProjectionPair := &workspace.KVProjectionPairFixed
+	if kvProjectionPair.Pointer() == 0 || kvProjectionPair.Count() != kvProjectionCap*2 {
+		t.Fatalf("KV projection pair workspace = %#v, want %d rows", kvProjectionPair, kvProjectionCap*2)
+	}
+	valueRows := 2 * layer0.ValueProjection.Rows
+	if valueRows != keyRows {
+		t.Fatalf("KV projection fixture rows differ key=%d value=%d", keyRows, valueRows)
+	}
+	keyOutputPointer := kvProjectionPair.Pointer()
+	valueOutputPointer := kvProjectionPair.Pointer() + nativeDevicePointer(kvProjectionCap*4)
+	headRows := 2 * layer0.HeadDim
+	keyValueNormOutput := &workspace.KeyValueNormFixed
+	if keyValueNormOutput.Pointer() == 0 || keyValueNormOutput.Count() != headRows*2 {
+		t.Fatalf("key/value norm workspace = %#v, want %d rows", keyValueNormOutput, headRows*2)
+	}
+	queryRoPERows := 2 * layer0.QueryProjection.Rows
+	queryRoPEOutput := &workspace.RMSRoPEFixed
+	if queryRoPEOutput.Pointer() == 0 || queryRoPEOutput.Count() != queryRoPERows {
+		t.Fatalf("query RMS RoPE workspace = %#v, want %d rows", queryRoPEOutput, queryRoPERows)
+	}
+	attentionOutput := &workspace.AttentionOutputFixed
+	if attentionOutput.Pointer() == 0 || attentionOutput.Count() < queryRoPERows {
+		t.Fatalf("attention output workspace = %#v, want at least %d rows", attentionOutput, queryRoPERows)
+	}
+	qkvRows := hipGemma4Q4FusedDecodeQKVOutputRows(layer0)
+	qkvOutput := &workspace.QKVOutputFixed
+	if qkvOutput.Pointer() == 0 || qkvOutput.Count() != qkvRows {
+		t.Fatalf("decode QKV workspace = %#v, want %d rows", qkvOutput, qkvRows)
+	}
+	core.AssertEqual(t, allocStart+13, len(driver.allocations))
+	small, err := workspace.EnsureActivationOutput(driver, layer0.GateProjection.Rows)
+	core.RequireNoError(t, err)
+	if small.Pointer() != large.Pointer() || small.Count() != layer0.GateProjection.Rows {
+		t.Fatalf("small activation view = %#v, want borrowed view of large workspace %x", small, large.Pointer())
+	}
+	smallResidual, err := workspace.EnsureRMSResidualOutput(driver, layer0.HiddenSize)
+	core.RequireNoError(t, err)
+	if smallResidual.Pointer() != rmsOutput.Pointer() || smallResidual.Count() != layer0.HiddenSize {
+		t.Fatalf("small RMS residual view = %#v, want borrowed view of large workspace %x", smallResidual, rmsOutput.Pointer())
+	}
+	smallNorm, err := workspace.EnsureRMSNormOutput(driver, layer0.HiddenSize)
+	core.RequireNoError(t, err)
+	rmsNormPointer := rmsOutput.Pointer() + nativeDevicePointer(rmsCap*4)
+	if smallNorm.Pointer() != rmsNormPointer || smallNorm.Count() != layer0.HiddenSize {
+		t.Fatalf("small RMS norm view = %#v, want borrowed view of large workspace %x", smallNorm, rmsNormPointer)
+	}
+	smallProjection, err := workspace.EnsureProjectionOutput(driver, projectionRows/2)
+	core.RequireNoError(t, err)
+	if smallProjection.Pointer() != projectionOutput.Pointer() || smallProjection.Count() != projectionRows/2 {
+		t.Fatalf("small projection view = %#v, want borrowed view of large workspace %x", smallProjection, projectionOutput.Pointer())
+	}
+	smallKey, err := workspace.EnsureKVProjectionOutput(driver, layer0.KeyProjection.Rows, 0)
+	core.RequireNoError(t, err)
+	if smallKey.Pointer() != keyOutputPointer || smallKey.Count() != layer0.KeyProjection.Rows {
+		t.Fatalf("small KV key projection view = %#v, want borrowed view of large workspace %x", smallKey, keyOutputPointer)
+	}
+	smallValue, err := workspace.EnsureKVProjectionOutput(driver, layer0.ValueProjection.Rows, 1)
+	core.RequireNoError(t, err)
+	if smallValue.Pointer() != valueOutputPointer || smallValue.Count() != layer0.ValueProjection.Rows {
+		t.Fatalf("small KV value projection view = %#v, want borrowed view of large workspace %x", smallValue, valueOutputPointer)
+	}
+	smallKeyRoPE, err := workspace.EnsureKeyRMSRoPEOutput(driver, layer0.HeadDim)
+	core.RequireNoError(t, err)
+	if smallKeyRoPE.Pointer() != keyValueNormOutput.Pointer() || smallKeyRoPE.Count() != layer0.HeadDim {
+		t.Fatalf("small key RMS RoPE view = %#v, want borrowed view of large workspace %x", smallKeyRoPE, keyValueNormOutput.Pointer())
+	}
+	smallValueNorm, err := workspace.EnsureRMSNoScaleOutput(driver, layer0.HeadDim)
+	core.RequireNoError(t, err)
+	valueNormPointer := keyValueNormOutput.Pointer() + nativeDevicePointer(headRows*4)
+	if smallValueNorm.Pointer() != valueNormPointer || smallValueNorm.Count() != layer0.HeadDim {
+		t.Fatalf("small RMS no-scale view = %#v, want borrowed view of large workspace %x", smallValueNorm, valueNormPointer)
+	}
+	smallQueryRoPE, err := workspace.EnsureRMSRoPEOutput(driver, layer0.QueryProjection.Rows)
+	core.RequireNoError(t, err)
+	if smallQueryRoPE.Pointer() != queryRoPEOutput.Pointer() || smallQueryRoPE.Count() != layer0.QueryProjection.Rows {
+		t.Fatalf("small query RMS RoPE view = %#v, want borrowed view of large workspace %x", smallQueryRoPE, queryRoPEOutput.Pointer())
+	}
+	smallQKV, err := workspace.EnsureQKVOutput(driver, qkvRows/2)
+	core.RequireNoError(t, err)
+	if smallQKV.Pointer() != qkvOutput.Pointer() || smallQKV.Count() != qkvRows/2 {
+		t.Fatalf("small QKV view = %#v, want borrowed view of large workspace %x", smallQKV, qkvOutput.Pointer())
+	}
+	core.AssertEqual(t, allocStart+13, len(driver.allocations))
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_PerLayerProjectedReusesLarger_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	large, err := workspace.EnsurePerLayerProjected(driver, 24576)
+	core.RequireNoError(t, err)
+	largePointer := large.Pointer()
+	small, err := workspace.EnsurePerLayerProjected(driver, 12288)
+	core.RequireNoError(t, err)
+
+	if small.Pointer() != largePointer || small.Count() != 12288 {
+		t.Fatalf("small per-layer projected view = %#v, want borrowed view of large workspace %x", small, largePointer)
+	}
+	core.AssertEqual(t, 1, len(driver.allocations))
+	if _, ok := workspace.PerLayerProjected[hipAttentionHeadsChunkedWorkspaceCapacityCount(12288)]; ok && hipAttentionHeadsChunkedWorkspaceCapacityCount(12288) != hipAttentionHeadsChunkedWorkspaceCapacityCount(24576) {
+		t.Fatalf("smaller per-layer projected output got its own allocation")
 	}
 }
 
@@ -3418,6 +6862,119 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_FinalHiddenOutputReused(b *testi
 	}
 }
 
+func TestHIPAttentionHeadsChunkedWorkspace_FinalHiddenOutputReusesLargerSlot_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	large0, err := workspace.EnsureFinalHiddenOutput(driver, 3072, 0)
+	core.RequireNoError(t, err)
+	small0, err := workspace.EnsureFinalHiddenOutput(driver, 1536, 0)
+	core.RequireNoError(t, err)
+	large1, err := workspace.EnsureFinalHiddenOutput(driver, 3072, 1)
+	core.RequireNoError(t, err)
+	small1, err := workspace.EnsureFinalHiddenOutput(driver, 1536, 1)
+	core.RequireNoError(t, err)
+
+	if small0.Pointer() != large0.Pointer() || small0.Count() != 1536 {
+		t.Fatalf("small final-hidden slot 0 view = %#v, want borrowed view of %x", small0, large0.Pointer())
+	}
+	if small1.Pointer() != large1.Pointer() || small1.Count() != 1536 {
+		t.Fatalf("small final-hidden slot 1 view = %#v, want borrowed view of %x", small1, large1.Pointer())
+	}
+	pairCapCount := 4096
+	if large1.Pointer() != large0.Pointer()+nativeDevicePointer(pairCapCount*4) {
+		t.Fatalf("final-hidden slot 1 pointer = %x, want slot 0+%d", large1.Pointer(), pairCapCount*4)
+	}
+	core.AssertEqual(t, 1, len(driver.allocations))
+	if _, ok := workspace.FinalHiddenOutputs[0][1536]; ok {
+		t.Fatalf("smaller final-hidden slot 0 output got its own allocation")
+	}
+	if _, ok := workspace.FinalHiddenOutputs[1][1536]; ok {
+		t.Fatalf("smaller final-hidden slot 1 output got its own allocation")
+	}
+	if output := &workspace.FinalHiddenPairFixed; output.Pointer() == 0 || output.Count() != pairCapCount*2 {
+		t.Fatalf("final-hidden pair output = %#v, want %d rows", output, pairCapCount*2)
+	}
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_KVProjectionOutputReusesLargerSlot_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	largeKey, err := workspace.EnsureKVProjectionOutput(driver, 1024, 0)
+	core.RequireNoError(t, err)
+	largeKeyPointer := largeKey.Pointer()
+	smallKey, err := workspace.EnsureKVProjectionOutput(driver, 512, 0)
+	core.RequireNoError(t, err)
+	largeValue, err := workspace.EnsureKVProjectionOutput(driver, 1024, 1)
+	core.RequireNoError(t, err)
+	largeValuePointer := largeValue.Pointer()
+	smallValue, err := workspace.EnsureKVProjectionOutput(driver, 512, 1)
+	core.RequireNoError(t, err)
+
+	if smallKey.Pointer() != largeKeyPointer || smallKey.Count() != 512 {
+		t.Fatalf("small KV key slot view = %#v, want borrowed view of %x", smallKey, largeKeyPointer)
+	}
+	if smallValue.Pointer() != largeValuePointer || smallValue.Count() != 512 {
+		t.Fatalf("small KV value slot view = %#v, want borrowed view of %x", smallValue, largeValuePointer)
+	}
+	if largeKeyPointer == largeValuePointer {
+		t.Fatalf("KV projection slots share backing pointer %x", largeKeyPointer)
+	}
+	if largeValuePointer != largeKeyPointer+nativeDevicePointer(1024*4) {
+		t.Fatalf("KV value slot pointer = %x, want key+%d", largeValuePointer, 1024*4)
+	}
+	core.AssertEqual(t, 1, len(driver.allocations))
+	if _, ok := workspace.KVProjectionOutputs[0][512]; ok {
+		t.Fatalf("smaller KV key slot output got its own allocation")
+	}
+	if _, ok := workspace.KVProjectionOutputs[1][512]; ok {
+		t.Fatalf("smaller KV value slot output got its own allocation")
+	}
+	if output := &workspace.KVProjectionPairFixed; output.Pointer() == 0 || output.Count() != 2048 {
+		t.Fatalf("KV projection pair output = %#v, want 2048 rows", output)
+	}
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_KeyValueNormOutputsReuseLarger_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	largeKey, err := workspace.EnsureKeyRMSRoPEOutput(driver, 1024)
+	core.RequireNoError(t, err)
+	largeKeyPointer := largeKey.Pointer()
+	smallKey, err := workspace.EnsureKeyRMSRoPEOutput(driver, 512)
+	core.RequireNoError(t, err)
+	largeValue, err := workspace.EnsureRMSNoScaleOutput(driver, 1024)
+	core.RequireNoError(t, err)
+	largeValuePointer := largeValue.Pointer()
+	smallValue, err := workspace.EnsureRMSNoScaleOutput(driver, 512)
+	core.RequireNoError(t, err)
+
+	if smallKey.Pointer() != largeKeyPointer || smallKey.Count() != 512 {
+		t.Fatalf("small key RMS RoPE view = %#v, want borrowed view of %x", smallKey, largeKeyPointer)
+	}
+	if smallValue.Pointer() != largeValuePointer || smallValue.Count() != 512 {
+		t.Fatalf("small RMS no-scale view = %#v, want borrowed view of %x", smallValue, largeValuePointer)
+	}
+	if largeValuePointer != largeKeyPointer+nativeDevicePointer(1024*4) {
+		t.Fatalf("RMS no-scale pointer = %x, want key+%d", largeValuePointer, 1024*4)
+	}
+	core.AssertEqual(t, 1, len(driver.allocations))
+	if _, ok := workspace.KeyRMSRoPEOutputs[512]; ok {
+		t.Fatalf("smaller key RMS RoPE output got its own allocation")
+	}
+	if _, ok := workspace.RMSNoScaleOutputs[512]; ok {
+		t.Fatalf("smaller RMS no-scale output got its own allocation")
+	}
+	if output := &workspace.KeyValueNormFixed; output.Pointer() == 0 || output.Count() != 2048 {
+		t.Fatalf("key/value norm pair output = %#v, want 2048 rows", output)
+	}
+}
+
 func BenchmarkHIPAttentionHeadsChunkedWorkspace_NextInputOutputReused(b *testing.B) {
 	driver := &fakeHIPDriver{available: true}
 	workspace := &hipAttentionHeadsChunkedWorkspace{}
@@ -3438,6 +6995,42 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_NextInputOutputReused(b *testing
 		if output.Count() != 2304 || output.SizeBytes() != 9216 {
 			b.Fatalf("next input output shape = %d/%d, want 2304/9216", output.Count(), output.SizeBytes())
 		}
+	}
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_NextInputOutputReusesLargerSlot_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+
+	large0, err := workspace.EnsureNextInputOutput(driver, 3072, 0)
+	core.RequireNoError(t, err)
+	small0, err := workspace.EnsureNextInputOutput(driver, 1536, 0)
+	core.RequireNoError(t, err)
+	large1, err := workspace.EnsureNextInputOutput(driver, 3072, 1)
+	core.RequireNoError(t, err)
+	small1, err := workspace.EnsureNextInputOutput(driver, 1536, 1)
+	core.RequireNoError(t, err)
+
+	if small0.Pointer() != large0.Pointer() || small0.Count() != 1536 {
+		t.Fatalf("small next-input slot 0 view = %#v, want borrowed view of %x", small0, large0.Pointer())
+	}
+	if small1.Pointer() != large1.Pointer() || small1.Count() != 1536 {
+		t.Fatalf("small next-input slot 1 view = %#v, want borrowed view of %x", small1, large1.Pointer())
+	}
+	pairCapCount := 4096
+	if large1.Pointer() != large0.Pointer()+nativeDevicePointer(pairCapCount*4) {
+		t.Fatalf("next-input slot 1 pointer = %x, want slot 0+%d", large1.Pointer(), pairCapCount*4)
+	}
+	core.AssertEqual(t, 1, len(driver.allocations))
+	if _, ok := workspace.NextInputOutputs[0][1536]; ok {
+		t.Fatalf("smaller next-input slot 0 output got its own allocation")
+	}
+	if _, ok := workspace.NextInputOutputs[1][1536]; ok {
+		t.Fatalf("smaller next-input slot 1 output got its own allocation")
+	}
+	if output := &workspace.NextInputPairFixed; output.Pointer() == 0 || output.Count() != pairCapCount*2 {
+		t.Fatalf("next-input pair output = %#v, want %d rows", output, pairCapCount*2)
 	}
 }
 
@@ -3503,6 +7096,43 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_PerLayerInputDeviceSetReused(b *
 	}
 }
 
+func TestHIPAttentionHeadsChunkedWorkspace_PerLayerInputDeviceSetBatchReused_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	const (
+		layerCount      = 32
+		layerValueCount = 4608
+	)
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	backing := &hipDeviceByteBuffer{
+		driver:    driver,
+		pointer:   0x100000,
+		count:     layerCount * layerValueCount,
+		sizeBytes: uint64(layerCount * layerValueCount * 4),
+	}
+	set, err := workspace.BorrowPerLayerInputDeviceSetBatch(driver, layerCount, layerValueCount, backing, "test batch layer")
+	core.RequireNoError(t, err)
+	if set != &workspace.PerLayerInputSet {
+		t.Fatalf("set pointer = %#v, want workspace-owned set %#v", set, &workspace.PerLayerInputSet)
+	}
+	first := set.Layer(0)
+	firstPointer := first.Pointer()
+	second := set.Layer(1)
+	secondPointer := second.Pointer()
+	if first == nil || second == nil {
+		t.Fatalf("layer views = %#v %#v, want two borrowed views", first, second)
+	}
+	core.AssertEqual(t, backing.Pointer(), firstPointer)
+	core.AssertEqual(t, backing.Pointer()+nativeDevicePointer(layerValueCount*4), secondPointer)
+	core.AssertEqual(t, layerValueCount, second.Count())
+
+	next, err := workspace.BorrowPerLayerInputDeviceSetBatch(driver, layerCount, layerValueCount, backing, "test batch layer")
+	core.RequireNoError(t, err)
+	if next != set {
+		t.Fatalf("next set pointer = %#v, want reused %#v", next, set)
+	}
+}
+
 func BenchmarkHIPGemma4Q4PerLayerInputConfigScales_Cached(b *testing.B) {
 	cfg := hipGemma4Q4PerLayerInputConfig{
 		InputSize: 256,
@@ -3536,6 +7166,90 @@ func BenchmarkHIPGemma4Q4LayerConfigEmbeddingScale_Cached(b *testing.B) {
 	}
 }
 
+func TestHIPAttentionHeadsChunkedWorkspace_SuppressTokenBufferUsesGreedyReserve_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	tokens := []int32{0, 2, 105, 106, 107, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218}
+
+	buffer, err := workspace.EnsureSuppressTokenBuffer(driver, tokens)
+	core.RequireNoError(t, err)
+	if buffer == nil || buffer.Count() != len(tokens) || buffer.SizeBytes() != uint64(len(tokens)*4) {
+		t.Fatalf("suppress token buffer = %#v, want %d tokens", buffer, len(tokens))
+	}
+	if len(workspace.ProjectionGreedyBest) != 1 {
+		t.Fatalf("greedy slabs = %d, want one shared suppress-token slab", len(workspace.ProjectionGreedyBest))
+	}
+	slab := workspace.ProjectionGreedyBest[0]
+	wantPointer := slab.Pointer() + nativeDevicePointer(hipProjectionGreedySuppressReserveOffsetBytes)
+	core.AssertEqual(t, wantPointer, buffer.Pointer())
+	core.AssertEqual(t, true, buffer.borrowed)
+	core.AssertEqual(t, hipProjectionGreedySuppressReserveBytes, cap(workspace.SuppressTokenPayload))
+	core.AssertEqual(t, hipProjectionGreedySuppressReserveBytes/4, cap(workspace.SuppressTokenIDs))
+	core.AssertEqual(t, []uint64{uint64(hipProjectionGreedyBestWorkspaceSlots * hipMLXQ4ProjectionBestBytes)}, driver.allocations)
+	core.AssertEqual(t, []uint64{uint64(hipProjectionGreedyBestWorkspaceSlots * hipMLXQ4ProjectionBestBytes)}, driver.memsets)
+	core.AssertEqual(t, []uint64{uint64(len(tokens) * 4)}, driver.copies)
+
+	payload, offset, ok := driver.memoryForPointer(buffer.Pointer(), int(buffer.SizeBytes()))
+	core.RequireTrue(t, ok)
+	for index, token := range tokens {
+		got := int32(binary.LittleEndian.Uint32(payload[offset+index*4:]))
+		core.AssertEqual(t, token, got)
+	}
+
+	greedy, err := workspace.BorrowProjectionGreedyBest(driver)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, slab.Pointer(), greedy.Pointer())
+	if greedy.Pointer() == buffer.Pointer() {
+		t.Fatalf("greedy slot overlapped suppress-token reserve at %x", greedy.Pointer())
+	}
+}
+
+func TestHIPAttentionHeadsChunkedWorkspace_PrefillTokenBufferUsesGreedyReserve_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	tokens := make([]int32, 512)
+	for index := range tokens {
+		tokens[index] = int32(index + 11)
+	}
+
+	prefill, err := workspace.EnsurePrefillTokenBuffer(driver, tokens)
+	core.RequireNoError(t, err)
+	if prefill == nil || prefill.Count() != len(tokens) || prefill.SizeBytes() != uint64(len(tokens)*4) {
+		t.Fatalf("prefill token buffer = %#v, want %d tokens", prefill, len(tokens))
+	}
+	if len(workspace.ProjectionGreedyBest) != 1 {
+		t.Fatalf("greedy slabs = %d, want one shared prefill-token slab", len(workspace.ProjectionGreedyBest))
+	}
+	slab := workspace.ProjectionGreedyBest[0]
+	core.AssertEqual(t, slab.Pointer()+nativeDevicePointer(hipProjectionGreedyPrefillReserveOffsetBytes), prefill.Pointer())
+	core.AssertEqual(t, true, prefill.borrowed)
+	core.AssertEqual(t, []uint64{uint64(hipProjectionGreedyBestWorkspaceSlots * hipMLXQ4ProjectionBestBytes)}, driver.allocations)
+	core.AssertEqual(t, []uint64{uint64(hipProjectionGreedyBestWorkspaceSlots * hipMLXQ4ProjectionBestBytes)}, driver.memsets)
+	core.AssertEqual(t, []uint64{uint64(len(tokens) * 4)}, driver.copies)
+
+	payload, offset, ok := driver.memoryForPointer(prefill.Pointer(), int(prefill.SizeBytes()))
+	core.RequireTrue(t, ok)
+	for index, token := range tokens {
+		got := int32(binary.LittleEndian.Uint32(payload[offset+index*4:]))
+		core.AssertEqual(t, token, got)
+	}
+
+	suppress, err := workspace.EnsureSuppressTokenBuffer(driver, []int32{0, 2, 105, 106})
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, slab.Pointer()+nativeDevicePointer(hipProjectionGreedySuppressReserveOffsetBytes), suppress.Pointer())
+	if prefill.Pointer()+nativeDevicePointer(prefill.SizeBytes()) > suppress.Pointer() {
+		t.Fatalf("prefill token reserve overlapped suppress reserve: prefill=%x/%d suppress=%x", prefill.Pointer(), prefill.SizeBytes(), suppress.Pointer())
+	}
+	greedy, err := workspace.BorrowProjectionGreedyBest(driver)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, slab.Pointer(), greedy.Pointer())
+	if greedy.Pointer()+nativeDevicePointer(greedy.SizeBytes()) > prefill.Pointer() {
+		t.Fatalf("greedy slot overlapped prefill reserve: greedy=%x/%d prefill=%x", greedy.Pointer(), greedy.SizeBytes(), prefill.Pointer())
+	}
+}
+
 func BenchmarkHIPAttentionHeadsChunkedWorkspace_SuppressTokenBufferReused(b *testing.B) {
 	driver := &fakeHIPDriver{available: true}
 	workspace := &hipAttentionHeadsChunkedWorkspace{}
@@ -3556,6 +7270,33 @@ func BenchmarkHIPAttentionHeadsChunkedWorkspace_SuppressTokenBufferReused(b *tes
 		}
 		if buffer == nil || buffer.Count() != len(tokens) {
 			b.Fatalf("suppress token buffer = %#v, want %d tokens", buffer, len(tokens))
+		}
+	}
+}
+
+func BenchmarkHIPAttentionHeadsChunkedWorkspace_PrefillTokenBufferBorrowed(b *testing.B) {
+	driver := &fakeHIPDriver{available: true}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	tokens := make([]int32, 512)
+	for index := range tokens {
+		tokens[index] = int32(index + 11)
+	}
+	buffer, err := workspace.EnsurePrefillTokenBuffer(driver, tokens)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if buffer == nil || buffer.Count() != len(tokens) {
+		b.Fatalf("prefill token buffer = %#v, want %d tokens", buffer, len(tokens))
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		buffer, err = workspace.EnsurePrefillTokenBuffer(driver, tokens)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if buffer == nil || buffer.Count() != len(tokens) {
+			b.Fatalf("prefill token buffer = %#v, want %d tokens", buffer, len(tokens))
 		}
 	}
 }
@@ -3701,6 +7442,65 @@ func BenchmarkHIPGemma4Q4DeviceLayerKVStateValueHandoff(b *testing.B) {
 	}
 }
 
+func BenchmarkHIPLoadedSmallDecodePriorKVRestoreInto_Reused(b *testing.B) {
+	smoke := hipSmallDecodeFixture("qwen3")
+	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, defaultROCmKVBlockSize)
+	if err != nil {
+		b.Fatalf("create KV cache: %v", err)
+	}
+	if err := cache.AppendVectors(0, smoke.HiddenSize, smoke.HiddenSize, smoke.PriorKeys, smoke.PriorValues); err != nil {
+		b.Fatalf("append KV cache vectors: %v", err)
+	}
+	model := &hipLoadedModel{}
+	req := hipDecodeRequest{TokenID: 2, KV: cache}
+	keyWidth, valueWidth, err := req.kvVectorWidths()
+	if err != nil {
+		b.Fatalf("KV widths: %v", err)
+	}
+	if _, _, err := model.restoreLoadedSmallDecodePriorKV(req, keyWidth, valueWidth); err != nil {
+		b.Fatalf("warm restore prior KV: %v", err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		keys, values, err := model.restoreLoadedSmallDecodePriorKV(req, keyWidth, valueWidth)
+		if err != nil {
+			b.Fatalf("restore prior KV: %v", err)
+		}
+		if len(keys) != len(smoke.PriorKeys) || len(values) != len(smoke.PriorValues) {
+			b.Fatalf("restored KV lengths = %d/%d, want %d/%d", len(keys), len(values), len(smoke.PriorKeys), len(smoke.PriorValues))
+		}
+	}
+}
+
+func TestHIPGemma4Q4DeviceDecodeStatePoolPrewarm_Good(t *testing.T) {
+	hipPrewarmGemma4Q4DeviceDecodeStatePool(35, 2)
+	state := hipNewGemma4Q4DeviceDecodeState(rocmKVCacheModeKQ8VQ4, 35)
+	if state == nil || state.mode != rocmKVCacheModeKQ8VQ4 || len(state.layers) != 0 || cap(state.layers) < 35 {
+		t.Fatalf("prewarmed decode state = %#v len/cap=%d/%d, want empty state with >=35 layer capacity", state, len(state.layers), cap(state.layers))
+	}
+	statePointer := uintptr(unsafe.Pointer(state))
+	state.appendLayers = 3
+	hipReleaseGemma4Q4DeviceLayerStates(state.layers)
+	state.layers = nil
+	state.closed = true
+	hipReleaseClosedGemma4Q4DeviceDecodeState(state)
+
+	reused := hipNewGemma4Q4DeviceDecodeState(rocmKVCacheModeFP16, 35)
+	defer func() {
+		hipReleaseGemma4Q4DeviceLayerStates(reused.layers)
+		reused.layers = nil
+		reused.closed = true
+		hipReleaseClosedGemma4Q4DeviceDecodeState(reused)
+	}()
+	if reused == nil || uintptr(unsafe.Pointer(reused)) != statePointer {
+		t.Fatalf("reused decode state = %#v, want original state pointer %x", reused, statePointer)
+	}
+	if reused.mode != rocmKVCacheModeFP16 || reused.appendLayers != 0 || len(reused.layers) != 0 || cap(reused.layers) < 35 {
+		t.Fatalf("reused decode state = %#v len/cap=%d/%d, want cleared state with FP16 mode and >=35 layer capacity", reused, len(reused.layers), cap(reused.layers))
+	}
+}
+
 func BenchmarkHIPGemma4Q4DeviceLayerStatePool_Reused(b *testing.B) {
 	layers := hipBorrowGemma4Q4DeviceLayerStates(32)
 	hipReleaseGemma4Q4DeviceLayerStates(layers)
@@ -3711,6 +7511,42 @@ func BenchmarkHIPGemma4Q4DeviceLayerStatePool_Reused(b *testing.B) {
 			b.Fatalf("layer state slice len/cap = %d/%d, want 0/>=32", len(layers), cap(layers))
 		}
 		hipReleaseGemma4Q4DeviceLayerStates(layers)
+	}
+}
+
+func TestHIPGemma4Q4DeviceOwnershipActionPool_ReusesClearedSlice_Good(t *testing.T) {
+	actions := hipBorrowGemma4Q4DeviceOwnershipActions(8)
+	if len(actions) != 0 || cap(actions) < 8 {
+		t.Fatalf("borrowed ownership actions len/cap = %d/%d, want 0/>=8", len(actions), cap(actions))
+	}
+	layer := &hipGemma4Q4DeviceLayerKVState{}
+	cache := &rocmDeviceKVCache{}
+	actions = append(actions, hipGemma4Q4DeviceOwnershipAction{oldLayer: layer, newCache: cache, append: true})
+	hipReleaseGemma4Q4DeviceOwnershipActions(actions)
+
+	reused := hipBorrowGemma4Q4DeviceOwnershipActions(8)
+	defer hipReleaseGemma4Q4DeviceOwnershipActions(reused)
+	if len(reused) != 0 || cap(reused) < 8 {
+		t.Fatalf("reused ownership actions len/cap = %d/%d, want 0/>=8", len(reused), cap(reused))
+	}
+	full := reused[:cap(reused)]
+	for index, action := range full {
+		if action.oldLayer != nil || action.newCache != nil || action.append {
+			t.Fatalf("reused ownership action %d = %+v, want cleared", index, action)
+		}
+	}
+}
+
+func BenchmarkHIPGemma4Q4DeviceOwnershipActionPool_Reused(b *testing.B) {
+	actions := hipBorrowGemma4Q4DeviceOwnershipActions(32)
+	hipReleaseGemma4Q4DeviceOwnershipActions(actions)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		actions = hipBorrowGemma4Q4DeviceOwnershipActions(32)
+		if len(actions) != 0 || cap(actions) < 32 {
+			b.Fatalf("ownership action slice len/cap = %d/%d, want 0/>=32", len(actions), cap(actions))
+		}
+		hipReleaseGemma4Q4DeviceOwnershipActions(actions)
 	}
 }
 
@@ -3847,6 +7683,57 @@ func BenchmarkHIPMLXQ4TripleProjLaunchArgsBinary_Hot(b *testing.B) {
 	}
 }
 
+func BenchmarkHIPMLXQ4TripleProjLaunchArgsBinaryInto_Hot(b *testing.B) {
+	args := hipMLXQ4TripleProjLaunchArgs{
+		InputPointer:        0x1000,
+		OutputPointer:       0x2000,
+		FirstWeightPointer:  0x3000,
+		FirstScalePointer:   0x4000,
+		FirstBiasPointer:    0x5000,
+		SecondWeightPointer: 0x6000,
+		SecondScalePointer:  0x7000,
+		SecondBiasPointer:   0x8000,
+		ThirdWeightPointer:  0x9000,
+		ThirdScalePointer:   0xa000,
+		ThirdBiasPointer:    0xb000,
+		FirstRows:           16,
+		SecondRows:          4,
+		ThirdRows:           4,
+		Cols:                16,
+		GroupSize:           8,
+		Bits:                hipMLXQ4ProjectionBits,
+		InputBytes:          64,
+		OutputBytes:         96,
+		FirstWeightBytes:    128,
+		FirstScaleBytes:     64,
+		FirstBiasBytes:      64,
+		SecondWeightBytes:   32,
+		SecondScaleBytes:    16,
+		SecondBiasBytes:     16,
+		ThirdWeightBytes:    32,
+		ThirdScaleBytes:     16,
+		ThirdBiasBytes:      16,
+	}
+	var scratch [hipMLXQ4TripleProjLaunchArgsBytes]byte
+	packet, err := args.BinaryInto(scratch[:])
+	if err != nil {
+		b.Fatal(err)
+	}
+	if len(packet) != hipMLXQ4TripleProjLaunchArgsBytes {
+		b.Fatalf("packet len = %d, want %d", len(packet), hipMLXQ4TripleProjLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		packet, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(packet) != hipMLXQ4TripleProjLaunchArgsBytes {
+			b.Fatalf("packet len = %d, want %d", len(packet), hipMLXQ4TripleProjLaunchArgsBytes)
+		}
+	}
+}
+
 type hipLaunchPacketReleasingStubDriver struct {
 	inferenceBenchmarkHIPKernelCountingStubDriver
 }
@@ -3854,6 +7741,21 @@ type hipLaunchPacketReleasingStubDriver struct {
 func (hipLaunchPacketReleasingStubDriver) LaunchKernel(config hipKernelLaunchConfig) error {
 	hipReleaseLaunchPacket(config.Args)
 	return nil
+}
+
+type hipPackedTopKSampleStubDriver struct {
+	hipLaunchPacketReleasingStubDriver
+}
+
+func (hipPackedTopKSampleStubDriver) CopyDeviceToHost(_ nativeDevicePointer, payload []byte) error {
+	if len(payload) >= 8 {
+		binary.LittleEndian.PutUint64(payload, hipPackGreedyBest(1, 1))
+	}
+	return nil
+}
+
+func (hipPackedTopKSampleStubDriver) CopyDeviceToHostUint64(nativeDevicePointer) (uint64, error) {
+	return hipPackGreedyBest(1, 1), nil
 }
 
 func BenchmarkHIPMLXQ4TripleProjectionKernelWithDeviceInputViewsOutput_Hot(b *testing.B) {
@@ -3930,6 +7832,165 @@ func BenchmarkHIPMLXQ4TripleProjectionKernelWithDeviceInputViewsOutput_Hot(b *te
 	}
 }
 
+func BenchmarkHIPMLXQ4ProjectionKernelWithDeviceInputOutputWithWorkspace_Hot(b *testing.B) {
+	driver := hipLaunchPacketReleasingStubDriver{}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	input := &hipDeviceByteBuffer{driver: driver, pointer: 0x1000, count: 16, sizeBytes: 64, borrowed: true, label: "benchmark q4 projection input"}
+	output := &hipDeviceByteBuffer{driver: driver, pointer: 0x2000, count: 16, sizeBytes: 64, borrowed: true, label: "benchmark q4 projection output"}
+	cfg := hipMLXQ4DeviceWeightConfig{WeightPointer: 0x3000, ScalePointer: 0x4000, BiasPointer: 0x5000, WeightBytes: 128, ScaleBytes: 64, BiasBytes: 64, Rows: 16, Cols: 16, GroupSize: 8}
+	if err := hipRunMLXQ4ProjectionKernelWithDeviceInputOutputWithWorkspace(context.Background(), driver, input, cfg, output, workspace); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := hipRunMLXQ4ProjectionKernelWithDeviceInputOutputWithWorkspace(context.Background(), driver, input, cfg, output, workspace); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkHIPMLXQ4TripleProjectionKernelWithDeviceInputViewsOutputWithWorkspace_Hot(b *testing.B) {
+	driver := hipLaunchPacketReleasingStubDriver{}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	input := &hipDeviceByteBuffer{driver: driver, pointer: 0x1000, count: 16, sizeBytes: 64, borrowed: true, label: "benchmark q4 triple input"}
+	output := &hipDeviceByteBuffer{driver: driver, pointer: 0x2000, count: 24, sizeBytes: 96, borrowed: true, label: "benchmark q4 triple output"}
+	firstCfg := hipMLXQ4DeviceWeightConfig{WeightPointer: 0x3000, ScalePointer: 0x4000, BiasPointer: 0x5000, WeightBytes: 128, ScaleBytes: 64, BiasBytes: 64, Rows: 16, Cols: 16, GroupSize: 8}
+	secondCfg := hipMLXQ4DeviceWeightConfig{WeightPointer: 0x6000, ScalePointer: 0x7000, BiasPointer: 0x8000, WeightBytes: 32, ScaleBytes: 16, BiasBytes: 16, Rows: 4, Cols: 16, GroupSize: 8}
+	thirdCfg := hipMLXQ4DeviceWeightConfig{WeightPointer: 0x9000, ScalePointer: 0xa000, BiasPointer: 0xb000, WeightBytes: 32, ScaleBytes: 16, BiasBytes: 16, Rows: 4, Cols: 16, GroupSize: 8}
+	first, second, third, err := hipRunMLXQ4TripleProjectionKernelWithDeviceInputViewsOutputWithWorkspace(context.Background(), driver, input, firstCfg, secondCfg, thirdCfg, output, workspace)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if first.Pointer() != output.Pointer() || second.Pointer() != output.Pointer()+nativeDevicePointer(firstCfg.Rows*4) || third.Pointer() != output.Pointer()+nativeDevicePointer((firstCfg.Rows+secondCfg.Rows)*4) {
+		b.Fatalf("bad borrowed output views")
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		first, second, third, err = hipRunMLXQ4TripleProjectionKernelWithDeviceInputViewsOutputWithWorkspace(context.Background(), driver, input, firstCfg, secondCfg, thirdCfg, output, workspace)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if first.Pointer() != output.Pointer() || second.Pointer() != output.Pointer()+nativeDevicePointer(firstCfg.Rows*4) || third.Pointer() != output.Pointer()+nativeDevicePointer((firstCfg.Rows+secondCfg.Rows)*4) {
+			b.Fatalf("bad borrowed output views")
+		}
+	}
+}
+
+func BenchmarkHIPMLXQ4PairProjectionKernelWithDeviceInputViewsOutputWithWorkspace_Hot(b *testing.B) {
+	driver := hipLaunchPacketReleasingStubDriver{}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	input := &hipDeviceByteBuffer{driver: driver, pointer: 0x1000, count: 16, sizeBytes: 64, borrowed: true, label: "benchmark q4 pair input"}
+	output := &hipDeviceByteBuffer{driver: driver, pointer: 0x2000, count: 20, sizeBytes: 80, borrowed: true, label: "benchmark q4 pair output"}
+	firstCfg := hipMLXQ4DeviceWeightConfig{WeightPointer: 0x3000, ScalePointer: 0x4000, BiasPointer: 0x5000, WeightBytes: 128, ScaleBytes: 64, BiasBytes: 64, Rows: 16, Cols: 16, GroupSize: 8}
+	secondCfg := hipMLXQ4DeviceWeightConfig{WeightPointer: 0x6000, ScalePointer: 0x7000, BiasPointer: 0x8000, WeightBytes: 32, ScaleBytes: 16, BiasBytes: 16, Rows: 4, Cols: 16, GroupSize: 8}
+	first, second, err := hipRunMLXQ4PairProjectionKernelWithDeviceInputViewsOutputWithWorkspace(context.Background(), driver, input, firstCfg, secondCfg, output, workspace)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if first.Pointer() != output.Pointer() || second.Pointer() != output.Pointer()+nativeDevicePointer(firstCfg.Rows*4) {
+		b.Fatalf("bad borrowed output views")
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		first, second, err = hipRunMLXQ4PairProjectionKernelWithDeviceInputViewsOutputWithWorkspace(context.Background(), driver, input, firstCfg, secondCfg, output, workspace)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if first.Pointer() != output.Pointer() || second.Pointer() != output.Pointer()+nativeDevicePointer(firstCfg.Rows*4) {
+			b.Fatalf("bad borrowed output views")
+		}
+	}
+}
+
+func BenchmarkHIPMLXQ4GELUTanhMultiplyKernelWithDeviceInputOutputWithWorkspace_Hot(b *testing.B) {
+	driver := hipLaunchPacketReleasingStubDriver{}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	input := &hipDeviceByteBuffer{driver: driver, pointer: 0x1000, count: 16, sizeBytes: 64, borrowed: true, label: "benchmark q4 gelu multiply input"}
+	output := &hipDeviceByteBuffer{driver: driver, pointer: 0x2000, count: 16, sizeBytes: 64, borrowed: true, label: "benchmark q4 gelu multiply output"}
+	gateCfg := hipMLXQ4DeviceWeightConfig{WeightPointer: 0x3000, ScalePointer: 0x4000, BiasPointer: 0x5000, WeightBytes: 128, ScaleBytes: 64, BiasBytes: 64, Rows: 16, Cols: 16, GroupSize: 8}
+	upCfg := hipMLXQ4DeviceWeightConfig{WeightPointer: 0x6000, ScalePointer: 0x7000, BiasPointer: 0x8000, WeightBytes: 128, ScaleBytes: 64, BiasBytes: 64, Rows: 16, Cols: 16, GroupSize: 8}
+	if err := hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInputOutputWithWorkspace(context.Background(), driver, input, gateCfg, upCfg, output, workspace); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInputOutputWithWorkspace(context.Background(), driver, input, gateCfg, upCfg, output, workspace); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkHIPMLXQ4GELUTanhProjectionKernelWithDeviceMultiplierOutputWithWorkspace_Hot(b *testing.B) {
+	driver := hipLaunchPacketReleasingStubDriver{}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	input := &hipDeviceByteBuffer{driver: driver, pointer: 0x1000, count: 16, sizeBytes: 64, borrowed: true, label: "benchmark q4 gelu projection input"}
+	multiplier := &hipDeviceByteBuffer{driver: driver, pointer: 0x2000, count: 16, sizeBytes: 64, borrowed: true, label: "benchmark q4 gelu projection multiplier"}
+	output := &hipDeviceByteBuffer{driver: driver, pointer: 0x3000, count: 16, sizeBytes: 64, borrowed: true, label: "benchmark q4 gelu projection output"}
+	cfg := hipMLXQ4DeviceWeightConfig{WeightPointer: 0x4000, ScalePointer: 0x5000, BiasPointer: 0x6000, WeightBytes: 128, ScaleBytes: 64, BiasBytes: 64, Rows: 16, Cols: 16, GroupSize: 8}
+	if err := hipRunMLXQ4GELUTanhProjectionKernelWithDeviceMultiplierOutputWithWorkspace(context.Background(), driver, input, multiplier, cfg, output, workspace); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := hipRunMLXQ4GELUTanhProjectionKernelWithDeviceMultiplierOutputWithWorkspace(context.Background(), driver, input, multiplier, cfg, output, workspace); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkHIPEmbeddingLookupTokenBufferScaledOutputWithWorkspace_Hot(b *testing.B) {
+	driver := hipLaunchPacketReleasingStubDriver{}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	cfg := hipDeviceEmbeddingLookupConfig{
+		EmbeddingPointer: 0x3000,
+		EmbeddingBytes:   256 * 16 * 2,
+		VocabSize:        256,
+		HiddenSize:       16,
+		TableEncoding:    hipEmbeddingTableEncodingBF16,
+	}
+	token := &hipDeviceByteBuffer{driver: driver, pointer: 0x1000, count: 1, sizeBytes: 4, borrowed: true, label: "benchmark embedding token"}
+	output := &hipDeviceByteBuffer{driver: driver, pointer: 0x2000, count: 16, sizeBytes: 16 * 4, borrowed: true, label: "benchmark embedding output"}
+	if err := hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferScaledOutputWithWorkspace(context.Background(), driver, cfg, token, output, 0.5, workspace); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferScaledOutputWithWorkspace(context.Background(), driver, cfg, token, output, 0.5, workspace); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkHIPEmbeddingLookupGreedyTokenScaledOutputWithWorkspace_Hot(b *testing.B) {
+	driver := hipLaunchPacketReleasingStubDriver{}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	cfg := hipDeviceEmbeddingLookupConfig{
+		EmbeddingPointer: 0x3000,
+		EmbeddingBytes:   256 * 16 * 2,
+		VocabSize:        256,
+		HiddenSize:       16,
+		TableEncoding:    hipEmbeddingTableEncodingBF16,
+	}
+	token := &hipDeviceByteBuffer{driver: driver, pointer: 0x1000, count: 1, sizeBytes: hipMLXQ4ProjectionBestBytes, borrowed: true, label: "benchmark greedy embedding token"}
+	output := &hipDeviceByteBuffer{driver: driver, pointer: 0x2000, count: 16, sizeBytes: 16 * 4, borrowed: true, label: "benchmark greedy embedding output"}
+	if err := hipRunEmbeddingLookupKernelWithDeviceTableGreedyTokenScaledOutputWithWorkspace(context.Background(), driver, cfg, token, output, 0.5, workspace); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := hipRunEmbeddingLookupKernelWithDeviceTableGreedyTokenScaledOutputWithWorkspace(context.Background(), driver, cfg, token, output, 0.5, workspace); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkHIPPackedTopKLaunchArgsBinary_Hot(b *testing.B) {
 	inputCount := 256000
 	topK := 64
@@ -3960,6 +8021,385 @@ func BenchmarkHIPPackedTopKLaunchArgsBinary_Hot(b *testing.B) {
 			b.Fatalf("packet len = %d, want %d", len(packet), hipPackedTopKLaunchArgsBytes)
 		}
 		hipReleaseLaunchPacket(packet)
+	}
+}
+
+func BenchmarkHIPPackedTopKLaunchArgsBinaryInto_Hot(b *testing.B) {
+	inputCount := 256000
+	topK := 64
+	chunkCount := (inputCount + hipPackedTopKChunkSize - 1) / hipPackedTopKChunkSize
+	outputCount := chunkCount * topK
+	args := hipPackedTopKLaunchArgs{
+		InputPointer:  0x1000,
+		OutputPointer: 0x2000,
+		InputCount:    inputCount,
+		OutputCount:   outputCount,
+		TopK:          topK,
+		ChunkSize:     hipPackedTopKChunkSize,
+		InputBytes:    uint64(inputCount * hipMLXQ4ProjectionBestBytes),
+		OutputBytes:   uint64(outputCount * hipMLXQ4ProjectionBestBytes),
+	}
+	var scratch [hipPackedTopKLaunchArgsBytes]byte
+	packet, err := args.BinaryInto(scratch[:])
+	if err != nil {
+		b.Fatal(err)
+	}
+	if len(packet) != hipPackedTopKLaunchArgsBytes {
+		b.Fatalf("packet len = %d, want %d", len(packet), hipPackedTopKLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		packet, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(packet) != hipPackedTopKLaunchArgsBytes {
+			b.Fatalf("packet len = %d, want %d", len(packet), hipPackedTopKLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPPackedTopKSampleLaunchArgsBinaryInto_Hot(b *testing.B) {
+	args := hipPackedTopKSampleLaunchArgs{
+		InputPointer:  0x1000,
+		OutputPointer: 0x2000,
+		InputCount:    64,
+		TopK:          64,
+		InputBytes:    64 * hipMLXQ4ProjectionBestBytes,
+		OutputBytes:   hipMLXQ4ProjectionBestBytes,
+		Temperature:   0.7,
+		TopP:          0.95,
+		Draw:          0.25,
+	}
+	var scratch [hipPackedTopKSampleLaunchArgsBytes]byte
+	packet, err := args.BinaryInto(scratch[:])
+	if err != nil {
+		b.Fatal(err)
+	}
+	if len(packet) != hipPackedTopKSampleLaunchArgsBytes {
+		b.Fatalf("packet len = %d, want %d", len(packet), hipPackedTopKSampleLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		packet, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(packet) != hipPackedTopKSampleLaunchArgsBytes {
+			b.Fatalf("packet len = %d, want %d", len(packet), hipPackedTopKSampleLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPVectorScaleDeviceKernelOutputWithWorkspace_Hot(b *testing.B) {
+	driver := hipLaunchPacketReleasingStubDriver{}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	input := &hipDeviceByteBuffer{
+		driver:    driver,
+		pointer:   0x1000,
+		count:     2048,
+		sizeBytes: 2048 * 4,
+		borrowed:  true,
+		label:     "benchmark vector scale input",
+	}
+	output := &hipDeviceByteBuffer{
+		driver:    driver,
+		pointer:   0x2000,
+		count:     2048,
+		sizeBytes: 2048 * 4,
+		borrowed:  true,
+		label:     "benchmark vector scale output",
+	}
+	if err := hipRunVectorScaleDeviceKernelOutputWithWorkspace(context.Background(), driver, input, 0.5, output, workspace); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := hipRunVectorScaleDeviceKernelOutputWithWorkspace(context.Background(), driver, input, 0.5, output, workspace); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkHIPVectorAddScaledDeviceKernelOutputWithWorkspace_Hot(b *testing.B) {
+	driver := hipLaunchPacketReleasingStubDriver{}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	left := &hipDeviceByteBuffer{
+		driver:    driver,
+		pointer:   0x1000,
+		count:     2048,
+		sizeBytes: 2048 * 4,
+		borrowed:  true,
+		label:     "benchmark vector add-scaled left",
+	}
+	right := &hipDeviceByteBuffer{
+		driver:    driver,
+		pointer:   0x2000,
+		count:     2048,
+		sizeBytes: 2048 * 4,
+		borrowed:  true,
+		label:     "benchmark vector add-scaled right",
+	}
+	output := &hipDeviceByteBuffer{
+		driver:    driver,
+		pointer:   0x3000,
+		count:     2048,
+		sizeBytes: 2048 * 4,
+		borrowed:  true,
+		label:     "benchmark vector add-scaled output",
+	}
+	if err := hipRunVectorAddScaledDeviceKernelOutputWithWorkspace(context.Background(), driver, left, right, 0.5, output, workspace); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := hipRunVectorAddScaledDeviceKernelOutputWithWorkspace(context.Background(), driver, left, right, 0.5, output, workspace); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkHIPRMSNormDeviceToDeviceKernelWithWorkspace_Hot(b *testing.B) {
+	driver := hipLaunchPacketReleasingStubDriver{}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	cfg := hipRMSNormDeviceWeightConfig{
+		WeightPointer:  0x3000,
+		WeightBytes:    2048 * 2,
+		Count:          2048,
+		Epsilon:        1e-6,
+		WeightEncoding: hipRMSNormWeightEncodingBF16,
+	}
+	if err := hipRunRMSNormDeviceToDeviceKernelWithWorkspace(context.Background(), driver, 0x1000, 2048*4, 0x2000, 2048*4, cfg, workspace); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := hipRunRMSNormDeviceToDeviceKernelWithWorkspace(context.Background(), driver, 0x1000, 2048*4, 0x2000, 2048*4, cfg, workspace); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkHIPGemma4Q4RMSNormNoScaleDeviceKernelOutputWithWorkspace_Hot(b *testing.B) {
+	driver := hipLaunchPacketReleasingStubDriver{}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	input := &hipDeviceByteBuffer{driver: driver, pointer: 0x1000, count: 512, sizeBytes: 512 * 4, borrowed: true, label: "benchmark rms no-scale input"}
+	output := &hipDeviceByteBuffer{driver: driver, pointer: 0x2000, count: 512, sizeBytes: 512 * 4, borrowed: true, label: "benchmark rms no-scale output"}
+	if err := hipRunGemma4Q4RMSNormNoScaleDeviceKernelOutputWithWorkspace(context.Background(), driver, input, output, 1e-6, workspace); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := hipRunGemma4Q4RMSNormNoScaleDeviceKernelOutputWithWorkspace(context.Background(), driver, input, output, 1e-6, workspace); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkHIPRMSNormResidualAddScaledKernelWithWorkspace_Hot(b *testing.B) {
+	driver := hipLaunchPacketReleasingStubDriver{}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	input := &hipDeviceByteBuffer{driver: driver, pointer: 0x1000, count: 2048, sizeBytes: 2048 * 4, borrowed: true, label: "benchmark rms residual input"}
+	residual := &hipDeviceByteBuffer{driver: driver, pointer: 0x2000, count: 2048, sizeBytes: 2048 * 4, borrowed: true, label: "benchmark rms residual residual"}
+	output := &hipDeviceByteBuffer{driver: driver, pointer: 0x3000, count: 2048, sizeBytes: 2048 * 4, borrowed: true, label: "benchmark rms residual output"}
+	cfg := hipRMSNormDeviceWeightConfig{
+		WeightPointer:  0x4000,
+		WeightBytes:    2048 * 2,
+		Count:          2048,
+		Epsilon:        1e-6,
+		WeightEncoding: hipRMSNormWeightEncodingBF16,
+	}
+	if err := hipRunRMSNormResidualAddScaledKernelWithDeviceInputWeightConfigOutputWithWorkspace(context.Background(), driver, input, residual, cfg, output, 1, workspace); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := hipRunRMSNormResidualAddScaledKernelWithDeviceInputWeightConfigOutputWithWorkspace(context.Background(), driver, input, residual, cfg, output, 1, workspace); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkHIPRMSNormResidualAddNormScaledKernelWithWorkspace_Hot(b *testing.B) {
+	driver := hipLaunchPacketReleasingStubDriver{}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	input := &hipDeviceByteBuffer{driver: driver, pointer: 0x1000, count: 2048, sizeBytes: 2048 * 4, borrowed: true, label: "benchmark rms residual-norm input"}
+	residual := &hipDeviceByteBuffer{driver: driver, pointer: 0x2000, count: 2048, sizeBytes: 2048 * 4, borrowed: true, label: "benchmark rms residual-norm residual"}
+	residualOutput := &hipDeviceByteBuffer{driver: driver, pointer: 0x3000, count: 2048, sizeBytes: 2048 * 4, borrowed: true, label: "benchmark rms residual-norm residual output"}
+	normOutput := &hipDeviceByteBuffer{driver: driver, pointer: 0x4000, count: 2048, sizeBytes: 2048 * 4, borrowed: true, label: "benchmark rms residual-norm norm output"}
+	residualCfg := hipRMSNormDeviceWeightConfig{WeightPointer: 0x5000, WeightBytes: 2048 * 2, Count: 2048, Epsilon: 1e-6, WeightEncoding: hipRMSNormWeightEncodingBF16}
+	normCfg := hipRMSNormDeviceWeightConfig{WeightPointer: 0x6000, WeightBytes: 2048 * 2, Count: 2048, Epsilon: 1e-6, WeightEncoding: hipRMSNormWeightEncodingBF16}
+	if err := hipRunRMSNormResidualAddNormScaledKernelWithDeviceInputWeightConfigOutputWithWorkspace(context.Background(), driver, input, residual, residualCfg, normCfg, residualOutput, normOutput, 1, workspace); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := hipRunRMSNormResidualAddNormScaledKernelWithDeviceInputWeightConfigOutputWithWorkspace(context.Background(), driver, input, residual, residualCfg, normCfg, residualOutput, normOutput, 1, workspace); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkHIPRMSNormHeadsKernelWithWorkspace_Hot(b *testing.B) {
+	driver := hipLaunchPacketReleasingStubDriver{}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	input := &hipDeviceByteBuffer{driver: driver, pointer: 0x1000, count: 2048, sizeBytes: 2048 * 4, borrowed: true, label: "benchmark rms heads input"}
+	output := &hipDeviceByteBuffer{driver: driver, pointer: 0x2000, count: 2048, sizeBytes: 2048 * 4, borrowed: true, label: "benchmark rms heads output"}
+	cfg := hipRMSNormDeviceWeightConfig{WeightPointer: 0x3000, WeightBytes: 512 * 2, Count: 512, Epsilon: 1e-6, WeightEncoding: hipRMSNormWeightEncodingBF16}
+	if err := hipRunRMSNormHeadsKernelWithDeviceInputWeightConfigOutputWithWorkspace(context.Background(), driver, input, cfg, 4, output, workspace); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := hipRunRMSNormHeadsKernelWithDeviceInputWeightConfigOutputWithWorkspace(context.Background(), driver, input, cfg, 4, output, workspace); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkHIPRMSNormRoPEHeadsKernelWithWorkspace_Hot(b *testing.B) {
+	driver := hipLaunchPacketReleasingStubDriver{}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	input := &hipDeviceByteBuffer{driver: driver, pointer: 0x1000, count: 2048, sizeBytes: 2048 * 4, borrowed: true, label: "benchmark rms rope heads input"}
+	output := &hipDeviceByteBuffer{driver: driver, pointer: 0x2000, count: 2048, sizeBytes: 2048 * 4, borrowed: true, label: "benchmark rms rope heads output"}
+	cfg := hipRMSNormDeviceWeightConfig{WeightPointer: 0x3000, WeightBytes: 512 * 2, Count: 512, Epsilon: 1e-6, WeightEncoding: hipRMSNormWeightEncodingBF16}
+	if err := hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigOutputFrequencyScaleWithWorkspace(context.Background(), driver, input, cfg, 4, 17, 10000, 512, 512, 1, output, workspace); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := hipRunRMSNormRoPEHeadsKernelWithDeviceInputWeightConfigOutputFrequencyScaleWithWorkspace(context.Background(), driver, input, cfg, 4, 17, 10000, 512, 512, 1, output, workspace); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkHIPPackedTopKKernelWithWorkspaceOutput_Hot(b *testing.B) {
+	driver := hipLaunchPacketReleasingStubDriver{}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	inputCount := 256000
+	topK := 64
+	input := &hipDeviceByteBuffer{
+		driver:    driver,
+		pointer:   0x1000,
+		count:     inputCount,
+		sizeBytes: uint64(inputCount * hipMLXQ4ProjectionBestBytes),
+		borrowed:  true,
+		label:     "benchmark packed top-k input",
+	}
+	output, outputCount, err := hipRunPackedTopKKernelWithWorkspaceOutput(context.Background(), driver, input, inputCount, topK, workspace, false)
+	if err != nil {
+		b.Fatal(err)
+	}
+	wantOutputCount := hipPackedTopKOutputCount(inputCount, topK)
+	if outputCount != wantOutputCount || output.Count() != wantOutputCount || output.SizeBytes() != uint64(wantOutputCount*hipMLXQ4ProjectionBestBytes) {
+		b.Fatalf("packed top-k output = %d %d/%d, want %d/%d", outputCount, output.Count(), output.SizeBytes(), wantOutputCount, wantOutputCount*hipMLXQ4ProjectionBestBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		output, outputCount, err = hipRunPackedTopKKernelWithWorkspaceOutput(context.Background(), driver, input, inputCount, topK, workspace, false)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if outputCount != wantOutputCount || output.Count() != wantOutputCount || output.SizeBytes() != uint64(wantOutputCount*hipMLXQ4ProjectionBestBytes) {
+			b.Fatalf("packed top-k output = %d %d/%d, want %d/%d", outputCount, output.Count(), output.SizeBytes(), wantOutputCount, wantOutputCount*hipMLXQ4ProjectionBestBytes)
+		}
+	}
+}
+
+func BenchmarkHIPPackedTopKSampleKernelWithWorkspace_Hot(b *testing.B) {
+	driver := hipPackedTopKSampleStubDriver{}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	inputCount := 64
+	topK := 64
+	input := &hipDeviceByteBuffer{
+		driver:    driver,
+		pointer:   0x1000,
+		count:     inputCount,
+		sizeBytes: uint64(inputCount * hipMLXQ4ProjectionBestBytes),
+		borrowed:  true,
+		label:     "benchmark packed top-k sample input",
+	}
+	output := &hipDeviceByteBuffer{
+		driver:    driver,
+		pointer:   0x2000,
+		count:     1,
+		sizeBytes: hipMLXQ4ProjectionBestBytes,
+		borrowed:  true,
+		label:     "benchmark packed top-k sample output",
+	}
+	_, _, err := hipRunPackedTopKSampleKernel(context.Background(), driver, input, inputCount, topK, 0.7, 0.95, 0.25, output, workspace)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _, err = hipRunPackedTopKSampleKernel(context.Background(), driver, input, inputCount, topK, 0.7, 0.95, 0.25, output, workspace)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkHIPMLXQ4ProjectionSoftcapSampleKernelWithWorkspace_Hot(b *testing.B) {
+	driver := hipPackedTopKSampleStubDriver{}
+	workspace := &hipAttentionHeadsChunkedWorkspace{}
+	defer workspace.Close()
+	rows := 256000
+	cols := 16
+	groupSize := 8
+	groupsPerRow := cols / groupSize
+	packedPerRow, err := hipMLXAffinePackedCols(cols, hipMLXQ4ProjectionBits)
+	if err != nil {
+		b.Fatal(err)
+	}
+	input := &hipDeviceByteBuffer{
+		driver:    driver,
+		pointer:   0x1000,
+		count:     cols,
+		sizeBytes: uint64(cols * 4),
+		borrowed:  true,
+		label:     "benchmark q4 sampled projection input",
+	}
+	best := &hipDeviceByteBuffer{
+		driver:    driver,
+		pointer:   0x2000,
+		count:     1,
+		sizeBytes: hipMLXQ4ProjectionBestBytes,
+		borrowed:  true,
+		label:     "benchmark q4 sampled projection best",
+	}
+	cfg := hipMLXQ4DeviceWeightConfig{
+		WeightPointer: 0x3000,
+		ScalePointer:  0x4000,
+		BiasPointer:   0x5000,
+		WeightBytes:   uint64(rows * packedPerRow * 4),
+		ScaleBytes:    uint64(rows * groupsPerRow * 2),
+		BiasBytes:     uint64(rows * groupsPerRow * 2),
+		Rows:          rows,
+		Cols:          cols,
+		GroupSize:     groupSize,
+	}
+	_, _, err = hipRunMLXQ4ProjectionSoftcapSampleKernelWithDeviceInputBufferSuppress(context.Background(), driver, input, cfg, 30, 64, 0.7, 0.95, 0.25, best, nil, workspace)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _, err = hipRunMLXQ4ProjectionSoftcapSampleKernelWithDeviceInputBufferSuppress(context.Background(), driver, input, cfg, 30, 64, 0.7, 0.95, 0.25, best, nil, workspace)
+		if err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -4004,6 +8444,172 @@ func BenchmarkHIPMLXQ4GELUTanhMultiplyLaunchArgsBinary_Hot(b *testing.B) {
 	}
 }
 
+func BenchmarkHIPMLXQ4GELUTanhMultiplyLaunchArgsBinaryInto_Hot(b *testing.B) {
+	args := hipMLXQ4GELUTanhMulLaunchArgs{
+		InputPointer:      0x1000,
+		GateWeightPointer: 0x2000,
+		GateScalePointer:  0x3000,
+		GateBiasPointer:   0x4000,
+		UpWeightPointer:   0x5000,
+		UpScalePointer:    0x6000,
+		UpBiasPointer:     0x7000,
+		OutputPointer:     0x8000,
+		Rows:              32,
+		Cols:              16,
+		GroupSize:         8,
+		Bits:              hipMLXQ4ProjectionBits,
+		InputBytes:        64,
+		GateWeightBytes:   256,
+		GateScaleBytes:    128,
+		GateBiasBytes:     128,
+		UpWeightBytes:     256,
+		UpScaleBytes:      128,
+		UpBiasBytes:       128,
+		OutputBytes:       128,
+	}
+	var scratch [hipMLXQ4GELUTanhMulLaunchArgsBytes]byte
+	packet, err := args.BinaryInto(scratch[:])
+	if err != nil {
+		b.Fatal(err)
+	}
+	if len(packet) != hipMLXQ4GELUTanhMulLaunchArgsBytes {
+		b.Fatalf("packet len = %d, want %d", len(packet), hipMLXQ4GELUTanhMulLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		packet, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(packet) != hipMLXQ4GELUTanhMulLaunchArgsBytes {
+			b.Fatalf("packet len = %d, want %d", len(packet), hipMLXQ4GELUTanhMulLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPMLXQ4GELUTanhMultiplyBatchLaunchArgsBinaryInto_Hot(b *testing.B) {
+	args := hipMLXQ4GELUTanhMulBatchLaunchArgs{
+		InputPointer:      0x1000,
+		GateWeightPointer: 0x2000,
+		GateScalePointer:  0x3000,
+		GateBiasPointer:   0x4000,
+		UpWeightPointer:   0x5000,
+		UpScalePointer:    0x6000,
+		UpBiasPointer:     0x7000,
+		OutputPointer:     0x8000,
+		Rows:              32,
+		Cols:              16,
+		Batch:             8,
+		GroupSize:         8,
+		Bits:              hipMLXQ4ProjectionBits,
+		InputBytes:        8 * 64,
+		GateWeightBytes:   256,
+		GateScaleBytes:    128,
+		GateBiasBytes:     128,
+		UpWeightBytes:     256,
+		UpScaleBytes:      128,
+		UpBiasBytes:       128,
+		OutputBytes:       8 * 128,
+	}
+	var scratch [hipMLXQ4GELUTanhMulBatchLaunchArgsBytes]byte
+	packet, err := args.BinaryInto(scratch[:])
+	if err != nil {
+		b.Fatal(err)
+	}
+	if len(packet) != hipMLXQ4GELUTanhMulBatchLaunchArgsBytes {
+		b.Fatalf("packet len = %d, want %d", len(packet), hipMLXQ4GELUTanhMulBatchLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		packet, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(packet) != hipMLXQ4GELUTanhMulBatchLaunchArgsBytes {
+			b.Fatalf("packet len = %d, want %d", len(packet), hipMLXQ4GELUTanhMulBatchLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPMLXQ4GELUTanhProjectionLaunchArgsBinaryInto_Hot(b *testing.B) {
+	args := hipMLXQ4GELUTanhProjLaunchArgs{
+		InputPointer:      0x1000,
+		WeightPointer:     0x2000,
+		ScalePointer:      0x3000,
+		BiasPointer:       0x4000,
+		MultiplierPointer: 0x5000,
+		OutputPointer:     0x6000,
+		Rows:              32,
+		Cols:              16,
+		GroupSize:         8,
+		Bits:              hipMLXQ4ProjectionBits,
+		InputBytes:        64,
+		WeightBytes:       256,
+		ScaleBytes:        128,
+		BiasBytes:         128,
+		MultiplierBytes:   128,
+		OutputBytes:       128,
+	}
+	var scratch [hipMLXQ4GELUTanhProjLaunchArgsBytes]byte
+	packet, err := args.BinaryInto(scratch[:])
+	if err != nil {
+		b.Fatal(err)
+	}
+	if len(packet) != hipMLXQ4GELUTanhProjLaunchArgsBytes {
+		b.Fatalf("packet len = %d, want %d", len(packet), hipMLXQ4GELUTanhProjLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		packet, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(packet) != hipMLXQ4GELUTanhProjLaunchArgsBytes {
+			b.Fatalf("packet len = %d, want %d", len(packet), hipMLXQ4GELUTanhProjLaunchArgsBytes)
+		}
+	}
+}
+
+func BenchmarkHIPMLXQ4GELUTanhProjectionBatchLaunchArgsBinaryInto_Hot(b *testing.B) {
+	args := hipMLXQ4GELUTanhProjBatchLaunchArgs{
+		InputPointer:      0x1000,
+		WeightPointer:     0x2000,
+		ScalePointer:      0x3000,
+		BiasPointer:       0x4000,
+		MultiplierPointer: 0x5000,
+		OutputPointer:     0x6000,
+		Rows:              32,
+		Cols:              16,
+		Batch:             8,
+		GroupSize:         8,
+		Bits:              hipMLXQ4ProjectionBits,
+		InputBytes:        8 * 64,
+		WeightBytes:       256,
+		ScaleBytes:        128,
+		BiasBytes:         128,
+		MultiplierBytes:   8 * 128,
+		OutputBytes:       8 * 128,
+	}
+	var scratch [hipMLXQ4GELUTanhProjBatchLaunchArgsBytes]byte
+	packet, err := args.BinaryInto(scratch[:])
+	if err != nil {
+		b.Fatal(err)
+	}
+	if len(packet) != hipMLXQ4GELUTanhProjBatchLaunchArgsBytes {
+		b.Fatalf("packet len = %d, want %d", len(packet), hipMLXQ4GELUTanhProjBatchLaunchArgsBytes)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		packet, err = args.BinaryInto(scratch[:])
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(packet) != hipMLXQ4GELUTanhProjBatchLaunchArgsBytes {
+			b.Fatalf("packet len = %d, want %d", len(packet), hipMLXQ4GELUTanhProjBatchLaunchArgsBytes)
+		}
+	}
+}
+
 func BenchmarkROCmDeviceKVPageSlicePool_ReusedCapacity(b *testing.B) {
 	rocmDeviceKVPageSlicePools.Range(func(key, _ any) bool {
 		rocmDeviceKVPageSlicePools.Delete(key)
@@ -4016,6 +8622,23 @@ func BenchmarkROCmDeviceKVPageSlicePool_ReusedCapacity(b *testing.B) {
 		pages = rocmDeviceKVBorrowPageSlice(32, rocmDeviceKVHotPageCapacity)
 		if len(pages) != 32 || cap(pages) != rocmDeviceKVHotPageCapacity {
 			b.Fatalf("page slice len/cap = %d/%d, want 32/%d", len(pages), cap(pages), rocmDeviceKVHotPageCapacity)
+		}
+		rocmDeviceKVReleasePageSlice(pages)
+	}
+}
+
+func BenchmarkROCmDeviceKVPageSlicePool_SmallReusedCapacity(b *testing.B) {
+	rocmDeviceKVPageSlicePools.Range(func(key, _ any) bool {
+		rocmDeviceKVPageSlicePools.Delete(key)
+		return true
+	})
+	pages := rocmDeviceKVBorrowPageSlice(1, 1)
+	rocmDeviceKVReleasePageSlice(pages)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		pages = rocmDeviceKVBorrowPageSlice(1, 1)
+		if len(pages) != 1 || cap(pages) != rocmDeviceKVPagePoolMinCapacity {
+			b.Fatalf("page slice len/cap = %d/%d, want 1/%d", len(pages), cap(pages), rocmDeviceKVPagePoolMinCapacity)
 		}
 		rocmDeviceKVReleasePageSlice(pages)
 	}
@@ -4342,7 +8965,7 @@ func TestHIPGemma4Q4PackagePrefillDecode_Bad(t *testing.T) {
 func TestHIPSmallDecode_Bad(t *testing.T) {
 	_, err := hipReferenceSmallDecode(hipSmallDecodeFixture("llama"))
 	core.AssertError(t, err)
-	core.AssertContains(t, err.Error(), "Qwen or Gemma")
+	core.AssertContains(t, err.Error(), "Qwen, Gemma, or dense route")
 
 	req := hipSmallDecodeFixture("qwen3")
 	req.Position = 99
@@ -4371,6 +8994,29 @@ func TestHIPSmallDecode_Bad(t *testing.T) {
 	_, err = hipRunSmallDecode(context.Background(), &fakeHIPDriver{}, hipSmallDecodeFixture("qwen3"))
 	core.AssertError(t, err)
 	core.AssertContains(t, err.Error(), "HIP driver is not available")
+}
+
+func TestHIPSmallDecode_DenseQuickWinArchitectures_Good(t *testing.T) {
+	for _, architecture := range []string{"mistral", "phi", "glm", "glm4", "hermes", "granite"} {
+		req := hipSmallDecodeFixture(architecture)
+		reference, err := hipReferenceSmallDecode(req)
+		core.RequireNoError(t, err)
+		core.AssertEqual(t, architecture, reference.Labels["decode_architecture"])
+		core.AssertEqual(t, "dense_route", reference.Labels["decode_family"])
+
+		driver := &fakeHIPDriver{available: true}
+		got, err := hipRunSmallDecode(context.Background(), driver, req)
+		core.RequireNoError(t, err)
+		core.AssertEqual(t, architecture, got.Labels["decode_architecture"])
+		core.AssertEqual(t, "dense_route", got.Labels["decode_family"])
+		assertFloat32SlicesNear(t, reference.Logits, got.Logits, 0.0001)
+
+		loaded, _ := hipLoadedSmallDecodeFixture(t, architecture)
+		cfg, err := loaded.loadedSmallDecodeConfig()
+		core.RequireNoError(t, err)
+		core.AssertEqual(t, architecture, normalizeROCmArchitecture(cfg.Architecture))
+		core.RequireNoError(t, loaded.Close())
+	}
 }
 
 func TestHIPRuntime_LoadedSmallDecodeRequestFiniteValidation_Bad(t *testing.T) {
@@ -4664,7 +9310,7 @@ func TestHIPRuntime_LoadedSmallDecodeConfig_Bad(t *testing.T) {
 	defer loaded.Close()
 	_, err := loaded.loadedSmallDecodeConfig()
 	core.AssertError(t, err)
-	core.AssertContains(t, err.Error(), "Qwen or Gemma")
+	core.AssertContains(t, err.Error(), "Qwen, Gemma, or dense route")
 
 	loaded, _ = hipLoadedSmallDecodeFixture(t, "qwen3")
 	defer loaded.Close()

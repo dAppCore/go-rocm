@@ -234,3 +234,96 @@ func TestHIPJANGTQProjectionReadOutputValidation_Bad(t *testing.T) {
 	core.AssertError(t, err)
 	core.AssertContains(t, err.Error(), "copy JANGTQ output")
 }
+
+func BenchmarkHIPJANGTQProjectionLaunch_MXTQ2Rows128Cols256(b *testing.B) {
+	req := hipJANGTQProjectionRequest{
+		Input:         jangtqBenchmarkInput(256),
+		PackedWeights: jangtqBenchmarkPackedWeights(2, 128*256),
+		Descriptor:    rocmJANGTQDescriptor{WeightFormat: "mxtq", Bits: 2, GroupSize: 64},
+		Rows:          128,
+		Cols:          256,
+		Scale:         0.125,
+		Bias:          jangtqBenchmarkInput(128),
+	}
+	driver := &fakeHIPDriver{available: true}
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		got, err := hipRunJANGTQProjectionKernel(context.Background(), driver, req)
+		if err != nil {
+			b.Fatalf("run JANGTQ fixture: %v", err)
+		}
+		if len(got) != req.Rows {
+			b.Fatalf("output rows = %d, want %d", len(got), req.Rows)
+		}
+	}
+}
+
+func BenchmarkHIPJANGTQProjectionLaunchPrepared_MXTQ2Rows128Cols256(b *testing.B) {
+	req := hipJANGTQProjectionRequest{
+		Input:         jangtqBenchmarkInput(256),
+		PackedWeights: jangtqBenchmarkPackedWeights(2, 128*256),
+		Descriptor:    rocmJANGTQDescriptor{WeightFormat: "mxtq", Bits: 2, GroupSize: 64},
+		Rows:          128,
+		Cols:          256,
+		Scale:         0.125,
+		Bias:          jangtqBenchmarkInput(128),
+	}
+	driver := &fakeHIPDriver{available: true, skipLaunchRecording: true, copies: make([]uint64, 0, 8)}
+	buffers, err := req.deviceBuffers(driver)
+	if err != nil {
+		b.Fatalf("prepare JANGTQ fixture buffers: %v", err)
+	}
+	defer buffers.Close()
+	launch, err := req.launchArgs(buffers)
+	if err != nil {
+		b.Fatalf("prepare JANGTQ fixture launch args: %v", err)
+	}
+	launchBytes, err := launch.BinaryInto(make([]byte, hipJANGTQLaunchArgsBytes))
+	if err != nil {
+		b.Fatalf("encode JANGTQ fixture launch args: %v", err)
+	}
+	config, err := hipOneDimensionalLaunchConfig(hipKernelNameJANGTQ, launchBytes, req.Rows)
+	if err != nil {
+		b.Fatalf("prepare JANGTQ fixture launch config: %v", err)
+	}
+	outputPayload := make([]byte, req.Rows*4)
+	outputValues := make([]float32, req.Rows)
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := hipLaunchKernel(driver, config); err != nil {
+			b.Fatalf("launch JANGTQ fixture: %v", err)
+		}
+		got, err := buffers.ReadOutputInto(outputValues, outputPayload)
+		if err != nil {
+			b.Fatalf("read JANGTQ fixture: %v", err)
+		}
+		if len(got) != req.Rows {
+			b.Fatalf("output rows = %d, want %d", len(got), req.Rows)
+		}
+		driver.copies = driver.copies[:0]
+	}
+}
+
+func jangtqBenchmarkInput(count int) []float32 {
+	values := make([]float32, count)
+	for i := range values {
+		values[i] = float32(math.Sin(float64(i)*0.017) + math.Cos(float64(i)*0.041))
+	}
+	return values
+}
+
+func jangtqBenchmarkPackedWeights(bits, count int) []byte {
+	packed := make([]byte, packedROCmJANGTQBytes(bits, count))
+	mask := (1 << bits) - 1
+	for i := 0; i < count; i++ {
+		raw := i & mask
+		bitOffset := i * bits
+		packed[bitOffset/8] |= byte(raw << (bitOffset % 8))
+		if bitOffset%8+bits > 8 {
+			packed[bitOffset/8+1] |= byte(raw >> (8 - bitOffset%8))
+		}
+	}
+	return packed
+}

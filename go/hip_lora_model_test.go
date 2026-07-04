@@ -205,6 +205,16 @@ func TestHIPLoRAModel_SmallAdapterValidation_Bad(t *testing.T) {
 	}
 }
 
+func TestHIPLoRAModel_SmallAdapterStatusUsesDenseRoute_Good(t *testing.T) {
+	core.AssertEqual(t, "experimental_qwen_gemma_small_decode", hipSmallDecodeLoRAModelStatus("qwen3"))
+	core.AssertEqual(t, "experimental_qwen_gemma_small_decode", hipSmallDecodeLoRAModelStatus("gemma4_text"))
+	core.AssertEqual(t, "experimental_dense_small_decode", hipSmallDecodeLoRAModelStatus("mistral"))
+	core.AssertEqual(t, "experimental_dense_small_decode", hipSmallDecodeLoRAModelStatus("phi"))
+	core.AssertEqual(t, "experimental_dense_small_decode", hipSmallDecodeLoRAModelStatus("glm4"))
+	core.AssertEqual(t, "experimental_dense_small_decode", hipSmallDecodeLoRAModelStatus("hermes"))
+	core.AssertEqual(t, "experimental_dense_small_decode", hipSmallDecodeLoRAModelStatus("granite"))
+}
+
 func TestHIPLoRAModel_ClassifierAdapterValidation_Bad(t *testing.T) {
 	cfg := hipLoadedSequenceClassifierConfig{
 		HiddenSize:         2,

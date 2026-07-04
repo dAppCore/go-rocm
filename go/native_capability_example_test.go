@@ -45,12 +45,14 @@ func Example_trainingCapabilityReport() {
 			capability.Labels["training_kernel"],
 			capability.Labels["training_interface"],
 			capability.Labels["required_kernel"],
+			capability.Labels["optimizer_status"],
+			capability.Labels["optimizer_helper"],
 		)
 	}
 	// Output:
-	// lora.training planned planned not_linked not_implemented lora_backward
-	// distillation planned planned not_linked not_implemented distillation_forward_loss
-	// grpo planned planned not_linked not_implemented grpo_rollout_policy
+	// lora.training planned planned not_linked not_implemented lora_backward update_only RunNativeAdamWUpdatePass
+	// distillation planned planned not_linked not_implemented distillation_forward_loss update_only RunNativeAdamWUpdatePass
+	// grpo planned planned not_linked not_implemented grpo_rollout_policy update_only RunNativeAdamWUpdatePass
 }
 
 func Example_metadataOnlyFixtureCapabilities() {
@@ -65,15 +67,15 @@ func Example_metadataOnlyFixtureCapabilities() {
 		core.Println(
 			capability.ID,
 			capability.Labels["runtime_status"],
-			capability.Labels["kernel_status"],
+			firstNonEmptyString(capability.Labels["fixture_kernel"], capability.Labels["kernel_status"]),
 			capability.Labels["fixture_kernel_name"],
 			capability.Labels["production_integration"],
 			capability.Labels["required_integration"],
 		)
 	}
 	// Output:
-	// moe.routing metadata_only planned rocm_moe_router pending model_router_forward
-	// moe.lazy_experts metadata_only planned rocm_moe_lazy_experts pending expert_paging
-	// jangtq metadata_only planned rocm_jangtq_projection pending packed_weight_model_integration
-	// codebook.vq metadata_only planned rocm_codebook_lookup pending codebook_weight_model_integration
+	// moe.routing experimental linked rocm_moe_router pending model_router_forward
+	// moe.lazy_experts experimental linked rocm_moe_lazy_experts pending expert_paging
+	// jangtq experimental linked rocm_jangtq_projection pending packed_weight_model_integration
+	// codebook.vq experimental linked rocm_codebook_lookup pending codebook_weight_model_integration
 }

@@ -15,6 +15,7 @@ import (
 	core "dappco.re/go"
 	"dappco.re/go/inference"
 	"dappco.re/go/rocm/internal/gguf"
+	rocmmodel "dappco.re/go/rocm/model"
 )
 
 const (
@@ -45,51 +46,17 @@ type nativeLoadConfig struct {
 	GPULayerCount      int
 	ParallelSlotCount  int
 	AdapterPath        string
+	AllowAttachedOnly  bool
 	ModelInfo          inference.ModelInfo
 	ModelLabels        map[string]string
+	EngineProfile      ROCmModelProfile
+	DeviceKVMode       string
+	SequenceMixerPlan  *SequenceMixerLoadPlan
 	TokenizerPath      string
 	Gemma4TextConfig   nativeGemma4TextConfig
 	DataOffset         int64
 	Tensors            []nativeTensorInfo
 	TiedWordEmbeddings bool
-}
-
-type nativeGemma4TextConfig struct {
-	LayerTypes              []string
-	KVSharedLayers          int
-	KVSharedLayersSet       bool
-	SlidingWindow           int
-	HeadDim                 int
-	GlobalHeadDim           int
-	HiddenSizePerLayerInput int
-	VocabSizePerLayerInput  int
-	AttentionKEqV           bool
-	FinalLogitSoftcap       float64
-	UseDoubleWideMLP        bool
-	EnableMoEBlock          bool
-	NumExperts              int
-	TopKExperts             int
-	MoEIntermediateSize     int
-	RoPEParameters          map[string]nativeGemma4RoPEParameters
-}
-
-type nativeGemma4RoPEParameters struct {
-	PartialRotaryFactor float64
-	RopeTheta           float64
-	RopeType            string
-	Factor              float64
-}
-
-func cloneNativeGemma4TextConfig(cfg nativeGemma4TextConfig) nativeGemma4TextConfig {
-	cfg.LayerTypes = append([]string(nil), cfg.LayerTypes...)
-	if len(cfg.RoPEParameters) > 0 {
-		params := make(map[string]nativeGemma4RoPEParameters, len(cfg.RoPEParameters))
-		for key, value := range cfg.RoPEParameters {
-			params[key] = value
-		}
-		cfg.RoPEParameters = params
-	}
-	return cfg
 }
 
 type nativeTensorInfo struct {
@@ -135,7 +102,18 @@ func (b *rocmBackend) Capabilities() inference.CapabilityReport {
 }
 
 func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (inference.TextModel, error) {
-	loadConfig := inference.ApplyLoadOpts(opts)
+	return b.loadModelWithROCmConfig(path, inference.ApplyLoadOpts(opts), ROCmLoadConfig{})
+}
+
+func (b *rocmBackend) loadModelWithROCmConfig(path string, loadConfig inference.LoadConfig, rocmConfig ROCmLoadConfig) (inference.TextModel, error) {
+	return b.loadModelWithROCmConfigMode(path, loadConfig, rocmConfig, false)
+}
+
+func (b *rocmBackend) loadModelWithROCmConfigMode(path string, loadConfig inference.LoadConfig, rocmConfig ROCmLoadConfig, allowAttachedOnly bool) (inference.TextModel, error) {
+	deviceKVMode, err := rocmConfig.deviceKVMode()
+	if err != nil {
+		return nil, err
+	}
 	if loadConfig.AdapterPath != "" && core.Trim(loadConfig.AdapterPath) == "" {
 		return nil, core.E("rocm.LoadModel", "adapter path is required", nil)
 	}
@@ -151,7 +129,10 @@ func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (infe
 			GPULayerCount:     loadConfig.GPULayers,
 			ParallelSlotCount: loadConfig.ParallelSlots,
 			AdapterPath:       loadConfig.AdapterPath,
+			AllowAttachedOnly: allowAttachedOnly,
 			ModelInfo:         modelInfo,
+			ModelLabels:       rocmGGUFNativeLoadLabels(modelInfo, path),
+			DeviceKVMode:      deviceKVMode,
 			DataOffset:        modelPack.DataOffset,
 			Tensors:           nativeTensorInfos(modelPack.Tensors),
 		}
@@ -162,11 +143,16 @@ func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (infe
 		}
 		modelInfo = nativeConfig.ModelInfo
 	}
+	nativeConfig.AllowAttachedOnly = allowAttachedOnly
+	nativeConfig.DeviceKVMode = deviceKVMode
+	nativeConfig.ModelLabels = rocmApplyNativeLoadDeviceKVModeLabels(nativeConfig.ModelLabels, deviceKVMode)
+	rocmApplyNativeLoadModelProfile(path, &nativeConfig)
 
 	runtime := b.nativeRuntime()
 	if !runtime.Available() {
 		return nil, core.E("rocm.LoadModel", "native ROCm runtime is not available", nil)
 	}
+	warmROCmVRAMInfoCache()
 
 	loaded, err := runtime.LoadModel(modelPath, nativeConfig)
 	if err != nil {
@@ -174,22 +160,29 @@ func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (infe
 	}
 
 	if hipModel, ok := loaded.(*hipLoadedModel); ok &&
-		isROCmGemma4Architecture(modelInfo.Architecture) &&
-		modelInfo.QuantBits == 4 &&
+		hipLoadedGemma4Q4GenerateLinked(hipModel) &&
 		modelInfo.NumLayers > 0 {
 		if _, err := hipModel.cachedGemma4Q4ForwardConfig(modelInfo.NumLayers); err != nil {
 			_ = loaded.Close()
-			return nil, core.E("rocm.LoadModel", "prepare Gemma4 q4 forward config", err)
+			return nil, core.E("rocm.LoadModel", "prepare Gemma4 MLX affine forward config", err)
 		}
 	}
 
-	model := &rocmModel{native: loaded, modelType: modelInfo.Architecture, modelInfo: modelInfo}
+	model := &rocmModel{
+		native:        loaded,
+		modelPath:     path,
+		modelType:     modelInfo.Architecture,
+		modelInfo:     modelInfo,
+		modelLabels:   cloneStringMap(nativeConfig.ModelLabels),
+		engineProfile: nativeConfig.EngineProfile.clone(),
+	}
 	if loadConfig.AdapterPath != "" {
 		if _, err := model.LoadAdapter(loadConfig.AdapterPath); err != nil {
 			_ = model.Close()
 			return nil, core.E("rocm.LoadModel", "load adapter", err)
 		}
 	}
+	ApplyROCmRuntimeFeaturesForModel(model)
 	return model, nil
 }
 
@@ -200,6 +193,7 @@ func (b *rocmBackend) PlanModelFit(ctx context.Context, model inference.ModelIde
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	model = rocmGemma4ModelWithInferredPathQuant(model)
 	if memoryBytes == 0 {
 		device := b.nativeRuntime().DeviceInfo()
 		memoryBytes = device.MemoryBytes
@@ -228,6 +222,14 @@ func (b *rocmBackend) PlanModelFit(ctx context.Context, model inference.ModelIde
 	fitLimitBytes := memoryBytes * 85 / 100
 	architectureOK := supportedNativeArchitecture(model.Architecture)
 	quantizationOK := supportedNativeQuantization(model.QuantBits, model.QuantType)
+	gemma4Model := isROCmGemma4Architecture(model.Architecture)
+	gemma4PackLoadOK := true
+	if gemma4Model {
+		gemma4PackLoadOK = rocmGemma4PlanModelFitPackLoadOK(model)
+	}
+	if gemma4Model && !gemma4PackLoadOK {
+		quantizationOK = false
+	}
 	fits := architectureOK && quantizationOK && kvBytes < memoryBytes*7/10
 	if weightBytes > 0 {
 		fits = architectureOK && quantizationOK && runtimeBytes < fitLimitBytes
@@ -241,14 +243,18 @@ func (b *rocmBackend) PlanModelFit(ctx context.Context, model inference.ModelIde
 		CacheMode:         cacheMode,
 		Quantization:      rocmQuantizationLabel(model),
 		KVCacheBytes:      kvBytes,
-		TrainingFeasible:  rocmAtLeastMemoryClass(memoryBytes, 16*memoryGiB) && model.QuantBits <= 8,
+		TrainingFeasible:  quantizationOK && rocmAtLeastMemoryClass(memoryBytes, 16*memoryGiB) && model.QuantBits <= 8,
 		Labels:            labels,
 	}
 	if !architectureOK {
 		plan.Notes = append(plan.Notes, "architecture is not in the native ROCm allow-list yet")
 	}
 	if !quantizationOK {
-		plan.Notes = append(plan.Notes, "quantisation is not expected to fit the native ROCm path")
+		if gemma4Model && !gemma4PackLoadOK {
+			plan.Notes = append(plan.Notes, "Gemma4 size/quant support matrix does not expose linked generation for this pack")
+		} else {
+			plan.Notes = append(plan.Notes, "quantisation is not expected to fit the native ROCm path")
+		}
 	}
 	if weightBytes > 0 && runtimeBytes >= fitLimitBytes {
 		plan.Notes = append(plan.Notes, "weight and KV cache estimate leaves too little memory for workspace")
@@ -302,9 +308,12 @@ func nativeRuntimeKernelStatus(runtime nativeRuntime) hipKernelStatus {
 }
 
 type rocmModel struct {
-	native    nativeModel
-	modelType string
-	modelInfo inference.ModelInfo
+	native        nativeModel
+	modelPath     string
+	modelType     string
+	modelInfo     inference.ModelInfo
+	modelLabels   map[string]string
+	engineProfile ROCmModelProfile
 
 	stateMutex  sync.Mutex
 	lastError   error
@@ -313,6 +322,7 @@ type rocmModel struct {
 	adapter     inference.AdapterIdentity
 	cache       *BlockCacheService
 	state       *StateSession
+	promptCache *ROCmPromptCacheEntry
 }
 
 func (m *rocmModel) Generate(ctx context.Context, prompt string, opts ...inference.GenerateOption) iter.Seq[inference.Token] {
@@ -327,8 +337,12 @@ func (m *rocmModel) Generate(ctx context.Context, prompt string, opts ...inferen
 		}
 		return emptyTokenSeq
 	}
-	cfg := cloneGenerateConfig(inference.ApplyGenerateOpts(opts))
-	if loaded, ok := m.native.(*hipLoadedModel); ok {
+	cfg := m.applyGenerateOpts(opts)
+	promptTokens, err := m.resolveGenerateGemma4Context(prompt, &cfg, "rocm.Generate")
+	if err != nil {
+		return m.wrapTokenStream(emptyTokenSeq, func() error { return err }, promptTokens, time.Now(), nil)
+	}
+	if loaded, ok := m.native.(*hipLoadedModel); ok && hipLoadedGemma4Q4GenerateLinked(loaded) {
 		if _, linked := loaded.kernelSet().(hipNativeProjectionKernelSet); linked {
 			promptTokenIDs, matched, err := hipGemma4Q4PromptTokenIDs(prompt, loaded)
 			if err != nil {
@@ -344,12 +358,11 @@ func (m *rocmModel) Generate(ctx context.Context, prompt string, opts ...inferen
 				if err != nil {
 					return m.wrapTokenStream(emptyTokenSeq, func() error { return err }, len(promptTokenIDs), start, nil)
 				}
-				stream, streamError := hipGemma4Q4GenerateTokenSeq(ctx, loaded, q4Cfg, promptTokenIDs, cloneGenerateConfig(cfg))
+				stream, streamError := m.hipGemma4Q4GenerateTokenSeq(ctx, nil, loaded, q4Cfg, promptTokenIDs, cloneGenerateConfig(cfg))
 				return m.wrapTokenStream(stream, streamError, len(promptTokenIDs), start, nil)
 			}
 		}
 	}
-	promptTokens := m.promptTokenCount(prompt)
 	start := time.Now()
 	stream, streamError := m.native.Generate(ctx, prompt, cloneGenerateConfig(cfg))
 	return m.wrapTokenStream(stream, streamError, promptTokens, start, nil)
@@ -371,11 +384,62 @@ func (m *rocmModel) Chat(ctx context.Context, messages []inference.Message, opts
 		m.setLastFailure(err)
 		return emptyTokenSeq
 	}
-	cfg := cloneGenerateConfig(inference.ApplyGenerateOpts(opts))
-	promptTokens := m.chatPromptTokenCount(messages)
+	cfg := m.applyGenerateOpts(opts)
+	loaded, loadedOK := m.native.(*hipLoadedModel)
+	directGemma4Q4Linked := false
+	if loadedOK && hipLoadedGemma4Q4GenerateLinked(loaded) {
+		_, directGemma4Q4Linked = loaded.kernelSet().(hipNativeProjectionKernelSet)
+	}
+	var session *StateSession
+	templateConfig := m.gemma4ChatTemplateConfig(cfg, false)
+	if directGemma4Q4Linked {
+		session = m.stateSession()
+		templateConfig.Continuation = session.hasRuntimeOwnedKV()
+	}
+	promptTokens, err := m.resolveChatGemma4ContextWithTemplateConfig(messages, &cfg, templateConfig)
+	if err != nil {
+		return m.wrapTokenStream(emptyTokenSeq, func() error { return err }, promptTokens, time.Now(), nil)
+	}
 	start := time.Now()
+	if directGemma4Q4Linked {
+		if loaded != nil {
+			chatPrompt := formatGemma4ChatTemplateWithConfig(messages, templateConfig)
+			promptTokenIDs, err := hipGemma4Q4TextPromptIDsRequired("text:"+chatPrompt, loaded)
+			if err != nil {
+				return m.wrapTokenStream(emptyTokenSeq, func() error { return err }, promptTokens, time.Now(), nil)
+			}
+			if loaded.modelInfo.NumLayers <= 0 {
+				err := core.E(hipGemma4Q4Layer0Operation, "loaded Gemma4 q4 layer count is required", nil)
+				return m.wrapTokenStream(emptyTokenSeq, func() error { return err }, len(promptTokenIDs), start, nil)
+			}
+			q4Cfg, err := loaded.cachedGemma4Q4ForwardConfig(loaded.modelInfo.NumLayers)
+			if err != nil {
+				return m.wrapTokenStream(emptyTokenSeq, func() error { return err }, len(promptTokenIDs), start, nil)
+			}
+			stream, streamError := m.hipGemma4Q4GenerateTokenSeq(ctx, session, loaded, q4Cfg, promptTokenIDs, cloneGenerateConfig(cfg))
+			return m.wrapTokenStream(stream, streamError, len(promptTokenIDs), start, nil)
+		}
+	}
 	stream, streamError := m.native.Chat(ctx, append([]inference.Message(nil), messages...), cloneGenerateConfig(cfg))
 	return m.wrapTokenStream(stream, streamError, promptTokens, start, nil)
+}
+
+func (m *rocmModel) hipGemma4Q4GenerateTokenSeq(ctx context.Context, session *StateSession, loaded *hipLoadedModel, q4Cfg hipGemma4Q4ForwardConfig, promptTokenIDs []int32, cfg inference.GenerateConfig) (iter.Seq[inference.Token], func() error) {
+	if session == nil {
+		session = m.stateSession()
+	}
+	initialState, err := session.takeGemma4Q4DeviceDecodeState(loaded.driver, q4Cfg)
+	if err != nil {
+		return emptyTokenSeq, func() error {
+			return core.E(hipGemma4Q4Layer0Operation, "restore retained Gemma4 q4 device state", err)
+		}
+	}
+	return hipGemma4Q4GenerateTokenSeqWithState(ctx, loaded, q4Cfg, promptTokenIDs, cfg, loaded.gemma4Q4EngineConfig(), initialState, func(state *hipGemma4Q4DeviceDecodeState) error {
+		if state == nil {
+			return nil
+		}
+		return session.replaceRuntime(state)
+	})
 }
 
 func (m *rocmModel) Classify(ctx context.Context, prompts []string, opts ...inference.GenerateOption) ([]inference.ClassifyResult, error) {
@@ -398,7 +462,7 @@ func (m *rocmModel) Classify(ctx context.Context, prompts []string, opts ...infe
 		m.setLastFailure(err)
 		return nil, err
 	}
-	cfg := cloneGenerateConfig(inference.ApplyGenerateOpts(opts))
+	cfg := m.applyGenerateOpts(opts)
 	start := time.Now()
 	results, err := m.native.Classify(ctx, append([]string(nil), prompts...), cloneGenerateConfig(cfg))
 	results = cloneClassifyResults(results)
@@ -495,7 +559,11 @@ func (m *rocmModel) BatchGenerate(ctx context.Context, prompts []string, opts ..
 		return nil, err
 	}
 	start := time.Now()
-	cfg := cloneGenerateConfig(inference.ApplyGenerateOpts(opts))
+	cfg := m.applyGenerateOpts(opts)
+	if err := m.resolveBatchGenerateGemma4Context(prompts, &cfg); err != nil {
+		m.setLastFailure(err)
+		return nil, err
+	}
 	results, err := m.native.BatchGenerate(ctx, append([]string(nil), prompts...), cloneGenerateConfig(cfg))
 	results = cloneBatchResults(results)
 	generated := 0
@@ -542,17 +610,66 @@ func (m *rocmModel) Info() inference.ModelInfo {
 	if m == nil {
 		return inference.ModelInfo{}
 	}
-	return m.modelInfo
+	return m.modelInfoReport().Info
+}
+
+func (m *rocmModel) ModelIdentity() inference.ModelIdentity {
+	if m == nil {
+		return inference.ModelIdentity{}
+	}
+	return cloneModelIdentity(m.modelIdentity())
+}
+
+func (m *rocmModel) ModelProfile() ROCmModelProfile {
+	if m == nil {
+		return ROCmModelProfile{}
+	}
+	identity := m.modelIdentity()
+	profile := m.engineProfile
+	if !profile.Matched() {
+		var ok bool
+		profile, ok = ResolveROCmModelProfile(identity.Path, identity)
+		if !ok {
+			return ROCmModelProfile{}
+		}
+	}
+	profile.Model = identity
+	return profile.clone()
+}
+
+func (m *rocmModel) ROCmEngineFeatures() ROCmEngineFeatures {
+	profile := m.ModelProfile()
+	if !profile.Matched() {
+		return ROCmEngineFeatures{}
+	}
+	features := profile.EngineFeatures
+	if features.empty() {
+		features = ROCmEngineFeaturesForProfile(profile)
+	}
+	return features.clone()
+}
+
+func (m *rocmModel) ModelRoutePlan() ROCmModelRoutePlan {
+	profile := m.ModelProfile()
+	if !profile.Matched() {
+		return ROCmModelRoutePlan{}
+	}
+	plan := ROCmModelRoutePlanForProfile(profile)
+	return rocmModelRoutePlanWithLiveCacheProfile(plan, m)
 }
 
 func (m *rocmModel) Capabilities() inference.CapabilityReport {
 	if m == nil {
 		return rocmCapabilityReport(nativeDeviceInfo{}, inference.ModelIdentity{}, inference.AdapterIdentity{}, false, defaultHIPKernelStatus())
 	}
-	return rocmCapabilityReport(nativeDeviceInfo{}, m.modelIdentity(), m.ActiveAdapter(), m.native != nil, m.kernelStatus(), rocmCapabilityReportOption{
+	report := rocmCapabilityReport(nativeDeviceInfo{}, m.modelIdentity(), m.ActiveAdapter(), m.native != nil, m.kernelStatus(), rocmCapabilityReportOption{
 		ClassifyLinked:         m.classifyLinked(),
 		Gemma4Q4GenerateLinked: m.gemma4Q4GenerateLinked(),
 	})
+	lastErr := m.Err()
+	report = rocmCapabilityReportWithReactiveProfile(report, m)
+	m.setLastFailure(lastErr)
+	return report
 }
 
 func (m *rocmModel) classifyLinked() bool {
@@ -579,7 +696,7 @@ func (m *rocmModel) gemma4Q4GenerateLinked() bool {
 	if !ok || loaded == nil {
 		return false
 	}
-	if !isROCmGemma4Architecture(loaded.modelInfo.Architecture) || loaded.modelInfo.QuantBits != 4 || loaded.modelInfo.NumLayers <= 0 {
+	if !hipLoadedGemma4Q4GenerateLinked(loaded) || loaded.modelInfo.NumLayers <= 0 {
 		return false
 	}
 	_, err := loaded.cachedGemma4Q4ForwardConfig(loaded.modelInfo.NumLayers)
@@ -677,15 +794,29 @@ func (m *rocmModel) promptsTokenCount(prompts []string) int {
 }
 
 func (m *rocmModel) chatPromptTokenCount(messages []inference.Message) int {
+	template := gemma4ChatTemplateConfig{}
+	if m != nil && isROCmGemma4Architecture(m.modelIdentity().Architecture) {
+		template = m.gemma4ChatTemplateConfig(inference.GenerateConfig{}, false)
+	}
+	return m.chatPromptTokenCountWithTemplateConfig(messages, template)
+}
+
+func (m *rocmModel) chatPromptTokenCountWithTemplateConfig(messages []inference.Message, template gemma4ChatTemplateConfig) int {
 	if m == nil || m.native == nil {
 		return approximateMessageTokens(messages)
 	}
-	prompt, err := m.applyChatTemplate(messages)
-	if err != nil {
-		return approximateMessageTokens(messages)
+	prompt := ""
+	if isROCmGemma4Architecture(m.modelIdentity().Architecture) {
+		prompt = formatGemma4ChatTemplateWithConfig(messages, template)
+	} else {
+		rendered, err := m.applyChatTemplate(messages)
+		if err != nil {
+			return approximateMessageTokens(messages)
+		}
+		prompt = rendered
 	}
 	if loaded, ok := m.native.(*hipLoadedModel); ok {
-		if _, q4, q4Err := loaded.loadedGemma4Q4PackageForwardConfig(); q4 && q4Err == nil {
+		if _, q4, q4Err := loaded.loadedGemma4Q4PackageForwardConfig(); q4 && q4Err == nil && hipLoadedGemma4Q4GenerateLinked(loaded) {
 			return m.promptTokenCount("text:" + prompt)
 		}
 	}
@@ -763,7 +894,17 @@ func (m *rocmModel) LoadAdapter(path string) (identity inference.AdapterIdentity
 	if identity.Path == "" {
 		identity.Path = path
 	}
-	identity = cloneAdapterIdentity(identity)
+	model := m.modelIdentity()
+	if err := checkROCmAdapterModelCompatibility("rocm.LoadAdapter", model, identity); err != nil {
+		_ = m.native.UnloadAdapter()
+		m.stateMutex.Lock()
+		m.adapter = inference.AdapterIdentity{}
+		m.cache = nil
+		m.state = nil
+		m.stateMutex.Unlock()
+		return inference.AdapterIdentity{}, err
+	}
+	identity = rocmAdapterIdentityForModel(identity, model)
 	m.stateMutex.Lock()
 	m.adapter = identity
 	m.cache = nil
@@ -820,12 +961,12 @@ func (m *rocmModel) ActiveAdapter() inference.AdapterIdentity {
 	native := m.native
 	m.stateMutex.Unlock()
 	if !adapterIdentityIsZero(adapter) {
-		return cloneAdapterIdentity(adapter)
+		return rocmAdapterIdentityForModel(adapter, m.modelIdentity())
 	}
 	if native == nil {
 		return inference.AdapterIdentity{}
 	}
-	return cloneAdapterIdentity(native.ActiveAdapter())
+	return rocmAdapterIdentityForModel(native.ActiveAdapter(), m.modelIdentity())
 }
 
 func (m *rocmModel) kernelStatus() hipKernelStatus {
@@ -886,9 +1027,9 @@ func (m *rocmModel) Benchmark(ctx context.Context, cfg inference.BenchConfig) (r
 	if warmupRuns < 0 {
 		warmupRuns = 0
 	}
-	maxTokens := cfg.MaxTokens
-	if maxTokens <= 0 {
-		maxTokens = 32
+	maxTokens, err := m.benchmarkMaxTokens(prompts, cfg.MaxTokens)
+	if err != nil {
+		return nil, err
 	}
 	var stopSequences []string
 	if err := m.benchmarkWarmupRuns(ctx, prompts, maxTokens, warmupRuns, stopSequences); err != nil {
@@ -907,7 +1048,9 @@ func (m *rocmModel) Benchmark(ctx context.Context, cfg inference.BenchConfig) (r
 	}
 	kernelStatus := m.kernelStatus()
 	gemma4Q4GenerateLinked := m.gemma4Q4GenerateLinked()
-	decodeHelperStatus := rocmDecodeHelperStatusLabel(kernelStatus, gemma4Q4GenerateLinked)
+	modelIdentity := m.modelIdentity()
+	reportKernelStatus := rocmReportKernelStatusForModel(kernelStatus, modelIdentity)
+	decodeHelperStatus := rocmDecodeHelperStatusLabel(reportKernelStatus, gemma4Q4GenerateLinked)
 	operationCount := benchmarkOperationCount(prompts, measuredRuns)
 	labels := map[string]string{
 		"backend":                "rocm",
@@ -934,17 +1077,20 @@ func (m *rocmModel) Benchmark(ctx context.Context, cfg inference.BenchConfig) (r
 		"total_duration_ms":      durationMillisecondsLabel(metricsTotalDuration(aggregate)),
 		"warmup_runs":            core.Sprintf("%d", warmupRuns),
 	}
-	for key, value := range kernelStatus.Labels() {
+	for key, value := range reportKernelStatus.Labels() {
 		labels[key] = value
 	}
-	if kernelStatus.Decode == hipKernelStatusLinked {
-		rocmAddReportLabels(labels, rocmDecodeCapabilityLabels(kernelStatus, m.modelIdentity()))
+	if reportKernelStatus.Decode == hipKernelStatusLinked {
+		rocmAddReportLabels(labels, rocmDecodeCapabilityLabels(reportKernelStatus, modelIdentity))
 	}
 	if gemma4Q4GenerateLinked {
-		rocmAddReportLabels(labels, rocmGemma4Q4BenchmarkCapabilityLabels(m.modelIdentity()))
+		rocmAddReportLabels(labels, rocmGemma4Q4BenchmarkCapabilityLabels(modelIdentity))
+		rocmAddGemma4AttachedDrafterBenchmarkLabels(labels, modelIdentity)
 		labels["prompt.lookup.decode"] = "experimental"
+		labels["prompt.lookup.decode.affine_source"] = "gemma4_mlx_affine_generate"
 		labels["prompt.lookup.decode.source"] = "gemma4_q4_generate"
 		labels["speculative.decode"] = "experimental"
+		labels["speculative.decode.affine_source"] = "gemma4_mlx_affine_generate"
 		labels["speculative.decode.source"] = "gemma4_q4_generate"
 	}
 	for key, value := range cacheStats.Labels {
@@ -953,6 +1099,7 @@ func (m *rocmModel) Benchmark(ctx context.Context, cfg inference.BenchConfig) (r
 		}
 	}
 	m.addLoRAOverheadBenchLabels(ctx, labels, prompts, maxTokens, measuredRuns, stopSequences, aggregate)
+	rocmAddAdapterMetadataLabels(labels, m.ActiveAdapter())
 	m.clearLastError()
 	m.setLastMetrics(aggregate)
 	report = &inference.BenchReport{
@@ -972,16 +1119,6 @@ func (m *rocmModel) Benchmark(ctx context.Context, cfg inference.BenchConfig) (r
 	labels["probe_count"] = core.Sprintf("%d", probeCounter.Count())
 	labels["probe_count_status"] = "measured"
 	return report, nil
-}
-
-func rocmDecodeHelperStatusLabel(status hipKernelStatus, gemma4Q4GenerateLinked bool) string {
-	if gemma4Q4GenerateLinked {
-		return "experimental"
-	}
-	if normalizeHIPKernelStatus(status).Decode == hipKernelStatusLinked {
-		return "experimental"
-	}
-	return "planned"
 }
 
 type rocmBenchmarkProbeCounter struct {
@@ -1104,7 +1241,7 @@ func (m *rocmModel) gemma4Q4TextPromptSupported() bool {
 	if !ok || loaded == nil || loaded.tokenText == nil {
 		return false
 	}
-	return isROCmGemma4Architecture(loaded.modelInfo.Architecture) && loaded.modelInfo.QuantBits == 4
+	return hipLoadedGemma4Q4GenerateLinked(loaded)
 }
 
 func hipGemma4Q4PromptHasExplicitMode(prompt string) bool {
@@ -1309,7 +1446,11 @@ func (m *rocmModel) Evaluate(ctx context.Context, dataset inference.DatasetStrea
 		"perplexity_status": lossStatus,
 	}
 	loss.apply(ctx, m, &metrics, labels)
-	probes, failures, probeError, err := m.evaluateQualityProbes(ctx, cfg.Probes, firstPositiveInt(cfg.MaxSeqLen, 32), nil)
+	probeMaxTokens, err := m.qualityProbeMaxTokens(cfg.Probes, cfg.MaxSeqLen)
+	if err != nil {
+		return nil, err
+	}
+	probes, failures, probeError, err := m.evaluateQualityProbes(ctx, cfg.Probes, probeMaxTokens, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1340,9 +1481,11 @@ func (m *rocmModel) Evaluate(ctx context.Context, dataset inference.DatasetStrea
 		labels["classify_path"] = "bert_sequence_classifier"
 		labels["classify_status"] = string(inference.FeatureRuntimeExperimental)
 	}
+	adapter := m.ActiveAdapter()
+	rocmAddAdapterMetadataLabels(labels, adapter)
 	report = &inference.EvalReport{
 		Model:   m.modelIdentity(),
-		Adapter: m.ActiveAdapter(),
+		Adapter: adapter,
 		Metrics: metrics,
 		Probes:  probes,
 		Labels:  labels,
@@ -1415,12 +1558,10 @@ func (m *rocmModel) observeGemma4Q4EvalLossBatch(ctx context.Context, candidates
 		return false, nil
 	}
 	loaded, ok := m.native.(*hipLoadedModel)
-	if !ok || loaded == nil ||
-		!isROCmGemma4Architecture(loaded.modelInfo.Architecture) ||
-		loaded.modelInfo.QuantBits != 4 {
+	if !ok || loaded == nil || !hipLoadedGemma4Q4GenerateLinked(loaded) {
 		return false, nil
 	}
-	loss.source = "gemma4_q4_package_prefill"
+	loss.source = "gemma4_mlx_affine_package_prefill"
 	for _, candidate := range candidates {
 		if err := ctx.Err(); err != nil {
 			return true, err
@@ -1929,15 +2070,60 @@ func rocmContextErr(ctx context.Context) error {
 }
 
 func (m *rocmModel) modelIdentity() inference.ModelIdentity {
-	info := m.Info()
-	return inference.ModelIdentity{
-		Architecture: info.Architecture,
+	if m == nil {
+		return inference.ModelIdentity{}
+	}
+	report := m.modelInfoReport()
+	if !report.Matched() {
+		return inference.ModelIdentity{}
+	}
+	return rocmGemma4ModelWithInferredPathQuant(report.Identity)
+}
+
+func (m *rocmModel) modelInfoReport() rocmmodel.ModelInfoReport {
+	if m == nil {
+		return rocmmodel.ModelInfoReport{}
+	}
+	info := m.modelInfo
+	labels := m.resolvedModelLabels()
+	identity := inference.ModelIdentity{
+		Path:         m.modelPath,
+		Architecture: firstNonEmptyString(info.Architecture, m.modelType),
 		VocabSize:    info.VocabSize,
 		NumLayers:    info.NumLayers,
 		HiddenSize:   info.HiddenSize,
 		QuantBits:    info.QuantBits,
 		QuantGroup:   info.QuantGroup,
+		Labels:       labels,
 	}
+	if loaded, ok := m.native.(*hipLoadedModel); ok && loaded != nil {
+		identity.ContextLength = loaded.contextSize
+	}
+	if len(identity.Labels) > 0 && identity.QuantType == "" {
+		identity.QuantType = identity.Labels["quant_type"]
+	}
+	if len(identity.Labels) > 0 && identity.QuantType == "" && rocmIsGemma4SizeQuantIdentity(identity.Architecture) {
+		identity.QuantType = identity.Labels["gemma4_quant_mode"]
+	}
+	identity = rocmGemma4ModelWithInferredPathQuant(identity)
+	return rocmmodel.ResolveModelInfo(rocmmodel.ModelInfoRequest{
+		Path:      m.modelPath,
+		ModelType: m.modelType,
+		Info:      info,
+		Identity:  identity,
+		Labels:    labels,
+	})
+}
+
+func (m *rocmModel) resolvedModelLabels() map[string]string {
+	if m == nil {
+		return nil
+	}
+	labels := cloneStringMap(m.modelLabels)
+	if loaded, ok := m.native.(*hipLoadedModel); ok && loaded != nil {
+		labels = mergeStringMaps(labels, loaded.modelLabels)
+	}
+	return labels
 }
 
 type rocmCapabilityReportOption struct {
@@ -1946,11 +2132,24 @@ type rocmCapabilityReportOption struct {
 }
 
 func rocmCapabilityReport(device nativeDeviceInfo, model inference.ModelIdentity, adapter inference.AdapterIdentity, available bool, kernelStatus hipKernelStatus, options ...rocmCapabilityReportOption) inference.CapabilityReport {
+	model = rocmGemma4ModelWithInferredPathQuant(model)
 	option := rocmCapabilityReportOption{}
 	if len(options) > 0 {
 		option = options[0]
 	}
+	engineFeatures, hasEngineFeatures := ROCmEngineFeaturesForIdentity(model.Path, model)
+	loadStatus, hasLoadStatus := ROCmModelLoadStatusForIdentity(model.Path, model)
+	gemma4Features := Gemma4EngineFeaturesForIdentity(model)
+	gemma4DeclaredFeatures := Gemma4DeclaredFeaturesForIdentity(model)
+	gemma4Model := isROCmGemma4Architecture(model.Architecture)
+	gemma4GenerateLinked := gemma4Features.GenerateLinked()
+	if option.Gemma4Q4GenerateLinked && !gemma4GenerateLinked {
+		option.Gemma4Q4GenerateLinked = false
+	}
 	kernelStatus = normalizeHIPKernelStatus(kernelStatus)
+	decodeLinked := kernelStatus.Decode == hipKernelStatusLinked && (!gemma4Model || gemma4GenerateLinked)
+	prefillLinked := kernelStatus.Prefill == hipKernelStatusLinked && (!gemma4Model || gemma4GenerateLinked)
+	reportKernelStatus := rocmReportKernelStatusForModel(kernelStatus, model)
 	labels := map[string]string{
 		"library":         "go-rocm",
 		"metadata_status": "supported",
@@ -1959,7 +2158,20 @@ func rocmCapabilityReport(device nativeDeviceInfo, model inference.ModelIdentity
 	if available {
 		labels["runtime_status"] = "available"
 	}
-	for key, value := range kernelStatus.Labels() {
+	if hasEngineFeatures {
+		rocmApplyROCmEngineFeatureLabels(labels, engineFeatures)
+	}
+	if hasLoadStatus {
+		rocmApplyROCmModelLoadStatusLabels(labels, loadStatus)
+	}
+	if routePlan, ok := ROCmModelRoutePlanForIdentity(model.Path, model); ok {
+		labels = ApplyROCmModelRoutePlanLabels(labels, routePlan)
+	}
+	if gemma4Model {
+		rocmApplyGemma4EngineFeatureLabels(labels, gemma4Features, gemma4DeclaredFeatures)
+	}
+	rocmAddCapabilityAdapterLabels(labels, adapter)
+	for key, value := range reportKernelStatus.Labels() {
 		labels[key] = value
 	}
 	if device.FreeBytes > 0 {
@@ -1978,7 +2190,10 @@ func rocmCapabilityReport(device nativeDeviceInfo, model inference.ModelIdentity
 	generateCapability := inference.PlannedCapability(inference.CapabilityGenerate, inference.CapabilityGroupModel, "native decode kernels are not linked yet")
 	chatCapability := inference.PlannedCapability(inference.CapabilityChat, inference.CapabilityGroupModel, "native decode kernels are not linked yet")
 	batchCapability := inference.PlannedCapability(inference.CapabilityBatchGenerate, inference.CapabilityGroupModel, "native decode kernels are not linked yet")
-	if kernelStatus.Decode == hipKernelStatusLinked {
+	rocmApplyGemma4CapabilitySupportLabels(&generateCapability, model)
+	rocmApplyGemma4CapabilitySupportLabels(&chatCapability, model)
+	rocmApplyGemma4CapabilitySupportLabels(&batchCapability, model)
+	if decodeLinked {
 		generateCapability = inference.ExperimentalCapability(inference.CapabilityGenerate, inference.CapabilityGroupModel, "native decode kernel is linked; ROCm generation remains experimental")
 		chatCapability = inference.ExperimentalCapability(inference.CapabilityChat, inference.CapabilityGroupModel, "native decode kernel is linked; ROCm chat remains experimental")
 		batchCapability = inference.ExperimentalCapability(inference.CapabilityBatchGenerate, inference.CapabilityGroupModel, "native decode kernel is linked; ROCm batch generation remains experimental")
@@ -1987,47 +2202,51 @@ func rocmCapabilityReport(device nativeDeviceInfo, model inference.ModelIdentity
 		chatCapability.Labels = cloneStringMap(decodeLabels)
 		batchCapability.Labels = cloneStringMap(decodeLabels)
 	} else if option.Gemma4Q4GenerateLinked {
-		generateCapability = inference.ExperimentalCapability(inference.CapabilityGenerate, inference.CapabilityGroupModel, "loaded Gemma4 MLX-q4 token/text prompt generation is linked through the experimental q4 path; production native prefill/decode remain pending")
+		generateCapability = inference.ExperimentalCapability(inference.CapabilityGenerate, inference.CapabilityGroupModel, "loaded Gemma4 MLX affine 4/6/8-bit token/text prompt generation is linked; production native prefill/decode remain pending")
 		generateCapability.Labels = rocmGemma4Q4GenerateCapabilityLabels(model)
-		chatCapability = inference.ExperimentalCapability(inference.CapabilityChat, inference.CapabilityGroupModel, "loaded Gemma4 MLX-q4 chat generation is linked through the Gemma4 chat template and the experimental q4 text prompt path; production native prefill/decode remain pending")
+		chatCapability = inference.ExperimentalCapability(inference.CapabilityChat, inference.CapabilityGroupModel, "loaded Gemma4 MLX affine 4/6/8-bit chat generation is linked through the Gemma4 chat template; production native prefill/decode remain pending")
 		chatCapability.Labels = rocmGemma4Q4ChatCapabilityLabels(model)
-		batchCapability = inference.ExperimentalCapability(inference.CapabilityBatchGenerate, inference.CapabilityGroupModel, "loaded Gemma4 MLX-q4 batch generation is linked through the experimental q4 path; production native prefill/decode remain pending")
+		batchCapability = inference.ExperimentalCapability(inference.CapabilityBatchGenerate, inference.CapabilityGroupModel, "loaded Gemma4 MLX affine 4/6/8-bit batch generation is linked; production native prefill/decode remain pending")
 		batchCapability.Labels = rocmGemma4Q4BatchGenerateCapabilityLabels(model)
 	}
 	classifyCapability := inference.PlannedCapability(inference.CapabilityClassify, inference.CapabilityGroupModel, "native prefill kernels are not linked yet")
-	classifyLinked := kernelStatus.Prefill == hipKernelStatusLinked || option.ClassifyLinked
+	rocmApplyGemma4CapabilitySupportLabels(&classifyCapability, model)
+	classifyLinked := (prefillLinked || option.ClassifyLinked) && (!gemma4Model || gemma4GenerateLinked)
 	classifyLabels := rocmClassifyCapabilityLabels(kernelStatus, model, option)
 	if classifyLinked {
 		classifyCapability = inference.ExperimentalCapability(inference.CapabilityClassify, inference.CapabilityGroupModel, "native prefill kernel is linked; ROCm classification remains experimental")
-		if option.ClassifyLinked && kernelStatus.Prefill != hipKernelStatusLinked {
+		if option.ClassifyLinked && !prefillLinked {
 			classifyCapability.Detail = "loaded BERT sequence-classifier path is linked through embedding mean-pool plus projection; ROCm classification remains experimental"
 		}
 		classifyCapability.Labels = classifyLabels
 	}
 	if option.Gemma4Q4GenerateLinked {
-		classifyCapability = inference.ExperimentalCapability(inference.CapabilityClassify, inference.CapabilityGroupModel, "loaded Gemma4 MLX-q4 classification is linked through the experimental q4 package Prefill path; production native prefill remains pending")
+		classifyCapability = inference.ExperimentalCapability(inference.CapabilityClassify, inference.CapabilityGroupModel, "loaded Gemma4 MLX affine 4/6/8-bit classification is linked through the package Prefill path; production native prefill remains pending")
 		classifyCapability.Labels = rocmGemma4Q4ClassifyCapabilityLabels(model)
 	}
 	logitProbeCapability := inference.PlannedCapability(inference.CapabilityLogitProbe, inference.CapabilityGroupProbe, "logit probes need native prefill kernels first")
+	rocmApplyGemma4CapabilitySupportLabels(&logitProbeCapability, model)
 	if classifyLinked {
 		logitProbeCapability = inference.ExperimentalCapability(inference.CapabilityLogitProbe, inference.CapabilityGroupProbe, "classification logits can emit compact logit and entropy probe summaries")
 		logitProbeCapability.Labels = classifyLabels
 	}
 	if option.Gemma4Q4GenerateLinked {
-		logitProbeCapability = inference.ExperimentalCapability(inference.CapabilityLogitProbe, inference.CapabilityGroupProbe, "loaded Gemma4 MLX-q4 classification logits can emit compact logit and entropy probe summaries through the experimental q4 package Prefill path")
+		logitProbeCapability = inference.ExperimentalCapability(inference.CapabilityLogitProbe, inference.CapabilityGroupProbe, "loaded Gemma4 MLX affine 4/6/8-bit classification logits can emit compact logit and entropy probe summaries through the package Prefill path")
 		logitProbeCapability.Labels = rocmGemma4Q4LogitProbeCapabilityLabels(model)
 	}
 	benchmarkCapability := inference.ExperimentalCapability(inference.CapabilityBenchmark, inference.CapabilityGroupRuntime, "benchmark wrapper is available; native decode kernels are not linked yet")
-	if kernelStatus.Decode == hipKernelStatusLinked {
+	rocmApplyGemma4CapabilitySupportLabels(&benchmarkCapability, model)
+	if decodeLinked {
 		benchmarkCapability = inference.ExperimentalCapability(inference.CapabilityBenchmark, inference.CapabilityGroupRuntime, "benchmark wrapper can exercise the experimental linked ROCm decode path")
 		benchmarkCapability.Labels = rocmDecodeCapabilityLabels(kernelStatus, model)
 	}
 	if option.Gemma4Q4GenerateLinked {
-		benchmarkCapability = inference.ExperimentalCapability(inference.CapabilityBenchmark, inference.CapabilityGroupRuntime, "benchmark wrapper can exercise the experimental Gemma4 q4 generation path with explicit text prompt normalization; production native prefill/decode remain pending")
+		benchmarkCapability = inference.ExperimentalCapability(inference.CapabilityBenchmark, inference.CapabilityGroupRuntime, "benchmark wrapper can exercise the experimental Gemma4 MLX affine 4/6/8-bit generation path and retained-state 10-turn book gate with prompt replay forbidden; production native prefill/decode remain pending")
 		benchmarkCapability.Labels = rocmGemma4Q4BenchmarkCapabilityLabels(model)
 	}
 	evaluationCapability := inference.ExperimentalCapability(inference.CapabilityEvaluation, inference.CapabilityGroupRuntime, "token-count eval is available before prefill kernels are linked")
 	evaluationCapability.Labels = rocmEvaluationCapabilityLabels(kernelStatus, nil)
+	rocmApplyGemma4CapabilitySupportLabels(&evaluationCapability, model)
 	if classifyLinked {
 		evaluationCapability = inference.ExperimentalCapability(inference.CapabilityEvaluation, inference.CapabilityGroupRuntime, "eval can exercise the experimental linked ROCm prefill/classification path")
 		evaluationCapability.Labels = rocmEvaluationCapabilityLabels(kernelStatus, classifyLabels)
@@ -2040,9 +2259,9 @@ func rocmCapabilityReport(device nativeDeviceInfo, model inference.ModelIdentity
 		evaluationCapability.Labels = rocmEvaluationCapabilityLabels(kernelStatus, classifyLabels)
 	}
 	if option.Gemma4Q4GenerateLinked {
-		detail := "eval can use experimental Gemma4 q4 package Prefill logits for loss/perplexity; production native prefill/decode remain pending"
+		detail := "eval can use experimental Gemma4 MLX affine 4/6/8-bit package Prefill logits for loss/perplexity; production native prefill/decode remain pending"
 		if kernelStatus.CrossEntropy == hipKernelStatusLinked {
-			detail = "eval can use experimental Gemma4 q4 package Prefill logits with the linked HIP cross-entropy/perplexity loss fixture; production native prefill/decode remain pending"
+			detail = "eval can use experimental Gemma4 MLX affine 4/6/8-bit package Prefill logits with the linked HIP cross-entropy/perplexity loss fixture; production native prefill/decode remain pending"
 		}
 		evaluationCapability = inference.ExperimentalCapability(inference.CapabilityEvaluation, inference.CapabilityGroupRuntime, detail)
 		evaluationCapability.Labels = rocmEvaluationCapabilityLabels(kernelStatus, classifyLabels)
@@ -2057,9 +2276,10 @@ func rocmCapabilityReport(device nativeDeviceInfo, model inference.ModelIdentity
 			"lora_kernel":                    kernelStatus.LoRA,
 			"production_adapter_application": hipKernelStatusNotLinked,
 			"runtime_status":                 string(inference.FeatureRuntimeExperimental),
-			"supported_adapter_scopes":       "tiny_output_head,qwen_gemma_small_lm_head,bert_sequence_classifier",
+			"supported_adapter_scopes":       "tiny_output_head,qwen_gemma_dense_small_lm_head,bert_sequence_classifier",
 		}
 	}
+	loraCapability.Labels = rocmApplyGemma4LoRAAdapterCapabilityLabels(loraCapability.Labels, model)
 	embeddingCapability := inference.PlannedCapability(inference.CapabilityEmbeddings, inference.CapabilityGroupModel, "embedding contract is available; native ROCm embedding kernels are pending")
 	if kernelStatus.Embedding == hipKernelStatusLinked {
 		embeddingCapability = inference.ExperimentalCapability(inference.CapabilityEmbeddings, inference.CapabilityGroupModel, "native embedding mean-pool kernel is linked for loaded f32 token/word embedding tables including BERT-style embedding-only packs; production embedding models remain experimental")
@@ -2092,18 +2312,42 @@ func rocmCapabilityReport(device nativeDeviceInfo, model inference.ModelIdentity
 	}
 	speculativeCapability := inference.PlannedCapability(inference.CapabilitySpeculativeDecode, inference.CapabilityGroupModel, "speculative decode needs native decode kernels first")
 	promptLookupCapability := inference.PlannedCapability(inference.CapabilityPromptLookupDecode, inference.CapabilityGroupModel, "prompt lookup decode needs native prefill/decode kernels first")
-	if kernelStatus.Decode == hipKernelStatusLinked {
+	rocmApplyGemma4CapabilitySupportLabels(&speculativeCapability, model)
+	rocmApplyGemma4CapabilitySupportLabels(&promptLookupCapability, model)
+	if decodeLinked {
 		speculativeCapability = inference.ExperimentalCapability(inference.CapabilitySpeculativeDecode, inference.CapabilityGroupModel, "shared speculative decode helper is available over the experimental ROCm generation path")
 		speculativeCapability.Labels = rocmDecodeCapabilityLabels(kernelStatus, model)
 		promptLookupCapability = inference.ExperimentalCapability(inference.CapabilityPromptLookupDecode, inference.CapabilityGroupModel, "shared prompt-lookup decode helper is available over the experimental ROCm generation path")
 		promptLookupCapability.Labels = rocmDecodeCapabilityLabels(kernelStatus, model)
 	}
 	if option.Gemma4Q4GenerateLinked {
-		speculativeCapability = inference.ExperimentalCapability(inference.CapabilitySpeculativeDecode, inference.CapabilityGroupModel, "shared speculative decode helper is available over the experimental Gemma4 q4 generation path; production native prefill/decode remain pending")
+		speculativeCapability = inference.ExperimentalCapability(inference.CapabilitySpeculativeDecode, inference.CapabilityGroupModel, "shared speculative and attached-drafter decode helpers are available over the experimental Gemma4 MLX affine 4/6/8-bit generation path; native HIP drafter attachment and production native prefill/decode remain pending")
 		speculativeCapability.Labels = rocmGemma4Q4SpeculativeDecodeCapabilityLabels(model)
-		promptLookupCapability = inference.ExperimentalCapability(inference.CapabilityPromptLookupDecode, inference.CapabilityGroupModel, "shared prompt-lookup decode helper is available over the experimental Gemma4 q4 generation path; production native prefill/decode remain pending")
+		promptLookupCapability = inference.ExperimentalCapability(inference.CapabilityPromptLookupDecode, inference.CapabilityGroupModel, "shared prompt-lookup decode helper is available over the experimental Gemma4 MLX affine 4/6/8-bit generation path; production native prefill/decode remain pending")
 		promptLookupCapability.Labels = rocmGemma4Q4PromptLookupDecodeCapabilityLabels(model)
 	}
+	chatTemplateCapability := rocmChatTemplateCapability(model, option)
+	toolParseCapability := inference.SupportedCapability(inference.CapabilityToolParse, inference.CapabilityGroupModel)
+	reasoningParseCapability := inference.SupportedCapability(inference.CapabilityReasoningParse, inference.CapabilityGroupModel)
+	if hasEngineFeatures {
+		toolParseCapability.Labels = rocmApplyROCmEngineFeatureLabels(toolParseCapability.Labels, engineFeatures)
+		reasoningParseCapability.Labels = rocmApplyROCmEngineFeatureLabels(reasoningParseCapability.Labels, engineFeatures)
+	}
+	modelLoadCapability := inference.SupportedCapability(inference.CapabilityModelLoad, inference.CapabilityGroupRuntime)
+	modelFitCapability := inference.SupportedCapability(inference.CapabilityModelFit, inference.CapabilityGroupRuntime)
+	memoryPlanningCapability := inference.SupportedCapability(inference.CapabilityMemoryPlanning, inference.CapabilityGroupRuntime)
+	kvCachePlanningCapability := inference.SupportedCapability(inference.CapabilityKVCachePlanning, inference.CapabilityGroupRuntime)
+	tokenizerCapability := inference.ExperimentalCapability(inference.CapabilityTokenizer, inference.CapabilityGroupModel, "Hugging Face tokenizer sidecar encode/decode is wired for loaded safetensors packs; GGUF/native templates remain limited")
+	rocmApplyGemma4CapabilitySupportLabels(&modelLoadCapability, model)
+	if hasLoadStatus {
+		modelLoadCapability.Labels = rocmApplyROCmModelLoadStatusLabels(modelLoadCapability.Labels, loadStatus)
+	}
+	rocmApplySequenceMixerCapabilityLabels(&modelLoadCapability)
+	rocmApplyGemma4CapabilitySupportLabels(&modelFitCapability, model)
+	rocmApplyGemma4CapabilitySupportLabels(&memoryPlanningCapability, model)
+	rocmApplyGemma4CapabilitySupportLabels(&kvCachePlanningCapability, model)
+	rocmApplyGemma4CapabilitySupportLabels(&tokenizerCapability, model)
+	tokenizerCapability.Labels = rocmApplyROCmModelTokenizerCapabilityLabels(tokenizerCapability.Labels, model)
 	kvSnapshotCapability := rocmCacheRuntimeCapability(
 		inference.CapabilityKVSnapshot,
 		"runtime-owned package-local KV snapshots, HIP device-mirror snapshot serialization, loaded-model state wake remirror, and block-cache warm/disk-restore remirror are available; fully HIP-owned restore remains pending",
@@ -2124,7 +2368,34 @@ func rocmCapabilityReport(device nativeDeviceInfo, model inference.ModelIdentity
 		inference.CapabilityCacheWarm,
 		"cache warm accounting is available before native prefill kernels, with planner-shaped package-local KV pages and optional HIP device remirror",
 	)
-	return inference.CapabilityReport{
+	stateBundleCapability := rocmStateContextCapability(
+		inference.CapabilityStateBundle,
+		"metadata-only StateBundle capture/restore is available; durable KV payloads remain URI-first through AgentMemorySession wake/sleep",
+		model,
+	)
+	stateWakeCapability := rocmStateContextCapability(
+		inference.CapabilityStateWake,
+		"state wake restores portable KV snapshot refs into package-local pages and loaded ROCm models can best-effort remirror them to HIP device pages",
+		model,
+	)
+	stateSleepCapability := rocmStateContextCapability(
+		inference.CapabilityStateSleep,
+		"state sleep serializes runtime-owned package-local and HIP device-mirror KV snapshots into portable refs",
+		model,
+	)
+	stateForkCapability := rocmStateContextCapability(
+		inference.CapabilityStateFork,
+		"state fork wakes refs into a fresh session and loaded ROCm models can best-effort remirror forked KV refs to HIP device pages; production HIP KV page ownership is pending",
+		model,
+	)
+	modelMergeCapability := inference.ExperimentalCapability(inference.CapabilityModelMerge, inference.CapabilityGroupRuntime, "dense F32 safetensors LoRA model-pack merge is linked; quantized production Gemma4 merge remains pending")
+	modelMergeCapability.Labels = rocmApplyGemma4LoRAAdapterCapabilityLabels(modelMergeCapability.Labels, model)
+	loraTrainingCapability := rocmPlannedTrainingCapability(inference.CapabilityLoRATraining, "native ROCm LoRA backward/update kernels are not linked yet", "lora_backward", kernelStatus)
+	loraTrainingCapability.Labels = rocmApplyGemma4LoRAAdapterCapabilityLabels(loraTrainingCapability.Labels, model)
+	agentMemoryCapability := rocmAgentMemoryCapability()
+	quantizationCapability := inference.ExperimentalCapability(inference.CapabilityQuantization, inference.CapabilityGroupRuntime, "TurboQuant KV-cache compression has a CPU reference codec for research validation; model weight quantisation remains owned by model-pack metadata and production HIP KV compression is pending")
+	quantizationCapability.Labels = rocmQuantizationCapabilityLabels()
+	report := inference.CapabilityReport{
 		Runtime: inference.RuntimeIdentity{
 			Backend:       "rocm",
 			Device:        device.Name,
@@ -2139,33 +2410,33 @@ func rocmCapabilityReport(device nativeDeviceInfo, model inference.ModelIdentity
 		Quantizations: append([]string(nil), rocmCapabilityQuantizations...),
 		CacheModes:    append([]string(nil), rocmCapabilityCacheModes...),
 		Capabilities: []inference.Capability{
-			inference.SupportedCapability(inference.CapabilityModelLoad, inference.CapabilityGroupRuntime),
-			inference.SupportedCapability(inference.CapabilityModelFit, inference.CapabilityGroupRuntime),
-			inference.SupportedCapability(inference.CapabilityMemoryPlanning, inference.CapabilityGroupRuntime),
-			inference.SupportedCapability(inference.CapabilityKVCachePlanning, inference.CapabilityGroupRuntime),
+			modelLoadCapability,
+			modelFitCapability,
+			memoryPlanningCapability,
+			kvCachePlanningCapability,
 			benchmarkCapability,
 			evaluationCapability,
-			inference.PlannedCapability(inference.CapabilityQuantization, inference.CapabilityGroupRuntime, "GGUF quantisation is owned by shared model-pack tooling for now"),
-			inference.PlannedCapability(inference.CapabilityModelMerge, inference.CapabilityGroupRuntime, "model-pack merge is not implemented in the ROCm package yet"),
+			quantizationCapability,
+			modelMergeCapability,
 			generateCapability,
 			chatCapability,
 			classifyCapability,
 			batchCapability,
-			inference.ExperimentalCapability(inference.CapabilityTokenizer, inference.CapabilityGroupModel, "Hugging Face tokenizer sidecar encode/decode is wired for loaded safetensors packs; GGUF/native templates remain limited"),
-			inference.ExperimentalCapability(inference.CapabilityChatTemplate, inference.CapabilityGroupModel, "fallback chat template until model-native templates are wired"),
+			tokenizerCapability,
+			chatTemplateCapability,
 			loraCapability,
-			inference.ExperimentalCapability(inference.CapabilityStateBundle, inference.CapabilityGroupRuntime, "metadata-only StateBundle capture/restore is available; durable KV payloads remain URI-first through AgentMemorySession wake/sleep"),
+			stateBundleCapability,
 			kvSnapshotCapability,
 			promptCacheCapability,
-			rocmPlannedTrainingCapability(inference.CapabilityLoRATraining, "native ROCm LoRA backward/update kernels are not linked yet", "lora_backward", kernelStatus),
+			loraTrainingCapability,
 			rocmPlannedTrainingCapability(inference.CapabilityDistillation, "distillation needs teacher/student forward and loss kernels first", "distillation_forward_loss", kernelStatus),
 			rocmPlannedTrainingCapability(inference.CapabilityGRPO, "GRPO needs rollout generation and policy-gradient kernels first", "grpo_rollout_policy", kernelStatus),
 			inference.ExperimentalCapability(inference.CapabilityProbeEvents, inference.CapabilityGroupProbe, "probe sink is wired around streams; kernel-level probes are pending"),
 			inference.PlannedCapability(inference.CapabilityAttentionProbe, inference.CapabilityGroupProbe, "attention probes need native prefill kernels first"),
 			logitProbeCapability,
-			inference.ExperimentalCapability(inference.CapabilityResponsesAPI, inference.CapabilityGroupRuntime, "non-streaming OpenAI Responses handler and service mux are available; streaming is pending"),
-			inference.ExperimentalCapability(inference.CapabilityAnthropicMessages, inference.CapabilityGroupRuntime, "non-streaming Anthropic Messages handler is available; streaming is pending"),
-			inference.ExperimentalCapability(inference.CapabilityOllamaCompat, inference.CapabilityGroupRuntime, "non-streaming Ollama chat/generate handlers are available; streaming and model registry endpoints are pending"),
+			inference.ExperimentalCapability(inference.CapabilityResponsesAPI, inference.CapabilityGroupRuntime, "OpenAI Responses handler and service mux are available with SSE streaming"),
+			inference.ExperimentalCapability(inference.CapabilityAnthropicMessages, inference.CapabilityGroupRuntime, "Anthropic Messages handler is available for non-streaming responses and SSE streaming"),
+			inference.ExperimentalCapability(inference.CapabilityOllamaCompat, inference.CapabilityGroupRuntime, "Ollama chat/generate streaming plus /api/tags and /api/show registry handlers are available"),
 			embeddingCapability,
 			rerankCapability,
 			inference.SupportedCapability(inference.CapabilityScheduler, inference.CapabilityGroupRuntime),
@@ -2173,21 +2444,77 @@ func rocmCapabilityReport(device nativeDeviceInfo, model inference.ModelIdentity
 			cacheBlocksCapability,
 			cacheDiskCapability,
 			cacheWarmCapability,
-			inference.SupportedCapability(inference.CapabilityToolParse, inference.CapabilityGroupModel),
-			inference.SupportedCapability(inference.CapabilityReasoningParse, inference.CapabilityGroupModel),
+			toolParseCapability,
+			reasoningParseCapability,
 			speculativeCapability,
 			promptLookupCapability,
-			rocmMetadataOnlyCapability(inference.CapabilityMoERouting, inference.CapabilityGroupModel, "MoE architecture metadata is recognised; native router kernels are pending"),
-			rocmMetadataOnlyCapability(inference.CapabilityMoELazyExperts, inference.CapabilityGroupRuntime, "MoE lazy expert residency is planned from metadata; native expert paging is pending"),
-			rocmMetadataOnlyCapability(inference.CapabilityJANGTQ, inference.CapabilityGroupRuntime, "JANG/JANGTQ metadata can be shared; native ROCm packed kernels are pending"),
-			rocmMetadataOnlyCapability(inference.CapabilityCodebookVQ, inference.CapabilityGroupRuntime, "codebook/VQ metadata can be shared; native ROCm VQ kernels are pending"),
-			inference.ExperimentalCapability(inference.CapabilityAgentMemory, inference.CapabilityGroupRuntime, "URI-first go-inference/state refs and package-local KV restore are wired; loaded ROCm models best-effort remirror portable KV refs to HIP device pages while fully HIP-owned kernel restore remains pending"),
-			inference.ExperimentalCapability(inference.CapabilityStateWake, inference.CapabilityGroupRuntime, "state wake restores portable KV snapshot refs into package-local pages and loaded ROCm models can best-effort remirror them to HIP device pages"),
-			inference.ExperimentalCapability(inference.CapabilityStateSleep, inference.CapabilityGroupRuntime, "state sleep serializes runtime-owned package-local and HIP device-mirror KV snapshots into portable refs"),
-			inference.ExperimentalCapability(inference.CapabilityStateFork, inference.CapabilityGroupRuntime, "state fork wakes refs into a fresh session and loaded ROCm models can best-effort remirror forked KV refs to HIP device pages; production HIP KV page ownership is pending"),
+			rocmFixtureKernelCapability(inference.CapabilityMoERouting, inference.CapabilityGroupModel, "MoE router top-k fixture kernel is linked; full model router integration remains pending"),
+			rocmFixtureKernelCapability(inference.CapabilityMoELazyExperts, inference.CapabilityGroupRuntime, "MoE lazy expert residency fixture kernel is linked; production expert paging remains pending"),
+			rocmFixtureKernelCapability(inference.CapabilityJANGTQ, inference.CapabilityGroupRuntime, "JANG/JANGTQ projection fixture kernel is linked; packed-weight model integration remains pending"),
+			rocmFixtureKernelCapability(inference.CapabilityCodebookVQ, inference.CapabilityGroupRuntime, "codebook/VQ lookup fixture kernel is linked; codebook-weight model integration remains pending"),
+			agentMemoryCapability,
+			stateWakeCapability,
+			stateSleepCapability,
+			stateForkCapability,
 		},
 		Labels: labels,
 	}
+	rocmApplyCapabilityAdapterLabels(report.Capabilities, adapter)
+	return report
+}
+
+func rocmQuantizationCapabilityLabels() map[string]string {
+	labels := make(map[string]string, 32)
+	rocmApplyQuantizationCapabilityLabels(labels)
+	return labels
+}
+
+func rocmApplyQuantizationCapabilityLabels(labels map[string]string) {
+	if labels == nil {
+		return
+	}
+	labels["autoround_algorithms"] = productionAutoRoundAlgorithmsLabel
+	labels["autoround_calibration_decision_helper"] = "EvaluateProductionAutoRoundCalibrationEvidence"
+	labels["autoround_calibration_decision_labels"] = productionAutoRoundCalibrationDecisionLabelsLabel
+	labels["autoround_calibration_decision_label_evidence_helper"] = "ApplyProductionAutoRoundCalibrationDecisionLabelEvidence"
+	labels["autoround_calibration_decision_label_evaluator"] = "EvaluateProductionAutoRoundCalibrationDecisionLabels"
+	labels["autoround_calibration_decision_validator"] = "ValidateProductionAutoRoundCalibrationDecisionLabels"
+	labels["autoround_calibration_evidence_decision_label_helper"] = "ApplyProductionAutoRoundCalibrationEvidenceDecisionLabels"
+	labels["autoround_calibration_evidence_decision_validator"] = "ValidateProductionAutoRoundCalibrationEvidenceDecisionLabels"
+	labels["autoround_calibration_evidence_helper"] = "ApplyProductionAutoRoundCalibrationLabelEvidence"
+	labels["autoround_calibration_labels"] = productionAutoRoundCalibrationLabelsLabel
+	labels["autoround_calibration_knobs"] = "nsamples,seqlen,iters"
+	labels["autoround_calibration_validator"] = "ValidateProductionAutoRoundCalibrationLabels"
+	labels["autoround_float_formats"] = productionAutoRoundFloatFormatsLabel
+	labels["autoround_formats"] = productionAutoRoundFormatsLabel
+	labels["autoround_group_sizes"] = productionAutoRoundGroupSizesLabel
+	labels["autoround_hip_kernel"] = hipKernelStatusNotLinked
+	labels["autoround_profiles"] = productionAutoRoundProfilesLabel
+	labels["autoround_runtime"] = "planned_hip"
+	labels["autoround_weight_schemes"] = productionAutoRoundSchemesLabel
+	labels["kv_compression"] = rocmTurboQuantKVMode
+	labels["kv_compression_bits"] = "3.5"
+	labels["kv_compression_default"] = "true"
+	labels["kv_compression_group_size"] = rocmTurboQuantKVDefaultGroupLabel
+	labels["kv_compression_residual"] = rocmTurboQuantKVResidualPrecision
+	labels["kv_compression_runtime"] = "cpu_reference"
+	labels["production_combined_gate"] = ProductionCombinedMTPAndTurboQuantMode
+	labels["production_combined_required_metrics"] = defaultProductionCombinedMTPAndTurboQuantRequiredMetricsLabel
+	labels["production_candidate_gate"] = "linked"
+	labels["production_compare_cache_modes"] = defaultProductionTurboQuantCompareAgainstCacheModesLabel
+	labels["production_explicit_opt_in_required"] = "false"
+	labels["production_fast_lane_default"] = "true"
+	labels["production_requires_cli_flag"] = "false"
+	labels["production_requires_env_gate"] = "false"
+	labels["production_hip_integration"] = hipKernelStatusNotLinked
+	labels["production_required_key_algorithm"] = ProductionTurboQuantKeyAlgorithm
+	labels["production_required_layout_version"] = ProductionTurboQuantKVLayoutVersion
+	labels["production_required_metrics"] = defaultProductionTurboQuantRequiredMetricsLabel
+	labels["production_required_outlier_policy"] = ProductionTurboQuantOutlierPolicy
+	labels["production_required_value_algorithm"] = ProductionTurboQuantValueAlgorithm
+	labels["production_target_effective_bits_milli"] = "3500"
+	labels["runtime_status"] = string(inference.FeatureRuntimeExperimental)
+	labels["weight_quantization_runtime"] = "metadata"
 }
 
 func rocmCacheRuntimeCapability(id inference.CapabilityID, detail string) inference.Capability {
@@ -2204,6 +2531,80 @@ func rocmCacheRuntimeCapability(id inference.CapabilityID, detail string) infere
 	return capability
 }
 
+func rocmStateContextCapability(id inference.CapabilityID, detail string, model inference.ModelIdentity) inference.Capability {
+	capability := inference.ExperimentalCapability(id, inference.CapabilityGroupRuntime, detail)
+	capability.Labels = rocmApplyGemma4StateContextCapabilityLabels(capability.Labels, model)
+	return capability
+}
+
+func rocmAgentMemoryCapability() inference.Capability {
+	capability := inference.ExperimentalCapability(
+		inference.CapabilityAgentMemory,
+		inference.CapabilityGroupRuntime,
+		"URI-first go-inference/state refs and package-local KV restore are wired; hierarchical-memory pretraining primitives are available for CPU-side memory bank build/retrieval/injection, while loaded model HIP layer injection remains pending",
+	)
+	capability.Labels = map[string]string{
+		"fully_hip_owned":                               "pending",
+		"hierarchical_memory_pretraining":               "experimental",
+		"kv_device_backing":                             "best_effort_remirror",
+		"memory_bank_builder":                           "hierarchical_kmeans",
+		"memory_pretraining_hot_path_benchmarks":        "present",
+		"memory_pretraining_hip_injection":              "pending",
+		"memory_pretraining_injection":                  "additive",
+		"memory_pretraining_package":                    "dappco.re/go/rocm/memorypretrain",
+		"memory_pretraining_retrieval":                  "leaf_cluster_topk",
+		"memory_pretraining_runtime":                    "cpu_native",
+		"memory_pretraining_training_bridge":            "RunModelNativeSimpleSelfDistillationMemoryPretraining",
+		"memory_pretraining_optimizer_track":            "append_only_adamw",
+		"memory_pretraining_optimizer_track_containers": "kv,mp4,binary",
+		"memory_pretraining_optimizer_track_frames":     "propagated",
+		"memory_pretraining_optimizer_track_finder":     "FindNativeAdamWStateTrackStep",
+		"memory_pretraining_optimizer_track_lister":     "ListNativeAdamWStateTrack",
+		"memory_pretraining_optimizer_track_loader":     "LoadNativeAdamWStateTrackStep",
+		"runtime_status":                                string(inference.FeatureRuntimeExperimental),
+		"state_refs":                                    "uri_first",
+	}
+	return capability
+}
+
+func rocmChatTemplateCapability(model inference.ModelIdentity, option rocmCapabilityReportOption) inference.Capability {
+	if isROCmGemma4Architecture(model.Architecture) {
+		detail := "Gemma4 HF-style turn template is available for the loaded Gemma4 family model; generation may remain planned or load-only"
+		if option.Gemma4Q4GenerateLinked {
+			detail = "Gemma4 HF-style turn template is wired for the loaded Gemma4 text route"
+		}
+		capability := inference.ExperimentalCapability(inference.CapabilityChatTemplate, inference.CapabilityGroupModel, detail)
+		capability.Labels = map[string]string{
+			"chat_template":   "gemma4_hf_turn",
+			"generation_role": "model",
+			"runtime_status":  string(inference.FeatureRuntimeExperimental),
+			"turn_end":        "<turn|>",
+			"turn_start":      "<|turn>",
+		}
+		rocmApplyGemma4CapabilitySupportLabels(&capability, model)
+		capability.Labels = rocmApplyROCmModelTokenizerCapabilityLabels(capability.Labels, model)
+		return capability
+	}
+	if features, ok := ROCmEngineFeaturesForIdentity(model.Path, model); ok && features.ChatTemplateID != "" {
+		capability := inference.ExperimentalCapability(inference.CapabilityChatTemplate, inference.CapabilityGroupModel, "registry-declared chat template is available for the loaded model profile")
+		capability.Labels = rocmApplyROCmEngineFeatureLabels(map[string]string{
+			"chat_template":  features.ChatTemplateID,
+			"runtime_status": string(inference.FeatureRuntimeExperimental),
+		}, features)
+		if role, ok := ROCmGenerationRole(features.Architecture); ok {
+			capability.Labels["generation_role"] = role
+		}
+		capability.Labels = rocmApplyROCmModelTokenizerCapabilityLabels(capability.Labels, model)
+		return capability
+	}
+	capability := inference.ExperimentalCapability(inference.CapabilityChatTemplate, inference.CapabilityGroupModel, "fallback chat template until model-native templates are wired")
+	capability.Labels = map[string]string{
+		"chat_template":  "fallback",
+		"runtime_status": string(inference.FeatureRuntimeExperimental),
+	}
+	return capability
+}
+
 func rocmMetadataOnlyCapability(id inference.CapabilityID, group inference.CapabilityGroup, detail string) inference.Capability {
 	capability := inference.ExperimentalCapability(id, group, detail)
 	capability.Labels = map[string]string{
@@ -2215,6 +2616,20 @@ func rocmMetadataOnlyCapability(id inference.CapabilityID, group inference.Capab
 	if fixture, required := rocmMetadataOnlyFixtureKernel(id); fixture != "" {
 		capability.Labels["fixture_kernel_name"] = fixture
 		capability.Labels["required_integration"] = required
+	}
+	return capability
+}
+
+func rocmFixtureKernelCapability(id inference.CapabilityID, group inference.CapabilityGroup, detail string) inference.Capability {
+	capability := inference.ExperimentalCapability(id, group, detail)
+	fixture, required := rocmMetadataOnlyFixtureKernel(id)
+	capability.Labels = map[string]string{
+		"fixture_kernel":         hipKernelStatusLinked,
+		"fixture_kernel_name":    fixture,
+		"metadata_status":        "recognised",
+		"production_integration": "pending",
+		"required_integration":   required,
+		"runtime_status":         string(inference.FeatureRuntimeExperimental),
 	}
 	return capability
 }
@@ -2252,104 +2667,6 @@ func rocmDecodeCapabilityLabels(kernelStatus hipKernelStatus, model inference.Mo
 		labels["production_decode"] = hipKernelStatusNotLinked
 		labels["production_prefill"] = hipKernelStatusNotLinked
 	}
-	return labels
-}
-
-func rocmGemma4Q4GenerateCapabilityLabels(model inference.ModelIdentity) map[string]string {
-	labels := map[string]string{
-		"attention_kv_backing":        "hip_device_descriptor",
-		"attention_kv_mode":           rocmKVCacheModeKQ8VQ4,
-		"decode_architecture":         "gemma4",
-		"decode_quant":                "mlx_q4",
-		"gemma4_q4_device_kv_state":   "forward_returned_device_state",
-		"gemma4_q4_decode_kernel":     hipKernelStatusLinked,
-		"gemma4_q4_decode_name":       "rocm_gemma4_q4_greedy_decode_smoke",
-		"kernel_scope":                "loaded_gemma4_q4_experimental_generate",
-		"production_decode":           hipKernelStatusNotLinked,
-		"production_kv_cache_backing": hipKernelStatusNotLinked,
-		"production_prefill":          hipKernelStatusNotLinked,
-		"prompt_modes":                "tokens,text,env_plain_text",
-		"runtime_status":              string(inference.FeatureRuntimeExperimental),
-	}
-	if model.NumLayers > 0 {
-		labels["decode_layers"] = core.Sprintf("%d", model.NumLayers)
-	}
-	if model.VocabSize > 0 {
-		labels["decode_vocab_size"] = core.Sprintf("%d", model.VocabSize)
-	}
-	if model.HiddenSize > 0 {
-		labels["decode_hidden_size"] = core.Sprintf("%d", model.HiddenSize)
-	}
-	return labels
-}
-
-func rocmGemma4Q4BatchGenerateCapabilityLabels(model inference.ModelIdentity) map[string]string {
-	labels := rocmGemma4Q4GenerateCapabilityLabels(model)
-	labels["batch_generate_kernel"] = hipKernelStatusLinked
-	labels["batch_generate_name"] = "rocm_gemma4_q4_batch_generate_experimental"
-	labels["kernel_scope"] = "loaded_gemma4_q4_experimental_batch_generate"
-	return labels
-}
-
-func rocmGemma4Q4ChatCapabilityLabels(model inference.ModelIdentity) map[string]string {
-	labels := rocmGemma4Q4GenerateCapabilityLabels(model)
-	labels["chat_kernel"] = hipKernelStatusLinked
-	labels["chat_name"] = "rocm_gemma4_q4_chat_generate_experimental"
-	labels["chat_template"] = "fallback"
-	labels["kernel_scope"] = "loaded_gemma4_q4_experimental_chat"
-	return labels
-}
-
-func rocmGemma4Q4EvaluationCapabilityLabels(model inference.ModelIdentity) map[string]string {
-	labels := rocmGemma4Q4GenerateCapabilityLabels(model)
-	labels["eval_loss_logits_source"] = "gemma4_q4_package_prefill"
-	labels["eval_prefill_kernel"] = hipKernelStatusLinked
-	labels["eval_prefill_name"] = "rocm_gemma4_q4_package_prefill_experimental"
-	labels["kernel_scope"] = "loaded_gemma4_q4_experimental_eval"
-	labels["production_prefill"] = hipKernelStatusNotLinked
-	return labels
-}
-
-func rocmGemma4Q4BenchmarkCapabilityLabels(model inference.ModelIdentity) map[string]string {
-	labels := rocmGemma4Q4GenerateCapabilityLabels(model)
-	labels["benchmark_kernel"] = hipKernelStatusLinked
-	labels["benchmark_name"] = "rocm_gemma4_q4_benchmark_experimental"
-	labels["benchmark_prompt_mode"] = "explicit_text"
-	labels["kernel_scope"] = "loaded_gemma4_q4_experimental_benchmark"
-	return labels
-}
-
-func rocmGemma4Q4ClassifyCapabilityLabels(model inference.ModelIdentity) map[string]string {
-	labels := rocmGemma4Q4GenerateCapabilityLabels(model)
-	labels["classify_kernel"] = hipKernelStatusLinked
-	labels["classify_name"] = "rocm_gemma4_q4_classify_experimental"
-	labels["classify_logits_source"] = "gemma4_q4_package_prefill"
-	labels["kernel_scope"] = "loaded_gemma4_q4_experimental_classify"
-	labels["production_prefill"] = hipKernelStatusNotLinked
-	return labels
-}
-
-func rocmGemma4Q4LogitProbeCapabilityLabels(model inference.ModelIdentity) map[string]string {
-	labels := rocmGemma4Q4ClassifyCapabilityLabels(model)
-	labels["kernel_scope"] = "loaded_gemma4_q4_experimental_logit_probe"
-	labels["logit_probe_kernel"] = hipKernelStatusLinked
-	labels["logit_probe_source"] = "gemma4_q4_classify_logits"
-	return labels
-}
-
-func rocmGemma4Q4SpeculativeDecodeCapabilityLabels(model inference.ModelIdentity) map[string]string {
-	labels := rocmGemma4Q4GenerateCapabilityLabels(model)
-	labels["kernel_scope"] = "loaded_gemma4_q4_experimental_speculative_decode"
-	labels["speculative_decode_helper"] = hipKernelStatusLinked
-	labels["speculative_decode_source"] = "gemma4_q4_generate"
-	return labels
-}
-
-func rocmGemma4Q4PromptLookupDecodeCapabilityLabels(model inference.ModelIdentity) map[string]string {
-	labels := rocmGemma4Q4GenerateCapabilityLabels(model)
-	labels["kernel_scope"] = "loaded_gemma4_q4_experimental_prompt_lookup_decode"
-	labels["prompt_lookup_decode_helper"] = hipKernelStatusLinked
-	labels["prompt_lookup_decode_source"] = "gemma4_q4_generate"
 	return labels
 }
 
@@ -2405,21 +2722,55 @@ func rocmPlannedTrainingCapability(id inference.CapabilityID, detail, requiredKe
 	capability := inference.PlannedCapability(id, inference.CapabilityGroupTraining, detail)
 	kernelStatus = normalizeHIPKernelStatus(kernelStatus)
 	capability.Labels = map[string]string{
-		"kernel_status":      hipKernelStatusPlanned,
-		"required_kernel":    requiredKernel,
-		"runtime_status":     string(inference.FeatureRuntimePlanned),
-		"training_kernel":    hipKernelStatusNotLinked,
-		"training_interface": "not_implemented",
+		"kernel_status":                    hipKernelStatusPlanned,
+		"optimizer_backend":                "reference",
+		"optimizer_direct_helper":          "RunNativeAdamWUpdate",
+		"optimizer_helper":                 "RunNativeAdamWUpdatePass",
+		"optimizer_kernel":                 kernelStatus.Optimizer,
+		"optimizer_launch_args":            "hipAdamWUpdateLaunchArgs",
+		"optimizer_launch_args_bytes":      core.Sprintf("%d", hipAdamWUpdateLaunchArgsBytes),
+		"optimizer_layout":                 "packed_contiguous_parameters_m_v",
+		"optimizer_status":                 "update_only",
+		"optimizer_track":                  "append_only",
+		"optimizer_track_containers":       "kv,mp4,binary",
+		"optimizer_track_find_helper":      "FindNativeAdamWStateTrackStep",
+		"optimizer_track_helper":           "AppendNativeAdamWStateTrack",
+		"optimizer_track_list_helper":      "ListNativeAdamWStateTrack",
+		"optimizer_track_load_step_helper": "LoadNativeAdamWStateTrackStep",
+		"required_kernel":                  requiredKernel,
+		"runtime_status":                   string(inference.FeatureRuntimePlanned),
+		"training_kernel":                  hipKernelStatusNotLinked,
+		"training_interface":               "not_implemented",
 	}
 	switch id {
+	case inference.CapabilityLoRATraining:
+		capability.Labels["lora_adapter_snapshot_helper"] = "SaveNativeLoRAAdapterSnapshot"
+		capability.Labels["lora_adapter_track_latest_snapshot_helper"] = "SaveNativeLoRAAdapterSnapshotTrackLast"
+		capability.Labels["lora_adapter_track_snapshot_helper"] = "SaveNativeLoRAAdapterSnapshotTrackStep"
+		capability.Labels["lora_backward_backend"] = "reference"
+		capability.Labels["lora_update_helper"] = "RunNativeLoRAAdamWUpdatePass"
 	case inference.CapabilityDistillation:
 		capability.Labels["fixture_kernel"] = kernelStatus.Distillation
 		capability.Labels["fixture_kernel_name"] = hipKernelNameDistillKL
 		capability.Labels["fixture_scope"] = "toy_kl_loss"
+		capability.Labels["distillation_track_helper"] = "RunNativeDistillationAdamWUpdateTrackPass"
+		capability.Labels["distillation_update_helper"] = "RunNativeDistillationAdamWUpdatePass"
 	case inference.CapabilityGRPO:
 		capability.Labels["fixture_kernel"] = kernelStatus.GRPO
 		capability.Labels["fixture_kernel_name"] = hipKernelNameGRPOAdvantage
 		capability.Labels["fixture_scope"] = "toy_advantage_normalization"
+		capability.Labels["advantage_track_helper"] = "RunNativeGRPOAdamWUpdateTrackPass"
+		capability.Labels["advantage_update_helper"] = "RunNativeGRPOAdamWUpdatePass"
+		capability.Labels["policy_loss_backend"] = "reference"
+		capability.Labels["policy_loss_helper"] = "RunNativeGRPOPolicyLossPass"
+		capability.Labels["policy_rollout_group_label"] = "group_id"
+		capability.Labels["policy_rollout_group_result_labels"] = "grpo_rollout_group_source,grpo_rollout_groups"
+		capability.Labels["policy_rollout_identity_labels"] = "rollout_id,sample_id,trajectory_id,turn_id,completion_id,episode_id"
+		capability.Labels["policy_rollout_identity_result_labels"] = "grpo_rollouts,grpo_rollout_samples,grpo_rollout_trajectories,grpo_rollout_turns,grpo_rollout_completions,grpo_rollout_episodes"
+		capability.Labels["policy_rollout_prompt_labels"] = "prompt_id,query_id"
+		capability.Labels["policy_rollout_prompt_result_labels"] = "grpo_rollout_prompt_source,grpo_rollout_prompts"
+		capability.Labels["policy_track_helper"] = "RunNativeGRPOPolicyAdamWUpdateTrackPass"
+		capability.Labels["policy_update_helper"] = "RunNativeGRPOPolicyAdamWUpdatePass"
 	}
 	return capability
 }
@@ -2427,13 +2778,19 @@ func rocmPlannedTrainingCapability(id inference.CapabilityID, detail, requiredKe
 var (
 	rocmCapabilityArchitectures = []string{
 		"bert",
+		"bert_rerank",
 		"deepseek",
 		"deepseek_r1",
+		"diffusion_gemma",
 		"gemma",
 		"gemma2",
 		"gemma3",
+		"gemma3_text",
 		"gemma4",
+		"gemma4_assistant",
 		"gemma4_text",
+		"gemma4_unified",
+		"gemma4_unified_text",
 		"glm",
 		"glm4",
 		"gpt-oss",
@@ -2449,10 +2806,13 @@ var (
 		"phi3",
 		"qwen2",
 		"qwen3",
+		"qwen3_6",
+		"qwen3_6_moe",
 		"qwen3_moe",
 		"qwen3_next",
 	}
 	rocmCapabilityQuantizations = []string{
+		"bf16",
 		"codebook",
 		"f16",
 		"f32",
@@ -2471,6 +2831,7 @@ var (
 		"q6",
 		"q8",
 		"q8_0",
+		rocmTurboQuantKVMode,
 		"vq",
 	}
 	rocmCapabilityCacheModes = []string{
@@ -2479,6 +2840,7 @@ var (
 		"k-q8-v-q4",
 		"paged",
 		"q8",
+		rocmTurboQuantKVMode,
 	}
 )
 
@@ -2489,7 +2851,7 @@ func resolveContextLength(requestedContextLength int, metadata gguf.Metadata) in
 	if metadata.ContextLength == 0 {
 		return defaultContextLengthCap
 	}
-	return min(int(metadata.ContextLength), defaultContextLengthCap)
+	return int(metadata.ContextLength)
 }
 
 func resolveModelContextLength(requestedContextLength, modelContextLength int) int {
@@ -2499,7 +2861,7 @@ func resolveModelContextLength(requestedContextLength, modelContextLength int) i
 	if modelContextLength <= 0 {
 		return defaultContextLengthCap
 	}
-	return min(modelContextLength, defaultContextLengthCap)
+	return modelContextLength
 }
 
 func modelInfoFromMetadata(metadata gguf.Metadata) inference.ModelInfo {
@@ -2555,115 +2917,6 @@ func quantisationFromFileType(fileType uint32) (bits, groupSize int) {
 	default:
 		return 0, 0
 	}
-}
-
-func normalizeROCmArchitecture(architecture string) string {
-	normalized := core.Lower(architecture)
-	normalized = core.Replace(normalized, "-", "_")
-	normalized = core.Replace(normalized, ".", "_")
-	normalized = core.Replace(normalized, " ", "_")
-	switch {
-	case normalized == "":
-		return ""
-	case core.Contains(normalized, "minimax") && core.Contains(normalized, "m2"):
-		return "minimax_m2"
-	case core.Contains(normalized, "minimax"):
-		return "minimax"
-	case core.Contains(normalized, "qwen3") && core.Contains(normalized, "moe"):
-		return "qwen3_moe"
-	case core.Contains(normalized, "qwen3") && core.Contains(normalized, "next"):
-		return "qwen3_next"
-	case core.Contains(normalized, "qwen3"):
-		return "qwen3"
-	case core.Contains(normalized, "qwen2"):
-		return "qwen2"
-	case core.Contains(normalized, "deepseek"):
-		if core.Contains(normalized, "r1") {
-			return "deepseek_r1"
-		}
-		return "deepseek"
-	case core.Contains(normalized, "gpt_oss") || core.Contains(normalized, "gptoss"):
-		return "gpt-oss"
-	case core.Contains(normalized, "gemma4"):
-		if core.Contains(normalized, "text") || core.Contains(normalized, "forcausallm") {
-			return "gemma4_text"
-		}
-		return "gemma4"
-	case core.Contains(normalized, "gemma3"):
-		return "gemma3"
-	case core.Contains(normalized, "gemma2"):
-		return "gemma2"
-	case core.Contains(normalized, "gemma"):
-		return "gemma"
-	case core.Contains(normalized, "mixtral"):
-		return "mixtral"
-	case core.Contains(normalized, "mistral"):
-		return "mistral"
-	case core.Contains(normalized, "phi3"):
-		return "phi3"
-	case core.Contains(normalized, "phi"):
-		return "phi"
-	case core.Contains(normalized, "bert"):
-		return "bert"
-	case core.Contains(normalized, "glm4"):
-		return "glm4"
-	case core.Contains(normalized, "glm"):
-		return "glm"
-	case core.Contains(normalized, "kimi"):
-		return "kimi"
-	case core.Contains(normalized, "llama"):
-		return "llama"
-	case core.Contains(normalized, "hermes"):
-		return "hermes"
-	case core.Contains(normalized, "granite"):
-		return "granite"
-	default:
-		return normalized
-	}
-}
-
-func isROCmGemma4Architecture(architecture string) bool {
-	architecture = normalizeROCmArchitecture(architecture)
-	return architecture == "gemma4" || architecture == "gemma4_text"
-}
-
-func supportedNativeArchitecture(architecture string) bool {
-	architecture = normalizeROCmArchitecture(architecture)
-	if architecture == "" {
-		return true
-	}
-	supported := map[string]struct{}{
-		"bert": {}, "deepseek": {}, "deepseek_r1": {}, "gemma": {}, "gemma2": {}, "gemma3": {}, "gemma4": {}, "gemma4_text": {},
-		"glm": {}, "glm4": {}, "gpt-oss": {}, "granite": {}, "hermes": {}, "kimi": {}, "llama": {},
-		"minimax": {}, "minimax_m2": {}, "mistral": {}, "mixtral": {}, "phi": {}, "phi3": {},
-		"qwen2": {}, "qwen3": {}, "qwen3_moe": {}, "qwen3_next": {},
-	}
-	_, ok := supported[architecture]
-	return ok
-}
-
-func supportedNativeQuantization(bits int, quantType string) bool {
-	if bits == 0 && quantType == "" {
-		return true
-	}
-	if bits > 0 && bits <= 8 {
-		return true
-	}
-	quantType = core.Lower(quantType)
-	if quantType == "f16" || quantType == "f32" || quantType == "bf16" {
-		return true
-	}
-	return core.Contains(quantType, "q4") || core.Contains(quantType, "q5") || core.Contains(quantType, "q8") || isROCmMetadataQuantization(quantType)
-}
-
-func isROCmMetadataQuantization(quantType string) bool {
-	quantType = core.Lower(quantType)
-	return core.Contains(quantType, "jang") || core.Contains(quantType, "mxtq") || core.Contains(quantType, "codebook") || core.Contains(quantType, "vq") || core.Contains(quantType, "iq") || core.Contains(quantType, "mxfp4") || core.Contains(quantType, "nvfp4")
-}
-
-func isROCmMoEArchitecture(architecture string) bool {
-	architecture = normalizeROCmArchitecture(architecture)
-	return core.Contains(architecture, "moe") || architecture == "mixtral" || architecture == "minimax_m2"
 }
 
 func rocmRecommendedCacheMode(memoryBytes uint64, contextLength int, model inference.ModelIdentity) string {
@@ -2798,6 +3051,30 @@ func rocmMemoryPlanLabels(memoryBytes uint64, contextLength, layers, hidden int,
 	if isROCmMetadataQuantization(model.QuantType) {
 		labels["metadata_quantization"] = model.QuantType
 	}
+	if isROCmDenseQuickWinArchitecture(model.Architecture) {
+		labels["dense_route_candidate"] = "true"
+		labels["dense_route_status"] = "experimental"
+		labels["dense_route_family"] = "loader_neutral"
+		labels["dense_route_backend"] = "hip_small_decode"
+		labels["dense_route_reference"] = "gemma4_mlx_affine_matvec"
+	}
+	if isROCmGemma4AssistantArchitecture(model.Architecture) {
+		labels["attached_drafter"] = "experimental_retained_plan"
+		labels["attached_drafter_native_attachment"] = hipKernelStatusNotLinked
+		labels["attached_drafter_retained_state_entrypoint"] = hipKernelStatusLinked
+		labels["attached_drafter_retained_state_required"] = "true"
+		labels["attached_drafter_state_source"] = "rocm_state_session_runtime_kv"
+		labels["attached_drafter_prompt_replay_fallback"] = "forbidden"
+		labels["mtp_role"] = "drafter"
+		labels["mtp_target_family"] = "gemma4"
+	}
+	if isROCmGemma4Architecture(model.Architecture) || isROCmGemma4AssistantArchitecture(model.Architecture) {
+		rocmApplyGemma4SizeQuantSupportLabels(labels, model)
+		rocmApplyGemma4ProductionQuantLabels(labels, model)
+		labels = rocmApplyGemma4StateContextCapabilityLabels(labels, model)
+		labels = rocmApplyGemma4LoRAAdapterCapabilityLabels(labels, model)
+		labels = rocmApplyGemma4AttachedDrafterCapabilityLabels(labels, model)
+	}
 	if weightBytes > 0 {
 		labels["weight_bytes"] = core.Sprintf("%d", weightBytes)
 	}
@@ -2831,6 +3108,109 @@ func rocmMemoryPlanLabels(memoryBytes uint64, contextLength, layers, hidden int,
 		}
 	}
 	return labels
+}
+
+func rocmApplyGemma4ProductionQuantLabels(labels map[string]string, model inference.ModelIdentity) {
+	if labels == nil {
+		return
+	}
+	labels["quant_family"] = "mlx_affine"
+	labels["quant_default_tier"] = "q6"
+	labels["quant_ladder"] = productionQuantizationLadderLabel
+	labels["production_quant_policy"] = "gemma4_mlx_affine"
+	labels["production_quant_default_bits"] = "6"
+	labels["production_quant_quality_bits"] = "8"
+	labels["production_quant_constrained_bits"] = "4"
+	labels["production_quant_min_visible_tokens_per_sec"] = "100"
+	ApplyProductionQuantizationPackSupportLabels(labels)
+
+	model = rocmGemma4ModelWithInferredPathQuant(model)
+	if pack, ok := rocmGemma4ProductionQuantPackForModel(model); ok {
+		rocmApplyGemma4ProductionQuantPackLabels(labels, pack)
+		rocmApplyGemma4EffectiveProductionQuantLabels(labels, model)
+		return
+	}
+	bits := rocmModelQuantBits(model)
+	if bits > 0 {
+		if tier := rocmGemma4ProductionQuantTierForBits(bits); tier != "" {
+			labels["production_quant_tier"] = tier
+			rocmApplyGemma4StaticProductionQuantTierLabels(labels, bits)
+		} else {
+			labels["production_quant_bits"] = core.Sprintf("%d", bits)
+			labels["production_quant_tier"] = "custom"
+		}
+		if size := rocmGemma4ModelPackSize(model, model.Path); size != "" {
+			labels["production_quant_size"] = size
+		}
+		if mode := rocmGemma4ModelPackQuantModeForPath(model, model.Path); mode != "" {
+			labels["production_quant_mode"] = rocmGemma4NormalizeSizeQuantMode(rocmGemma4ModelPackSize(model, model.Path), mode)
+		}
+	}
+	rocmApplyGemma4EffectiveProductionQuantLabels(labels, model)
+}
+
+func rocmApplyGemma4EffectiveProductionQuantLabels(labels map[string]string, model inference.ModelIdentity) {
+	if labels == nil {
+		return
+	}
+	if value := model.Labels["gemma4_runtime"]; value != "" {
+		labels["production_quant_runtime"] = value
+	}
+	if value := model.Labels["gemma4_generate_status"]; value != "" {
+		labels["production_quant_generate_status"] = value
+	}
+	if value := model.Labels["gemma4_pack_supported"]; value != "" {
+		labels["production_quant_supported"] = value
+	}
+	if value := model.Labels["gemma4_runnable_on_card"]; value != "" {
+		labels["production_quant_runnable_on_card"] = value
+	}
+}
+
+func rocmGemma4ProductionQuantTierForBits(bits int) string {
+	switch bits {
+	case ProductionLaneQualityQuantBits:
+		return "quality"
+	case ProductionLaneProductDefaultQuantBits:
+		return "default"
+	case ProductionLaneConstrainedQuantBits:
+		return "constrained"
+	default:
+		return ""
+	}
+}
+
+func rocmApplyGemma4StaticProductionQuantTierLabels(labels map[string]string, bits int) {
+	switch bits {
+	case ProductionLaneQualityQuantBits:
+		labels["production_quant_bits"] = "8"
+		labels["production_quant_group"] = "64"
+		labels["production_quant_active_weight_read_bytes_per_token"] = "2300000000"
+		labels["production_quant_step_down_to_bits"] = "6"
+	case ProductionLaneProductDefaultQuantBits:
+		labels["production_quant_bits"] = "6"
+		labels["production_quant_group"] = "64"
+		labels["production_quant_active_weight_read_bytes_per_token"] = "1725000000"
+		labels["production_quant_step_down_to_bits"] = "4"
+	case ProductionLaneConstrainedQuantBits:
+		labels["production_quant_bits"] = "4"
+		labels["production_quant_group"] = "64"
+		labels["production_quant_active_weight_read_bytes_per_token"] = "1150000000"
+	}
+}
+
+func rocmModelQuantBits(model inference.ModelIdentity) int {
+	if model.QuantBits > 0 {
+		return model.QuantBits
+	}
+	quantType := strings.TrimPrefix(core.Lower(model.QuantType), "mlx_")
+	quantType = strings.TrimPrefix(quantType, "affine_")
+	quantType = strings.TrimPrefix(quantType, "q")
+	bits, err := strconv.Atoi(quantType)
+	if err != nil {
+		return 0
+	}
+	return bits
 }
 
 func rocmKVCacheLayerWidth(layers, hidden int, model inference.ModelIdentity) int {
@@ -2977,57 +3357,6 @@ func formatFallbackChatTemplate(messages []inference.Message) string {
 		builder.WriteString("\n")
 	}
 	return builder.String()
-}
-
-func formatGemma4ChatTemplate(messages []inference.Message) string {
-	builder := core.NewBuilder()
-	builder.WriteString("<bos>")
-	start := 0
-	if len(messages) > 0 {
-		role := core.Lower(core.Trim(messages[0].Role))
-		if role == "system" || role == "developer" {
-			builder.WriteString("<|turn>system\n")
-			builder.WriteString(core.Trim(messages[0].Content))
-			builder.WriteString("<turn|>\n")
-			start = 1
-		}
-	}
-	for _, message := range messages[start:] {
-		role := core.Lower(core.Trim(message.Role))
-		if role == "assistant" {
-			role = "model"
-		}
-		if role == "" {
-			role = "user"
-		}
-		builder.WriteString("<|turn>")
-		builder.WriteString(role)
-		builder.WriteByte('\n')
-		content := core.Trim(message.Content)
-		if role == "model" {
-			content = stripGemma4ThinkingChannels(content)
-		}
-		builder.WriteString(content)
-		builder.WriteString("<turn|>\n")
-	}
-	builder.WriteString("<|turn>model\n")
-	return builder.String()
-}
-
-func stripGemma4ThinkingChannels(text string) string {
-	if text == "" || !strings.Contains(text, "<channel|>") {
-		return core.Trim(text)
-	}
-	var builder strings.Builder
-	for _, part := range strings.Split(text, "<channel|>") {
-		before, _, found := strings.Cut(part, "<|channel>")
-		if found {
-			builder.WriteString(before)
-			continue
-		}
-		builder.WriteString(part)
-	}
-	return core.Trim(builder.String())
 }
 
 func sampleText(sample inference.DatasetSample) string {

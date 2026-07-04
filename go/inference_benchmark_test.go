@@ -9,18 +9,23 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"runtime"
-	"sort"
+	"runtime/pprof"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
+	core "dappco.re/go"
 	"dappco.re/go/inference"
 )
 
 const inferenceBenchmarkKernelRouteMetricsEnv = "GO_ROCM_BENCH_KERNEL_ROUTE_METRICS"
+const inferenceBenchmarkCopySizeMetricLimitEnv = "GO_ROCM_BENCH_COPY_SIZE_LIMIT"
 
 type inferenceBenchmarkHIPKernelStats struct {
 	Launches uint64
@@ -41,6 +46,37 @@ type inferenceBenchmarkHIPKernelEntry struct {
 
 type inferenceBenchmarkHIPAllocationEntry struct {
 	size  uint64
+	count uint64
+	bytes uint64
+}
+
+type inferenceBenchmarkHIPCopySizeEntry struct {
+	size  uint64
+	count uint64
+	bytes uint64
+}
+
+type inferenceBenchmarkHIPCopyLabelKey struct {
+	size      uint64
+	operation string
+	label     string
+	async     bool
+}
+
+type inferenceBenchmarkHIPCopyLabelEntry struct {
+	inferenceBenchmarkHIPCopyLabelKey
+	count uint64
+	bytes uint64
+}
+
+type inferenceBenchmarkHIPAllocationLabelKey struct {
+	size      uint64
+	operation string
+	label     string
+}
+
+type inferenceBenchmarkHIPAllocationLabelEntry struct {
+	inferenceBenchmarkHIPAllocationLabelKey
 	count uint64
 	bytes uint64
 }
@@ -72,38 +108,53 @@ type inferenceBenchmarkHIPKernelStatsSnapshot struct {
 }
 
 type inferenceBenchmarkHIPDriverTrafficStats struct {
-	Mallocs                uint64
-	MallocBytes            uint64
-	Frees                  uint64
-	HostToDeviceCopies     uint64
-	HostToDeviceBytes      uint64
-	HostToDeviceAsync      uint64
-	HostToDeviceAsyncBytes uint64
-	DeviceToHostCopies     uint64
-	DeviceToHostBytes      uint64
-	Memsets                uint64
-	MemsetBytes            uint64
+	Mallocs                   uint64
+	MallocBytes               uint64
+	Frees                     uint64
+	HostToDeviceCopies        uint64
+	HostToDeviceBytes         uint64
+	HostToDeviceDuration      time.Duration
+	HostToDeviceAsync         uint64
+	HostToDeviceAsyncBytes    uint64
+	HostToDeviceAsyncDuration time.Duration
+	DeviceToHostCopies        uint64
+	DeviceToHostBytes         uint64
+	DeviceToHostDuration      time.Duration
+	Memsets                   uint64
+	MemsetBytes               uint64
+	MemsetDuration            time.Duration
 }
 
 type inferenceBenchmarkHIPKernelCountingDriver struct {
 	nativeHIPDriver
-	mu          sync.Mutex
-	kernel      map[string]inferenceBenchmarkHIPKernelStats
-	shape       map[inferenceBenchmarkHIPKernelShapeKey]inferenceBenchmarkHIPKernelStats
-	total       inferenceBenchmarkHIPKernelStats
-	traffic     inferenceBenchmarkHIPDriverTrafficStats
-	allocations map[nativeDevicePointer]uint64
-	allocSizes  map[uint64]uint64
+	mu               sync.Mutex
+	kernel           map[string]inferenceBenchmarkHIPKernelStats
+	shape            map[inferenceBenchmarkHIPKernelShapeKey]inferenceBenchmarkHIPKernelStats
+	total            inferenceBenchmarkHIPKernelStats
+	traffic          inferenceBenchmarkHIPDriverTrafficStats
+	allocations      map[nativeDevicePointer]uint64
+	allocSizes       map[uint64]uint64
+	allocLabels      map[inferenceBenchmarkHIPAllocationLabelKey]uint64
+	copySizesEnabled bool
+	h2dSizes         map[uint64]uint64
+	h2dAsyncSizes    map[uint64]uint64
+	h2dLabels        map[inferenceBenchmarkHIPCopyLabelKey]uint64
 }
 
 func newInferenceBenchmarkHIPKernelCountingDriver(driver nativeHIPDriver) *inferenceBenchmarkHIPKernelCountingDriver {
 	return &inferenceBenchmarkHIPKernelCountingDriver{
-		nativeHIPDriver: driver,
-		kernel:          make(map[string]inferenceBenchmarkHIPKernelStats),
-		shape:           make(map[inferenceBenchmarkHIPKernelShapeKey]inferenceBenchmarkHIPKernelStats),
-		allocations:     make(map[nativeDevicePointer]uint64),
-		allocSizes:      make(map[uint64]uint64),
+		nativeHIPDriver:  driver,
+		kernel:           make(map[string]inferenceBenchmarkHIPKernelStats, 128),
+		shape:            make(map[inferenceBenchmarkHIPKernelShapeKey]inferenceBenchmarkHIPKernelStats, 256),
+		allocations:      make(map[nativeDevicePointer]uint64, 256),
+		allocSizes:       make(map[uint64]uint64, 128),
+		allocLabels:      make(map[inferenceBenchmarkHIPAllocationLabelKey]uint64, 256),
+		copySizesEnabled: inferenceBenchmarkHIPCopySizeMetricsEnabled(),
 	}
+}
+
+func inferenceBenchmarkHIPCopySizeMetricsEnabled() bool {
+	return os.Getenv(inferenceBenchmarkCopySizeMetricLimitEnv) != ""
 }
 
 func (driver *inferenceBenchmarkHIPKernelCountingDriver) rocmUnwrapNativeHIPDriver() nativeHIPDriver {
@@ -127,6 +178,19 @@ func (driver *inferenceBenchmarkHIPKernelCountingDriver) Malloc(size uint64) (na
 	return pointer, nil
 }
 
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) RecordDeviceAllocationLabel(sizeBytes uint64, operation, label string) {
+	if driver == nil || sizeBytes == 0 {
+		return
+	}
+	driver.mu.Lock()
+	driver.allocLabels[inferenceBenchmarkHIPAllocationLabelKey{
+		size:      sizeBytes,
+		operation: operation,
+		label:     label,
+	}]++
+	driver.mu.Unlock()
+}
+
 func (driver *inferenceBenchmarkHIPKernelCountingDriver) Free(pointer nativeDevicePointer) error {
 	if err := driver.nativeHIPDriver.Free(pointer); err != nil {
 		return err
@@ -139,50 +203,181 @@ func (driver *inferenceBenchmarkHIPKernelCountingDriver) Free(pointer nativeDevi
 }
 
 func (driver *inferenceBenchmarkHIPKernelCountingDriver) CopyHostToDevice(pointer nativeDevicePointer, data []byte) error {
-	if err := driver.nativeHIPDriver.CopyHostToDevice(pointer, data); err != nil {
-		return err
+	return driver.copyHostToDevice(pointer, data, "", "")
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) CopyHostToDeviceLabeled(pointer nativeDevicePointer, data []byte, operation, label string) error {
+	if async, ok := driver.nativeHIPDriver.(nativeHIPAsyncHostToDevice); ok {
+		return driver.copyHostToDeviceAsync(pointer, data, async, operation, label)
 	}
+	return driver.copyHostToDevice(pointer, data, operation, label)
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) CopyPinnedHostToDevice(pointer nativeDevicePointer, host unsafe.Pointer, sizeBytes int) error {
+	return driver.copyPinnedHostToDevice(pointer, host, sizeBytes, "", "")
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) CopyPinnedHostToDeviceLabeled(pointer nativeDevicePointer, host unsafe.Pointer, sizeBytes int, operation, label string) error {
+	return driver.copyPinnedHostToDevice(pointer, host, sizeBytes, operation, label)
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) copyPinnedHostToDevice(pointer nativeDevicePointer, host unsafe.Pointer, sizeBytes int, operation, label string) error {
+	if sizeBytes == 0 {
+		return nil
+	}
+	if host == nil {
+		return core.E("rocm.hip.CopyPinnedHostToDevice", "host pointer is nil", nil)
+	}
+	start := time.Now()
+	if pinned, ok := driver.nativeHIPDriver.(nativeHIPPinnedHostToDevice); ok {
+		if err := pinned.CopyPinnedHostToDevice(pointer, host, sizeBytes); err != nil {
+			return err
+		}
+	} else {
+		data := unsafe.Slice((*byte)(host), sizeBytes)
+		if err := driver.nativeHIPDriver.CopyHostToDevice(pointer, data); err != nil {
+			return err
+		}
+	}
+	elapsed := time.Since(start)
 	driver.mu.Lock()
 	driver.traffic.HostToDeviceCopies++
-	driver.traffic.HostToDeviceBytes += uint64(len(data))
+	driver.traffic.HostToDeviceBytes += uint64(sizeBytes)
+	driver.traffic.HostToDeviceDuration += elapsed
+	driver.recordHostToDeviceSizeLocked(uint64(sizeBytes), false)
+	driver.recordHostToDeviceLabelLocked(uint64(sizeBytes), operation, label, false)
 	driver.mu.Unlock()
 	return nil
 }
 
 func (driver *inferenceBenchmarkHIPKernelCountingDriver) CopyHostToDeviceAsync(pointer nativeDevicePointer, data []byte) error {
 	if async, ok := driver.nativeHIPDriver.(nativeHIPAsyncHostToDevice); ok {
-		if err := async.CopyHostToDeviceAsync(pointer, data); err != nil {
-			return err
-		}
-		driver.mu.Lock()
-		driver.traffic.HostToDeviceAsync++
-		driver.traffic.HostToDeviceAsyncBytes += uint64(len(data))
-		driver.mu.Unlock()
-		return nil
+		return driver.copyHostToDeviceAsync(pointer, data, async, "", "")
 	}
 	return driver.CopyHostToDevice(pointer, data)
 }
 
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) copyHostToDevice(pointer nativeDevicePointer, data []byte, operation, label string) error {
+	start := time.Now()
+	if err := driver.nativeHIPDriver.CopyHostToDevice(pointer, data); err != nil {
+		return err
+	}
+	elapsed := time.Since(start)
+	driver.mu.Lock()
+	driver.traffic.HostToDeviceCopies++
+	driver.traffic.HostToDeviceBytes += uint64(len(data))
+	driver.traffic.HostToDeviceDuration += elapsed
+	driver.recordHostToDeviceSizeLocked(uint64(len(data)), false)
+	driver.recordHostToDeviceLabelLocked(uint64(len(data)), operation, label, false)
+	driver.mu.Unlock()
+	return nil
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) copyHostToDeviceAsync(pointer nativeDevicePointer, data []byte, async nativeHIPAsyncHostToDevice, operation, label string) error {
+	start := time.Now()
+	if err := async.CopyHostToDeviceAsync(pointer, data); err != nil {
+		return err
+	}
+	elapsed := time.Since(start)
+	driver.mu.Lock()
+	driver.traffic.HostToDeviceAsync++
+	driver.traffic.HostToDeviceAsyncBytes += uint64(len(data))
+	driver.traffic.HostToDeviceAsyncDuration += elapsed
+	driver.recordHostToDeviceSizeLocked(uint64(len(data)), true)
+	driver.recordHostToDeviceLabelLocked(uint64(len(data)), operation, label, true)
+	driver.mu.Unlock()
+	return nil
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) recordHostToDeviceSizeLocked(size uint64, async bool) {
+	if !driver.copySizesEnabled {
+		return
+	}
+	target := driver.h2dSizes
+	if async {
+		target = driver.h2dAsyncSizes
+	}
+	if target == nil {
+		target = make(map[uint64]uint64, 64)
+		if async {
+			driver.h2dAsyncSizes = target
+		} else {
+			driver.h2dSizes = target
+		}
+	}
+	target[size]++
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) recordHostToDeviceLabelLocked(size uint64, operation, label string, async bool) {
+	if !driver.copySizesEnabled {
+		return
+	}
+	if operation == "" || label == "" {
+		operation, label = inferenceBenchmarkHostToDeviceCallerLabel()
+	}
+	if driver.h2dLabels == nil {
+		driver.h2dLabels = make(map[inferenceBenchmarkHIPCopyLabelKey]uint64, 32)
+	}
+	driver.h2dLabels[inferenceBenchmarkHIPCopyLabelKey{
+		size:      size,
+		operation: operation,
+		label:     label,
+		async:     async,
+	}]++
+}
+
+func inferenceBenchmarkHostToDeviceCallerLabel() (string, string) {
+	var pcs [16]uintptr
+	count := runtime.Callers(4, pcs[:])
+	frames := runtime.CallersFrames(pcs[:count])
+	for {
+		frame, more := frames.Next()
+		name := frame.Function
+		switch {
+		case name == "":
+		case strings.Contains(name, "inferenceBenchmarkHIPKernelCountingDriver"):
+		case strings.Contains(name, "KernelDescriptorTable"):
+		case strings.HasSuffix(name, ".hipCopyPinnedHostToDevice"):
+		case strings.HasSuffix(name, ".hipCopyHostToDevice"):
+		case strings.HasSuffix(name, ".hipCopyHostToDeviceLabeled"):
+		case strings.HasSuffix(name, ".CopyHostToDeviceAsync"):
+		case strings.HasSuffix(name, ".CopyHostToDevice"):
+		default:
+			return "rocm.hip.H2D", name
+		}
+		if !more {
+			break
+		}
+	}
+	return "rocm.hip.H2D", "unknown caller"
+}
+
 func (driver *inferenceBenchmarkHIPKernelCountingDriver) CopyDeviceToHost(pointer nativeDevicePointer, data []byte) error {
+	start := time.Now()
 	if err := driver.nativeHIPDriver.CopyDeviceToHost(pointer, data); err != nil {
 		return err
 	}
+	elapsed := time.Since(start)
 	driver.mu.Lock()
 	driver.traffic.DeviceToHostCopies++
 	driver.traffic.DeviceToHostBytes += uint64(len(data))
+	driver.traffic.DeviceToHostDuration += elapsed
 	driver.mu.Unlock()
 	return nil
 }
 
 func (driver *inferenceBenchmarkHIPKernelCountingDriver) CopyDeviceToHostUint64(pointer nativeDevicePointer) (uint64, error) {
 	if reader, ok := driver.nativeHIPDriver.(nativeHIPDeviceUint64Reader); ok {
+		start := time.Now()
 		value, err := reader.CopyDeviceToHostUint64(pointer)
 		if err != nil {
 			return 0, err
 		}
+		elapsed := time.Since(start)
 		driver.mu.Lock()
 		driver.traffic.DeviceToHostCopies++
 		driver.traffic.DeviceToHostBytes += 8
+		driver.traffic.DeviceToHostDuration += elapsed
 		driver.mu.Unlock()
 		return value, nil
 	}
@@ -200,7 +395,33 @@ func (driver *inferenceBenchmarkHIPKernelCountingDriver) CopyDeviceToHostUint64(
 		uint64(payload[7])<<56, nil
 }
 
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) CopyDeviceToHostUint32(pointer nativeDevicePointer) (uint32, error) {
+	if reader, ok := driver.nativeHIPDriver.(nativeHIPDeviceUint32Reader); ok {
+		start := time.Now()
+		value, err := reader.CopyDeviceToHostUint32(pointer)
+		if err != nil {
+			return 0, err
+		}
+		elapsed := time.Since(start)
+		driver.mu.Lock()
+		driver.traffic.DeviceToHostCopies++
+		driver.traffic.DeviceToHostBytes += 4
+		driver.traffic.DeviceToHostDuration += elapsed
+		driver.mu.Unlock()
+		return value, nil
+	}
+	var payload [4]byte
+	if err := driver.CopyDeviceToHost(pointer, payload[:]); err != nil {
+		return 0, err
+	}
+	return uint32(payload[0]) |
+		uint32(payload[1])<<8 |
+		uint32(payload[2])<<16 |
+		uint32(payload[3])<<24, nil
+}
+
 func (driver *inferenceBenchmarkHIPKernelCountingDriver) MemsetAsync(pointer nativeDevicePointer, value byte, size uint64) error {
+	start := time.Now()
 	if memset, ok := driver.nativeHIPDriver.(nativeHIPDeviceMemset); ok {
 		if err := memset.MemsetAsync(pointer, value, size); err != nil {
 			return err
@@ -208,9 +429,11 @@ func (driver *inferenceBenchmarkHIPKernelCountingDriver) MemsetAsync(pointer nat
 	} else if err := hipMemsetDevice(driver.nativeHIPDriver, pointer, value, size); err != nil {
 		return err
 	}
+	elapsed := time.Since(start)
 	driver.mu.Lock()
 	driver.traffic.Memsets++
 	driver.traffic.MemsetBytes += size
+	driver.traffic.MemsetDuration += elapsed
 	driver.mu.Unlock()
 	return nil
 }
@@ -260,6 +483,16 @@ func (driver *inferenceBenchmarkHIPKernelCountingDriver) ResetKernelStats() {
 	driver.traffic = inferenceBenchmarkHIPDriverTrafficStats{}
 	clear(driver.allocations)
 	clear(driver.allocSizes)
+	clear(driver.allocLabels)
+	if driver.h2dSizes != nil {
+		clear(driver.h2dSizes)
+	}
+	if driver.h2dAsyncSizes != nil {
+		clear(driver.h2dAsyncSizes)
+	}
+	if driver.h2dLabels != nil {
+		clear(driver.h2dLabels)
+	}
 	driver.mu.Unlock()
 }
 
@@ -320,6 +553,16 @@ func (driver *inferenceBenchmarkHIPKernelCountingDriver) AllocationSizeSnapshot(
 	snapshot := make(map[uint64]uint64, len(driver.allocSizes))
 	for size, count := range driver.allocSizes {
 		snapshot[size] = count
+	}
+	return snapshot
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) AllocationLabelSnapshot() map[inferenceBenchmarkHIPAllocationLabelKey]uint64 {
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	snapshot := make(map[inferenceBenchmarkHIPAllocationLabelKey]uint64, len(driver.allocLabels))
+	for key, count := range driver.allocLabels {
+		snapshot[key] = count
 	}
 	return snapshot
 }
@@ -386,12 +629,31 @@ func inferenceBenchmarkReportHIPKernelRouteMetrics(b *testing.B, driver *inferen
 	report(hipKernelNameAttentionHeadsBatchChunkedStage2, "kernel_attention_batch_chunked_stage2")
 	report(hipKernelNameAttentionHeadsChunkedStage1, "kernel_attention_decode_chunked_stage1")
 	report(hipKernelNameAttentionHeadsChunkedStage2, "kernel_attention_decode_chunked_stage2")
+	report(hipKernelNameKVDescriptorAppend, "kernel_rocm_kv_descriptor_append")
 	report(hipKernelNameMLXQ4Proj, "kernel_mlx_q4_projection")
 	report(hipKernelNameMLXQ4ProjCols256, "kernel_mlx_q4_projection_cols256")
+	report(hipKernelNameMLXQ4ProjQ6Row16, "kernel_mlx_q4_projection_q6_row16")
+	report(hipKernelNameMLXQ4ProjQ6Row32, "kernel_mlx_q4_projection_q6_row32")
+	report(hipKernelNameMLXQ4ProjQ6Row64, "kernel_mlx_q4_projection_q6_row64")
+	report(hipKernelNameMLXQ4ProjBatchQ6Row16, "kernel_mlx_q4_projection_batch_q6_row16")
+	report(hipKernelNameMLXQ4ProjGreedyQ6Row64, "kernel_mlx_q4_projection_greedy_q6_row64")
+	report(hipKernelNameMLXQ4ProjGreedyBatch, "kernel_mlx_q4_projection_greedy_batch")
+	report(hipKernelNameMLXQ4ProjGreedyBatchQ6Row64, "kernel_mlx_q4_projection_greedy_batch_q6_row64")
+	report(hipKernelNameMLXQ4ProjScoresQ6Row64, "kernel_mlx_q4_projection_scores_q6_row64")
+	report(hipKernelNameMLXQ4ProjSelectedGreedyQ6Row64, "kernel_mlx_q4_projection_selected_greedy_q6_row64")
+	report(hipKernelNameOrderedEmbeddingCandidates, "kernel_ordered_embedding_candidates")
+	report(hipKernelNamePackedTopK, "kernel_packed_topk")
+	report(hipKernelNamePackedTopKSample, "kernel_packed_topk_sample")
 	report(hipKernelNameMLXQ4TripleProj, "kernel_mlx_q4_triple_projection")
+	report(hipKernelNameMLXQ4TripleProjQ6Row16, "kernel_mlx_q4_triple_projection_q6_row16")
+	report(hipKernelNameMLXQ4TripleProjQ6Row64, "kernel_mlx_q4_triple_projection_q6_row64")
 	report(hipKernelNameMLXQ4PairProj, "kernel_mlx_q4_pair_projection")
 	report(hipKernelNameMLXQ4GELUTanhMul, "kernel_mlx_q4_gelu_tanh_multiply")
+	report(hipKernelNameMLXQ4GELUTanhMulQ6Cols1536, "kernel_mlx_q4_gelu_tanh_multiply_q6_cols1536")
+	report(hipKernelNameMLXQ4GELUTanhMulQ6Cols1536Row32, "kernel_mlx_q4_gelu_tanh_multiply_q6_cols1536_row32")
+	report(hipKernelNameMLXQ4GELUTanhMulQ6Cols1536Row64, "kernel_mlx_q4_gelu_tanh_multiply_q6_cols1536_row64")
 	report(hipKernelNameMLXQ4GELUTanhProj, "kernel_mlx_q4_gelu_tanh_projection")
+	report(hipKernelNameMLXQ4GELUTanhProjQ6Row16, "kernel_mlx_q4_gelu_tanh_projection_q6_row16")
 	inferenceBenchmarkReportHIPDriverTrafficMetrics(b, driver)
 	inferenceBenchmarkReportTopHIPKernels(b, driver, 12)
 	inferenceBenchmarkReportTopHIPKernelBlocks(b, driver, 12)
@@ -408,18 +670,58 @@ func inferenceBenchmarkReportHIPDriverTrafficMetrics(b *testing.B, driver *infer
 	report := func(value uint64, label string) {
 		b.ReportMetric(float64(value)/float64(b.N), label+"/op")
 	}
+	reportSeconds := func(value time.Duration, label string) {
+		b.ReportMetric(value.Seconds()/float64(b.N), label+"/op")
+	}
 	report(traffic.Mallocs, "device_mallocs")
 	report(traffic.MallocBytes, "device_malloc_bytes")
 	report(traffic.Frees, "device_frees")
 	report(traffic.HostToDeviceCopies, "h2d_copies")
 	report(traffic.HostToDeviceBytes, "h2d_bytes")
+	reportSeconds(traffic.HostToDeviceDuration, "h2d_seconds")
 	report(traffic.HostToDeviceAsync, "h2d_async_copies")
 	report(traffic.HostToDeviceAsyncBytes, "h2d_async_bytes")
+	reportSeconds(traffic.HostToDeviceAsyncDuration, "h2d_async_seconds")
 	report(traffic.DeviceToHostCopies, "d2h_copies")
 	report(traffic.DeviceToHostBytes, "d2h_bytes")
+	reportSeconds(traffic.DeviceToHostDuration, "d2h_seconds")
 	report(traffic.Memsets, "device_memsets")
 	report(traffic.MemsetBytes, "device_memset_bytes")
-	inferenceBenchmarkReportTopHIPAllocationSizes(b, driver, 8)
+	reportSeconds(traffic.MemsetDuration, "device_memset_seconds")
+	sizeLimit, labelLimit := inferenceBenchmarkHIPAllocationMetricLimits(b)
+	inferenceBenchmarkReportTopHIPAllocationSizes(b, driver, sizeLimit)
+	inferenceBenchmarkReportTopHIPAllocationLabels(b, driver, labelLimit)
+	copySizeLimit := inferenceBenchmarkHIPCopySizeMetricLimit(b)
+	inferenceBenchmarkReportTopHIPCopySizes(b, driver, copySizeLimit, false)
+	inferenceBenchmarkReportTopHIPCopySizes(b, driver, copySizeLimit, true)
+	inferenceBenchmarkReportTopHIPCopyLabels(b, driver, copySizeLimit)
+}
+
+func inferenceBenchmarkHIPAllocationMetricLimits(b *testing.B) (int, int) {
+	b.Helper()
+	sizeLimit := 8
+	labelLimit := 8
+	if value, ok, err := inferenceBenchmarkOptionalPositiveEnv("GO_ROCM_BENCH_ALLOC_SIZE_LIMIT"); err != nil {
+		b.Fatal(err)
+	} else if ok {
+		sizeLimit = value
+	}
+	if value, ok, err := inferenceBenchmarkOptionalPositiveEnv("GO_ROCM_BENCH_ALLOC_LABEL_LIMIT"); err != nil {
+		b.Fatal(err)
+	} else if ok {
+		labelLimit = value
+	}
+	return sizeLimit, labelLimit
+}
+
+func inferenceBenchmarkHIPCopySizeMetricLimit(b *testing.B) int {
+	b.Helper()
+	if value, ok, err := inferenceBenchmarkOptionalPositiveEnv(inferenceBenchmarkCopySizeMetricLimitEnv); err != nil {
+		b.Fatal(err)
+	} else if ok {
+		return value
+	}
+	return 0
 }
 
 func inferenceBenchmarkReportHIPKernelGeneratedTokenMetrics(b *testing.B, driver *inferenceBenchmarkHIPKernelCountingDriver, generatedTokens int) {
@@ -435,15 +737,35 @@ func inferenceBenchmarkReportHIPKernelGeneratedTokenMetrics(b *testing.B, driver
 		b.ReportMetric(float64(entry.stats.Launches)/float64(generatedTokens), label+"_launches/generated_token")
 		b.ReportMetric(float64(entry.stats.Blocks)/float64(generatedTokens), label+"_blocks/generated_token")
 	}
+	for _, name := range []string{
+		hipKernelNamePackedTopK,
+		hipKernelNameOrderedEmbeddingCandidates,
+		hipKernelNamePackedTopKSample,
+		hipKernelNameMLXQ4ProjScoresQ6Row64,
+		hipKernelNameMLXQ4ProjSelectedGreedyQ6Row64,
+		hipKernelNameMLXQ4ProjGreedyQ6Row64,
+		hipKernelNameMLXQ4ProjGreedyBatchQ6Row64,
+	} {
+		stats := driver.KernelStats(name)
+		label := "kernel_selected_" + inferenceBenchmarkSanitizeMetricName(name)
+		b.ReportMetric(float64(stats.Launches)/float64(generatedTokens), label+"_launches/generated_token")
+		b.ReportMetric(float64(stats.Blocks)/float64(generatedTokens), label+"_blocks/generated_token")
+	}
 	traffic := driver.TrafficStats()
 	reportTraffic := func(value uint64, label string) {
 		b.ReportMetric(float64(value)/float64(generatedTokens), label+"/generated_token")
 	}
+	reportTrafficSeconds := func(value time.Duration, label string) {
+		b.ReportMetric(value.Seconds()/float64(generatedTokens), label+"/generated_token")
+	}
 	reportTraffic(traffic.Mallocs, "device_mallocs")
 	reportTraffic(traffic.MallocBytes, "device_malloc_bytes")
 	reportTraffic(traffic.HostToDeviceBytes+traffic.HostToDeviceAsyncBytes, "h2d_total_bytes")
+	reportTrafficSeconds(traffic.HostToDeviceDuration+traffic.HostToDeviceAsyncDuration, "h2d_seconds")
 	reportTraffic(traffic.DeviceToHostBytes, "d2h_bytes")
+	reportTrafficSeconds(traffic.DeviceToHostDuration, "d2h_seconds")
 	reportTraffic(traffic.MemsetBytes, "device_memset_bytes")
+	reportTrafficSeconds(traffic.MemsetDuration, "device_memset_seconds")
 }
 
 func inferenceBenchmarkReportTopHIPKernels(b *testing.B, driver *inferenceBenchmarkHIPKernelCountingDriver, limit int) {
@@ -475,6 +797,113 @@ func inferenceBenchmarkReportTopHIPAllocationSizes(b *testing.B, driver *inferen
 	}
 }
 
+func inferenceBenchmarkReportTopHIPAllocationLabels(b *testing.B, driver *inferenceBenchmarkHIPKernelCountingDriver, limit int) {
+	b.Helper()
+	for _, entry := range inferenceBenchmarkTopHIPAllocationLabelEntries(driver, limit) {
+		label := "device_malloc_label_" + inferenceBenchmarkSanitizeMetricName(entry.operation+"_"+entry.label+"_"+strconv.FormatUint(entry.size, 10))
+		b.ReportMetric(float64(entry.count)/float64(b.N), label+"_count/op")
+		b.ReportMetric(float64(entry.bytes)/float64(b.N), label+"_bytes/op")
+	}
+}
+
+func inferenceBenchmarkReportTopHIPCopySizes(b *testing.B, driver *inferenceBenchmarkHIPKernelCountingDriver, limit int, async bool) {
+	b.Helper()
+	if driver == nil || limit <= 0 {
+		return
+	}
+	prefix := "h2d_size"
+	if async {
+		prefix = "h2d_async_size"
+	}
+	for _, entry := range inferenceBenchmarkTopHIPCopySizeEntries(driver.HostToDeviceSizeSnapshot(async), limit) {
+		label := fmt.Sprintf("%s_%d", prefix, entry.size)
+		b.ReportMetric(float64(entry.count)/float64(b.N), label+"_count/op")
+		b.ReportMetric(float64(entry.bytes)/float64(b.N), label+"_bytes/op")
+	}
+}
+
+func inferenceBenchmarkTopHIPCopySizeEntries(snapshot map[uint64]uint64, limit int) []inferenceBenchmarkHIPCopySizeEntry {
+	if len(snapshot) == 0 || limit <= 0 {
+		return nil
+	}
+	entries := make([]inferenceBenchmarkHIPCopySizeEntry, 0, len(snapshot))
+	for size, count := range snapshot {
+		if size == 0 || count == 0 {
+			continue
+		}
+		entries = append(entries, inferenceBenchmarkHIPCopySizeEntry{
+			size:  size,
+			count: count,
+			bytes: size * count,
+		})
+	}
+	slices.SortFunc(entries, func(left, right inferenceBenchmarkHIPCopySizeEntry) int {
+		if left.bytes != right.bytes {
+			return compareUint64Desc(left.bytes, right.bytes)
+		}
+		if left.count != right.count {
+			return compareUint64Desc(left.count, right.count)
+		}
+		return compareUint64Desc(left.size, right.size)
+	})
+	if len(entries) > limit {
+		entries = entries[:limit]
+	}
+	return entries
+}
+
+func inferenceBenchmarkReportTopHIPCopyLabels(b *testing.B, driver *inferenceBenchmarkHIPKernelCountingDriver, limit int) {
+	b.Helper()
+	if driver == nil || limit <= 0 {
+		return
+	}
+	for _, entry := range inferenceBenchmarkTopHIPCopyLabelEntries(driver.HostToDeviceLabelSnapshot(), limit) {
+		prefix := "h2d_label"
+		if entry.async {
+			prefix = "h2d_async_label"
+		}
+		label := prefix + "_" + inferenceBenchmarkSanitizeMetricName(entry.operation+"_"+entry.label+"_"+strconv.FormatUint(entry.size, 10))
+		b.ReportMetric(float64(entry.count)/float64(b.N), label+"_count/op")
+		b.ReportMetric(float64(entry.bytes)/float64(b.N), label+"_bytes/op")
+	}
+}
+
+func inferenceBenchmarkTopHIPCopyLabelEntries(snapshot map[inferenceBenchmarkHIPCopyLabelKey]uint64, limit int) []inferenceBenchmarkHIPCopyLabelEntry {
+	if len(snapshot) == 0 || limit <= 0 {
+		return nil
+	}
+	entries := make([]inferenceBenchmarkHIPCopyLabelEntry, 0, len(snapshot))
+	for key, count := range snapshot {
+		if key.size == 0 || key.operation == "" || key.label == "" || count == 0 {
+			continue
+		}
+		entries = append(entries, inferenceBenchmarkHIPCopyLabelEntry{
+			inferenceBenchmarkHIPCopyLabelKey: key,
+			count:                             count,
+			bytes:                             key.size * count,
+		})
+	}
+	slices.SortFunc(entries, func(left, right inferenceBenchmarkHIPCopyLabelEntry) int {
+		if left.bytes != right.bytes {
+			return compareUint64Desc(left.bytes, right.bytes)
+		}
+		if left.count != right.count {
+			return compareUint64Desc(left.count, right.count)
+		}
+		if left.operation != right.operation {
+			return strings.Compare(left.operation, right.operation)
+		}
+		if left.label != right.label {
+			return strings.Compare(left.label, right.label)
+		}
+		return compareUint64Desc(left.size, right.size)
+	})
+	if len(entries) > limit {
+		entries = entries[:limit]
+	}
+	return entries
+}
+
 func inferenceBenchmarkReportTopHIPKernelShapes(b *testing.B, driver *inferenceBenchmarkHIPKernelCountingDriver, limit int, sortMode inferenceBenchmarkHIPKernelSortMode) {
 	b.Helper()
 	entries := inferenceBenchmarkTopHIPKernelShapeEntries(driver, limit, sortMode)
@@ -501,24 +930,24 @@ func inferenceBenchmarkTopHIPKernelEntries(driver *inferenceBenchmarkHIPKernelCo
 		}
 		entries = append(entries, inferenceBenchmarkHIPKernelEntry{name: name, stats: stats})
 	}
-	sort.Slice(entries, func(i, j int) bool {
+	slices.SortFunc(entries, func(left, right inferenceBenchmarkHIPKernelEntry) int {
 		switch sortMode {
 		case inferenceBenchmarkHIPKernelSortByBlocks:
-			if entries[i].stats.Blocks != entries[j].stats.Blocks {
-				return entries[i].stats.Blocks > entries[j].stats.Blocks
+			if left.stats.Blocks != right.stats.Blocks {
+				return compareUint64Desc(left.stats.Blocks, right.stats.Blocks)
 			}
-			if entries[i].stats.Launches != entries[j].stats.Launches {
-				return entries[i].stats.Launches > entries[j].stats.Launches
+			if left.stats.Launches != right.stats.Launches {
+				return compareUint64Desc(left.stats.Launches, right.stats.Launches)
 			}
 		default:
-			if entries[i].stats.Launches != entries[j].stats.Launches {
-				return entries[i].stats.Launches > entries[j].stats.Launches
+			if left.stats.Launches != right.stats.Launches {
+				return compareUint64Desc(left.stats.Launches, right.stats.Launches)
 			}
-			if entries[i].stats.Blocks != entries[j].stats.Blocks {
-				return entries[i].stats.Blocks > entries[j].stats.Blocks
+			if left.stats.Blocks != right.stats.Blocks {
+				return compareUint64Desc(left.stats.Blocks, right.stats.Blocks)
 			}
 		}
-		return entries[i].name < entries[j].name
+		return strings.Compare(left.name, right.name)
 	})
 	if len(entries) > limit {
 		entries = entries[:limit]
@@ -542,14 +971,51 @@ func inferenceBenchmarkTopHIPAllocationSizeEntries(driver *inferenceBenchmarkHIP
 			bytes: size * count,
 		})
 	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].bytes != entries[j].bytes {
-			return entries[i].bytes > entries[j].bytes
+	slices.SortFunc(entries, func(left, right inferenceBenchmarkHIPAllocationEntry) int {
+		if left.bytes != right.bytes {
+			return compareUint64Desc(left.bytes, right.bytes)
 		}
-		if entries[i].count != entries[j].count {
-			return entries[i].count > entries[j].count
+		if left.count != right.count {
+			return compareUint64Desc(left.count, right.count)
 		}
-		return entries[i].size > entries[j].size
+		return compareUint64Desc(left.size, right.size)
+	})
+	if len(entries) > limit {
+		entries = entries[:limit]
+	}
+	return entries
+}
+
+func inferenceBenchmarkTopHIPAllocationLabelEntries(driver *inferenceBenchmarkHIPKernelCountingDriver, limit int) []inferenceBenchmarkHIPAllocationLabelEntry {
+	if driver == nil || limit <= 0 {
+		return nil
+	}
+	snapshot := driver.AllocationLabelSnapshot()
+	entries := make([]inferenceBenchmarkHIPAllocationLabelEntry, 0, len(snapshot))
+	for key, count := range snapshot {
+		if key.size == 0 || count == 0 {
+			continue
+		}
+		entries = append(entries, inferenceBenchmarkHIPAllocationLabelEntry{
+			inferenceBenchmarkHIPAllocationLabelKey: key,
+			count:                                   count,
+			bytes:                                   key.size * count,
+		})
+	}
+	slices.SortFunc(entries, func(left, right inferenceBenchmarkHIPAllocationLabelEntry) int {
+		if left.bytes != right.bytes {
+			return compareUint64Desc(left.bytes, right.bytes)
+		}
+		if left.count != right.count {
+			return compareUint64Desc(left.count, right.count)
+		}
+		if left.size != right.size {
+			return compareUint64Desc(left.size, right.size)
+		}
+		if cmp := strings.Compare(left.operation, right.operation); cmp != 0 {
+			return cmp
+		}
+		return strings.Compare(left.label, right.label)
 	})
 	if len(entries) > limit {
 		entries = entries[:limit]
@@ -585,24 +1051,24 @@ func inferenceBenchmarkTopHIPKernelShapeEntriesFromEntries(entries []inferenceBe
 	entries = slicesDeleteFunc(entries, func(entry inferenceBenchmarkHIPKernelShapeEntry) bool {
 		return entry.stats.Launches == 0 && entry.stats.Blocks == 0
 	})
-	sort.Slice(entries, func(i, j int) bool {
+	slices.SortFunc(entries, func(left, right inferenceBenchmarkHIPKernelShapeEntry) int {
 		switch sortMode {
 		case inferenceBenchmarkHIPKernelSortByBlocks:
-			if entries[i].stats.Blocks != entries[j].stats.Blocks {
-				return entries[i].stats.Blocks > entries[j].stats.Blocks
+			if left.stats.Blocks != right.stats.Blocks {
+				return compareUint64Desc(left.stats.Blocks, right.stats.Blocks)
 			}
-			if entries[i].stats.Launches != entries[j].stats.Launches {
-				return entries[i].stats.Launches > entries[j].stats.Launches
+			if left.stats.Launches != right.stats.Launches {
+				return compareUint64Desc(left.stats.Launches, right.stats.Launches)
 			}
 		default:
-			if entries[i].stats.Launches != entries[j].stats.Launches {
-				return entries[i].stats.Launches > entries[j].stats.Launches
+			if left.stats.Launches != right.stats.Launches {
+				return compareUint64Desc(left.stats.Launches, right.stats.Launches)
 			}
-			if entries[i].stats.Blocks != entries[j].stats.Blocks {
-				return entries[i].stats.Blocks > entries[j].stats.Blocks
+			if left.stats.Blocks != right.stats.Blocks {
+				return compareUint64Desc(left.stats.Blocks, right.stats.Blocks)
 			}
 		}
-		return inferenceBenchmarkHIPKernelShapeLabel(entries[i]) < inferenceBenchmarkHIPKernelShapeLabel(entries[j])
+		return inferenceBenchmarkCompareHIPKernelShapeKey(left.inferenceBenchmarkHIPKernelShapeKey, right.inferenceBenchmarkHIPKernelShapeKey)
 	})
 	if len(entries) > limit {
 		entries = entries[:limit]
@@ -623,6 +1089,65 @@ func slicesDeleteFunc[S ~[]E, E any](s S, del func(E) bool) S {
 		s[j] = zero
 	}
 	return s[:i]
+}
+
+func compareUint64Desc(left, right uint64) int {
+	switch {
+	case left > right:
+		return -1
+	case left < right:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func compareUint32Asc(left, right uint32) int {
+	switch {
+	case left < right:
+		return -1
+	case left > right:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func inferenceBenchmarkCompareHIPKernelShapeKey(left, right inferenceBenchmarkHIPKernelShapeKey) int {
+	if cmp := strings.Compare(left.name, right.name); cmp != 0 {
+		return cmp
+	}
+	if cmp := compareUint32Asc(left.gridX, right.gridX); cmp != 0 {
+		return cmp
+	}
+	if cmp := compareUint32Asc(left.gridY, right.gridY); cmp != 0 {
+		return cmp
+	}
+	if cmp := compareUint32Asc(left.gridZ, right.gridZ); cmp != 0 {
+		return cmp
+	}
+	if cmp := compareUint32Asc(left.blockX, right.blockX); cmp != 0 {
+		return cmp
+	}
+	if cmp := compareUint32Asc(left.blockY, right.blockY); cmp != 0 {
+		return cmp
+	}
+	if cmp := compareUint32Asc(left.blockZ, right.blockZ); cmp != 0 {
+		return cmp
+	}
+	if cmp := compareUint32Asc(left.sharedMemBytes, right.sharedMemBytes); cmp != 0 {
+		return cmp
+	}
+	if cmp := compareUint32Asc(left.tensorRows, right.tensorRows); cmp != 0 {
+		return cmp
+	}
+	if cmp := compareUint32Asc(left.tensorCols, right.tensorCols); cmp != 0 {
+		return cmp
+	}
+	if cmp := compareUint32Asc(left.tensorGroup, right.tensorGroup); cmp != 0 {
+		return cmp
+	}
+	return compareUint32Asc(left.tensorBatch, right.tensorBatch)
 }
 
 func inferenceBenchmarkHIPKernelShapeLabel(entry inferenceBenchmarkHIPKernelShapeEntry) string {
@@ -646,20 +1171,22 @@ func inferenceBenchmarkHIPKernelShapeLabel(entry inferenceBenchmarkHIPKernelShap
 func inferenceBenchmarkHIPKernelTensorShape(config hipKernelLaunchConfig) (rows, cols, group, batch uint32) {
 	args := config.Args
 	switch config.Name {
-	case hipKernelNameMLXQ4Proj, hipKernelNameMLXQ4ProjCols256, hipKernelNameMLXQ4ProjGreedy, hipKernelNameMLXQ4ProjScores:
+	case hipKernelNameMLXQ4Proj, hipKernelNameMLXQ4ProjCols256, hipKernelNameMLXQ4ProjQ6Row16, hipKernelNameMLXQ4ProjQ6Row32, hipKernelNameMLXQ4ProjQ6Row64, hipKernelNameMLXQ4ProjGreedy, hipKernelNameMLXQ4ProjGreedyQ6Row64, hipKernelNameMLXQ4ProjScores, hipKernelNameMLXQ4ProjScoresQ6Row64:
 		return inferenceBenchmarkU32At(args, 48), inferenceBenchmarkU32At(args, 52), inferenceBenchmarkU32At(args, 56), 0
-	case hipKernelNameMLXQ4ProjBatch:
+	case hipKernelNameMLXQ4ProjGreedyBatch, hipKernelNameMLXQ4ProjGreedyBatchQ6Row64:
+		return inferenceBenchmarkU32At(args, 56), inferenceBenchmarkU32At(args, 60), inferenceBenchmarkU32At(args, 68), inferenceBenchmarkU32At(args, 64)
+	case hipKernelNameMLXQ4ProjBatch, hipKernelNameMLXQ4ProjBatchQ6Row16:
 		return inferenceBenchmarkU32At(args, 48), inferenceBenchmarkU32At(args, 52), inferenceBenchmarkU32At(args, 60), inferenceBenchmarkU32At(args, 56)
-	case hipKernelNameMLXQ4TripleProj, hipKernelNameMLXQ4PairProj:
+	case hipKernelNameMLXQ4TripleProj, hipKernelNameMLXQ4TripleProjQ6Row16, hipKernelNameMLXQ4TripleProjQ6Row64, hipKernelNameMLXQ4PairProj:
 		firstRows := inferenceBenchmarkU32At(args, 96)
 		secondRows := inferenceBenchmarkU32At(args, 100)
 		thirdRows := inferenceBenchmarkU32At(args, 104)
 		return firstRows + secondRows + thirdRows, inferenceBenchmarkU32At(args, 108), inferenceBenchmarkU32At(args, 112), 0
-	case hipKernelNameMLXQ4GELUTanhMul:
+	case hipKernelNameMLXQ4GELUTanhMul, hipKernelNameMLXQ4GELUTanhMulQ6Cols1536, hipKernelNameMLXQ4GELUTanhMulQ6Cols1536Row32, hipKernelNameMLXQ4GELUTanhMulQ6Cols1536Row64:
 		return inferenceBenchmarkU32At(args, 72), inferenceBenchmarkU32At(args, 76), inferenceBenchmarkU32At(args, 80), 0
 	case hipKernelNameMLXQ4GELUTanhMulBatch:
 		return inferenceBenchmarkU32At(args, 72), inferenceBenchmarkU32At(args, 76), inferenceBenchmarkU32At(args, 80), inferenceBenchmarkU32At(args, 120)
-	case hipKernelNameMLXQ4GELUTanhProj:
+	case hipKernelNameMLXQ4GELUTanhProj, hipKernelNameMLXQ4GELUTanhProjQ6Row16:
 		return inferenceBenchmarkU32At(args, 56), inferenceBenchmarkU32At(args, 60), inferenceBenchmarkU32At(args, 64), 0
 	case hipKernelNameMLXQ4GELUTanhProjBatch:
 		return inferenceBenchmarkU32At(args, 56), inferenceBenchmarkU32At(args, 60), inferenceBenchmarkU32At(args, 68), inferenceBenchmarkU32At(args, 64)
@@ -745,6 +1272,7 @@ func (inferenceBenchmarkHIPKernelCountingStubDriver) LaunchKernel(hipKernelLaunc
 
 func TestInferenceBenchmarkHIPKernelCountingDriver_Good(t *testing.T) {
 	driver := newInferenceBenchmarkHIPKernelCountingDriver(inferenceBenchmarkHIPKernelCountingStubDriver{})
+	driver.copySizesEnabled = true
 	err := driver.LaunchKernel(hipKernelLaunchConfig{
 		Name:   hipKernelNameAttentionHeadsBatchChunkedStage1,
 		Args:   []byte{1},
@@ -798,6 +1326,9 @@ func TestInferenceBenchmarkHIPKernelCountingDriver_Good(t *testing.T) {
 	if err := driver.CopyHostToDevice(pointer, []byte{1, 2, 3, 4}); err != nil {
 		t.Fatalf("CopyHostToDevice: %v", err)
 	}
+	if err := driver.CopyHostToDeviceLabeled(pointer, []byte{7, 8, 9}, "rocm.hip.Test", "labeled token copy"); err != nil {
+		t.Fatalf("CopyHostToDeviceLabeled: %v", err)
+	}
 	if err := driver.CopyHostToDeviceAsync(pointer, []byte{5, 6}); err != nil {
 		t.Fatalf("CopyHostToDeviceAsync: %v", err)
 	}
@@ -817,8 +1348,8 @@ func TestInferenceBenchmarkHIPKernelCountingDriver_Good(t *testing.T) {
 	if traffic.Mallocs != 1 ||
 		traffic.MallocBytes != 16 ||
 		traffic.Frees != 1 ||
-		traffic.HostToDeviceCopies != 2 ||
-		traffic.HostToDeviceBytes != 6 ||
+		traffic.HostToDeviceCopies != 3 ||
+		traffic.HostToDeviceBytes != 9 ||
 		traffic.DeviceToHostCopies != 2 ||
 		traffic.DeviceToHostBytes != 11 ||
 		traffic.Memsets != 1 ||
@@ -836,6 +1367,7 @@ func TestInferenceBenchmarkHIPKernelCountingDriver_Good(t *testing.T) {
 	if err := driver.Free(pointer); err != nil {
 		t.Fatalf("Free second pointer: %v", err)
 	}
+	driver.RecordDeviceAllocationLabel(32, "rocm.test.Alloc", "test buffer")
 	allocEntries := inferenceBenchmarkTopHIPAllocationSizeEntries(driver, 2)
 	if len(allocEntries) != 2 ||
 		allocEntries[0].size != 32 ||
@@ -846,9 +1378,129 @@ func TestInferenceBenchmarkHIPKernelCountingDriver_Good(t *testing.T) {
 		allocEntries[1].bytes != 16 {
 		t.Fatalf("allocation size entries = %+v, want 32-byte then 16-byte buckets", allocEntries)
 	}
+	copyEntries := inferenceBenchmarkTopHIPCopySizeEntries(driver.HostToDeviceSizeSnapshot(false), 3)
+	if len(copyEntries) != 3 ||
+		copyEntries[0].size != 4 ||
+		copyEntries[0].count != 1 ||
+		copyEntries[0].bytes != 4 ||
+		copyEntries[1].size != 3 ||
+		copyEntries[1].count != 1 ||
+		copyEntries[1].bytes != 3 ||
+		copyEntries[2].size != 2 ||
+		copyEntries[2].count != 1 ||
+		copyEntries[2].bytes != 2 {
+		t.Fatalf("H2D size entries = %+v, want 4-byte, 3-byte, then 2-byte buckets", copyEntries)
+	}
+	copyLabelEntries := inferenceBenchmarkTopHIPCopyLabelEntries(driver.HostToDeviceLabelSnapshot(), 4)
+	hasCopyLabel := false
+	for _, entry := range copyLabelEntries {
+		if entry.operation == "rocm.hip.Test" &&
+			entry.label == "labeled token copy" &&
+			entry.size == 3 &&
+			entry.count == 1 &&
+			entry.bytes == 3 {
+			hasCopyLabel = true
+			break
+		}
+	}
+	if !hasCopyLabel {
+		t.Fatalf("H2D label entries = %+v, want labeled 3-byte copy", copyLabelEntries)
+	}
 	entries := inferenceBenchmarkTopHIPKernelEntries(driver, 1, inferenceBenchmarkHIPKernelSortByBlocks)
 	if len(entries) != 1 || entries[0].name != hipKernelNameAttentionHeadsBatchChunkedStage1 {
 		t.Fatalf("top kernel entries = %+v, want %s", entries, hipKernelNameAttentionHeadsBatchChunkedStage1)
+	}
+	labelEntries := inferenceBenchmarkTopHIPAllocationLabelEntries(driver, 1)
+	if len(labelEntries) != 1 ||
+		labelEntries[0].operation != "rocm.test.Alloc" ||
+		labelEntries[0].label != "test buffer" ||
+		labelEntries[0].size != 32 ||
+		labelEntries[0].count != 1 ||
+		labelEntries[0].bytes != 32 {
+		t.Fatalf("allocation label entries = %+v, want labeled 32-byte allocation", labelEntries)
+	}
+	packedTopKArgs, err := (hipPackedTopKLaunchArgs{
+		InputPointer:  1,
+		OutputPointer: 2,
+		InputCount:    hipPackedTopKChunkSize,
+		OutputCount:   64,
+		TopK:          64,
+		ChunkSize:     hipPackedTopKChunkSize,
+		InputBytes:    hipPackedTopKChunkSize * hipMLXQ4ProjectionBestBytes,
+		OutputBytes:   64 * hipMLXQ4ProjectionBestBytes,
+	}).Binary()
+	if err != nil {
+		t.Fatalf("packed top-k args: %v", err)
+	}
+	err = driver.LaunchKernel(hipKernelLaunchConfig{
+		Name:   hipKernelNamePackedTopK,
+		Args:   packedTopKArgs,
+		GridX:  1,
+		GridY:  1,
+		GridZ:  1,
+		BlockX: hipPackedTopKBlockSize,
+		BlockY: 1,
+		BlockZ: 1,
+	})
+	if err != nil {
+		t.Fatalf("LaunchKernel packed top-k: %v", err)
+	}
+	orderedArgs, err := (hipOrderedEmbeddingCandidatesLaunchArgs{
+		TopKPointer:               4,
+		TokenOrderingPointer:      5,
+		OutputPointer:             6,
+		TopKCount:                 2,
+		NumCentroids:              2,
+		TokensPerCentroid:         4,
+		TokenOrderingElementBytes: 4,
+		TokenOrderingCount:        8,
+		OutputCount:               8,
+		TopKBytes:                 2 * hipMLXQ4ProjectionBestBytes,
+		TokenOrderingBytes:        8 * 4,
+		OutputBytes:               8 * 4,
+	}).Binary()
+	if err != nil {
+		t.Fatalf("ordered embedding candidates args: %v", err)
+	}
+	err = driver.LaunchKernel(hipKernelLaunchConfig{
+		Name:   hipKernelNameOrderedEmbeddingCandidates,
+		Args:   orderedArgs,
+		GridX:  1,
+		GridY:  1,
+		GridZ:  1,
+		BlockX: hipOrderedEmbeddingCandidatesBlockSize,
+		BlockY: 1,
+		BlockZ: 1,
+	})
+	if err != nil {
+		t.Fatalf("LaunchKernel ordered embedding candidates: %v", err)
+	}
+	packedTopKSampleArgs, err := (hipPackedTopKSampleLaunchArgs{
+		InputPointer:  2,
+		OutputPointer: 3,
+		InputCount:    64,
+		TopK:          64,
+		InputBytes:    64 * hipMLXQ4ProjectionBestBytes,
+		OutputBytes:   hipMLXQ4ProjectionBestBytes,
+		Temperature:   1,
+		TopP:          0.95,
+		Draw:          0.5,
+	}).Binary()
+	if err != nil {
+		t.Fatalf("packed top-k sample args: %v", err)
+	}
+	err = driver.LaunchKernel(hipKernelLaunchConfig{
+		Name:   hipKernelNamePackedTopKSample,
+		Args:   packedTopKSampleArgs,
+		GridX:  1,
+		GridY:  1,
+		GridZ:  1,
+		BlockX: 1,
+		BlockY: 1,
+		BlockZ: 1,
+	})
+	if err != nil {
+		t.Fatalf("LaunchKernel packed top-k sample: %v", err)
 	}
 	var builder strings.Builder
 	inferenceBenchmarkWriteHIPKernelRouteMetrics(&builder, driver, 1, 2)
@@ -857,8 +1509,14 @@ func TestInferenceBenchmarkHIPKernelCountingDriver_Good(t *testing.T) {
 		!strings.Contains(got, "Top Shapes By Launches") ||
 		!strings.Contains(got, hipKernelNameMLXQ4PairProj) ||
 		!strings.Contains(got, hipKernelNameAttentionHeadsBatchChunkedStage1) ||
+		!strings.Contains(got, hipKernelNamePackedTopK) ||
+		!strings.Contains(got, hipKernelNameOrderedEmbeddingCandidates) ||
+		!strings.Contains(got, hipKernelNamePackedTopKSample) ||
 		!strings.Contains(got, "2x3x4") ||
 		!strings.Contains(got, "Top Device Malloc Sizes") ||
+		!strings.Contains(got, "Top Device Malloc Labels") ||
+		!strings.Contains(got, "rocm.test.Alloc") ||
+		!strings.Contains(got, "test buffer") ||
 		!strings.Contains(got, "| 32 | 1 | 32 |") ||
 		!strings.Contains(got, "h2d_bytes") ||
 		!strings.Contains(got, "d2h_bytes") ||
@@ -1148,6 +1806,370 @@ func TestInferenceBenchmarkBookDecodeAttentionSplitDeltas_UsesAttentionDim(t *te
 	}
 }
 
+func TestInferenceBenchmarkGemma4ProductionModelPath_Good(t *testing.T) {
+	t.Setenv("GO_ROCM_MODEL_PATH", "/tmp/constrained-q4")
+	t.Setenv("GO_ROCM_PRODUCTION_MODEL_PATH", "")
+	if got := inferenceBenchmarkGemma4ProductionModelPath(); got != "/tmp/constrained-q4" {
+		t.Fatalf("production model path = %q, want GO_ROCM_MODEL_PATH fallback", got)
+	}
+	t.Setenv("GO_ROCM_PRODUCTION_MODEL_PATH", "/tmp/default-q6")
+	if got := inferenceBenchmarkGemma4ProductionModelPath(); got != "/tmp/default-q6" {
+		t.Fatalf("production model path = %q, want GO_ROCM_PRODUCTION_MODEL_PATH precedence", got)
+	}
+}
+
+func TestInferenceBenchmarkGemma4ProductionQuantTier_Good(t *testing.T) {
+	tier, ok := inferenceBenchmarkGemma4ProductionQuantTier(inference.ModelInfo{Architecture: "gemma4_text", QuantBits: 6})
+	if !ok || tier.Name != "default" || tier.Bits != 6 || !tier.ProductDefault || tier.ModelID != ProductionLaneCurrentModelID {
+		t.Fatalf("q6 production tier = %+v ok=%v, want product default", tier, ok)
+	}
+	tier, ok = inferenceBenchmarkGemma4ProductionQuantTier(inference.ModelInfo{Architecture: "gemma4_text", QuantBits: 4})
+	if !ok || tier.Name != "constrained" || !tier.ConstrainedOnly || !tier.ArchivedControl {
+		t.Fatalf("q4 production tier = %+v ok=%v, want constrained archived control", tier, ok)
+	}
+}
+
+func TestInferenceBenchmarkGemma4ProductionQuantPackSizeAware_Good(t *testing.T) {
+	e4bQ6 := inference.ModelInfo{Architecture: "gemma4_text", HiddenSize: 2304, NumLayers: 26, QuantBits: 6, QuantGroup: 64}
+	pack, ok := inferenceBenchmarkGemma4ProductionQuantPack(e4bQ6, "lmstudio-community/gemma-4-E4B-it-MLX-6bit")
+	if !ok || pack.Size != "E4B" || pack.Name != "e4b-6bit" || pack.ModelID != "lmstudio-community/gemma-4-E4B-it-MLX-6bit" || pack.GenerateStatus != Gemma4GenerateLinked {
+		t.Fatalf("E4B q6 benchmark pack = %+v ok=%v, want E4B linked q6 pack", pack, ok)
+	}
+	if tier, ok := inferenceBenchmarkGemma4ProductionQuantTierForPath(e4bQ6, "lmstudio-community/gemma-4-E4B-it-MLX-6bit"); ok || tier.ModelID != "" {
+		t.Fatalf("E4B q6 benchmark tier = %+v ok=%v, want no E2B production tier metrics from path-aware E4B pack", tier, ok)
+	}
+
+	run := inferenceBenchmarkBookRun{Turns: 10, GeneratedTokens: 200, Decode: 2 * time.Second, ArcAnchorHits: 5}
+	if metrics, ok := inferenceBenchmarkGemma4ProductionBookMetricsForRun(e4bQ6, run); !ok || metrics.ActiveWeightReadBytes != productionQuantizationActiveWeightReadBytes(6) {
+		t.Fatalf("pathless q6 book metrics = %+v ok=%v, want generic q6 tier metrics without shape-derived E4B inference", metrics, ok)
+	}
+
+	pack, ok = inferenceBenchmarkGemma4ProductionQuantPack(
+		inference.ModelInfo{Architecture: "gemma4_text"},
+		"lmstudio-community/gemma-4-31B-it-MLX-4bit",
+	)
+	if !ok || pack.Size != "31B" || pack.Name != "31b-4bit" || pack.QuantMode != "q4-status" || pack.GenerateStatus != Gemma4GeneratePlannedOnly || pack.RunnableOnCard {
+		t.Fatalf("31B q4 benchmark pack = %+v ok=%v, want status-only LMStudio pack", pack, ok)
+	}
+}
+
+func TestInferenceBenchmarkGemma4ProductionBookMetricsForRun_Good(t *testing.T) {
+	metrics, ok := inferenceBenchmarkGemma4ProductionBookMetricsForRun(
+		inference.ModelInfo{Architecture: "gemma4_text", QuantBits: 6},
+		inferenceBenchmarkBookRun{
+			Turns:           10,
+			GeneratedTokens: 200,
+			Decode:          2 * time.Second,
+			ArcAnchorHits:   5,
+			TurnStats: []inferenceBenchmarkBookTurnStat{
+				{Chapter: 1, GeneratedTokens: 100},
+				{Chapter: 2, GeneratedTokens: 100},
+			},
+		},
+	)
+
+	core.RequireTrue(t, ok)
+	core.AssertEqual(t, float64(100), metrics.RawDecodeTokensPerSec)
+	core.AssertEqual(t, uint64(1725000000), metrics.ActiveWeightReadBytes)
+	core.AssertEqual(t, float64(172500000000), metrics.MemoryBandwidthBytesPerSec)
+	core.AssertEqual(t, 0, metrics.LongOutputQualityFlags)
+	core.AssertEqual(t, uint64(575000000), metrics.StepDownWorkingSetBytes)
+	core.AssertEqual(t, 100, metrics.VisibleTokensPerSecTarget)
+	core.AssertEqual(t, 1, metrics.VisibleTokensPerSecAchieved)
+
+	metrics, ok = inferenceBenchmarkGemma4ProductionBookMetricsForRun(
+		inference.ModelInfo{Architecture: "gemma4_text", QuantBits: 6},
+		inferenceBenchmarkBookRun{
+			Turns:           10,
+			GeneratedTokens: 10,
+			Decode:          time.Second,
+			ArcAnchorHits:   2,
+			RepeatedTurns:   1,
+			TurnStats:       []inferenceBenchmarkBookTurnStat{{Chapter: 1, HitMaxTokens: true}},
+		},
+	)
+	core.RequireTrue(t, ok)
+	core.AssertEqual(t, 3, metrics.LongOutputQualityFlags)
+	core.AssertEqual(t, 0, metrics.VisibleTokensPerSecAchieved)
+}
+
+func TestInferenceBenchmarkValidateGemma4ProductionBookGate_Good(t *testing.T) {
+	run := inferenceBenchmarkBookRun{
+		Turns:           10,
+		GeneratedTokens: 1000,
+		Decode:          10 * time.Second,
+		Wall:            90 * time.Second,
+		ArcAnchorHits:   5,
+		TurnStats:       []inferenceBenchmarkBookTurnStat{{Chapter: 1, GeneratedTokens: 1000}},
+	}
+	err := inferenceBenchmarkValidateGemma4ProductionBookGate(inference.ModelInfo{Architecture: "gemma4_text", QuantBits: 6}, run)
+	core.RequireNoError(t, err)
+
+	badQuant := inferenceBenchmarkValidateGemma4ProductionBookGate(inference.ModelInfo{Architecture: "gemma4_text", QuantBits: 4}, run)
+	core.AssertError(t, badQuant)
+	core.AssertContains(t, badQuant.Error(), "requires q6")
+
+	badSpeed := run
+	badSpeed.GeneratedTokens = 99
+	badSpeed.Decode = time.Second
+	err = inferenceBenchmarkValidateGemma4ProductionBookGate(inference.ModelInfo{Architecture: "gemma4_text", QuantBits: 6}, badSpeed)
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "below 100 tok/s")
+
+	badQuality := run
+	badQuality.ArcAnchorHits = 2
+	err = inferenceBenchmarkValidateGemma4ProductionBookGate(inference.ModelInfo{Architecture: "gemma4_text", QuantBits: 6}, badQuality)
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "quality flags")
+
+	badWall := run
+	badWall.Wall = 111 * time.Second
+	err = inferenceBenchmarkValidateGemma4ProductionBookGate(inference.ModelInfo{Architecture: "gemma4_text", QuantBits: 6}, badWall)
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "exceeds 110s")
+}
+
+func TestInferenceBenchmarkGemma4ProductionBookGateDecision_Good(t *testing.T) {
+	run := inferenceBenchmarkBookRun{
+		Turns:           10,
+		GeneratedTokens: 1000,
+		Decode:          10 * time.Second,
+		Wall:            90 * time.Second,
+		ArcAnchorHits:   5,
+		TurnStats:       []inferenceBenchmarkBookTurnStat{{Chapter: 1, GeneratedTokens: 1000}},
+	}
+
+	decision := inferenceBenchmarkGemma4ProductionBookGateDecisionForRun(inference.ModelInfo{Architecture: "gemma4_text", QuantBits: 6}, run)
+
+	core.AssertEqual(t, true, decision.ProductionCandidate)
+	core.AssertEqual(t, inferenceBenchmarkProductionBookGateReasonPass, decision.ReasonCode)
+	core.AssertEqual(t, true, decision.QuantAccepted)
+	core.AssertEqual(t, true, decision.TurnsAccepted)
+	core.AssertEqual(t, true, decision.WallAccepted)
+	core.AssertEqual(t, true, decision.DecodeAccepted)
+	core.AssertEqual(t, true, decision.QualityAccepted)
+	core.AssertEqual(t, float64(100), decision.RawDecodeTokensPerSec)
+	core.AssertEqual(t, float64(90), decision.WallSeconds)
+}
+
+func TestInferenceBenchmarkGemma4ProductionBookGateDecision_Bad_ReasonCodes(t *testing.T) {
+	base := inferenceBenchmarkBookRun{
+		Turns:           10,
+		GeneratedTokens: 1000,
+		Decode:          10 * time.Second,
+		Wall:            90 * time.Second,
+		ArcAnchorHits:   5,
+		TurnStats:       []inferenceBenchmarkBookTurnStat{{Chapter: 1, GeneratedTokens: 1000}},
+	}
+
+	decision := inferenceBenchmarkGemma4ProductionBookGateDecisionForRun(inference.ModelInfo{Architecture: "gemma4_text", QuantBits: 4}, base)
+	core.AssertEqual(t, false, decision.ProductionCandidate)
+	core.AssertEqual(t, inferenceBenchmarkProductionBookGateReasonQuant, decision.ReasonCode)
+
+	badWall := base
+	badWall.Wall = 111 * time.Second
+	decision = inferenceBenchmarkGemma4ProductionBookGateDecisionForRun(inference.ModelInfo{Architecture: "gemma4_text", QuantBits: 6}, badWall)
+	core.AssertEqual(t, inferenceBenchmarkProductionBookGateReasonWall, decision.ReasonCode)
+
+	badDecode := base
+	badDecode.GeneratedTokens = 99
+	badDecode.Decode = time.Second
+	decision = inferenceBenchmarkGemma4ProductionBookGateDecisionForRun(inference.ModelInfo{Architecture: "gemma4_text", QuantBits: 6}, badDecode)
+	core.AssertEqual(t, inferenceBenchmarkProductionBookGateReasonDecode, decision.ReasonCode)
+
+	badQuality := base
+	badQuality.ArcAnchorHits = 2
+	decision = inferenceBenchmarkGemma4ProductionBookGateDecisionForRun(inference.ModelInfo{Architecture: "gemma4_text", QuantBits: 6}, badQuality)
+	core.AssertEqual(t, inferenceBenchmarkProductionBookGateReasonQuality, decision.ReasonCode)
+}
+
+func TestInferenceBenchmarkReportGemma4ProductionBookGateDecision_Good(t *testing.T) {
+	result := testing.Benchmark(func(b *testing.B) {
+		inferenceBenchmarkReportGemma4ProductionBookGateDecision(b, inferenceBenchmarkGemma4ProductionBookGateDecision{
+			ProductionCandidate:   true,
+			ReasonCode:            inferenceBenchmarkProductionBookGateReasonPass,
+			QuantAccepted:         true,
+			TurnsAccepted:         true,
+			WallAccepted:          true,
+			DecodeAccepted:        true,
+			QualityAccepted:       true,
+			RawDecodeTokensPerSec: 101,
+			WallSeconds:           89,
+			QualityFlags:          0,
+		})
+	})
+
+	core.AssertEqual(t, float64(1), result.Extra["production_book_gate_candidate"])
+	core.AssertEqual(t, float64(inferenceBenchmarkProductionBookGateReasonPass), result.Extra["production_book_gate_reason_code"])
+	core.AssertEqual(t, float64(1), result.Extra["production_book_gate_q6"])
+	core.AssertEqual(t, float64(1), result.Extra["production_book_gate_turns"])
+	core.AssertEqual(t, float64(1), result.Extra["production_book_gate_wall"])
+	core.AssertEqual(t, float64(1), result.Extra["production_book_gate_decode"])
+	core.AssertEqual(t, float64(1), result.Extra["production_book_gate_quality"])
+	core.AssertEqual(t, float64(101), result.Extra["production_book_gate_raw_decode_tok/s"])
+	core.AssertEqual(t, float64(89), result.Extra["production_book_gate_wall_s"])
+	core.AssertEqual(t, float64(0), result.Extra["production_book_gate_quality_flags"])
+	decision, err := EvaluateProductionBookGateMetrics(result.Extra)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, true, decision.ProductionCandidate)
+	core.AssertEqual(t, ProductionBookGateReasonPass, decision.ReasonCode)
+	core.AssertContains(t, decision.Reason, "passes q6 retained-state")
+}
+
+func TestInferenceBenchmarkReportProductionBookRetainedArtifact_Good(t *testing.T) {
+	result := testing.Benchmark(func(b *testing.B) {
+		inferenceBenchmarkReportBookRun(b, inferenceBenchmarkBookRun{
+			Turns:           10,
+			GeneratedTokens: 6500,
+			Decode:          65 * time.Second,
+			Wall:            90 * time.Second,
+			ArcAnchorHits:   3,
+		}, 48000, 8192, 30*time.Second, "retained")
+		inferenceBenchmarkReportGemma4ProductionBookGateDecision(b, inferenceBenchmarkGemma4ProductionBookGateDecision{
+			ProductionCandidate:   true,
+			ReasonCode:            ProductionBookGateReasonPass,
+			QuantAccepted:         true,
+			TurnsAccepted:         true,
+			WallAccepted:          true,
+			DecodeAccepted:        true,
+			QualityAccepted:       true,
+			RawDecodeTokensPerSec: 100,
+			WallSeconds:           90,
+			QualityFlags:          0,
+		})
+	})
+
+	decision, err := EvaluateProductionBookRetainedArtifactMetrics(result.Extra)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, true, decision.RetainedRoute)
+	core.AssertEqual(t, true, decision.Gate.ProductionCandidate)
+	core.AssertEqual(t, ProductionBookGateReasonPass, decision.Gate.ReasonCode)
+	labels, err := ProductionBookRetainedArtifactMetricDecisionLabels(result.Extra)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, "true", labels["production_book_retained_artifact_candidate"])
+	core.AssertEqual(t, "true", labels["production_book_retained_artifact_retained_route"])
+	core.AssertEqual(t, "0", labels["production_book_retained_artifact_gate_reason_code"])
+	core.AssertEqual(t, "100.000000", labels["production_book_retained_artifact_raw_decode_tok/s"])
+	core.RequireNoError(t, ValidateProductionBookRetainedArtifactDecisionLabels(labels))
+}
+
+func TestInferenceBenchmarkReportProductionBookRetainedArtifact_Bad_ReplayRouteRejected(t *testing.T) {
+	result := testing.Benchmark(func(b *testing.B) {
+		inferenceBenchmarkReportBookRun(b, inferenceBenchmarkBookRun{
+			Turns:           10,
+			GeneratedTokens: 6500,
+			Decode:          65 * time.Second,
+			Wall:            90 * time.Second,
+			ArcAnchorHits:   3,
+		}, 48000, 8192, 30*time.Second, "replay")
+		inferenceBenchmarkReportGemma4ProductionBookGateDecision(b, inferenceBenchmarkGemma4ProductionBookGateDecision{
+			ProductionCandidate:   true,
+			ReasonCode:            ProductionBookGateReasonPass,
+			QuantAccepted:         true,
+			TurnsAccepted:         true,
+			WallAccepted:          true,
+			DecodeAccepted:        true,
+			QualityAccepted:       true,
+			RawDecodeTokensPerSec: 100,
+			WallSeconds:           90,
+			QualityFlags:          0,
+		})
+	})
+
+	_, err := EvaluateProductionBookRetainedArtifactMetrics(result.Extra)
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "book_retained_state")
+	_, err = ProductionBookRetainedArtifactMetricDecisionLabels(result.Extra)
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "book_retained_state")
+}
+
+func TestInferenceBenchmarkReportBookRun_RetainedStateModeMetrics(t *testing.T) {
+	result := testing.Benchmark(func(b *testing.B) {
+		inferenceBenchmarkReportBookRun(b, inferenceBenchmarkBookRun{
+			Turns:           10,
+			GeneratedTokens: 6500,
+			Decode:          65 * time.Second,
+			Wall:            90 * time.Second,
+			ArcAnchorHits:   3,
+		}, 48000, 8192, 30*time.Second, "retained")
+	})
+
+	core.AssertEqual(t, float64(1), result.Extra["book_retained_state"])
+	core.AssertEqual(t, float64(1), result.Extra["book_retained_state_required"])
+	core.AssertEqual(t, float64(1), result.Extra["book_prompt_replay_fallback_forbidden"])
+	core.AssertEqual(t, float64(1), result.Extra["book_state_source_runtime_kv"])
+	core.AssertEqual(t, float64(0), result.Extra["book_replay_baseline"])
+	core.RequireNoError(t, ValidateProductionBookRetainedRouteMetrics(result.Extra))
+}
+
+func TestInferenceBenchmarkReportBookRun_ReplayBaselineModeMetrics(t *testing.T) {
+	result := testing.Benchmark(func(b *testing.B) {
+		inferenceBenchmarkReportBookRun(b, inferenceBenchmarkBookRun{
+			Turns:           10,
+			GeneratedTokens: 6500,
+			Decode:          65 * time.Second,
+			Wall:            90 * time.Second,
+			ArcAnchorHits:   3,
+		}, 48000, 8192, 30*time.Second, "replay")
+	})
+
+	core.AssertEqual(t, float64(1), result.Extra["book_replay_baseline"])
+	core.AssertEqual(t, float64(0), result.Extra["book_retained_state"])
+	core.AssertEqual(t, float64(0), result.Extra["book_retained_state_required"])
+	core.AssertEqual(t, float64(0), result.Extra["book_prompt_replay_fallback_forbidden"])
+	core.AssertEqual(t, float64(0), result.Extra["book_state_source_runtime_kv"])
+	core.AssertError(t, ValidateProductionBookRetainedRouteMetrics(result.Extra))
+}
+
+var (
+	inferenceBenchmarkProductionBookMetricsSink  inferenceBenchmarkGemma4ProductionBookMetrics
+	inferenceBenchmarkProductionBookGateSink     error
+	inferenceBenchmarkProductionBookDecisionSink inferenceBenchmarkGemma4ProductionBookGateDecision
+)
+
+func BenchmarkInferenceBenchmarkGemma4ProductionBookMetrics_Q6Accepted(b *testing.B) {
+	info := inference.ModelInfo{Architecture: "gemma4_text", QuantBits: 6}
+	run := inferenceBenchmarkBookRun{
+		Turns:           ProductionLaneBookTurnCount,
+		GeneratedTokens: 6500,
+		Decode:          65 * time.Second,
+		Wall:            90 * time.Second,
+		ArcAnchorHits:   5,
+		TurnStats: []inferenceBenchmarkBookTurnStat{
+			{Chapter: 1, GeneratedTokens: 650},
+			{Chapter: 10, GeneratedTokens: 650},
+		},
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		metrics, ok := inferenceBenchmarkGemma4ProductionBookMetricsForRun(info, run)
+		if !ok {
+			b.Fatal("production book metrics missing")
+		}
+		inferenceBenchmarkProductionBookMetricsSink = metrics
+	}
+}
+
+func BenchmarkInferenceBenchmarkValidateGemma4ProductionBookGate_Q6Accepted(b *testing.B) {
+	info := inference.ModelInfo{Architecture: "gemma4_text", QuantBits: 6}
+	run := inferenceBenchmarkBookRun{
+		Turns:           ProductionLaneBookTurnCount,
+		GeneratedTokens: 6500,
+		Decode:          65 * time.Second,
+		Wall:            90 * time.Second,
+		ArcAnchorHits:   5,
+		TurnStats:       []inferenceBenchmarkBookTurnStat{{Chapter: 10, GeneratedTokens: 650}},
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		inferenceBenchmarkProductionBookGateSink = inferenceBenchmarkValidateGemma4ProductionBookGate(info, run)
+		if inferenceBenchmarkProductionBookGateSink != nil {
+			b.Fatal(inferenceBenchmarkProductionBookGateSink)
+		}
+	}
+}
+
 func TestInferenceBenchmarkHIPKernelTensorShape_AttentionUsesChunkCount(t *testing.T) {
 	decodeArgs, err := (hipAttentionHeadsChunkedLaunchArgs{
 		QueryPointer:      1,
@@ -1188,6 +2210,7 @@ func TestInferenceBenchmarkHIPKernelTensorShape_AttentionUsesChunkCount(t *testi
 		TokenCount:        2049,
 		HeadCount:         8,
 		QueryCount:        3,
+		QueryStartToken:   2046,
 		ChunkSize:         64,
 		ChunkCount:        33,
 		QueryBytes:        256 * 8 * 3 * 4,
@@ -1210,6 +2233,43 @@ func TestInferenceBenchmarkHIPKernelTensorShape_AttentionUsesChunkCount(t *testi
 	}
 }
 
+func BenchmarkInferenceBenchmarkTopHIPKernelShapeEntries_SixtyFourShapes(b *testing.B) {
+	names := inferenceBenchmarkSelectedHIPKernelNames()
+	entries := make([]inferenceBenchmarkHIPKernelShapeEntry, 64)
+	for i := range entries {
+		entries[i] = inferenceBenchmarkHIPKernelShapeEntry{
+			inferenceBenchmarkHIPKernelShapeKey: inferenceBenchmarkHIPKernelShapeKey{
+				name:           names[i%len(names)],
+				gridX:          uint32(1 + i%17),
+				gridY:          uint32(1 + i%3),
+				gridZ:          1,
+				blockX:         uint32(128 + (i%3)*64),
+				blockY:         1,
+				blockZ:         1,
+				sharedMemBytes: uint32((i % 5) * 1024),
+				tensorRows:     uint32(256 + (i%8)*128),
+				tensorCols:     uint32(512 + (i%4)*256),
+				tensorGroup:    64,
+				tensorBatch:    uint32(i % 2),
+			},
+			stats: inferenceBenchmarkHIPKernelStats{
+				Launches: uint64(1 + i%11),
+				Blocks:   uint64(64 + i*13),
+			},
+		}
+	}
+	scratch := make([]inferenceBenchmarkHIPKernelShapeEntry, len(entries))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		copy(scratch, entries)
+		out := inferenceBenchmarkTopHIPKernelShapeEntriesFromEntries(scratch, 16, inferenceBenchmarkHIPKernelSortByBlocks)
+		if len(out) != 16 {
+			b.Fatalf("top shape entries = %d, want 16", len(out))
+		}
+	}
+}
+
 func BenchmarkInferenceGemma4Q4Generate(b *testing.B) {
 	benchmarkInferenceGemma4Q4Generate(b)
 }
@@ -1219,11 +2279,11 @@ func BenchmarkInferenceGemma4Q4Generate_Ladder(b *testing.B) {
 		b.Skip("set GO_ROCM_RUN_BENCHMARKS=1 to run ROCm inference benchmarks")
 	}
 	if os.Getenv("GO_ROCM_RUN_LADDER_BENCHMARKS") != "1" {
-		b.Skip("set GO_ROCM_RUN_LADDER_BENCHMARKS=1 to run the q4 generation performance ladder")
+		b.Skip("set GO_ROCM_RUN_LADDER_BENCHMARKS=1 to run the Gemma4 MLX affine generation performance ladder")
 	}
-	modelPath := os.Getenv("GO_ROCM_MODEL_PATH")
+	modelPath := inferenceBenchmarkGemma4ProductionModelPath()
 	if modelPath == "" {
-		b.Skip("set GO_ROCM_MODEL_PATH to a local Gemma4 q4 model pack")
+		b.Skip("set GO_ROCM_PRODUCTION_MODEL_PATH or GO_ROCM_MODEL_PATH to a local Gemma4 q6/q8/q4 MLX affine model pack")
 	}
 	contextLen, err := inferenceBenchmarkPositiveEnv("GO_ROCM_BENCH_CONTEXT_LEN", 128)
 	if err != nil {
@@ -1241,8 +2301,6 @@ func BenchmarkInferenceGemma4Q4Generate_Ladder(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Setenv("GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE", "1")
-
 	nativeRuntime, kernelCounter := inferenceBenchmarkNativeRuntimeAndKernelCounter()
 	model, err := newROCmBackendWithRuntime(nativeRuntime).LoadModel(modelPath, inference.WithContextLen(contextLen))
 	if err != nil {
@@ -1267,11 +2325,11 @@ func BenchmarkInferenceGemma4Q4PromptPrefillUBatchLadder(b *testing.B) {
 		b.Skip("set GO_ROCM_RUN_BENCHMARKS=1 to run ROCm inference benchmarks")
 	}
 	if os.Getenv("GO_ROCM_RUN_PREFILL_UBATCH_LADDER") != "1" {
-		b.Skip("set GO_ROCM_RUN_PREFILL_UBATCH_LADDER=1 to run the q4 prompt prefill ubatch ladder")
+		b.Skip("set GO_ROCM_RUN_PREFILL_UBATCH_LADDER=1 to run the Gemma4 MLX affine prompt prefill ubatch ladder")
 	}
-	modelPath := os.Getenv("GO_ROCM_MODEL_PATH")
+	modelPath := inferenceBenchmarkGemma4ProductionModelPath()
 	if modelPath == "" {
-		b.Skip("set GO_ROCM_MODEL_PATH to a local Gemma4 q4 model pack")
+		b.Skip("set GO_ROCM_PRODUCTION_MODEL_PATH or GO_ROCM_MODEL_PATH to a local Gemma4 q6/q8/q4 MLX affine model pack")
 	}
 	if os.Getenv("GO_ROCM_BENCH_PROMPT") == "" &&
 		os.Getenv("GO_ROCM_BENCH_PROMPT_FILE") == "" &&
@@ -1282,11 +2340,11 @@ func BenchmarkInferenceGemma4Q4PromptPrefillUBatchLadder(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	maxTokens, err := inferenceBenchmarkPositiveEnv("GO_ROCM_BENCH_TOKENS", 1)
+	benchPrompt, err := inferenceBenchmarkPromptFromEnv()
 	if err != nil {
 		b.Fatal(err)
 	}
-	benchPrompt, err := inferenceBenchmarkPromptFromEnv()
+	maxTokens, err := inferenceBenchmarkGemma4MaxTokensEnv(benchPrompt, contextLen)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -1294,8 +2352,6 @@ func BenchmarkInferenceGemma4Q4PromptPrefillUBatchLadder(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Setenv("GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE", "1")
-
 	nativeRuntime, kernelCounter := inferenceBenchmarkNativeRuntimeAndKernelCounter()
 	model, err := newROCmBackendWithRuntime(nativeRuntime).LoadModel(modelPath, inference.WithContextLen(contextLen))
 	if err != nil {
@@ -1306,7 +2362,6 @@ func BenchmarkInferenceGemma4Q4PromptPrefillUBatchLadder(b *testing.B) {
 	for _, ubatchTokens := range ubatchSizes {
 		ubatchTokens := ubatchTokens
 		b.Run(fmt.Sprintf("ubatch_%d", ubatchTokens), func(b *testing.B) {
-			b.Setenv(hipGemma4Q4PrefillUBatchEnv, strconv.Itoa(ubatchTokens))
 			if kernelCounter != nil {
 				kernelCounter.ResetKernelStats()
 			}
@@ -1360,8 +2415,6 @@ func BenchmarkInferenceGemma4Q4Book10Turn_ReplayBaseline(b *testing.B) {
 	workload := inferenceBenchmarkBookWorkload()
 	model, _, _ := inferenceBenchmarkLoadGemma4Q4Model(b, contextLen, 1)
 	defer inferenceBenchmarkCloseModel(b, model)
-	b.Setenv("GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE", "1")
-
 	b.ReportAllocs()
 	b.ResetTimer()
 	var last inferenceBenchmarkBookRun
@@ -1426,7 +2479,6 @@ func BenchmarkInferenceGemma4Q4Book10Turn_RetainedState(b *testing.B) {
 	workload := inferenceBenchmarkBookWorkload()
 	model, loaded, cfg, kernelCounter := inferenceBenchmarkLoadGemma4Q4ModelWithKernelCounter(b, contextLen, layerCount)
 	defer inferenceBenchmarkCloseModel(b, model)
-	b.Setenv("GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE", "1")
 	warmupPromptTokens := inferenceBenchmarkRunBookWarmupPrefill(b, loaded, cfg)
 
 	b.ReportAllocs()
@@ -1436,11 +2488,13 @@ func BenchmarkInferenceGemma4Q4Book10Turn_RetainedState(b *testing.B) {
 		if kernelCounter != nil {
 			kernelCounter.ResetKernelStats()
 		}
-		run, err := inferenceBenchmarkRunBookRetained(context.Background(), loaded, cfg, workload, generate, turns, turnTimeout, kernelCounter)
+		run, err := inferenceBenchmarkRunBookRetained(context.Background(), loaded, cfg, workload, generate, turns, turnTimeout, prefillUBatchTokens, kernelCounter)
 		if err != nil {
 			b.StopTimer()
 			inferenceBenchmarkMaybeWriteBookOutput(b, run, "retained", kernelCounter)
 			inferenceBenchmarkReportBookRun(b, run, contextLen, generate.MaxTokens, turnTimeout, "retained")
+			inferenceBenchmarkReportGemma4ProductionBookMetrics(b, loaded.modelInfo, run)
+			inferenceBenchmarkReportGemma4ProductionBookGateDecision(b, inferenceBenchmarkGemma4ProductionBookGateDecisionForRun(loaded.modelInfo, run))
 			inferenceBenchmarkReportHIPKernelRouteMetrics(b, kernelCounter)
 			inferenceBenchmarkReportHIPKernelGeneratedTokenMetrics(b, kernelCounter, run.GeneratedTokens)
 			b.Fatalf("book retained workload: %v", err)
@@ -1450,6 +2504,8 @@ func BenchmarkInferenceGemma4Q4Book10Turn_RetainedState(b *testing.B) {
 	b.StopTimer()
 	inferenceBenchmarkMaybeWriteBookOutput(b, last, "retained", kernelCounter)
 	inferenceBenchmarkReportBookRun(b, last, contextLen, generate.MaxTokens, turnTimeout, "retained")
+	inferenceBenchmarkReportGemma4ProductionBookMetrics(b, loaded.modelInfo, last)
+	inferenceBenchmarkReportGemma4ProductionBookGateDecision(b, inferenceBenchmarkGemma4ProductionBookGateDecisionForRun(loaded.modelInfo, last))
 	inferenceBenchmarkReportHIPKernelRouteMetrics(b, kernelCounter)
 	inferenceBenchmarkReportHIPKernelGeneratedTokenMetrics(b, kernelCounter, last.GeneratedTokens)
 	b.ReportMetric(float64(generate.Temperature), "book_temperature")
@@ -1466,6 +2522,7 @@ func BenchmarkInferenceGemma4Q4Book10Turn_RetainedState(b *testing.B) {
 		b.ReportMetric(float64(warmupPromptTokens), "book_warmup_prompt_tokens")
 	}
 	inferenceBenchmarkRequireBookThresholds(b, last)
+	inferenceBenchmarkRequireGemma4ProductionBookGate(b, loaded.modelInfo, last)
 	if os.Getenv("GO_ROCM_BOOK_REQUIRE_ARC") == "1" && last.Turns >= 10 && last.ArcAnchorHits < 3 {
 		b.Fatalf("chapter 10 anchor hits = %d, want lighthouse/light/ocean arc retained", last.ArcAnchorHits)
 	}
@@ -1708,6 +2765,7 @@ type inferenceBenchmarkBookTurnKernelStat struct {
 type inferenceBenchmarkGemma4Q4RetainedBookSession struct {
 	model              *hipLoadedModel
 	cfg                hipGemma4Q4ForwardConfig
+	engineConfig       hipGemma4Q4EngineConfig
 	mode               string
 	position           int
 	hostState          hipGemma4Q4DecodeState
@@ -1715,6 +2773,8 @@ type inferenceBenchmarkGemma4Q4RetainedBookSession struct {
 	finalGreedyBuffer  *hipDeviceByteBuffer
 	attentionWorkspace *hipAttentionHeadsChunkedWorkspace
 	priorLayerKV       []*rocmDeviceKVCache
+	priorLayerDesc     []*rocmDeviceKVDescriptorTable
+	prefillPlanBatches []hipGemma4Q4PrefillUBatch
 }
 
 type inferenceBenchmarkGemma4Q4RetainedTurn struct {
@@ -1746,7 +2806,7 @@ func inferenceBenchmarkBookWorkload() inferenceBenchmarkBookWorkloadSpec {
 	}
 }
 
-func inferenceBenchmarkRunBookRetained(ctx context.Context, model *hipLoadedModel, cfg hipGemma4Q4ForwardConfig, workload inferenceBenchmarkBookWorkloadSpec, generate inference.GenerateConfig, turns int, turnTimeout time.Duration, kernelCounter *inferenceBenchmarkHIPKernelCountingDriver) (inferenceBenchmarkBookRun, error) {
+func inferenceBenchmarkRunBookRetained(ctx context.Context, model *hipLoadedModel, cfg hipGemma4Q4ForwardConfig, workload inferenceBenchmarkBookWorkloadSpec, generate inference.GenerateConfig, turns int, turnTimeout time.Duration, prefillUBatchTokens int, kernelCounter *inferenceBenchmarkHIPKernelCountingDriver) (inferenceBenchmarkBookRun, error) {
 	if model == nil {
 		return inferenceBenchmarkBookRun{}, fmt.Errorf("retained book workload model is nil")
 	}
@@ -1756,7 +2816,9 @@ func inferenceBenchmarkRunBookRetained(ctx context.Context, model *hipLoadedMode
 	if turns <= 0 || turns > 10 {
 		return inferenceBenchmarkBookRun{}, fmt.Errorf("retained book workload turns=%d, want 1..10", turns)
 	}
-	session, err := newInferenceBenchmarkGemma4Q4RetainedBookSession(model, cfg)
+	engineConfig := defaultHIPGemma4Q4EngineConfig()
+	engineConfig.PrefillUBatchTokens = prefillUBatchTokens
+	session, err := newInferenceBenchmarkGemma4Q4RetainedBookSession(model, cfg, engineConfig)
 	if err != nil {
 		return inferenceBenchmarkBookRun{}, err
 	}
@@ -1765,6 +2827,9 @@ func inferenceBenchmarkRunBookRetained(ctx context.Context, model *hipLoadedMode
 	var run inferenceBenchmarkBookRun
 	for chapter := 1; chapter <= turns; chapter++ {
 		prompt := inferenceBenchmarkBookRetainedTurnChatPrompt(workload, chapter)
+		if err := inferenceBenchmarkValidateRetainedBookTurnPrompt(workload, chapter, prompt); err != nil {
+			return inferenceBenchmarkFinalizeFailedBookRun(run, time.Since(start), err), err
+		}
 		turnCtx := ctx
 		cancel := func() {}
 		if turnTimeout > 0 {
@@ -1961,15 +3026,18 @@ func inferenceBenchmarkRetainedBookMemory(model *hipLoadedModel, session *infere
 	return active, peak
 }
 
-func newInferenceBenchmarkGemma4Q4RetainedBookSession(model *hipLoadedModel, cfg hipGemma4Q4ForwardConfig) (*inferenceBenchmarkGemma4Q4RetainedBookSession, error) {
+func newInferenceBenchmarkGemma4Q4RetainedBookSession(model *hipLoadedModel, cfg hipGemma4Q4ForwardConfig, engineConfig hipGemma4Q4EngineConfig) (*inferenceBenchmarkGemma4Q4RetainedBookSession, error) {
 	if model == nil {
 		return nil, fmt.Errorf("retained book session model is nil")
 	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	mode, err := hipGemma4Q4GenerateDeviceKVMode()
+	mode, err := engineConfig.deviceKVMode()
 	if err != nil {
+		return nil, err
+	}
+	if _, err := engineConfig.prefillUBatchTokens(); err != nil {
 		return nil, err
 	}
 	buffer, err := hipAllocateByteBuffer(model.driver, "rocm.hip.Gemma4Q4BookBenchmark", "Gemma4 q4 retained book final greedy result", hipMLXQ4ProjectionBestBytes, 1)
@@ -1979,6 +3047,7 @@ func newInferenceBenchmarkGemma4Q4RetainedBookSession(model *hipLoadedModel, cfg
 	return &inferenceBenchmarkGemma4Q4RetainedBookSession{
 		model:             model,
 		cfg:               cfg,
+		engineConfig:      engineConfig,
 		mode:              mode,
 		finalGreedyBuffer: buffer,
 	}, nil
@@ -1995,13 +3064,19 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Close() error {
 	if err := session.finalGreedyBuffer.Close(); err != nil {
 		lastErr = err
 	}
-	if err := session.attentionWorkspace.Close(); err != nil {
+	if err := hipRecycleAttentionHeadsChunkedWorkspace(session.attentionWorkspace); err != nil {
 		lastErr = err
 	}
 	session.deviceState = nil
 	session.finalGreedyBuffer = nil
 	session.attentionWorkspace = nil
 	return lastErr
+}
+
+func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) ensureAttentionWorkspace() {
+	if session != nil && session.attentionWorkspace == nil {
+		session.attentionWorkspace = hipBorrowAttentionHeadsChunkedWorkspace()
+	}
 }
 
 func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx context.Context, prompt string, generate inference.GenerateConfig, kernelCounter *inferenceBenchmarkHIPKernelCountingDriver) (inferenceBenchmarkGemma4Q4RetainedTurn, error) {
@@ -2024,13 +3099,19 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 	if len(generate.StopTokens) == 0 {
 		generate.StopTokens = hipGemma4Q4DefaultStopTokenIDs(session.model)
 	}
-	if session.attentionWorkspace == nil && hipGemma4Q4ChunkedAttentionEnabled(session.position+len(promptTokens)) {
-		session.attentionWorkspace = &hipAttentionHeadsChunkedWorkspace{}
-	}
 	suppressTokens := hipGemma4Q4GenerationSuppressTokenIDs(session.model, generate.StopTokens)
 	hostSampling := hipGemma4Q4HostSamplingRequested(generate)
+	deviceTopKSampling := hipGemma4Q4DeviceTopKSamplingRequested(generate)
 	deviceCandidateSampling := hipGemma4Q4DeviceCandidateSamplingRequested(generate)
-	ubatchTokens, err := hipGemma4Q4PrefillUBatchTokens()
+	if session.attentionWorkspace == nil && session.engineConfig.attentionWorkspaceNeeded(session.position+len(promptTokens), generate) {
+		session.ensureAttentionWorkspace()
+	}
+	if session.attentionWorkspace != nil {
+		if err := hipGemma4Q4EnsureAttentionWorkspaceDecodeCapacity(session.model.driver, session.attentionWorkspace, session.cfg, session.position+len(promptTokens)+generate.MaxTokens); err != nil {
+			return inferenceBenchmarkGemma4Q4RetainedTurn{}, err
+		}
+	}
+	ubatchTokens, err := session.engineConfig.prefillUBatchTokens()
 	if err != nil {
 		return inferenceBenchmarkGemma4Q4RetainedTurn{}, err
 	}
@@ -2038,17 +3119,28 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 	finalPromptToken := promptTokens[len(promptTokens)-1]
 	if len(promptTokens) > 1 {
 		prefixTokens := promptTokens[:len(promptTokens)-1]
-		prefillPlan, err := hipGemma4Q4PlanPromptPrefill(prefixTokens, session.position, ubatchTokens)
+		var prefillPlan hipGemma4Q4PrefillPlan
+		prefillPlan, session.prefillPlanBatches, err = hipGemma4Q4PlanPromptPrefillInto(prefixTokens, session.position, ubatchTokens, session.prefillPlanBatches)
 		if err != nil {
 			return inferenceBenchmarkGemma4Q4RetainedTurn{}, err
 		}
-		for _, ubatch := range prefillPlan.Batches {
+		if session.attentionWorkspace == nil {
+			session.ensureAttentionWorkspace()
+		}
+		if err := hipGemma4Q4EnsureAttentionWorkspacePrefillCapacity(session.model.driver, session.attentionWorkspace, session.cfg, prefillPlan, true); err != nil {
+			return inferenceBenchmarkGemma4Q4RetainedTurn{}, err
+		}
+		for batchIndex := 0; batchIndex < prefillPlan.LenBatches(); batchIndex++ {
+			ubatch := prefillPlan.Batch(batchIndex)
 			priorLayerKV := []*rocmDeviceKVCache(nil)
+			priorLayerDescriptorTables := []*rocmDeviceKVDescriptorTable(nil)
 			if session.deviceState != nil {
 				session.priorLayerKV = hipGemma4Q4DeviceLayerCaches(session.deviceState, session.priorLayerKV, len(session.cfg.Layers))
 				priorLayerKV = session.priorLayerKV
+				session.priorLayerDesc = hipGemma4Q4DeviceLayerDescriptorTables(session.deviceState, session.priorLayerDesc, len(session.cfg.Layers))
+				priorLayerDescriptorTables = session.priorLayerDesc
 			}
-			forward, err := hipRunGemma4Q4PrefillForwardBatchWithPrior(ctx, session.model.driver, session.cfg, ubatch.Tokens, ubatch.Position, 1e-6, session.mode, priorLayerKV, nil, nil, nil)
+			forward, err := hipRunGemma4Q4PrefillForwardBatchWithPriorDescriptorWorkspaceOutputRowWithEngineConfig(ctx, session.model.driver, session.cfg, ubatch.Tokens, ubatch.Position, 1e-6, session.mode, priorLayerKV, priorLayerDescriptorTables, nil, nil, -1, nil, session.attentionWorkspace, session.engineConfig)
 			if err != nil {
 				return inferenceBenchmarkGemma4Q4RetainedTurn{}, err
 			}
@@ -2071,23 +3163,32 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 		}
 		session.position = prefillPlan.NextPosition()
 	}
+	finalSampleDraw := 0.0
+	if deviceTopKSampling {
+		finalSampleDraw = rand.Float64()
+	}
 	finalForward, nextHostState, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx, session.model.driver, session.cfg, session.hostState, hipGemma4Q4ForwardRequest{
-		TokenID:             finalPromptToken,
-		Position:            session.position,
-		Epsilon:             1e-6,
-		DeviceKVAttention:   true,
-		DeviceKVMode:        session.mode,
-		PriorDeviceState:    session.deviceState,
-		ReturnDeviceState:   true,
-		DeviceFinalSample:   !hostSampling,
-		DeviceFinalScores:   deviceCandidateSampling,
-		FinalCandidateCount: generate.TopK,
-		FinalGreedyBuffer:   session.finalGreedyBuffer,
-		SuppressTokens:      suppressTokens,
-		AttentionWorkspace:  session.attentionWorkspace,
-		OmitDebugTensors:    true,
-		OmitLabels:          true,
-		OmitHostState:       true,
+		TokenID:               finalPromptToken,
+		Position:              session.position,
+		Epsilon:               1e-6,
+		DeviceKVAttention:     true,
+		DeviceKVMode:          session.mode,
+		EngineConfig:          session.engineConfig,
+		PriorDeviceState:      session.deviceState,
+		ReturnDeviceState:     true,
+		DeviceFinalSample:     !hostSampling,
+		DeviceFinalScores:     deviceCandidateSampling,
+		DeviceFinalTopKSample: deviceTopKSampling,
+		FinalCandidateCount:   generate.TopK,
+		FinalTemperature:      generate.Temperature,
+		FinalTopP:             generate.TopP,
+		FinalDraw:             finalSampleDraw,
+		FinalGreedyBuffer:     session.finalGreedyBuffer,
+		SuppressTokens:        suppressTokens,
+		AttentionWorkspace:    session.attentionWorkspace,
+		OmitDebugTensors:      true,
+		OmitLabels:            true,
+		OmitHostState:         true,
 	}, false)
 	if err != nil {
 		return inferenceBenchmarkGemma4Q4RetainedTurn{}, err
@@ -2096,9 +3197,10 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 		return inferenceBenchmarkGemma4Q4RetainedTurn{}, fmt.Errorf("retained book final prompt token did not return device KV state")
 	}
 	current := finalForward.Greedy
+	currentDevice := finalForward.GreedyDevice
 	var history []int32
 	trackHistory := hipGemma4Q4RepeatHistoryRequired(generate)
-	if hostSampling {
+	if hostSampling && !deviceTopKSampling {
 		if len(finalForward.Candidates) > 0 {
 			current, err = hipGemma4Q4HostSampleSortedCandidateResultWorkspace(finalForward.Candidates, generate, history, rand.Float64(), session.attentionWorkspace)
 		} else {
@@ -2107,6 +3209,7 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 		if err != nil {
 			return inferenceBenchmarkGemma4Q4RetainedTurn{}, err
 		}
+		currentDevice = nil
 	}
 	session.hostState = nextHostState
 	previousDeviceState := session.deviceState
@@ -2119,6 +3222,7 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 	decodeKernelBefore := inferenceBenchmarkBookKernelSnapshot(kernelCounter)
 	decodeStart := time.Now()
 	var text strings.Builder
+	inferenceBenchmarkGrowRetainedBookText(&text, generate.MaxTokens)
 	generatedCount := 0
 	if trackHistory {
 		history = make([]int32, 0, generate.MaxTokens)
@@ -2136,24 +3240,34 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 			history = append(history, tokenID)
 		}
 		generatedCount++
+		sampleDraw := 0.0
+		if deviceTopKSampling && generated+1 < generate.MaxTokens {
+			sampleDraw = rand.Float64()
+		}
 		request := hipGemma4Q4ForwardRequest{
-			TokenID:             tokenID,
-			Position:            session.position,
-			Epsilon:             1e-6,
-			DeviceKVAttention:   true,
-			DeviceKVMode:        session.mode,
-			PriorDeviceState:    session.deviceState,
-			ReturnDeviceState:   true,
-			DeviceFinalSample:   !hostSampling && generated+1 < generate.MaxTokens,
-			DeviceFinalScores:   deviceCandidateSampling && generated+1 < generate.MaxTokens,
-			FinalCandidateCount: generate.TopK,
-			SkipFinalSample:     generated+1 == generate.MaxTokens,
-			FinalGreedyBuffer:   session.finalGreedyBuffer,
-			SuppressTokens:      suppressTokens,
-			AttentionWorkspace:  session.attentionWorkspace,
-			OmitDebugTensors:    true,
-			OmitLabels:          true,
-			OmitHostState:       true,
+			TokenID:               tokenID,
+			Position:              session.position,
+			Epsilon:               1e-6,
+			DeviceKVAttention:     true,
+			DeviceKVMode:          session.mode,
+			EngineConfig:          session.engineConfig,
+			PriorDeviceState:      session.deviceState,
+			ReturnDeviceState:     true,
+			DeviceFinalSample:     !hostSampling && generated+1 < generate.MaxTokens,
+			DeviceFinalScores:     deviceCandidateSampling && generated+1 < generate.MaxTokens,
+			DeviceFinalTopKSample: deviceTopKSampling && generated+1 < generate.MaxTokens,
+			FinalCandidateCount:   generate.TopK,
+			FinalTemperature:      generate.Temperature,
+			FinalTopP:             generate.TopP,
+			FinalDraw:             sampleDraw,
+			SkipFinalSample:       generated+1 == generate.MaxTokens,
+			FinalGreedyBuffer:     session.finalGreedyBuffer,
+			TokenIDDeviceBuffer:   currentDevice,
+			SuppressTokens:        suppressTokens,
+			AttentionWorkspace:    session.attentionWorkspace,
+			OmitDebugTensors:      true,
+			OmitLabels:            true,
+			OmitHostState:         true,
 		}
 		forward, nextHostState, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx, session.model.driver, session.cfg, session.hostState, request, false)
 		if err != nil {
@@ -2169,7 +3283,8 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 		hipReleaseClosedGemma4Q4DeviceDecodeState(previousDeviceState)
 		if generated+1 < generate.MaxTokens {
 			current = forward.Greedy
-			if hostSampling {
+			currentDevice = forward.GreedyDevice
+			if hostSampling && !deviceTopKSampling {
 				if len(forward.Candidates) > 0 {
 					current, err = hipGemma4Q4HostSampleSortedCandidateResultWorkspace(forward.Candidates, generate, history, rand.Float64(), session.attentionWorkspace)
 				} else {
@@ -2178,6 +3293,7 @@ func (session *inferenceBenchmarkGemma4Q4RetainedBookSession) Generate(ctx conte
 				if err != nil {
 					return inferenceBenchmarkGemma4Q4RetainedTurn{}, err
 				}
+				currentDevice = nil
 			}
 		}
 		session.position++
@@ -2215,6 +3331,19 @@ func inferenceBenchmarkBookTurnPrompt(workload inferenceBenchmarkBookWorkloadSpe
 	}
 	builder.WriteString(inferenceBenchmarkBookContinuationInstruction(chapter, false))
 	return builder.String()
+}
+
+func inferenceBenchmarkGrowRetainedBookText(builder *strings.Builder, maxTokens int) {
+	if builder == nil || maxTokens <= 0 {
+		return
+	}
+	const charsPerTokenEstimate = 4
+	const maxReserveBytes = 8 << 10
+	reserve := maxTokens * charsPerTokenEstimate
+	if reserve > maxReserveBytes {
+		reserve = maxReserveBytes
+	}
+	builder.Grow(reserve)
 }
 
 func inferenceBenchmarkBookRetainedTurnPrompt(workload inferenceBenchmarkBookWorkloadSpec, chapter int) string {
@@ -2260,6 +3389,31 @@ func inferenceBenchmarkBookRetainedTurnChatPrompt(workload inferenceBenchmarkBoo
 		return "<bos><|turn>user\n" + strings.TrimSpace(prompt) + "<turn|>\n<|turn>model\n"
 	}
 	return "<turn|>\n<|turn>user\n" + strings.TrimSpace(prompt) + "<turn|>\n<|turn>model\n"
+}
+
+func inferenceBenchmarkValidateRetainedBookTurnPrompt(workload inferenceBenchmarkBookWorkloadSpec, chapter int, prompt string) error {
+	if chapter <= 1 {
+		if !strings.Contains(prompt, workload.Seed.ID) {
+			return fmt.Errorf("retained chapter 1 prompt must include seed prompt id")
+		}
+		return nil
+	}
+	if strings.Contains(prompt, "Book so far") || strings.Contains(prompt, "## Chapter ") {
+		return fmt.Errorf("retained chapter %d prompt must not replay manuscript text", chapter)
+	}
+	if strings.Contains(prompt, workload.Seed.ID) || strings.Contains(prompt, workload.Seed.Prompt) {
+		return fmt.Errorf("retained chapter %d prompt must not replay seed prompt", chapter)
+	}
+	for index, distractor := range workload.Distractors {
+		distractorChapter := index + 2
+		if distractorChapter >= chapter {
+			continue
+		}
+		if strings.Contains(prompt, distractor.ID) || strings.Contains(prompt, distractor.Prompt) {
+			return fmt.Errorf("retained chapter %d prompt must not replay prior distractor %s", chapter, distractor.ID)
+		}
+	}
+	return nil
 }
 
 func inferenceBenchmarkBookArcAnchorHits(text string) int {
@@ -2396,6 +3550,11 @@ func inferenceBenchmarkMaybeWriteBookOutput(b *testing.B, run inferenceBenchmark
 		builder.WriteString("\n\n")
 		builder.WriteString(chapter)
 		builder.WriteString("\n\n")
+	}
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			b.Fatalf("create GO_ROCM_BOOK_OUTPUT_FILE dir %q: %v", dir, err)
+		}
 	}
 	if err := os.WriteFile(path, []byte(builder.String()), 0644); err != nil {
 		b.Fatalf("write GO_ROCM_BOOK_OUTPUT_FILE=%q: %v", path, err)
@@ -2700,23 +3859,32 @@ func inferenceBenchmarkWriteHIPKernelRouteMetrics(builder *strings.Builder, driv
 	builder.WriteString(strconv.FormatUint(traffic.HostToDeviceCopies, 10))
 	builder.WriteString("\n- h2d_bytes: ")
 	builder.WriteString(strconv.FormatUint(traffic.HostToDeviceBytes, 10))
+	builder.WriteString("\n- h2d_seconds: ")
+	builder.WriteString(strconv.FormatFloat(traffic.HostToDeviceDuration.Seconds(), 'f', 6, 64))
 	builder.WriteString("\n- h2d_async_copies: ")
 	builder.WriteString(strconv.FormatUint(traffic.HostToDeviceAsync, 10))
 	builder.WriteString("\n- h2d_async_bytes: ")
 	builder.WriteString(strconv.FormatUint(traffic.HostToDeviceAsyncBytes, 10))
+	builder.WriteString("\n- h2d_async_seconds: ")
+	builder.WriteString(strconv.FormatFloat(traffic.HostToDeviceAsyncDuration.Seconds(), 'f', 6, 64))
 	builder.WriteString("\n- d2h_copies: ")
 	builder.WriteString(strconv.FormatUint(traffic.DeviceToHostCopies, 10))
 	builder.WriteString("\n- d2h_bytes: ")
 	builder.WriteString(strconv.FormatUint(traffic.DeviceToHostBytes, 10))
+	builder.WriteString("\n- d2h_seconds: ")
+	builder.WriteString(strconv.FormatFloat(traffic.DeviceToHostDuration.Seconds(), 'f', 6, 64))
 	builder.WriteString("\n- device_memsets: ")
 	builder.WriteString(strconv.FormatUint(traffic.Memsets, 10))
 	builder.WriteString("\n- device_memset_bytes: ")
 	builder.WriteString(strconv.FormatUint(traffic.MemsetBytes, 10))
+	builder.WriteString("\n- device_memset_seconds: ")
+	builder.WriteString(strconv.FormatFloat(traffic.MemsetDuration.Seconds(), 'f', 6, 64))
 	builder.WriteString("\n\n")
 	inferenceBenchmarkWriteHIPKernelRouteTable(builder, "Selected Hot Kernels", inferenceBenchmarkSelectedHIPKernelEntries(driver), generatedTokens)
 	inferenceBenchmarkWriteHIPKernelRouteTable(builder, "Top By Launches", inferenceBenchmarkTopHIPKernelEntries(driver, limit, inferenceBenchmarkHIPKernelSortByLaunches), generatedTokens)
 	inferenceBenchmarkWriteHIPKernelRouteTable(builder, "Top By Blocks", inferenceBenchmarkTopHIPKernelEntries(driver, limit, inferenceBenchmarkHIPKernelSortByBlocks), generatedTokens)
 	inferenceBenchmarkWriteHIPAllocationSizeRouteTable(builder, "Top Device Malloc Sizes", inferenceBenchmarkTopHIPAllocationSizeEntries(driver, limit), generatedTokens)
+	inferenceBenchmarkWriteHIPAllocationLabelRouteTable(builder, "Top Device Malloc Labels", inferenceBenchmarkTopHIPAllocationLabelEntries(driver, limit), generatedTokens)
 	inferenceBenchmarkWriteHIPKernelShapeRouteTable(builder, "Top Shapes By Launches", inferenceBenchmarkTopHIPKernelShapeEntries(driver, limit, inferenceBenchmarkHIPKernelSortByLaunches), generatedTokens)
 	inferenceBenchmarkWriteHIPKernelShapeRouteTable(builder, "Top Shapes By Blocks", inferenceBenchmarkTopHIPKernelShapeEntries(driver, limit, inferenceBenchmarkHIPKernelSortByBlocks), generatedTokens)
 }
@@ -2749,6 +3917,30 @@ func inferenceBenchmarkBookSelectedKernelDeltas(snapshot inferenceBenchmarkHIPKe
 			Launches: stats.Launches,
 			Blocks:   stats.Blocks,
 		})
+	}
+	return out
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) HostToDeviceSizeSnapshot(async bool) map[uint64]uint64 {
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	source := driver.h2dSizes
+	if async {
+		source = driver.h2dAsyncSizes
+	}
+	out := make(map[uint64]uint64, len(source))
+	for size, count := range source {
+		out[size] = count
+	}
+	return out
+}
+
+func (driver *inferenceBenchmarkHIPKernelCountingDriver) HostToDeviceLabelSnapshot() map[inferenceBenchmarkHIPCopyLabelKey]uint64 {
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	out := make(map[inferenceBenchmarkHIPCopyLabelKey]uint64, len(driver.h2dLabels))
+	for key, count := range driver.h2dLabels {
+		out[key] = count
 	}
 	return out
 }
@@ -2873,13 +4065,30 @@ func inferenceBenchmarkSelectedHIPKernelNames() []string {
 	return []string{
 		hipKernelNameMLXQ4Proj,
 		hipKernelNameMLXQ4ProjCols256,
+		hipKernelNameMLXQ4ProjQ6Row16,
+		hipKernelNameMLXQ4ProjQ6Row32,
+		hipKernelNameMLXQ4ProjQ6Row64,
+		hipKernelNameMLXQ4ProjBatchQ6Row16,
 		hipKernelNameMLXQ4TripleProj,
+		hipKernelNameMLXQ4TripleProjQ6Row16,
+		hipKernelNameMLXQ4TripleProjQ6Row64,
 		hipKernelNameMLXQ4PairProj,
 		hipKernelNameMLXQ4GELUTanhMul,
+		hipKernelNameMLXQ4GELUTanhMulQ6Cols1536,
+		hipKernelNameMLXQ4GELUTanhMulQ6Cols1536Row32,
+		hipKernelNameMLXQ4GELUTanhMulQ6Cols1536Row64,
 		hipKernelNameMLXQ4GELUTanhProj,
+		hipKernelNameMLXQ4GELUTanhProjQ6Row16,
 		hipKernelNameMLXQ4ProjGreedy,
+		hipKernelNameMLXQ4ProjGreedyQ6Row64,
+		hipKernelNameMLXQ4ProjGreedyBatch,
+		hipKernelNameMLXQ4ProjGreedyBatchQ6Row64,
 		hipKernelNameMLXQ4ProjScores,
+		hipKernelNameMLXQ4ProjScoresQ6Row64,
+		hipKernelNameMLXQ4ProjSelectedGreedyQ6Row64,
+		hipKernelNameOrderedEmbeddingCandidates,
 		hipKernelNamePackedTopK,
+		hipKernelNamePackedTopKSample,
 		hipKernelNameAttentionHeadsChunkedStage1,
 		hipKernelNameAttentionHeadsChunkedStage2,
 		hipKernelNameAttentionHeadsBatchCausal,
@@ -2994,6 +4203,42 @@ func inferenceBenchmarkWriteHIPAllocationSizeRouteTable(builder *strings.Builder
 	builder.WriteString("\n")
 }
 
+func inferenceBenchmarkWriteHIPAllocationLabelRouteTable(builder *strings.Builder, title string, entries []inferenceBenchmarkHIPAllocationLabelEntry, generatedTokens int) {
+	if len(entries) == 0 {
+		return
+	}
+	builder.WriteString("### ")
+	builder.WriteString(title)
+	builder.WriteString("\n\n")
+	if generatedTokens > 0 {
+		builder.WriteString("| operation | label | size_bytes | count | bytes | count/generated_token | bytes/generated_token |\n")
+		builder.WriteString("|---|---|---:|---:|---:|---:|---:|\n")
+	} else {
+		builder.WriteString("| operation | label | size_bytes | count | bytes |\n")
+		builder.WriteString("|---|---|---:|---:|---:|\n")
+	}
+	for _, entry := range entries {
+		builder.WriteString("| `")
+		builder.WriteString(entry.operation)
+		builder.WriteString("` | `")
+		builder.WriteString(entry.label)
+		builder.WriteString("` | ")
+		builder.WriteString(strconv.FormatUint(entry.size, 10))
+		builder.WriteString(" | ")
+		builder.WriteString(strconv.FormatUint(entry.count, 10))
+		builder.WriteString(" | ")
+		builder.WriteString(strconv.FormatUint(entry.bytes, 10))
+		if generatedTokens > 0 {
+			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatFloat(float64(entry.count)/float64(generatedTokens), 'f', 2, 64))
+			builder.WriteString(" | ")
+			builder.WriteString(strconv.FormatFloat(float64(entry.bytes)/float64(generatedTokens), 'f', 2, 64))
+		}
+		builder.WriteString(" |\n")
+	}
+	builder.WriteString("\n")
+}
+
 func inferenceBenchmarkFormatHIPKernelDims(x, y, z uint32) string {
 	return strconv.FormatUint(uint64(x), 10) + "x" +
 		strconv.FormatUint(uint64(y), 10) + "x" +
@@ -3048,9 +4293,19 @@ func inferenceBenchmarkReportBookRun(b *testing.B, run inferenceBenchmarkBookRun
 	}
 	if mode == "replay" {
 		b.ReportMetric(1, "book_replay_baseline")
+	} else {
+		b.ReportMetric(0, "book_replay_baseline")
 	}
 	if mode == "retained" {
 		b.ReportMetric(1, "book_retained_state")
+		b.ReportMetric(1, "book_retained_state_required")
+		b.ReportMetric(1, "book_prompt_replay_fallback_forbidden")
+		b.ReportMetric(1, "book_state_source_runtime_kv")
+	} else {
+		b.ReportMetric(0, "book_retained_state")
+		b.ReportMetric(0, "book_retained_state_required")
+		b.ReportMetric(0, "book_prompt_replay_fallback_forbidden")
+		b.ReportMetric(0, "book_state_source_runtime_kv")
 	}
 }
 
@@ -3137,6 +4392,24 @@ func inferenceBenchmarkRequireBookThresholds(b *testing.B, run inferenceBenchmar
 	} else if ok && run.MaxAdjacentRepeat > similarity {
 		b.Fatalf("book max adjacent repeat %.3f exceeds GO_ROCM_BOOK_MAX_ADJACENT_REPEAT=%.3f", run.MaxAdjacentRepeat, similarity)
 	}
+}
+
+func inferenceBenchmarkRequireGemma4ProductionBookGate(b *testing.B, info inference.ModelInfo, run inferenceBenchmarkBookRun) {
+	b.Helper()
+	if os.Getenv("GO_ROCM_REQUIRE_PRODUCTION_BOOK_GATE") != "1" {
+		return
+	}
+	if err := inferenceBenchmarkValidateGemma4ProductionBookGate(info, run); err != nil {
+		b.Fatal(err)
+	}
+}
+
+func inferenceBenchmarkValidateGemma4ProductionBookGate(info inference.ModelInfo, run inferenceBenchmarkBookRun) error {
+	decision := inferenceBenchmarkGemma4ProductionBookGateDecisionForRun(info, run)
+	if !decision.ProductionCandidate {
+		return fmt.Errorf("%s", decision.Reason)
+	}
+	return nil
 }
 
 const inferenceBenchmarkBookRepeatSimilarityThreshold = 0.55
@@ -3233,13 +4506,9 @@ func benchmarkInferenceGemma4Q4Generate(b *testing.B) {
 	if os.Getenv("GO_ROCM_RUN_BENCHMARKS") != "1" {
 		b.Skip("set GO_ROCM_RUN_BENCHMARKS=1 to run ROCm inference benchmarks")
 	}
-	modelPath := os.Getenv("GO_ROCM_MODEL_PATH")
+	modelPath := inferenceBenchmarkGemma4ProductionModelPath()
 	if modelPath == "" {
-		b.Skip("set GO_ROCM_MODEL_PATH to a local Gemma4 q4 model pack")
-	}
-	maxTokens, err := inferenceBenchmarkPositiveEnv("GO_ROCM_BENCH_TOKENS", 1)
-	if err != nil {
-		b.Fatal(err)
+		b.Skip("set GO_ROCM_PRODUCTION_MODEL_PATH or GO_ROCM_MODEL_PATH to a local Gemma4 q6/q8/q4 MLX affine model pack")
 	}
 	contextLen, err := inferenceBenchmarkPositiveEnv("GO_ROCM_BENCH_CONTEXT_LEN", 128)
 	if err != nil {
@@ -3249,11 +4518,14 @@ func benchmarkInferenceGemma4Q4Generate(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
+	maxTokens, err := inferenceBenchmarkGemma4MaxTokensEnv(benchPrompt, contextLen)
+	if err != nil {
+		b.Fatal(err)
+	}
 	prefillUBatchTokens, err := hipGemma4Q4PrefillUBatchTokens()
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Setenv("GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE", "1")
 	outputPath := strings.TrimSpace(os.Getenv("GO_ROCM_BENCH_OUTPUT_FILE"))
 
 	nativeRuntime, kernelCounter := inferenceBenchmarkNativeRuntimeAndKernelCounter()
@@ -3272,7 +4544,14 @@ func benchmarkInferenceGemma4Q4Generate(b *testing.B) {
 
 func inferenceBenchmarkRunGemma4Q4GenerateLoaded(b *testing.B, model inference.TextModel, benchPrompt inferenceBenchmarkPrompt, maxTokens, contextLen, prefillUBatchTokens int, outputPath string) {
 	b.Helper()
+	allocProfilePrefix := strings.TrimSpace(os.Getenv("GO_ROCM_BENCH_ALLOC_PROFILE_PREFIX"))
+	if allocProfilePrefix != "" {
+		runtime.MemProfileRate = 1
+		inferenceBenchmarkWriteAllocsProfile(b, allocProfilePrefix+".base")
+	}
 	b.ReportAllocs()
+	generateOptions := []inference.GenerateOption{inference.WithMaxTokens(maxTokens)}
+	loadedRoute := inferenceBenchmarkGemma4Q4GenerateLoadedRoute(b, model, benchPrompt.prompt, prefillUBatchTokens)
 	b.ResetTimer()
 	totalTokens := 0
 	start := time.Now()
@@ -3280,14 +4559,28 @@ func inferenceBenchmarkRunGemma4Q4GenerateLoaded(b *testing.B, model inference.T
 	for i := 0; i < b.N; i++ {
 		generated := 0
 		var generatedText strings.Builder
-		for token := range model.Generate(context.Background(), benchPrompt.prompt, inference.WithMaxTokens(maxTokens)) {
-			generated++
-			if outputPath != "" {
-				generatedText.WriteString(token.Text)
+		if loadedRoute.linked {
+			generate := inference.GenerateConfig{MaxTokens: maxTokens}
+			stream, streamErr := hipGemma4Q4GenerateTokenSeqWithEngineConfig(context.Background(), loadedRoute.model, loadedRoute.cfg, loadedRoute.promptTokens, generate, loadedRoute.engineConfig)
+			for token := range stream {
+				generated++
+				if outputPath != "" {
+					generatedText.WriteString(token.Text)
+				}
 			}
-		}
-		if err := model.Err(); err != nil {
-			b.Fatalf("Generate: %v", err)
+			if err := streamErr(); err != nil {
+				b.Fatalf("Generate: %v", err)
+			}
+		} else {
+			for token := range model.Generate(context.Background(), benchPrompt.prompt, generateOptions...) {
+				generated++
+				if outputPath != "" {
+					generatedText.WriteString(token.Text)
+				}
+			}
+			if err := model.Err(); err != nil {
+				b.Fatalf("Generate: %v", err)
+			}
 		}
 		if outputPath != "" {
 			lastOutput = generatedText.String()
@@ -3296,6 +4589,9 @@ func inferenceBenchmarkRunGemma4Q4GenerateLoaded(b *testing.B, model inference.T
 	}
 	elapsed := time.Since(start)
 	b.StopTimer()
+	if allocProfilePrefix != "" {
+		inferenceBenchmarkWriteAllocsProfile(b, allocProfilePrefix+".after")
+	}
 	if outputPath != "" {
 		if err := os.WriteFile(outputPath, []byte(lastOutput), 0644); err != nil {
 			b.Fatalf("write GO_ROCM_BENCH_OUTPUT_FILE=%q: %v", outputPath, err)
@@ -3325,6 +4621,73 @@ func inferenceBenchmarkRunGemma4Q4GenerateLoaded(b *testing.B, model inference.T
 	}
 }
 
+type inferenceBenchmarkGemma4Q4LoadedGenerateRoute struct {
+	linked       bool
+	model        *hipLoadedModel
+	cfg          hipGemma4Q4ForwardConfig
+	promptTokens []int32
+	engineConfig hipGemma4Q4EngineConfig
+}
+
+func inferenceBenchmarkGemma4Q4GenerateLoadedRoute(b *testing.B, model inference.TextModel, prompt string, prefillUBatchTokens int) inferenceBenchmarkGemma4Q4LoadedGenerateRoute {
+	b.Helper()
+	rocmLoaded, ok := model.(*rocmModel)
+	if !ok || rocmLoaded == nil {
+		return inferenceBenchmarkGemma4Q4LoadedGenerateRoute{}
+	}
+	loaded, ok := rocmLoaded.native.(*hipLoadedModel)
+	if !ok || !hipLoadedGemma4Q4GenerateLinked(loaded) {
+		return inferenceBenchmarkGemma4Q4LoadedGenerateRoute{}
+	}
+	promptTokens, matched, err := hipGemma4Q4PromptTokenIDs(prompt, loaded)
+	if err != nil {
+		b.Fatalf("Gemma4 q4 benchmark prompt: %v", err)
+	}
+	if !matched {
+		return inferenceBenchmarkGemma4Q4LoadedGenerateRoute{}
+	}
+	if loaded.modelInfo.NumLayers <= 0 {
+		b.Fatal("loaded Gemma4 q4 layer count is required")
+	}
+	q4Cfg, err := loaded.cachedGemma4Q4ForwardConfig(loaded.modelInfo.NumLayers)
+	if err != nil {
+		b.Fatalf("loaded Gemma4 q4 forward config: %v", err)
+	}
+	engineConfig := defaultHIPGemma4Q4EngineConfig()
+	engineConfig.PrefillUBatchTokens = prefillUBatchTokens
+	if _, err := engineConfig.prefillUBatchTokens(); err != nil {
+		b.Fatal(err)
+	}
+	return inferenceBenchmarkGemma4Q4LoadedGenerateRoute{
+		linked:       true,
+		model:        loaded,
+		cfg:          q4Cfg,
+		promptTokens: promptTokens,
+		engineConfig: engineConfig,
+	}
+}
+
+func inferenceBenchmarkWriteAllocsProfile(b *testing.B, path string) {
+	b.Helper()
+	runtime.GC()
+	if dir := filepath.Dir(path); dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			b.Fatalf("create alloc profile dir %q: %v", dir, err)
+		}
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		b.Fatalf("create alloc profile %q: %v", path, err)
+	}
+	if err := pprof.Lookup("allocs").WriteTo(file, 0); err != nil {
+		_ = file.Close()
+		b.Fatalf("write alloc profile %q: %v", path, err)
+	}
+	if err := file.Close(); err != nil {
+		b.Fatalf("close alloc profile %q: %v", path, err)
+	}
+}
+
 func inferenceBenchmarkLoadGemma4Q4Model(b *testing.B, contextLen, layerCount int) (inference.TextModel, *hipLoadedModel, hipGemma4Q4ForwardConfig) {
 	model, loaded, cfg, _ := inferenceBenchmarkLoadGemma4Q4ModelWithKernelCounter(b, contextLen, layerCount)
 	return model, loaded, cfg
@@ -3332,9 +4695,9 @@ func inferenceBenchmarkLoadGemma4Q4Model(b *testing.B, contextLen, layerCount in
 
 func inferenceBenchmarkLoadGemma4Q4ModelWithKernelCounter(b *testing.B, contextLen, layerCount int) (inference.TextModel, *hipLoadedModel, hipGemma4Q4ForwardConfig, *inferenceBenchmarkHIPKernelCountingDriver) {
 	b.Helper()
-	modelPath := os.Getenv("GO_ROCM_MODEL_PATH")
+	modelPath := inferenceBenchmarkGemma4ProductionModelPath()
 	if modelPath == "" {
-		b.Skip("set GO_ROCM_MODEL_PATH to a local Gemma4 q4 model pack")
+		b.Skip("set GO_ROCM_PRODUCTION_MODEL_PATH or GO_ROCM_MODEL_PATH to a local Gemma4 q6/q8/q4 MLX affine model pack")
 	}
 	nativeRuntime, kernelCounter := inferenceBenchmarkNativeRuntimeAndKernelCounter()
 	model, err := newROCmBackendWithRuntime(nativeRuntime).LoadModel(modelPath, inference.WithContextLen(contextLen))
@@ -3351,6 +4714,7 @@ func inferenceBenchmarkLoadGemma4Q4ModelWithKernelCounter(b *testing.B, contextL
 		_ = model.Close()
 		b.Fatalf("LoadModel(%q) native returned %T, want *hipLoadedModel", modelPath, rocmLoaded.native)
 	}
+	inferenceBenchmarkReportGemma4ProductionQuant(b, loaded.modelInfo, modelPath)
 	if layerCount <= 0 {
 		layerCount = loaded.modelInfo.NumLayers
 	}
@@ -3360,6 +4724,237 @@ func inferenceBenchmarkLoadGemma4Q4ModelWithKernelCounter(b *testing.B, contextL
 		b.Fatalf("loadedGemma4Q4ForwardConfig(%d): %v", layerCount, err)
 	}
 	return model, loaded, cfg, kernelCounter
+}
+
+func inferenceBenchmarkGemma4ProductionModelPath() string {
+	if path := os.Getenv("GO_ROCM_PRODUCTION_MODEL_PATH"); path != "" {
+		return path
+	}
+	return os.Getenv("GO_ROCM_MODEL_PATH")
+}
+
+func inferenceBenchmarkReportGemma4ProductionQuant(b *testing.B, info inference.ModelInfo, path string) {
+	b.Helper()
+	bits := inferenceBenchmarkGemma4ModelQuantBits(info)
+	if bits > 0 {
+		b.ReportMetric(float64(bits), "model_quant_bits")
+	}
+	reportedPack := false
+	if pack, ok := inferenceBenchmarkGemma4ProductionQuantPack(info, path); ok {
+		inferenceBenchmarkReportGemma4ProductionQuantPack(b, pack)
+		reportedPack = true
+	}
+	if tier, ok := inferenceBenchmarkGemma4ProductionQuantTierForPath(info, path); ok {
+		if !reportedPack {
+			b.ReportMetric(float64(tier.Bits), "production_quant_bits")
+		}
+		b.ReportMetric(float64(tier.ActiveWeightReadBytesPerToken), "production_active_weight_read_bytes_per_token")
+		if tier.ProductDefault {
+			b.ReportMetric(1, "production_quant_default")
+		}
+		if tier.QualityFirst {
+			b.ReportMetric(1, "production_quant_quality")
+		}
+		if tier.ConstrainedOnly {
+			b.ReportMetric(1, "production_quant_constrained")
+		}
+	}
+}
+
+func inferenceBenchmarkReportGemma4ProductionQuantPack(b *testing.B, pack ProductionQuantizationPackSupport) {
+	b.Helper()
+	b.ReportMetric(float64(pack.Bits), "production_quant_bits")
+	b.ReportMetric(inferenceBenchmarkBoolMetric(pack.RunnableOnCard), "production_quant_runnable_on_card")
+	b.ReportMetric(inferenceBenchmarkBoolMetric(pack.RequiresBench), "production_quant_requires_bench")
+	b.ReportMetric(inferenceBenchmarkBoolMetric(pack.RequiresNative), "production_quant_requires_native")
+	switch pack.GenerateStatus {
+	case Gemma4GenerateLinked:
+		b.ReportMetric(1, "production_quant_generate_linked")
+	case Gemma4GenerateLoadOnly:
+		b.ReportMetric(1, "production_quant_load_only")
+	case Gemma4GeneratePlannedOnly:
+		b.ReportMetric(1, "production_quant_planned_only")
+	}
+}
+
+type inferenceBenchmarkGemma4ProductionBookMetrics struct {
+	RawDecodeTokensPerSec       float64
+	ActiveWeightReadBytes       uint64
+	MemoryBandwidthBytesPerSec  float64
+	LongOutputQualityFlags      int
+	StepDownWorkingSetBytes     uint64
+	VisibleTokensPerSecTarget   int
+	VisibleTokensPerSecAchieved int
+}
+
+func inferenceBenchmarkReportGemma4ProductionBookMetrics(b *testing.B, info inference.ModelInfo, run inferenceBenchmarkBookRun) {
+	b.Helper()
+	metrics, ok := inferenceBenchmarkGemma4ProductionBookMetricsForRun(info, run)
+	if !ok {
+		return
+	}
+	b.ReportMetric(metrics.RawDecodeTokensPerSec, "raw_decode_tokens_per_sec")
+	b.ReportMetric(float64(metrics.ActiveWeightReadBytes), "active_weight_read_bytes_per_token")
+	b.ReportMetric(metrics.MemoryBandwidthBytesPerSec, "memory_bandwidth_bytes_per_sec")
+	b.ReportMetric(float64(metrics.LongOutputQualityFlags), "long_output_quality_flags")
+	b.ReportMetric(float64(metrics.StepDownWorkingSetBytes), "step_down_working_set_bytes")
+	b.ReportMetric(float64(metrics.VisibleTokensPerSecTarget), "production_visible_tokens_per_sec_target")
+	b.ReportMetric(float64(metrics.VisibleTokensPerSecAchieved), "production_visible_tokens_per_sec_achieved")
+}
+
+type inferenceBenchmarkGemma4ProductionBookGateReason = ProductionBookGateReasonCode
+
+const (
+	inferenceBenchmarkProductionBookGateReasonPass    = ProductionBookGateReasonPass
+	inferenceBenchmarkProductionBookGateReasonQuant   = ProductionBookGateReasonQuant
+	inferenceBenchmarkProductionBookGateReasonMetrics = ProductionBookGateReasonMetrics
+	inferenceBenchmarkProductionBookGateReasonTurns   = ProductionBookGateReasonTurns
+	inferenceBenchmarkProductionBookGateReasonWall    = ProductionBookGateReasonWall
+	inferenceBenchmarkProductionBookGateReasonDecode  = ProductionBookGateReasonDecode
+	inferenceBenchmarkProductionBookGateReasonQuality = ProductionBookGateReasonQuality
+)
+
+type inferenceBenchmarkGemma4ProductionBookGateDecision = ProductionBookGateMetricDecision
+
+func inferenceBenchmarkGemma4ProductionBookGateDecisionForRun(info inference.ModelInfo, run inferenceBenchmarkBookRun) inferenceBenchmarkGemma4ProductionBookGateDecision {
+	quantBits := inferenceBenchmarkGemma4ModelQuantBits(info)
+	decision := inferenceBenchmarkGemma4ProductionBookGateDecision{
+		ReasonCode:      inferenceBenchmarkProductionBookGateReasonPass,
+		QuantAccepted:   quantBits == ProductionLaneProductDefaultQuantBits,
+		TurnsAccepted:   run.Turns >= ProductionLaneBookTurnCount,
+		WallAccepted:    run.Wall > 0 && run.Wall <= time.Duration(ProductionLaneBookWallSeconds)*time.Second,
+		WallSeconds:     run.Wall.Seconds(),
+		DecodeAccepted:  false,
+		QualityAccepted: false,
+	}
+	if !decision.QuantAccepted {
+		decision.ReasonCode = inferenceBenchmarkProductionBookGateReasonQuant
+		decision.Reason = fmt.Sprintf("production book gate requires q%d, got q%d", ProductionLaneProductDefaultQuantBits, quantBits)
+		return decision
+	}
+	metrics, ok := inferenceBenchmarkGemma4ProductionBookMetricsForRun(info, run)
+	if !ok {
+		decision.ReasonCode = inferenceBenchmarkProductionBookGateReasonMetrics
+		decision.Reason = fmt.Sprintf("production book gate requires complete q%d metrics", ProductionLaneProductDefaultQuantBits)
+		return decision
+	}
+	decision.RawDecodeTokensPerSec = metrics.RawDecodeTokensPerSec
+	decision.DecodeAccepted = metrics.VisibleTokensPerSecAchieved == 1
+	decision.QualityFlags = metrics.LongOutputQualityFlags
+	decision.QualityAccepted = metrics.LongOutputQualityFlags == 0
+	if !decision.TurnsAccepted {
+		decision.ReasonCode = inferenceBenchmarkProductionBookGateReasonTurns
+		decision.Reason = fmt.Sprintf("production book gate requires %d turns, got %d", ProductionLaneBookTurnCount, run.Turns)
+		return decision
+	}
+	if !decision.WallAccepted {
+		decision.ReasonCode = inferenceBenchmarkProductionBookGateReasonWall
+		decision.Reason = fmt.Sprintf("production book gate wall %.3fs exceeds %ds candidate limit", run.Wall.Seconds(), ProductionLaneBookWallSeconds)
+		return decision
+	}
+	if !decision.DecodeAccepted {
+		decision.ReasonCode = inferenceBenchmarkProductionBookGateReasonDecode
+		decision.Reason = fmt.Sprintf("production book gate raw decode %.3f tok/s below %d tok/s", metrics.RawDecodeTokensPerSec, metrics.VisibleTokensPerSecTarget)
+		return decision
+	}
+	if !decision.QualityAccepted {
+		decision.ReasonCode = inferenceBenchmarkProductionBookGateReasonQuality
+		decision.Reason = fmt.Sprintf("production book gate quality flags = %d, want 0", metrics.LongOutputQualityFlags)
+		return decision
+	}
+	decision.ProductionCandidate = true
+	decision.Reason = "production book gate passes q6 retained-state throughput, wall, and quality checks"
+	return decision
+}
+
+func inferenceBenchmarkReportGemma4ProductionBookGateDecision(b *testing.B, decision inferenceBenchmarkGemma4ProductionBookGateDecision) {
+	b.Helper()
+	b.ReportMetric(inferenceBenchmarkBoolMetric(decision.ProductionCandidate), "production_book_gate_candidate")
+	b.ReportMetric(float64(decision.ReasonCode), "production_book_gate_reason_code")
+	b.ReportMetric(inferenceBenchmarkBoolMetric(decision.QuantAccepted), "production_book_gate_q6")
+	b.ReportMetric(inferenceBenchmarkBoolMetric(decision.TurnsAccepted), "production_book_gate_turns")
+	b.ReportMetric(inferenceBenchmarkBoolMetric(decision.WallAccepted), "production_book_gate_wall")
+	b.ReportMetric(inferenceBenchmarkBoolMetric(decision.DecodeAccepted), "production_book_gate_decode")
+	b.ReportMetric(inferenceBenchmarkBoolMetric(decision.QualityAccepted), "production_book_gate_quality")
+	b.ReportMetric(decision.RawDecodeTokensPerSec, "production_book_gate_raw_decode_tok/s")
+	b.ReportMetric(decision.WallSeconds, "production_book_gate_wall_s")
+	b.ReportMetric(float64(decision.QualityFlags), "production_book_gate_quality_flags")
+}
+
+func inferenceBenchmarkBoolMetric(value bool) float64 {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func inferenceBenchmarkGemma4ProductionBookMetricsForRun(info inference.ModelInfo, run inferenceBenchmarkBookRun) (inferenceBenchmarkGemma4ProductionBookMetrics, bool) {
+	tier, ok := inferenceBenchmarkGemma4ProductionQuantTier(info)
+	if !ok || run.GeneratedTokens <= 0 || run.Decode <= 0 {
+		return inferenceBenchmarkGemma4ProductionBookMetrics{}, false
+	}
+	rawDecodeTokensPerSec := float64(run.GeneratedTokens) / run.Decode.Seconds()
+	qualityFlags := 0
+	if run.Turns >= ProductionLaneBookTurnCount && run.ArcAnchorHits < 3 {
+		qualityFlags++
+	}
+	if run.RepeatedTurns > 0 {
+		qualityFlags++
+	}
+	if inferenceBenchmarkBookMaxedTurns(run) > 0 {
+		qualityFlags++
+	}
+	stepDownWorkingSetBytes := uint64(0)
+	if tier.StepDownToBits > 0 {
+		stepDownBytes := productionQuantizationActiveWeightReadBytes(tier.StepDownToBits)
+		if tier.ActiveWeightReadBytesPerToken > stepDownBytes {
+			stepDownWorkingSetBytes = tier.ActiveWeightReadBytesPerToken - stepDownBytes
+		}
+	}
+	achieved := 0
+	if rawDecodeTokensPerSec >= float64(productionLaneRetainedVisibleTokensSec) {
+		achieved = 1
+	}
+	return inferenceBenchmarkGemma4ProductionBookMetrics{
+		RawDecodeTokensPerSec:       rawDecodeTokensPerSec,
+		ActiveWeightReadBytes:       tier.ActiveWeightReadBytesPerToken,
+		MemoryBandwidthBytesPerSec:  float64(tier.ActiveWeightReadBytesPerToken) * rawDecodeTokensPerSec,
+		LongOutputQualityFlags:      qualityFlags,
+		StepDownWorkingSetBytes:     stepDownWorkingSetBytes,
+		VisibleTokensPerSecTarget:   productionLaneRetainedVisibleTokensSec,
+		VisibleTokensPerSecAchieved: achieved,
+	}, true
+}
+
+func inferenceBenchmarkGemma4ProductionQuantTier(info inference.ModelInfo) (ProductionQuantizationTier, bool) {
+	return inferenceBenchmarkGemma4ProductionQuantTierForPath(info, "")
+}
+
+func inferenceBenchmarkGemma4ProductionQuantTierForPath(info inference.ModelInfo, path string) (ProductionQuantizationTier, bool) {
+	if pack, ok := inferenceBenchmarkGemma4ProductionQuantPack(info, path); ok {
+		if pack.Size != "E2B" {
+			return ProductionQuantizationTier{}, false
+		}
+		return inferenceBenchmarkGemma4ProductionQuantTierByBits(pack.Bits)
+	}
+	return inferenceBenchmarkGemma4ProductionQuantTierByBits(inferenceBenchmarkGemma4ModelQuantBits(info))
+}
+
+func inferenceBenchmarkGemma4ProductionQuantTierByBits(bits int) (ProductionQuantizationTier, bool) {
+	for _, tier := range productionQuantizationTiers {
+		if tier.Bits == bits {
+			return tier, true
+		}
+	}
+	return ProductionQuantizationTier{}, false
+}
+
+func inferenceBenchmarkGemma4ProductionQuantPack(info inference.ModelInfo, path string) (ProductionQuantizationPackSupport, bool) {
+	return rocmGemma4ProductionQuantPackForModel(rocmGemma4ModelInfoIdentity(info, path))
+}
+
+func inferenceBenchmarkGemma4ModelQuantBits(info inference.ModelInfo) int {
+	return info.QuantBits
 }
 
 func inferenceBenchmarkCloseModel(b *testing.B, model inference.TextModel) {
@@ -3520,6 +5115,24 @@ func inferenceBenchmarkPositiveEnv(name string, fallback int) (int, error) {
 	return parsed, nil
 }
 
+func inferenceBenchmarkGemma4MaxTokensEnv(prompt inferenceBenchmarkPrompt, contextLen int) (int, error) {
+	if maxTokens, ok, err := inferenceBenchmarkOptionalPositiveEnv("GO_ROCM_BENCH_TOKENS"); err != nil || ok {
+		return maxTokens, err
+	}
+	if contextLen <= 0 {
+		return 0, fmt.Errorf("GO_ROCM_BENCH_CONTEXT_LEN=%d, want positive integer", contextLen)
+	}
+	promptTokens := prompt.promptTokens
+	if promptTokens <= 0 {
+		promptTokens = len(approximateTokenIDs(prompt.prompt))
+	}
+	remaining := contextLen - promptTokens
+	if remaining <= 0 {
+		return 0, fmt.Errorf("GO_ROCM_BENCH_TOKENS unset and prompt tokens %d reach benchmark context window %d", promptTokens, contextLen)
+	}
+	return remaining, nil
+}
+
 func inferenceBenchmarkOptionalPositiveEnv(name string) (int, bool, error) {
 	value := os.Getenv(name)
 	if value == "" {
@@ -3612,12 +5225,6 @@ func inferenceBenchmarkFailBelowMetric(b *testing.B, envName, metricName string,
 func inferenceBenchmarkBookPrefillUBatchTokens(b *testing.B) int {
 	b.Helper()
 	if value, ok, err := inferenceBenchmarkOptionalPositiveEnv("GO_ROCM_BOOK_PREFILL_UBATCH_TOKENS"); err != nil {
-		b.Fatal(err)
-	} else if ok {
-		b.Setenv(hipGemma4Q4PrefillUBatchEnv, strconv.Itoa(value))
-		return value
-	}
-	if value, ok, err := inferenceBenchmarkOptionalPositiveEnv(hipGemma4Q4PrefillUBatchEnv); err != nil {
 		b.Fatal(err)
 	} else if ok {
 		return value
@@ -3736,6 +5343,7 @@ func inferenceBenchmarkBookGenerateOptions(cfg inference.GenerateConfig) []infer
 		inference.WithMaxTokens(cfg.MaxTokens),
 		inference.WithTemperature(cfg.Temperature),
 		inference.WithTopP(cfg.TopP),
+		inference.WithMinP(cfg.MinP),
 		inference.WithTopK(cfg.TopK),
 		inference.WithRepeatPenalty(cfg.RepeatPenalty),
 	}
@@ -3851,6 +5459,36 @@ func inferenceBenchmarkTokenPromptCount(prompt string) int {
 	return count
 }
 
+func TestInferenceBenchmarkGemma4MaxTokensEnv_Good_UsesRemainingContextWhenUnset(t *testing.T) {
+	t.Setenv("GO_ROCM_BENCH_TOKENS", "")
+
+	got, err := inferenceBenchmarkGemma4MaxTokensEnv(inferenceBenchmarkPrompt{prompt: "tokens:1,2,3,4,5", promptTokens: 5}, 12)
+
+	if err != nil || got != 7 {
+		t.Fatalf("Gemma4 benchmark max tokens = %d err=%v, want remaining context", got, err)
+	}
+}
+
+func TestInferenceBenchmarkGemma4MaxTokensEnv_Good_KeepsExplicitEnv(t *testing.T) {
+	t.Setenv("GO_ROCM_BENCH_TOKENS", "3")
+
+	got, err := inferenceBenchmarkGemma4MaxTokensEnv(inferenceBenchmarkPrompt{prompt: "tokens:1,2,3,4,5", promptTokens: 5}, 12)
+
+	if err != nil || got != 3 {
+		t.Fatalf("Gemma4 benchmark explicit max tokens = %d err=%v, want env value", got, err)
+	}
+}
+
+func TestInferenceBenchmarkGemma4MaxTokensEnv_Bad_RejectsPromptAtContextWindow(t *testing.T) {
+	t.Setenv("GO_ROCM_BENCH_TOKENS", "")
+
+	_, err := inferenceBenchmarkGemma4MaxTokensEnv(inferenceBenchmarkPrompt{prompt: "tokens:1,2,3", promptTokens: 3}, 3)
+
+	if err == nil || !strings.Contains(err.Error(), "reach benchmark context window") {
+		t.Fatalf("Gemma4 benchmark max tokens error = %v, want context-window rejection", err)
+	}
+}
+
 func TestInferenceBenchmarkBookTurnPrompt_Good(t *testing.T) {
 	workload := inferenceBenchmarkBookWorkload()
 	chapter1 := inferenceBenchmarkBookTurnPrompt(workload, "", 1)
@@ -3878,6 +5516,9 @@ func TestInferenceBenchmarkBookTurnPrompt_Good(t *testing.T) {
 		t.Fatalf("retained chapter 1 chat prompt = %q, want Gemma4 user/model turn", retainedChapter1)
 	}
 	retainedChapter2 := inferenceBenchmarkBookRetainedTurnChatPrompt(workload, 2)
+	if err := inferenceBenchmarkValidateRetainedBookTurnPrompt(workload, 2, retainedChapter2); err != nil {
+		t.Fatalf("retained chapter 2 replay guard: %v", err)
+	}
 	if !strings.HasPrefix(retainedChapter2, "<turn|>\n<|turn>user\n") ||
 		!strings.HasSuffix(retainedChapter2, "<turn|>\n<|turn>model\n") ||
 		strings.Contains(retainedChapter2, "Book so far") ||
@@ -3890,6 +5531,9 @@ func TestInferenceBenchmarkBookTurnPrompt_Good(t *testing.T) {
 		t.Fatalf("retained chapter 2 chat prompt = %q, want assistant close plus new user turn only", retainedChapter2)
 	}
 	retainedChapter3 := inferenceBenchmarkBookRetainedTurnChatPrompt(workload, 3)
+	if err := inferenceBenchmarkValidateRetainedBookTurnPrompt(workload, 3, retainedChapter3); err != nil {
+		t.Fatalf("retained chapter 3 replay guard: %v", err)
+	}
 	if strings.Contains(retainedChapter3, "Book so far") ||
 		strings.Contains(retainedChapter3, "C001_STORY_PERSPECTIVE") ||
 		strings.Contains(retainedChapter3, "C002_POETRY_TIME") ||
@@ -3910,6 +5554,47 @@ func TestInferenceBenchmarkBookTurnPrompt_Good(t *testing.T) {
 	if cfg.MaxTokens != 16 || cfg.Temperature != 1 || cfg.TopP != 0.95 || cfg.TopK != 64 || cfg.RepeatPenalty != 1 {
 		t.Fatalf("book generate config = %+v, want go-mlx-style sampling defaults", cfg)
 	}
+}
+
+func TestInferenceBenchmarkValidateRetainedBookTurnPrompt_Bad_RejectsReplay(t *testing.T) {
+	workload := inferenceBenchmarkBookWorkload()
+	chapter3 := inferenceBenchmarkBookRetainedTurnChatPrompt(workload, 3)
+
+	err := inferenceBenchmarkValidateRetainedBookTurnPrompt(workload, 3, chapter3+"\n\nBook so far:\n## Chapter 1\nThe lighthouse kept watch.")
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "must not replay manuscript")
+
+	err = inferenceBenchmarkValidateRetainedBookTurnPrompt(workload, 3, chapter3+"\n"+workload.Seed.ID)
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "must not replay seed")
+
+	err = inferenceBenchmarkValidateRetainedBookTurnPrompt(workload, 4, chapter3+"\n"+workload.Distractors[0].ID)
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "must not replay prior distractor")
+}
+
+func BenchmarkInferenceBenchmarkValidateRetainedBookTurnPrompt_Chapter10(b *testing.B) {
+	workload := inferenceBenchmarkBookWorkload()
+	prompt := inferenceBenchmarkBookRetainedTurnChatPrompt(workload, 10)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := inferenceBenchmarkValidateRetainedBookTurnPrompt(workload, 10, prompt); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestInferenceBenchmarkRetainedBookTextGrow_Good(t *testing.T) {
+	var builder strings.Builder
+	inferenceBenchmarkGrowRetainedBookText(&builder, 0)
+	core.AssertEqual(t, 0, builder.Cap())
+
+	inferenceBenchmarkGrowRetainedBookText(&builder, 64)
+	core.AssertTrue(t, builder.Cap() >= 64*4, "builder should reserve estimated token text bytes")
+
+	var capped strings.Builder
+	inferenceBenchmarkGrowRetainedBookText(&capped, 1<<20)
+	core.AssertTrue(t, capped.Cap() <= 8<<10, "builder reserve should stay capped for large max-token guards")
 }
 
 func TestInferenceBenchmarkDurationSecondsEnv_Good(t *testing.T) {

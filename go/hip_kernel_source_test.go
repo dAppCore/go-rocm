@@ -28,15 +28,33 @@ func TestHIPKernelSource_ExportsLaunchABI_Good(t *testing.T) {
 		`extern "C" __global__ void rocm_projection`,
 		`extern "C" __global__ void rocm_projection_batch`,
 		`extern "C" __global__ void rocm_mlx_q4_projection`,
+		`extern "C" __global__ void rocm_mlx_q4_projection_q6_row16`,
+		`extern "C" __global__ void rocm_mlx_q4_projection_q6_row32`,
+		`extern "C" __global__ void rocm_mlx_q4_projection_q6_row64`,
 		`extern "C" __global__ void rocm_mlx_q4_projection_batch`,
+		`extern "C" __global__ void rocm_mlx_q4_projection_batch_q6_row16`,
 		`extern "C" __global__ void rocm_mlx_q4_projection_greedy`,
+		`extern "C" __global__ void rocm_mlx_q4_projection_greedy_q6_row64`,
+		`extern "C" __global__ void rocm_mlx_q4_projection_greedy_batch`,
+		`extern "C" __global__ void rocm_mlx_q4_projection_greedy_batch_q6_row64`,
 		`extern "C" __global__ void rocm_mlx_q4_projection_scores`,
+		`extern "C" __global__ void rocm_mlx_q4_projection_scores_q6_row64`,
+		`extern "C" __global__ void rocm_mlx_q4_projection_selected_greedy`,
+		`extern "C" __global__ void rocm_mlx_q4_projection_selected_greedy_q6_row64`,
+		`extern "C" __global__ void rocm_ordered_embedding_candidates`,
 		`extern "C" __global__ void rocm_packed_topk`,
+		`extern "C" __global__ void rocm_packed_topk_sample`,
 		`extern "C" __global__ void rocm_mlx_q4_triple_projection`,
+		`extern "C" __global__ void rocm_mlx_q4_triple_projection_q6_row16`,
+		`extern "C" __global__ void rocm_mlx_q4_triple_projection_q6_row64`,
 		`extern "C" __global__ void rocm_mlx_q4_pair_projection`,
 		`extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply`,
+		`extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply_q6_cols1536`,
+		`extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply_q6_cols1536_row32`,
+		`extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply_q6_cols1536_row64`,
 		`extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply_batch`,
 		`extern "C" __global__ void rocm_mlx_q4_gelu_tanh_projection`,
+		`extern "C" __global__ void rocm_mlx_q4_gelu_tanh_projection_q6_row16`,
 		`extern "C" __global__ void rocm_mlx_q4_gelu_tanh_projection_batch`,
 		`extern "C" __global__ void rocm_rms_norm`,
 		`extern "C" __global__ void rocm_rms_norm_residual_add`,
@@ -75,6 +93,7 @@ func TestHIPKernelSource_ExportsLaunchABI_Good(t *testing.T) {
 		`extern "C" __global__ void rocm_cross_entropy_loss`,
 		`extern "C" __global__ void rocm_distillation_kl_loss`,
 		`extern "C" __global__ void rocm_grpo_advantage`,
+		`extern "C" __global__ void rocm_autoround_quantize`,
 	} {
 		core.AssertTrue(t, strings.Contains(source, symbol), symbol)
 	}
@@ -103,6 +122,7 @@ func TestHIPKernelSource_ExportsLaunchABI_Good(t *testing.T) {
 		core.Sprintf("ROCM_KV_DESCRIPTOR_APPEND_LAUNCH_ARGS_BYTES = %d", hipKVDescriptorAppendLaunchArgsBytes),
 		core.Sprintf("ROCM_KV_DESCRIPTOR_APPEND_BLOCK_SIZE = %d", hipKVDescriptorAppendBlockSize),
 		core.Sprintf("ROCM_KV_DESCRIPTOR_APPEND_MODE_GROW_LAST_PAGE = %d", rocmKVDescriptorAppendModeGrowLastPage),
+		core.Sprintf("ROCM_KV_DESCRIPTOR_APPEND_MODE_BUILD_SINGLE_PAGE = %d", rocmKVDescriptorAppendModeBuildSinglePage),
 		core.Sprintf("ROCM_PROJECTION_LAUNCH_ARGS_VERSION = %d", hipProjectionLaunchArgsVersion),
 		core.Sprintf("ROCM_PROJECTION_LAUNCH_ARGS_BYTES = %d", hipProjectionLaunchArgsBytes),
 		core.Sprintf("ROCM_PROJECTION_BATCH_LAUNCH_ARGS_VERSION = %d", hipProjectionBatchLaunchArgsVersion),
@@ -115,6 +135,8 @@ func TestHIPKernelSource_ExportsLaunchABI_Good(t *testing.T) {
 		core.Sprintf("ROCM_MLX_Q4_PROJECTION_LAUNCH_ARGS_BYTES = %d", hipMLXQ4ProjectionLaunchArgsBytes),
 		core.Sprintf("ROCM_MLX_Q4_PROJECTION_BATCH_LAUNCH_ARGS_VERSION = %d", hipMLXQ4ProjectionBatchLaunchArgsVersion),
 		core.Sprintf("ROCM_MLX_Q4_PROJECTION_BATCH_LAUNCH_ARGS_BYTES = %d", hipMLXQ4ProjectionBatchLaunchArgsBytes),
+		core.Sprintf("ROCM_MLX_Q4_PROJECTION_GREEDY_BATCH_LAUNCH_ARGS_VERSION = %d", hipMLXQ4ProjectionGreedyBatchLaunchArgsVersion),
+		core.Sprintf("ROCM_MLX_Q4_PROJECTION_GREEDY_BATCH_LAUNCH_ARGS_BYTES = %d", hipMLXQ4ProjectionGreedyBatchLaunchArgsBytes),
 		core.Sprintf("ROCM_MLX_Q4_TRIPLE_PROJECTION_LAUNCH_ARGS_VERSION = %d", hipMLXQ4TripleProjLaunchArgsVersion),
 		core.Sprintf("ROCM_MLX_Q4_TRIPLE_PROJECTION_LAUNCH_ARGS_BYTES = %d", hipMLXQ4TripleProjLaunchArgsBytes),
 		core.Sprintf("ROCM_MLX_Q4_GELU_TANH_MUL_LAUNCH_ARGS_VERSION = %d", hipMLXQ4GELUTanhMulLaunchArgsVersion),
@@ -129,9 +151,15 @@ func TestHIPKernelSource_ExportsLaunchABI_Good(t *testing.T) {
 		core.Sprintf("ROCM_MLX_Q4_PROJECTION_BLOCK_SIZE = %d", hipMLXQ4ProjectionBlockSize),
 		core.Sprintf("ROCM_MLX_Q4_PROJECTION_ROWS_PER_BLOCK = %d", hipMLXQ4ProjectionRowsPerBlock),
 		core.Sprintf("ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK = %d", hipMLXQ4ProjectionGreedyRowsPerBlock),
+		core.Sprintf("ROCM_MLX_Q4_PROJECTION_GREEDY_Q6_ROWS_PER_BLOCK = %d", hipMLXQ4ProjectionGreedyQ6RowsPerBlock),
 		core.Sprintf("ROCM_MLX_Q4_PROJECTION_BEST_BYTES = %d", hipMLXQ4ProjectionBestBytes),
 		core.Sprintf("ROCM_PACKED_TOPK_LAUNCH_ARGS_VERSION = %d", hipPackedTopKLaunchArgsVersion),
 		core.Sprintf("ROCM_PACKED_TOPK_LAUNCH_ARGS_BYTES = %d", hipPackedTopKLaunchArgsBytes),
+		core.Sprintf("ROCM_PACKED_TOPK_SAMPLE_LAUNCH_ARGS_VERSION = %d", hipPackedTopKSampleLaunchArgsVersion),
+		core.Sprintf("ROCM_PACKED_TOPK_SAMPLE_LAUNCH_ARGS_BYTES = %d", hipPackedTopKSampleLaunchArgsBytes),
+		core.Sprintf("ROCM_ORDERED_EMBEDDING_CANDIDATES_LAUNCH_ARGS_VERSION = %d", hipOrderedEmbeddingCandidatesLaunchArgsVersion),
+		core.Sprintf("ROCM_ORDERED_EMBEDDING_CANDIDATES_LAUNCH_ARGS_BYTES = %d", hipOrderedEmbeddingCandidatesLaunchArgsBytes),
+		core.Sprintf("ROCM_ORDERED_EMBEDDING_CANDIDATES_BLOCK_SIZE = %d", hipOrderedEmbeddingCandidatesBlockSize),
 		core.Sprintf("ROCM_PACKED_TOPK_MAX_K = %d", hipPackedTopKMaxK),
 		core.Sprintf("ROCM_PACKED_TOPK_BLOCK_SIZE = %d", hipPackedTopKBlockSize),
 		core.Sprintf("ROCM_PACKED_TOPK_CHUNK_SIZE = %d", hipPackedTopKChunkSize),
@@ -211,6 +239,13 @@ func TestHIPKernelSource_ExportsLaunchABI_Good(t *testing.T) {
 		core.Sprintf("ROCM_TINY_PREFILL_LAUNCH_ARGS_BYTES = %d", hipTinyPrefillLaunchArgsBytes),
 		core.Sprintf("ROCM_TINY_DECODE_LAUNCH_ARGS_VERSION = %d", hipTinyDecodeLaunchArgsVersion),
 		core.Sprintf("ROCM_TINY_DECODE_LAUNCH_ARGS_BYTES = %d", hipTinyDecodeLaunchArgsBytes),
+		core.Sprintf("ROCM_AUTOROUND_QUANTIZE_LAUNCH_ARGS_VERSION = %d", hipAutoRoundQuantizeLaunchArgsVersion),
+		core.Sprintf("ROCM_AUTOROUND_QUANTIZE_LAUNCH_ARGS_BYTES = %d", hipAutoRoundQuantizeLaunchArgsBytes),
+		core.Sprintf("ROCM_AUTOROUND_FORMAT_MXFP4 = %d", hipAutoRoundFormatMXFP4),
+		core.Sprintf("ROCM_AUTOROUND_FORMAT_NVFP4 = %d", hipAutoRoundFormatNVFP4),
+		core.Sprintf("ROCM_AUTOROUND_FORMAT_FP8 = %d", hipAutoRoundFormatFP8),
+		core.Sprintf("ROCM_AUTOROUND_FORMAT_MXFP8 = %d", hipAutoRoundFormatMXFP8),
+		core.Sprintf("ROCM_AUTOROUND_FORMAT_INT2 = %d", hipAutoRoundFormatINT2),
 		core.Sprintf("ROCM_TINY_OUTPUT_WEIGHT_ENCODING_FP32 = %d", hipTinyOutputWeightEncodingFP32),
 		core.Sprintf("ROCM_TINY_OUTPUT_WEIGHT_ENCODING_FP16 = %d", hipTinyOutputWeightEncodingFP16),
 		core.Sprintf("ROCM_TINY_OUTPUT_WEIGHT_ENCODING_Q8 = %d", hipTinyOutputWeightEncodingQ8),
@@ -235,9 +270,16 @@ func TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good(t *test
 	core.RequireNoError(t, err)
 	source := string(sourceBytes)
 
-	core.AssertTrue(t, strings.Contains(source, `if (group_size == 64u)`), "q4 row-sum must keep the Gemma group64 fast path")
+	core.AssertTrue(t, strings.Contains(source, `if (bits == 4u && group_size == 64u)`), "q4 row-sum must keep the Gemma group64 fast path")
 	core.AssertTrue(t, strings.Contains(source, `const uint32_t groups_per_row = cols >> 6u`), "q4 group64 fast path must use shift-derived group count")
 	core.AssertTrue(t, strings.Contains(source, `for (uint32_t group_packed = 0; group_packed < 8u; ++group_packed)`), "q4 group64 fast path must use fixed packed-word groups")
+	core.AssertTrue(t, strings.Contains(source, `if (bits == 6u && group_size == 64u)`), "q6 row-sum must keep the Gemma group64 fast path")
+	core.AssertTrue(t, strings.Contains(source, `rocm_mlx_affine_q6_16_dot`), "q6 row-sum must use fixed 16-value unpack blocks")
+	core.AssertTrue(t, strings.Contains(source, `rocm_mlx_affine_q6_16_pair_dot`), "q6 fused gate/up path must share fixed 16-value unpack blocks")
+	core.AssertTrue(t, strings.Contains(source, `rocm_mlx_affine_q6_16_batch_dot`), "q6 batch projection must use fixed 16-value unpack blocks")
+	core.AssertTrue(t, strings.Contains(source, `rocm_mlx_affine_q6_16_pair_batch_dot`), "q6 batch fused gate/up path must share fixed 16-value unpack blocks")
+	core.AssertTrue(t, strings.Contains(source, `rocm_mlx_affine_q6_quantized_value`), "q6 embedding/generic affine lookup must use specialized value extraction")
+	core.AssertTrue(t, strings.Contains(source, `rocm_mlx_affine_q8_quantized_value`), "q8 embedding/generic affine lookup must use specialized value extraction")
 
 	projection := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_projection`)
 	core.AssertTrue(t, strings.Contains(projection, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_THREADS_PER_ROW`), "projection rows use normal row geometry")
@@ -250,6 +292,24 @@ func TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good(t *test
 	core.AssertTrue(t, strings.Contains(cols256, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_COLS256_THREADS_PER_ROW`), "cols256 projection rows use narrow row geometry")
 	core.AssertTrue(t, strings.Contains(cols256, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_COLS256_ROWS_PER_BLOCK + row_lane`), "cols256 projection grid uses narrow row blocks")
 
+	q6Row16 := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_projection_q6_row16`)
+	core.AssertTrue(t, strings.Contains(q6Row16, `args.bits != 6u || args.group_size != 64u || args.cols < 1536u`), "q6 row16 projection must guard its specialized tensor shape")
+	core.AssertTrue(t, strings.Contains(q6Row16, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_Q6_ROW16_THREADS_PER_ROW`), "q6 row16 projection rows use narrow row geometry")
+	core.AssertTrue(t, strings.Contains(q6Row16, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_Q6_ROW16_ROWS_PER_BLOCK + row_lane`), "q6 row16 projection grid uses narrow row blocks")
+	core.AssertTrue(t, strings.Contains(q6Row16, `rocm_mlx_q4_projection_q6_row16_reduce`), "q6 row16 projection uses matching row reduction width")
+
+	q6Row32 := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_projection_q6_row32`)
+	core.AssertTrue(t, strings.Contains(q6Row32, `args.bits != 6u || args.group_size != 64u || args.cols < 1536u || args.cols > 2048u`), "q6 row32 projection must guard its specialized tensor shape")
+	core.AssertTrue(t, strings.Contains(q6Row32, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_Q6_ROW32_THREADS_PER_ROW`), "q6 row32 projection rows use narrow row geometry")
+	core.AssertTrue(t, strings.Contains(q6Row32, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_Q6_ROW32_ROWS_PER_BLOCK + row_lane`), "q6 row32 projection grid uses narrow row blocks")
+	core.AssertTrue(t, strings.Contains(q6Row32, `rocm_mlx_q4_projection_q6_row32_reduce`), "q6 row32 projection uses matching row reduction width")
+
+	q6Row64 := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_projection_q6_row64`)
+	core.AssertTrue(t, strings.Contains(q6Row64, `args.bits != 6u || args.group_size != 64u || args.cols < 1536u || args.cols > 2048u`), "q6 row64 projection must guard its specialized tensor shape")
+	core.AssertTrue(t, strings.Contains(q6Row64, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_Q6_ROW64_THREADS_PER_ROW`), "q6 row64 projection rows use row64 geometry")
+	core.AssertTrue(t, strings.Contains(q6Row64, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_Q6_ROW64_ROWS_PER_BLOCK + row_lane`), "q6 row64 projection grid uses row64 blocks")
+	core.AssertTrue(t, strings.Contains(q6Row64, `rocm_mlx_q4_projection_q6_row64_reduce`), "q6 row64 projection uses matching row reduction width")
+
 	batch := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_projection_batch`)
 	core.AssertTrue(t, strings.Contains(batch, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_THREADS_PER_ROW`), "batch projection rows use normal row geometry")
 	core.AssertTrue(t, strings.Contains(batch, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_ROWS_PER_BLOCK + row_lane`), "batch projection grid uses normal row blocks")
@@ -257,6 +317,26 @@ func TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good(t *test
 	core.AssertTrue(t, strings.Contains(batch, `batch >= args.batch`), "batch projection must guard partial token blocks")
 	core.AssertTrue(t, strings.Contains(batch, `+ batch * args.cols`), "batch projection input must be row-offset by batch")
 	core.AssertTrue(t, strings.Contains(batch, `+ batch * args.rows`), "batch projection output must be row-offset by batch")
+	core.AssertTrue(t, strings.Contains(batch, `args.bits == 6u && args.group_size == 64u`), "batch projection must keep the q6 group64 fast path")
+
+	batchQ6Row16 := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_projection_batch_q6_row16`)
+	core.AssertTrue(t, strings.Contains(batchQ6Row16, `args.bits != 6u || args.group_size != 64u || args.cols < 1536u`), "q6 row16 batch projection must guard its specialized tensor shape")
+	core.AssertTrue(t, strings.Contains(batchQ6Row16, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_Q6_ROW16_THREADS_PER_ROW`), "q6 row16 batch projection rows use row16 geometry")
+	core.AssertTrue(t, strings.Contains(batchQ6Row16, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_Q6_ROW16_ROWS_PER_BLOCK + row_lane`), "q6 row16 batch projection grid uses row16 row blocks")
+	core.AssertTrue(t, strings.Contains(batchQ6Row16, `rocm_mlx_affine_q6_16_batch_dot`), "q6 row16 batch projection must keep fixed q6 unpacking")
+	core.AssertTrue(t, strings.Contains(batchQ6Row16, `rocm_mlx_q4_projection_q6_row16_reduce`), "q6 row16 batch projection uses matching row reduction width")
+
+	tripleQ6Row16 := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_triple_projection_q6_row16`)
+	core.AssertTrue(t, strings.Contains(tripleQ6Row16, `args.bits != 6u || args.group_size != 64u || args.cols < 1536u`), "q6 row16 triple projection must guard its specialized tensor shape")
+	core.AssertTrue(t, strings.Contains(tripleQ6Row16, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_Q6_ROW16_THREADS_PER_ROW`), "q6 row16 triple projection rows use narrow row geometry")
+	core.AssertTrue(t, strings.Contains(tripleQ6Row16, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_Q6_ROW16_ROWS_PER_BLOCK + row_lane`), "q6 row16 triple projection grid uses narrow row blocks")
+	core.AssertTrue(t, strings.Contains(tripleQ6Row16, `rocm_mlx_q4_projection_q6_row16_reduce`), "q6 row16 triple projection uses matching row reduction width")
+
+	tripleQ6Row64 := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_triple_projection_q6_row64`)
+	core.AssertTrue(t, strings.Contains(tripleQ6Row64, `args.bits != 6u || args.group_size != 64u || args.cols != 1536u`), "q6 row64 triple projection must guard its specialized tensor shape")
+	core.AssertTrue(t, strings.Contains(tripleQ6Row64, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_Q6_ROW64_THREADS_PER_ROW`), "q6 row64 triple projection rows use row64 geometry")
+	core.AssertTrue(t, strings.Contains(tripleQ6Row64, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_Q6_ROW64_ROWS_PER_BLOCK + row_lane`), "q6 row64 triple projection grid uses row64 blocks")
+	core.AssertTrue(t, strings.Contains(tripleQ6Row64, `rocm_mlx_q4_projection_q6_row64_reduce`), "q6 row64 triple projection uses matching row reduction width")
 
 	gelu := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply`)
 	core.AssertTrue(t, strings.Contains(gelu, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_THREADS_PER_ROW`), "GELU multiply rows use projection row geometry")
@@ -265,6 +345,30 @@ func TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good(t *test
 	core.AssertTrue(t, strings.Contains(gelu, `const uint32_t row_group_base = row * groups_per_row`), "GELU multiply must hoist the row group base")
 	core.AssertTrue(t, strings.Contains(gelu, `row_group_base + (packed >> 3u)`), "GELU multiply group64 path must avoid runtime group division")
 
+	geluQ6Cols1536 := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply_q6_cols1536`)
+	core.AssertTrue(t, strings.Contains(geluQ6Cols1536, `args.bits != 6u || args.group_size != 64u || args.cols != 1536u`), "q6 cols1536 GELU multiply must guard its specialized tensor shape")
+	core.AssertTrue(t, strings.Contains(geluQ6Cols1536, `threadIdx.x / ROCM_MLX_Q4_GELU_TANH_Q6_COLS1536_THREADS_PER_ROW`), "q6 cols1536 GELU multiply rows use narrow row geometry")
+	core.AssertTrue(t, strings.Contains(geluQ6Cols1536, `blockIdx.x * ROCM_MLX_Q4_GELU_TANH_Q6_COLS1536_ROWS_PER_BLOCK + row_lane`), "q6 cols1536 GELU multiply grid uses narrow row blocks")
+	core.AssertTrue(t, strings.Contains(geluQ6Cols1536, `rocm_mlx_q4_gelu_tanh_q6_cols1536_row_reduce`), "q6 cols1536 GELU multiply uses matching row reduction width")
+
+	geluQ6Cols1536Row32 := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply_q6_cols1536_row32`)
+	core.AssertTrue(t, strings.Contains(geluQ6Cols1536Row32, `args.bits != 6u || args.group_size != 64u || args.cols != 1536u || args.rows > 6144u`), "q6 cols1536 row32 GELU multiply must guard its specialized tensor shape")
+	core.AssertTrue(t, strings.Contains(geluQ6Cols1536Row32, `threadIdx.x / ROCM_MLX_Q4_GELU_TANH_Q6_COLS1536_ROW32_THREADS_PER_ROW`), "q6 cols1536 row32 GELU multiply rows use row32 geometry")
+	core.AssertTrue(t, strings.Contains(geluQ6Cols1536Row32, `blockIdx.x * ROCM_MLX_Q4_GELU_TANH_Q6_COLS1536_ROW32_ROWS_PER_BLOCK + row_lane`), "q6 cols1536 row32 GELU multiply grid uses row32 blocks")
+	core.AssertTrue(t, strings.Contains(geluQ6Cols1536Row32, `rocm_mlx_q4_gelu_tanh_q6_cols1536_row32_reduce`), "q6 cols1536 row32 GELU multiply uses matching row reduction width")
+
+	geluQ6Cols1536Row64 := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply_q6_cols1536_row64`)
+	core.AssertTrue(t, strings.Contains(geluQ6Cols1536Row64, `args.bits != 6u || args.group_size != 64u || args.cols != 1536u || args.rows > 6144u`), "q6 cols1536 row64 GELU multiply must guard its specialized tensor shape")
+	core.AssertTrue(t, strings.Contains(geluQ6Cols1536Row64, `threadIdx.x / ROCM_MLX_Q4_GELU_TANH_Q6_COLS1536_ROW64_THREADS_PER_ROW`), "q6 cols1536 row64 GELU multiply rows use row64 geometry")
+	core.AssertTrue(t, strings.Contains(geluQ6Cols1536Row64, `blockIdx.x * ROCM_MLX_Q4_GELU_TANH_Q6_COLS1536_ROW64_ROWS_PER_BLOCK + row_lane`), "q6 cols1536 row64 GELU multiply grid uses row64 blocks")
+	core.AssertTrue(t, strings.Contains(geluQ6Cols1536Row64, `rocm_mlx_q4_gelu_tanh_q6_cols1536_row64_reduce`), "q6 cols1536 row64 GELU multiply uses matching row reduction width")
+
+	geluProjQ6Row16 := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_gelu_tanh_projection_q6_row16`)
+	core.AssertTrue(t, strings.Contains(geluProjQ6Row16, `args.bits != 6u || args.group_size != 64u || args.cols < 1536u`), "q6 row16 GELU projection must guard its specialized tensor shape")
+	core.AssertTrue(t, strings.Contains(geluProjQ6Row16, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_Q6_ROW16_THREADS_PER_ROW`), "q6 row16 GELU projection rows use narrow row geometry")
+	core.AssertTrue(t, strings.Contains(geluProjQ6Row16, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_Q6_ROW16_ROWS_PER_BLOCK + row_lane`), "q6 row16 GELU projection grid uses narrow row blocks")
+	core.AssertTrue(t, strings.Contains(geluProjQ6Row16, `rocm_mlx_q4_projection_q6_row16_reduce`), "q6 row16 GELU projection uses matching row reduction width")
+
 	geluBatch := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_gelu_tanh_multiply_batch`)
 	core.AssertTrue(t, strings.Contains(geluBatch, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_THREADS_PER_ROW`), "batch GELU multiply rows use projection row geometry")
 	core.AssertTrue(t, strings.Contains(geluBatch, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_ROWS_PER_BLOCK + row_lane`), "batch GELU multiply grid uses projection row blocks")
@@ -272,12 +376,14 @@ func TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good(t *test
 	core.AssertTrue(t, strings.Contains(geluBatch, `batch >= args.batch`), "batch GELU multiply must guard partial token blocks")
 	core.AssertTrue(t, strings.Contains(geluBatch, `+ batch * args.cols`), "batch GELU multiply input must be row-offset by batch")
 	core.AssertTrue(t, strings.Contains(geluBatch, `+ batch * args.rows`), "batch GELU multiply output must be row-offset by batch")
+	core.AssertTrue(t, strings.Contains(geluBatch, `args.bits == 6u && args.group_size == 64u`), "batch GELU multiply must keep the q6 group64 fast path")
 
 	geluProjBatch := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_gelu_tanh_projection_batch`)
 	core.AssertTrue(t, strings.Contains(geluProjBatch, `blockIdx.y * ROCM_MLX_Q4_PROJECTION_BATCH_TOKENS_PER_BLOCK`), "batch GELU projection must use grid Y for token blocks")
 	core.AssertTrue(t, strings.Contains(geluProjBatch, `batch >= args.batch`), "batch GELU projection must guard partial token blocks")
 	core.AssertTrue(t, strings.Contains(geluProjBatch, `+ batch * args.cols`), "batch GELU projection input must be row-offset by batch")
 	core.AssertTrue(t, strings.Contains(geluProjBatch, `+ batch * args.rows`), "batch GELU projection output must be row-offset by batch")
+	core.AssertTrue(t, strings.Contains(geluProjBatch, `args.bits == 6u && args.group_size == 64u`), "batch GELU projection must keep the q6 group64 fast path")
 
 	greedy := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_projection_greedy`)
 	core.AssertTrue(t, strings.Contains(greedy, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_GREEDY_THREADS_PER_ROW`), "greedy rows use greedy row geometry")
@@ -287,17 +393,56 @@ func TestHIPKernelSource_MLXQ4ProjectionGeometryMatchesLaunchConfig_Good(t *test
 	core.AssertTrue(t, strings.Contains(greedy, `for (uint32_t index = 1u; index < ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK; ++index)`), "greedy best reduction uses one post-sync serial pass")
 	core.AssertTrue(t, !strings.Contains(greedy, `ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK / 2u`), "greedy best reduction must not reintroduce repeated block barriers")
 
+	greedyQ6Row64 := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_projection_greedy_q6_row64`)
+	core.AssertTrue(t, strings.Contains(greedyQ6Row64, `args.bits != 6u || args.group_size != 64u || args.cols < 1536u`), "q6 row64 greedy must guard its specialized tensor shape")
+	core.AssertTrue(t, strings.Contains(greedyQ6Row64, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_GREEDY_Q6_THREADS_PER_ROW`), "q6 row64 greedy rows use narrow row geometry")
+	core.AssertTrue(t, strings.Contains(greedyQ6Row64, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_GREEDY_Q6_ROWS_PER_BLOCK + row_lane`), "q6 row64 greedy grid uses narrow row blocks")
+	core.AssertTrue(t, strings.Contains(greedyQ6Row64, `rocm_mlx_q4_greedy_q6_row_reduce`), "q6 row64 greedy uses matching row reduction width")
+	core.AssertTrue(t, strings.Contains(greedyQ6Row64, `for (uint32_t index = 1u; index < ROCM_MLX_Q4_PROJECTION_GREEDY_Q6_ROWS_PER_BLOCK; ++index)`), "q6 row64 greedy best reduction scans the matching per-block row count")
+
+	greedyBatch := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_projection_greedy_batch`)
+	core.AssertTrue(t, strings.Contains(greedyBatch, `const uint32_t batch_index = blockIdx.y`), "batch greedy must map grid Y to input rows")
+	core.AssertTrue(t, strings.Contains(greedyBatch, `static_cast<uint64_t>(batch_index) * args.cols`), "batch greedy must offset each input row")
+	core.AssertTrue(t, strings.Contains(greedyBatch, `atomicMax(&best[batch_index], best_value)`), "batch greedy must write one best result per input row")
+	core.AssertTrue(t, strings.Contains(greedyBatch, `!rocm_mlx_q4_token_suppressed(row, suppress_tokens, args.suppress_count)`), "batch greedy must filter suppressed rows on device")
+
+	greedyBatchQ6Row64 := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_projection_greedy_batch_q6_row64`)
+	core.AssertTrue(t, strings.Contains(greedyBatchQ6Row64, `args.bits != 6u || args.group_size != 64u || args.cols < 1536u`), "q6 row64 batch greedy must guard its specialized tensor shape")
+	core.AssertTrue(t, strings.Contains(greedyBatchQ6Row64, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_GREEDY_Q6_THREADS_PER_ROW`), "q6 row64 batch greedy rows use narrow row geometry")
+	core.AssertTrue(t, strings.Contains(greedyBatchQ6Row64, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_GREEDY_Q6_ROWS_PER_BLOCK + row_lane`), "q6 row64 batch greedy grid uses narrow row blocks")
+	core.AssertTrue(t, strings.Contains(greedyBatchQ6Row64, `atomicMax(&best[batch_index], best_value)`), "q6 row64 batch greedy must write one best result per input row")
+
 	scores := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_projection_scores`)
 	core.AssertTrue(t, strings.Contains(scores, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_GREEDY_THREADS_PER_ROW`), "score rows use greedy row geometry")
 	core.AssertTrue(t, strings.Contains(scores, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_GREEDY_ROWS_PER_BLOCK + row_lane`), "score grid uses greedy row blocks")
 	core.AssertTrue(t, strings.Contains(scores, `scores[row] = packed`), "score projection writes one packed score per vocab row")
 	core.AssertTrue(t, strings.Contains(scores, `!rocm_mlx_q4_token_suppressed(row, suppress_tokens, args.suppress_count)`), "score projection filters suppressed rows on device")
 
+	scoresQ6Row64 := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_mlx_q4_projection_scores_q6_row64`)
+	core.AssertTrue(t, strings.Contains(scoresQ6Row64, `args.bits != 6u || args.group_size != 64u || args.cols < 1536u`), "q6 row64 score projection must guard its specialized tensor shape")
+	core.AssertTrue(t, strings.Contains(scoresQ6Row64, `threadIdx.x / ROCM_MLX_Q4_PROJECTION_GREEDY_Q6_THREADS_PER_ROW`), "q6 row64 score projection rows use q6 greedy row geometry")
+	core.AssertTrue(t, strings.Contains(scoresQ6Row64, `blockIdx.x * ROCM_MLX_Q4_PROJECTION_GREEDY_Q6_ROWS_PER_BLOCK + row_lane`), "q6 row64 score projection grid uses q6 greedy row blocks")
+	core.AssertTrue(t, strings.Contains(scoresQ6Row64, `rocm_mlx_q4_greedy_q6_row_reduce`), "q6 row64 score projection uses matching row reduction width")
+	core.AssertTrue(t, strings.Contains(scoresQ6Row64, `scores[row] = packed`), "q6 row64 score projection writes one packed score per vocab row")
+
 	topK := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_packed_topk`)
 	core.AssertTrue(t, strings.Contains(topK, `__shared__ unsigned long long scratch[ROCM_PACKED_TOPK_CHUNK_SIZE]`), "packed top-k uses shared chunk sort")
 	core.AssertTrue(t, strings.Contains(topK, `blockIdx.x * args.chunk_size`), "packed top-k partitions scores by chunk")
 	core.AssertTrue(t, strings.Contains(topK, `local ^ stride`), "packed top-k uses parallel compare-swap passes")
 	core.AssertTrue(t, strings.Contains(topK, `output[blockIdx.x * args.top_k + threadIdx.x] = scratch[threadIdx.x]`), "packed top-k writes chunk-local candidates")
+}
+
+func TestHIPKernelSource_AutoRoundQuantizeGroupPacking_Good(t *testing.T) {
+	sourceBytes, err := os.ReadFile("../kernels/rocm_kernels.hip")
+	core.RequireNoError(t, err)
+	source := string(sourceBytes)
+
+	kernel := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_autoround_quantize`)
+	core.AssertTrue(t, strings.Contains(source, `static_assert(sizeof(rocm_autoround_quantize_launch_args) == ROCM_AUTOROUND_QUANTIZE_LAUNCH_ARGS_BYTES`), "AutoRound launch ABI must be statically checked")
+	core.AssertTrue(t, strings.Contains(source, `__device__ bool rocm_valid_autoround_quantize_args`), "AutoRound launch args must have a source-side validator")
+	core.AssertTrue(t, strings.Contains(kernel, `const uint32_t group_index = blockIdx.x * blockDim.x + threadIdx.x`), "AutoRound quantize must launch over row/group work items")
+	core.AssertTrue(t, strings.Contains(kernel, `scales[group_index] = scale`), "AutoRound quantize must emit one scale per row/group")
+	core.AssertTrue(t, strings.Contains(kernel, `rocm_autoround_pack_signed`), "AutoRound quantize must pack signed quantized values")
 }
 
 func TestHIPKernelSource_EmbeddingGreedyTokenReadsPackedBest_Good(t *testing.T) {
@@ -346,6 +491,7 @@ func TestHIPKernelSource_KVDescriptorAppendInPlaceSkipsSelfCopy_Good(t *testing.
 	source := string(sourceBytes)
 
 	appendKernel := hipKernelSourceFunctionBodyForTest(t, source, `extern "C" __global__ void rocm_kv_descriptor_append`)
+	core.AssertTrue(t, strings.Contains(appendKernel, `ROCM_KV_DESCRIPTOR_APPEND_MODE_BUILD_SINGLE_PAGE`), "descriptor append must build single-page tables on device")
 	core.AssertTrue(t, strings.Contains(appendKernel, `args.previous_descriptor_pointer == args.output_descriptor_pointer`), "descriptor append must detect in-place table reuse")
 	core.AssertTrue(t, strings.Contains(appendKernel, `args.previous_descriptor_pointer != args.output_descriptor_pointer`), "trimmed descriptor append must avoid parallel self-copy")
 	core.AssertTrue(t, strings.Contains(appendKernel, `args.output_page_count == previous->page_count + 1u`), "descriptor append must keep the no-trim append shape guard")
@@ -400,7 +546,7 @@ func TestHIPKernelSource_NVIDIAHIPCompile_Good(t *testing.T) {
 	arch := rocmNVIDIATestEnvDefault("GO_ROCM_NVIDIA_HIP_ARCH", "sm_75")
 	std := rocmNVIDIATestEnvDefault("GO_ROCM_NVIDIA_HIP_STD", "c++20")
 	outputPath := filepath.Join(t.TempDir(), "rocm_kernels_nvidia.o")
-	cmd := exec.Command(
+	cmd := rocmCompileTestCommand(t,
 		hipcc,
 		"--std="+std,
 		"-c",
@@ -412,7 +558,7 @@ func TestHIPKernelSource_NVIDIAHIPCompile_Good(t *testing.T) {
 		"-o",
 		outputPath,
 	)
-	cmd.Env = rocmNVIDIATestEnv(cudaPath, "HIP_PLATFORM=nvidia")
+	cmd.Env = rocmCompileTestEnv(rocmNVIDIATestEnv(cudaPath, "HIP_PLATFORM=nvidia"))
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("compile HIP kernels through NVIDIA backend: %v\n%s", err, rocmNVIDIATestOutputTail(output))
@@ -436,7 +582,7 @@ func TestHIPKernelSource_AMDHIPCompile_Good(t *testing.T) {
 	arch := rocmNVIDIATestEnvDefault("GO_ROCM_AMD_HIP_ARCH", "gfx1100")
 	std := rocmNVIDIATestEnvDefault("GO_ROCM_AMD_HIP_STD", "c++23")
 	outputPath := filepath.Join(t.TempDir(), "rocm_kernels_"+arch+".hsaco")
-	cmd := exec.Command(
+	cmd := rocmCompileTestCommand(t,
 		hipcc,
 		"--std="+std,
 		"--genco",
@@ -446,7 +592,7 @@ func TestHIPKernelSource_AMDHIPCompile_Good(t *testing.T) {
 		"-o",
 		outputPath,
 	)
-	cmd.Env = rocmNVIDIATestEnv("", "HIP_PLATFORM=amd")
+	cmd.Env = rocmCompileTestEnv(rocmNVIDIATestEnv("", "HIP_PLATFORM=amd"))
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("compile HIP kernels through AMD backend: %v\n%s", err, rocmNVIDIATestOutputTail(output))
@@ -481,7 +627,7 @@ func TestHIPKernelSource_HIPCPUCompile_Good(t *testing.T) {
 			}
 			args = append(args, target.extraCompileFlags...)
 			args = append(args, "-c", "../kernels/rocm_kernels.hip", "-o", outputPath)
-			cmd := exec.Command(compiler, args...)
+			cmd := rocmCompileTestCommand(t, compiler, args...)
 			output, err := cmd.CombinedOutput()
 			if err != nil {
 				t.Fatalf("compile HIP kernels through HIP-CPU target=%s compiler=%s: %v\n%s", target.name, compiler, err, rocmNVIDIATestOutputTail(output))
@@ -510,7 +656,7 @@ func TestHIPKernelSource_HIPCPURuntimeSmoke_Good(t *testing.T) {
 	binaryPath := filepath.Join(tempDir, "hip_cpu_smoke")
 	core.RequireNoError(t, os.WriteFile(sourcePath, []byte(rocmHIPCPUSmokeSource), 0o644))
 
-	compile := exec.Command(
+	compile := rocmCompileTestCommand(t,
 		compiler,
 		"-std=c++20",
 		"-O2",
@@ -551,7 +697,7 @@ func TestHIPKernelSource_HIPCPUProductionKernelRuntimeSmoke_Good(t *testing.T) {
 	source := rocmHIPCPUProductionKernelSmokeSource(kernelPath)
 	core.RequireNoError(t, os.WriteFile(sourcePath, []byte(source), 0o644))
 
-	compile := exec.Command(
+	compile := rocmCompileTestCommand(t,
 		compiler,
 		"-std=c++20",
 		"-O2",
@@ -594,7 +740,7 @@ func TestHIPKernelSource_ZLUDACUDARuntimeSmoke_Good(t *testing.T) {
 	binaryPath := filepath.Join(tempDir, "zluda_cuda_smoke")
 	core.RequireNoError(t, os.WriteFile(sourcePath, []byte(rocmZLUDACUDASmokeSource), 0o644))
 
-	compile := exec.Command(
+	compile := rocmCompileTestCommand(t,
 		nvcc,
 		"-std=c++17",
 		"-arch="+arch,
@@ -603,7 +749,7 @@ func TestHIPKernelSource_ZLUDACUDARuntimeSmoke_Good(t *testing.T) {
 		"-o",
 		binaryPath,
 	)
-	compile.Env = rocmNVIDIATestEnv(cudaPath)
+	compile.Env = rocmCompileTestEnv(rocmNVIDIATestEnv(cudaPath))
 	output, err := compile.CombinedOutput()
 	if err != nil {
 		t.Fatalf("compile CUDA smoke with nvcc: %v\n%s", err, rocmNVIDIATestOutputTail(output))
@@ -911,6 +1057,66 @@ func rocmNVIDIATestEnvDefault(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func rocmCompileTestCommand(t *testing.T, compiler string, args ...string) *exec.Cmd {
+	t.Helper()
+	ccache, ok := rocmCompileTestCCache()
+	if !ok {
+		return exec.Command(compiler, args...)
+	}
+	if filepath.Base(compiler) == "hipcc" {
+		cmd := exec.Command(compiler, args...)
+		cmd.Env = rocmCompileTestEnv(os.Environ())
+		t.Logf("using ccache PATH launcher for %s", compiler)
+		return cmd
+	}
+	commandArgs := make([]string, 0, len(args)+1)
+	commandArgs = append(commandArgs, compiler)
+	commandArgs = append(commandArgs, args...)
+	cmd := exec.Command(ccache, commandArgs...)
+	cmd.Env = rocmCompileTestEnv(os.Environ())
+	t.Logf("using ccache launcher for %s", compiler)
+	return cmd
+}
+
+func rocmCompileTestCCache() (string, bool) {
+	if os.Getenv("GO_ROCM_USE_CCACHE") == "0" {
+		return "", false
+	}
+	ccache := os.Getenv("GO_ROCM_CCACHE")
+	if ccache == "" {
+		path, err := exec.LookPath("ccache")
+		if err != nil {
+			return "", false
+		}
+		ccache = path
+	}
+	return ccache, true
+}
+
+func rocmCompileTestEnv(env []string) []string {
+	if _, ok := rocmCompileTestCCache(); !ok {
+		return env
+	}
+	ccacheDir := "/usr/lib/ccache"
+	if info, err := os.Stat(ccacheDir); err != nil || !info.IsDir() {
+		return env
+	}
+	prefixed := make([]string, 0, len(env)+1)
+	replaced := false
+	for _, item := range env {
+		if strings.HasPrefix(item, "PATH=") {
+			prefixed = append(prefixed, "PATH="+ccacheDir+string(os.PathListSeparator)+strings.TrimPrefix(item, "PATH="))
+			replaced = true
+			continue
+		}
+		prefixed = append(prefixed, item)
+	}
+	if !replaced {
+		prefixed = append(prefixed, "PATH="+ccacheDir)
+	}
+	return prefixed
 }
 
 func rocmNVIDIATestOutputTail(output []byte) string {

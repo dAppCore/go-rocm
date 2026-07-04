@@ -746,6 +746,23 @@ func (model *hipLoadedModel) RunGRPOAdvantage(ctx context.Context, rewards []flo
 	return result, true, err
 }
 
+func (model *hipLoadedModel) RunAdamWUpdate(ctx context.Context, state *NativeAdamWState, gradients [][]float32) (bool, error) {
+	if model == nil || model.driver == nil {
+		return false, nil
+	}
+	if normalizeHIPKernelStatus(model.KernelStatus()).Optimizer != hipKernelStatusLinked {
+		return false, nil
+	}
+	if state == nil || len(gradients) == 0 {
+		return false, nil
+	}
+	err := hipRunAdamWUpdateKernel(ctx, model.driver, hipAdamWUpdateRequest{
+		State:     state,
+		Gradients: gradients,
+	})
+	return true, err
+}
+
 func hipFlattenFloat32Rows(scope string, rows [][]float32) ([]float32, int, bool, error) {
 	if len(rows) == 0 {
 		return nil, 0, false, nil

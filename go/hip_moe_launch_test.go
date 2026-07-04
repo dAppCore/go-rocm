@@ -117,6 +117,20 @@ func TestHIPMoERouterLaunch_Bad(t *testing.T) {
 	}).Binary()
 	core.AssertError(t, err)
 	core.AssertContains(t, err.Error(), "router status pointer")
+
+	_, err = (hipMoERouterLaunchArgs{
+		LogitPointer:  1,
+		IDPointer:     2,
+		ProbPointer:   3,
+		StatusPointer: 4,
+		ExpertCount:   2,
+		TopK:          1,
+		LogitBytes:    8,
+		IDBytes:       4,
+		ProbBytes:     4,
+	}).BinaryInto(make([]byte, hipMoERouterLaunchArgsBytes-1))
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "launch arg payload buffer is too small")
 }
 
 func TestHIPMoERouterLaunchBufferValidation_Bad(t *testing.T) {
@@ -292,6 +306,17 @@ func TestHIPMoELazyExpertLaunch_Bad(t *testing.T) {
 	}).Binary()
 	core.AssertError(t, err)
 	core.AssertContains(t, err.Error(), "expert ID byte count")
+
+	_, err = (hipMoELazyExpertLaunchArgs{
+		IDPointer:       1,
+		ResidentPointer: 2,
+		SelectedCount:   2,
+		TotalExperts:    5,
+		IDBytes:         8,
+		ResidentBytes:   5,
+	}).BinaryInto(make([]byte, hipMoELazyLaunchArgsBytes-1))
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "launch arg payload buffer is too small")
 }
 
 func TestHIPMoELazyExpertLaunchBufferValidation_Bad(t *testing.T) {
@@ -344,4 +369,124 @@ func TestHIPMoELazyExpertReadOutputValidation_Bad(t *testing.T) {
 
 	core.AssertError(t, err)
 	core.AssertContains(t, err.Error(), "copy resident expert output")
+}
+
+func BenchmarkHIPMoERouterLaunch_Top2Of128(b *testing.B) {
+	logits := make([]float32, 128)
+	for i := range logits {
+		logits[i] = float32(math.Sin(float64(i)*0.11) + math.Cos(float64(i)*0.03))
+	}
+	req := hipMoERouterRequest{Logits: logits, TopK: 2, Layer: 7}
+	driver := &fakeHIPDriver{available: true}
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		got, err := hipRunMoERouterKernel(context.Background(), driver, req)
+		if err != nil {
+			b.Fatalf("run MoE router fixture: %v", err)
+		}
+		if len(got.Routes) != req.TopK || got.Status != hipMoERouterLaunchStatusOK {
+			b.Fatalf("router result = %+v, want top-k status OK", got)
+		}
+	}
+}
+
+func BenchmarkHIPMoERouterLaunchPrepared_Top2Of128(b *testing.B) {
+	logits := make([]float32, 128)
+	for i := range logits {
+		logits[i] = float32(math.Sin(float64(i)*0.11) + math.Cos(float64(i)*0.03))
+	}
+	req := hipMoERouterRequest{Logits: logits, TopK: 2, Layer: 7}
+	driver := &fakeHIPDriver{available: true, skipLaunchRecording: true, copies: make([]uint64, 0, 8)}
+	buffers, err := req.deviceBuffers(driver)
+	if err != nil {
+		b.Fatalf("prepare MoE router buffers: %v", err)
+	}
+	defer buffers.Close()
+	launch, err := req.launchArgs(buffers)
+	if err != nil {
+		b.Fatalf("prepare MoE router launch args: %v", err)
+	}
+	launchBytes, err := launch.BinaryInto(make([]byte, hipMoERouterLaunchArgsBytes))
+	if err != nil {
+		b.Fatalf("encode MoE router launch args: %v", err)
+	}
+	config, err := hipOneDimensionalLaunchConfig(hipKernelNameMoERouter, launchBytes, 1)
+	if err != nil {
+		b.Fatalf("prepare MoE router launch config: %v", err)
+	}
+	routes := make([]rocmExpertRoute, req.TopK)
+	idPayload := make([]byte, req.TopK*4)
+	probPayload := make([]byte, req.TopK*4)
+	statusPayload := make([]byte, 4)
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := hipLaunchKernel(driver, config); err != nil {
+			b.Fatalf("launch MoE router fixture: %v", err)
+		}
+		got, err := buffers.ReadOutputInto(routes, idPayload, probPayload, statusPayload)
+		if err != nil {
+			b.Fatalf("read MoE router fixture: %v", err)
+		}
+		if len(got.Routes) != req.TopK || got.Status != hipMoERouterLaunchStatusOK {
+			b.Fatalf("router result = %+v, want top-k status OK", got)
+		}
+		driver.copies = driver.copies[:0]
+	}
+}
+
+func BenchmarkHIPMoELazyExpertLaunch_Top2Of128(b *testing.B) {
+	req := hipMoELazyExpertRequest{ExpertIDs: []int32{37, 5}, TotalExperts: 128}
+	driver := &fakeHIPDriver{available: true}
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		got, err := hipRunMoELazyExpertKernel(context.Background(), driver, req)
+		if err != nil {
+			b.Fatalf("run MoE lazy expert fixture: %v", err)
+		}
+		if len(got.Resident) != req.TotalExperts || !got.Resident[37] || !got.Resident[5] {
+			b.Fatalf("resident result = %+v, want selected experts resident", got.Resident)
+		}
+	}
+}
+
+func BenchmarkHIPMoELazyExpertLaunchPrepared_Top2Of128(b *testing.B) {
+	req := hipMoELazyExpertRequest{ExpertIDs: []int32{37, 5}, TotalExperts: 128}
+	driver := &fakeHIPDriver{available: true, skipLaunchRecording: true, copies: make([]uint64, 0, 8)}
+	buffers, err := req.deviceBuffers(driver)
+	if err != nil {
+		b.Fatalf("prepare MoE lazy expert buffers: %v", err)
+	}
+	defer buffers.Close()
+	launch, err := req.launchArgs(buffers)
+	if err != nil {
+		b.Fatalf("prepare MoE lazy expert launch args: %v", err)
+	}
+	launchBytes, err := launch.BinaryInto(make([]byte, hipMoELazyLaunchArgsBytes))
+	if err != nil {
+		b.Fatalf("encode MoE lazy expert launch args: %v", err)
+	}
+	config, err := hipOneDimensionalLaunchConfig(hipKernelNameMoELazy, launchBytes, req.TotalExperts)
+	if err != nil {
+		b.Fatalf("prepare MoE lazy expert launch config: %v", err)
+	}
+	resident := make([]bool, req.TotalExperts)
+	payload := make([]byte, req.TotalExperts)
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := hipLaunchKernel(driver, config); err != nil {
+			b.Fatalf("launch MoE lazy expert fixture: %v", err)
+		}
+		got, err := buffers.ReadOutputInto(resident, payload)
+		if err != nil {
+			b.Fatalf("read MoE lazy expert fixture: %v", err)
+		}
+		if len(got.Resident) != req.TotalExperts || !got.Resident[37] || !got.Resident[5] {
+			b.Fatalf("resident result = %+v, want selected experts resident", got.Resident)
+		}
+		driver.copies = driver.copies[:0]
+	}
 }

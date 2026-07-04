@@ -61,6 +61,7 @@ type hipEmbeddingLookupRequest struct {
 	Q4Scales      []uint16
 	Q4Biases      []uint16
 	Q4GroupSize   int
+	QuantBits     int
 	VocabSize     int
 	HiddenSize    int
 }
@@ -75,6 +76,7 @@ type hipEmbeddingLookupDeviceBuffers struct {
 	VocabSize   int
 	HiddenSize  int
 	GroupSize   int
+	QuantBits   int
 	TableEncode uint32
 }
 
@@ -95,6 +97,7 @@ type hipEmbeddingLookupLaunchArgs struct {
 	ScaleBytes       uint64
 	BiasBytes        uint64
 	OutputScale      float32
+	QuantBits        int
 }
 
 type hipDeviceEmbeddingLookupConfig struct {
@@ -108,6 +111,7 @@ type hipDeviceEmbeddingLookupConfig struct {
 	BiasPointer      nativeDevicePointer
 	ScaleBytes       uint64
 	BiasBytes        uint64
+	QuantBits        int
 }
 
 func (cfg hipDeviceEmbeddingLookupConfig) validate(tokenIDs []int32) error {
@@ -156,16 +160,21 @@ func (cfg hipDeviceEmbeddingLookupConfig) validateShape() error {
 		if cfg.ScalePointer == 0 || cfg.BiasPointer == 0 {
 			return core.E("rocm.hip.EmbeddingLookupLaunch", "q4 scale and bias pointers are required", nil)
 		}
-		if cfg.GroupSize <= 0 || cfg.HiddenSize%8 != 0 || cfg.HiddenSize%cfg.GroupSize != 0 {
-			return core.E("rocm.hip.EmbeddingLookupLaunch", "hidden size must align with q4 packing and group size", nil)
+		bits := hipMLXQ4ProjectionBitsOrDefault(cfg.QuantBits)
+		packedPerRow, err := hipMLXAffinePackedCols(cfg.HiddenSize, bits)
+		if err != nil {
+			return err
 		}
-		weightBytes := uint64(cfg.VocabSize) * uint64(cfg.HiddenSize/8) * 4
+		if cfg.GroupSize <= 0 || cfg.HiddenSize%cfg.GroupSize != 0 {
+			return core.E("rocm.hip.EmbeddingLookupLaunch", "hidden size must align with MLX affine group size", nil)
+		}
+		weightBytes := uint64(cfg.VocabSize) * uint64(packedPerRow) * 4
 		if cfg.EmbeddingBytes != weightBytes {
-			return core.E("rocm.hip.EmbeddingLookupLaunch", "q4 embedding byte count mismatch", nil)
+			return core.E("rocm.hip.EmbeddingLookupLaunch", "MLX affine embedding byte count mismatch", nil)
 		}
 		groupBytes := uint64(cfg.VocabSize) * uint64(cfg.HiddenSize/cfg.GroupSize) * 2
 		if cfg.ScaleBytes != groupBytes || cfg.BiasBytes != groupBytes {
-			return core.E("rocm.hip.EmbeddingLookupLaunch", "q4 scale/bias byte count mismatch", nil)
+			return core.E("rocm.hip.EmbeddingLookupLaunch", "MLX affine scale/bias byte count mismatch", nil)
 		}
 	default:
 		return core.E("rocm.hip.EmbeddingLookupLaunch", core.Sprintf("unsupported embedding table encoding %d", cfg.TableEncoding), nil)
@@ -397,7 +406,7 @@ func (req hipEmbeddingLookupRequest) validate() error {
 		return core.E("rocm.hip.EmbeddingLookupLaunch", "bf16 embedding table length must match vocab*hidden", nil)
 	}
 	if len(req.EmbeddingQ4) > 0 || len(req.Q4Scales) > 0 || len(req.Q4Biases) > 0 {
-		if err := validateHIPMLXQ4ProjectionShape(req.HiddenSize, len(req.EmbeddingQ4), len(req.Q4Scales), len(req.Q4Biases), req.VocabSize, req.HiddenSize, req.Q4GroupSize); err != nil {
+		if err := validateHIPMLXAffineProjectionShape(req.HiddenSize, len(req.EmbeddingQ4), len(req.Q4Scales), len(req.Q4Biases), req.VocabSize, req.HiddenSize, req.Q4GroupSize, req.QuantBits); err != nil {
 			return err
 		}
 	}
@@ -418,6 +427,7 @@ func (req hipEmbeddingLookupRequest) deviceBuffers(driver nativeHIPDriver) (*hip
 		VocabSize:  req.VocabSize,
 		HiddenSize: req.HiddenSize,
 		GroupSize:  req.Q4GroupSize,
+		QuantBits:  hipMLXQ4ProjectionBitsOrDefault(req.QuantBits),
 	}
 	success := false
 	defer func() {
@@ -509,6 +519,7 @@ func (req hipEmbeddingLookupRequest) launchArgs(buffers *hipEmbeddingLookupDevic
 	if encoding == hipEmbeddingTableEncodingMLXQ4 {
 		if buffers.Scales == nil || buffers.Biases == nil ||
 			buffers.GroupSize != req.Q4GroupSize ||
+			buffers.QuantBits != hipMLXQ4ProjectionBitsOrDefault(req.QuantBits) ||
 			buffers.Embedding.Count() != len(req.EmbeddingQ4) ||
 			buffers.Scales.Count() != len(req.Q4Scales) ||
 			buffers.Biases.Count() != len(req.Q4Biases) {
@@ -531,6 +542,7 @@ func (req hipEmbeddingLookupRequest) launchArgs(buffers *hipEmbeddingLookupDevic
 	}
 	if encoding == hipEmbeddingTableEncodingMLXQ4 {
 		launch.GroupSize = req.Q4GroupSize
+		launch.QuantBits = hipMLXQ4ProjectionBitsOrDefault(req.QuantBits)
 		launch.ScalePointer = buffers.Scales.Pointer()
 		launch.BiasPointer = buffers.Biases.Pointer()
 		launch.ScaleBytes = buffers.Scales.SizeBytes()
@@ -540,14 +552,26 @@ func (req hipEmbeddingLookupRequest) launchArgs(buffers *hipEmbeddingLookupDevic
 }
 
 func (args hipEmbeddingLookupLaunchArgs) Binary() ([]byte, error) {
-	return args.binary(false)
+	return args.BinaryInto(nil)
+}
+
+func (args hipEmbeddingLookupLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
+	return args.binaryInto(false, payload)
 }
 
 func (args hipEmbeddingLookupLaunchArgs) GreedyTokenBinary() ([]byte, error) {
-	return args.binary(true)
+	return args.GreedyTokenBinaryInto(nil)
+}
+
+func (args hipEmbeddingLookupLaunchArgs) GreedyTokenBinaryInto(payload []byte) ([]byte, error) {
+	return args.binaryInto(true, payload)
 }
 
 func (args hipEmbeddingLookupLaunchArgs) binary(greedyToken bool) ([]byte, error) {
+	return args.binaryInto(greedyToken, nil)
+}
+
+func (args hipEmbeddingLookupLaunchArgs) binaryInto(greedyToken bool, payload []byte) ([]byte, error) {
 	if args.TokenPointer == 0 || args.EmbeddingPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.EmbeddingLookupLaunch", "token, embedding, and output pointers are required", nil)
 	}
@@ -578,6 +602,7 @@ func (args hipEmbeddingLookupLaunchArgs) binary(greedyToken bool) ([]byte, error
 	var groupSize uint32
 	var scaleBytes uint32
 	var biasBytes uint32
+	var quantBits uint32
 	switch args.TableEncoding {
 	case hipEmbeddingTableEncodingF32:
 		if args.EmbeddingBytes != tableCount*4 {
@@ -595,17 +620,19 @@ func (args hipEmbeddingLookupLaunchArgs) binary(greedyToken bool) ([]byte, error
 		if err != nil {
 			return nil, err
 		}
-		if hiddenSize%8 != 0 {
-			return nil, core.E("rocm.hip.EmbeddingLookupLaunch", "hidden size must be divisible by 8 for q4 packing", nil)
+		quantBits, err = rocmDeviceKVPositiveUint32("MLX affine bits", hipMLXQ4ProjectionBitsOrDefault(args.QuantBits))
+		if err != nil {
+			return nil, err
 		}
-		if hiddenSize%groupSize != 0 {
-			return nil, core.E("rocm.hip.EmbeddingLookupLaunch", "hidden size must be divisible by q4 group size", nil)
+		packedPerRow, groupsPerRow, err := hipMLXAffineLaunchPackedGroups("rocm.hip.EmbeddingLookupLaunch", hiddenSize, groupSize, quantBits)
+		if err != nil {
+			return nil, err
 		}
-		weightBytes := uint64(vocabSize) * uint64(hiddenSize/8) * 4
+		weightBytes := uint64(vocabSize) * packedPerRow * 4
 		if args.EmbeddingBytes != weightBytes {
-			return nil, core.E("rocm.hip.EmbeddingLookupLaunch", "q4 embedding byte count mismatch", nil)
+			return nil, core.E("rocm.hip.EmbeddingLookupLaunch", "MLX affine embedding byte count mismatch", nil)
 		}
-		groupBytes := uint64(vocabSize) * uint64(hiddenSize/groupSize) * 2
+		groupBytes := uint64(vocabSize) * groupsPerRow * 2
 		scaleBytes, err = hipExactUint32Bytes("q4 embedding scales", args.ScaleBytes, groupBytes)
 		if err != nil {
 			return nil, core.E("rocm.hip.EmbeddingLookupLaunch", "scale byte count", err)
@@ -624,7 +651,12 @@ func (args hipEmbeddingLookupLaunchArgs) binary(greedyToken bool) ([]byte, error
 	if math.IsNaN(float64(args.OutputScale)) || math.IsInf(float64(args.OutputScale), 0) {
 		return nil, core.E("rocm.hip.EmbeddingLookupLaunch", "output scale must be finite", nil)
 	}
-	payload := hipBorrowLaunchPacket(hipEmbeddingLookupLaunchArgsBytes)
+	if cap(payload) < hipEmbeddingLookupLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipEmbeddingLookupLaunchArgsBytes)
+	} else {
+		payload = payload[:hipEmbeddingLookupLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipEmbeddingLookupLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.TokenPointer))
@@ -645,6 +677,7 @@ func (args hipEmbeddingLookupLaunchArgs) binary(greedyToken bool) ([]byte, error
 	if args.OutputScale != 0 && args.OutputScale != 1 {
 		binary.LittleEndian.PutUint32(payload[96:], math.Float32bits(args.OutputScale))
 	}
+	binary.LittleEndian.PutUint32(payload[100:], quantBits)
 	return payload, nil
 }
 
@@ -737,7 +770,23 @@ func hipRunEmbeddingLookupKernelWithDeviceTableBuffer(ctx context.Context, drive
 		return nil, err
 	}
 	defer tokens.Close()
-	output, err := hipAllocateByteBuffer(driver, "rocm.hip.EmbeddingLookupLaunch", "embedding lookup output", uint64(len(tokenIDs)*cfg.HiddenSize*4), len(tokenIDs)*cfg.HiddenSize)
+	return hipRunEmbeddingLookupKernelWithDeviceTableTokenBatchBuffer(ctx, driver, cfg, tokens)
+}
+
+func hipRunEmbeddingLookupKernelWithDeviceTableTokenBatchBuffer(ctx context.Context, driver nativeHIPDriver, cfg hipDeviceEmbeddingLookupConfig, tokenBuffer *hipDeviceTokenBuffer) (*hipDeviceByteBuffer, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return nil, err
+	}
+	if driver == nil || !driver.Available() {
+		return nil, core.E("rocm.hip.EmbeddingLookupLaunch", "HIP driver is not available", nil)
+	}
+	if err := cfg.validateShape(); err != nil {
+		return nil, err
+	}
+	if tokenBuffer == nil || tokenBuffer.Pointer() == 0 || tokenBuffer.Count() <= 0 || tokenBuffer.SizeBytes() != uint64(tokenBuffer.Count()*4) {
+		return nil, core.E("rocm.hip.EmbeddingLookupLaunch", "token buffer is required", nil)
+	}
+	output, err := hipAllocateByteBuffer(driver, "rocm.hip.EmbeddingLookupLaunch", "embedding lookup output", uint64(tokenBuffer.Count()*cfg.HiddenSize*4), tokenBuffer.Count()*cfg.HiddenSize)
 	if err != nil {
 		return nil, err
 	}
@@ -747,14 +796,58 @@ func hipRunEmbeddingLookupKernelWithDeviceTableBuffer(ctx context.Context, drive
 			_ = output.Close()
 		}
 	}()
+	if err := hipRunEmbeddingLookupKernelWithDeviceTableTokenBatchScaledOutput(ctx, driver, cfg, tokenBuffer, output, 0); err != nil {
+		return nil, err
+	}
+	success = true
+	return output, nil
+}
+
+func hipRunEmbeddingLookupKernelWithDeviceTableBufferScaledOutput(ctx context.Context, driver nativeHIPDriver, tokenIDs []int32, cfg hipDeviceEmbeddingLookupConfig, output *hipDeviceByteBuffer, outputScale float32) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	if driver == nil || !driver.Available() {
+		return core.E("rocm.hip.EmbeddingLookupLaunch", "HIP driver is not available", nil)
+	}
+	if err := cfg.validate(tokenIDs); err != nil {
+		return err
+	}
+	if output == nil || output.Pointer() == 0 || output.Count() != len(tokenIDs)*cfg.HiddenSize || output.SizeBytes() != uint64(output.Count()*4) {
+		return core.E("rocm.hip.EmbeddingLookupLaunch", "embedding output buffer shape mismatch", nil)
+	}
+	tokens, err := hipUploadTokenIDs(driver, tokenIDs)
+	if err != nil {
+		return err
+	}
+	defer tokens.Close()
+	return hipRunEmbeddingLookupKernelWithDeviceTableTokenBatchScaledOutput(ctx, driver, cfg, tokens, output, outputScale)
+}
+
+func hipRunEmbeddingLookupKernelWithDeviceTableTokenBatchScaledOutput(ctx context.Context, driver nativeHIPDriver, cfg hipDeviceEmbeddingLookupConfig, tokenBuffer *hipDeviceTokenBuffer, output *hipDeviceByteBuffer, outputScale float32) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	if driver == nil || !driver.Available() {
+		return core.E("rocm.hip.EmbeddingLookupLaunch", "HIP driver is not available", nil)
+	}
+	if err := cfg.validateShape(); err != nil {
+		return err
+	}
+	if tokenBuffer == nil || tokenBuffer.Pointer() == 0 || tokenBuffer.Count() <= 0 || tokenBuffer.SizeBytes() != uint64(tokenBuffer.Count()*4) {
+		return core.E("rocm.hip.EmbeddingLookupLaunch", "token buffer is required", nil)
+	}
+	if output == nil || output.Pointer() == 0 || output.Count() != tokenBuffer.Count()*cfg.HiddenSize || output.SizeBytes() != uint64(output.Count()*4) {
+		return core.E("rocm.hip.EmbeddingLookupLaunch", "embedding output buffer shape mismatch", nil)
+	}
 	launchBytes, err := (hipEmbeddingLookupLaunchArgs{
-		TokenPointer:     tokens.Pointer(),
+		TokenPointer:     tokenBuffer.Pointer(),
 		EmbeddingPointer: cfg.EmbeddingPointer,
 		OutputPointer:    output.Pointer(),
-		TokenCount:       len(tokenIDs),
+		TokenCount:       tokenBuffer.Count(),
 		VocabSize:        cfg.VocabSize,
 		HiddenSize:       cfg.HiddenSize,
-		TokenBytes:       tokens.SizeBytes(),
+		TokenBytes:       tokenBuffer.SizeBytes(),
 		EmbeddingBytes:   cfg.EmbeddingBytes,
 		OutputBytes:      output.SizeBytes(),
 		TableEncoding:    cfg.TableEncoding,
@@ -763,19 +856,17 @@ func hipRunEmbeddingLookupKernelWithDeviceTableBuffer(ctx context.Context, drive
 		BiasPointer:      cfg.BiasPointer,
 		ScaleBytes:       cfg.ScaleBytes,
 		BiasBytes:        cfg.BiasBytes,
+		OutputScale:      outputScale,
+		QuantBits:        cfg.QuantBits,
 	}).Binary()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	config, err := hipOneDimensionalLaunchConfig(hipKernelNameEmbedLookup, launchBytes, cfg.HiddenSize*len(tokenIDs))
+	config, err := hipOneDimensionalLaunchConfig(hipKernelNameEmbedLookup, launchBytes, cfg.HiddenSize*tokenBuffer.Count())
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if err := hipLaunchKernel(driver, config); err != nil {
-		return nil, err
-	}
-	success = true
-	return output, nil
+	return hipLaunchKernel(driver, config)
 }
 
 func hipRunEmbeddingLookupKernelWithDeviceTableSingleTokenBuffer(ctx context.Context, driver nativeHIPDriver, tokenID int32, cfg hipDeviceEmbeddingLookupConfig, tokenBuffer *hipDeviceByteBuffer) (*hipDeviceByteBuffer, error) {
@@ -829,6 +920,10 @@ func hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferOutput(ctx context.Con
 }
 
 func hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferScaledOutput(ctx context.Context, driver nativeHIPDriver, cfg hipDeviceEmbeddingLookupConfig, tokenBuffer, output *hipDeviceByteBuffer, outputScale float32) error {
+	return hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferScaledOutputWithWorkspace(ctx, driver, cfg, tokenBuffer, output, outputScale, nil)
+}
+
+func hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferScaledOutputWithWorkspace(ctx context.Context, driver nativeHIPDriver, cfg hipDeviceEmbeddingLookupConfig, tokenBuffer, output *hipDeviceByteBuffer, outputScale float32, workspace *hipAttentionHeadsChunkedWorkspace) error {
 	if err := hipContextErr(ctx); err != nil {
 		return err
 	}
@@ -841,7 +936,7 @@ func hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferScaledOutput(ctx conte
 	if output == nil || output.Pointer() == 0 || output.Count() != cfg.HiddenSize || output.SizeBytes() != uint64(cfg.HiddenSize*4) {
 		return core.E("rocm.hip.EmbeddingLookupLaunch", "single-token output buffer shape mismatch", nil)
 	}
-	launchBytes, err := (hipEmbeddingLookupLaunchArgs{
+	launchArgs := hipEmbeddingLookupLaunchArgs{
 		TokenPointer:     tokenBuffer.Pointer(),
 		EmbeddingPointer: cfg.EmbeddingPointer,
 		OutputPointer:    output.Pointer(),
@@ -858,7 +953,15 @@ func hipRunEmbeddingLookupKernelWithDeviceTableTokenBufferScaledOutput(ctx conte
 		ScaleBytes:       cfg.ScaleBytes,
 		BiasBytes:        cfg.BiasBytes,
 		OutputScale:      outputScale,
-	}).Binary()
+		QuantBits:        cfg.QuantBits,
+	}
+	var launchBytes []byte
+	var err error
+	if workspace != nil {
+		launchBytes, err = launchArgs.BinaryInto(workspace.EmbeddingLookupArgs[:])
+	} else {
+		launchBytes, err = launchArgs.Binary()
+	}
 	if err != nil {
 		return err
 	}
@@ -877,6 +980,10 @@ func hipRunEmbeddingLookupKernelWithDeviceTableGreedyTokenOutput(ctx context.Con
 }
 
 func hipRunEmbeddingLookupKernelWithDeviceTableGreedyTokenScaledOutput(ctx context.Context, driver nativeHIPDriver, cfg hipDeviceEmbeddingLookupConfig, greedyToken, output *hipDeviceByteBuffer, outputScale float32) error {
+	return hipRunEmbeddingLookupKernelWithDeviceTableGreedyTokenScaledOutputWithWorkspace(ctx, driver, cfg, greedyToken, output, outputScale, nil)
+}
+
+func hipRunEmbeddingLookupKernelWithDeviceTableGreedyTokenScaledOutputWithWorkspace(ctx context.Context, driver nativeHIPDriver, cfg hipDeviceEmbeddingLookupConfig, greedyToken, output *hipDeviceByteBuffer, outputScale float32, workspace *hipAttentionHeadsChunkedWorkspace) error {
 	if err := hipContextErr(ctx); err != nil {
 		return err
 	}
@@ -889,7 +996,7 @@ func hipRunEmbeddingLookupKernelWithDeviceTableGreedyTokenScaledOutput(ctx conte
 	if output == nil || output.Pointer() == 0 || output.Count() != cfg.HiddenSize || output.SizeBytes() != uint64(cfg.HiddenSize*4) {
 		return core.E("rocm.hip.EmbeddingLookupLaunch", "single-token output buffer shape mismatch", nil)
 	}
-	launchBytes, err := (hipEmbeddingLookupLaunchArgs{
+	launchArgs := hipEmbeddingLookupLaunchArgs{
 		TokenPointer:     greedyToken.Pointer(),
 		EmbeddingPointer: cfg.EmbeddingPointer,
 		OutputPointer:    output.Pointer(),
@@ -906,7 +1013,15 @@ func hipRunEmbeddingLookupKernelWithDeviceTableGreedyTokenScaledOutput(ctx conte
 		ScaleBytes:       cfg.ScaleBytes,
 		BiasBytes:        cfg.BiasBytes,
 		OutputScale:      outputScale,
-	}).GreedyTokenBinary()
+		QuantBits:        cfg.QuantBits,
+	}
+	var launchBytes []byte
+	var err error
+	if workspace != nil {
+		launchBytes, err = launchArgs.GreedyTokenBinaryInto(workspace.EmbeddingLookupArgs[:])
+	} else {
+		launchBytes, err = launchArgs.GreedyTokenBinary()
+	}
 	if err != nil {
 		return err
 	}

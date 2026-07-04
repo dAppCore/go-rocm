@@ -12,93 +12,187 @@ import (
 	"io"
 	"slices"
 	"strconv"
+	"strings"
 
 	core "dappco.re/go"
 	"dappco.re/go/inference"
 	"dappco.re/go/inference/quant/codebook"
 	"dappco.re/go/inference/quant/jang"
 	"dappco.re/go/rocm/internal/gguf"
+	rocmmodel "dappco.re/go/rocm/model"
+	modelgemma4 "dappco.re/go/rocm/model/gemma4"
 )
 
 const maxSafetensorsHeaderBytes = 64 << 20
 
 type rocmModelPackConfigProbe struct {
-	ModelType              string                       `json:"model_type"`
-	Architectures          []string                     `json:"architectures"`
-	DType                  string                       `json:"dtype"`
-	HiddenSize             int                          `json:"hidden_size"`
-	NumHiddenLayers        int                          `json:"num_hidden_layers"`
-	NumLayers              int                          `json:"num_layers"`
-	NumAttentionHeads      int                          `json:"num_attention_heads"`
-	NumKeyValueHeads       int                          `json:"num_key_value_heads"`
-	NumGlobalKVHeads       int                          `json:"num_global_key_value_heads"`
-	HeadDim                int                          `json:"head_dim"`
-	GlobalHeadDim          int                          `json:"global_head_dim"`
-	GlobalPartialRotary    float64                      `json:"global_partial_rotary_factor"`
-	VocabSize              int                          `json:"vocab_size"`
-	VocabSizePerLayer      int                          `json:"vocab_size_per_layer_input"`
-	MaxPositionEmbeddings  int                          `json:"max_position_embeddings"`
-	MaxSequenceLength      int                          `json:"max_sequence_length"`
-	SeqLength              int                          `json:"seq_length"`
-	SlidingWindow          int                          `json:"sliding_window"`
-	SlidingWindowPattern   int                          `json:"sliding_window_pattern"`
-	NumKVSharedLayers      *int                         `json:"num_kv_shared_layers"`
-	HiddenSizePerLayer     int                          `json:"hidden_size_per_layer_input"`
-	LayerTypes             []string                     `json:"layer_types"`
-	AttentionKEqV          bool                         `json:"attention_k_eq_v"`
-	RoPEParameters         map[string]rocmRoPEProbe     `json:"rope_parameters"`
-	RMSNormEps             float64                      `json:"rms_norm_eps"`
-	FinalLogitSoftcap      float64                      `json:"final_logit_softcapping"`
-	NumLocalExperts        int                          `json:"num_local_experts"`
-	NumExperts             int                          `json:"num_experts"`
-	NumExpertsPerTok       int                          `json:"num_experts_per_tok"`
-	TopKExperts            int                          `json:"top_k_experts"`
-	MoEIntermediateSize    int                          `json:"moe_intermediate_size"`
-	ExpertIntermediateSize int                          `json:"expert_intermediate_size"`
-	UseDoubleWideMLP       bool                         `json:"use_double_wide_mlp"`
-	EnableMoEBlock         bool                         `json:"enable_moe_block"`
-	QuantizationConfig     rocmQuantizationConfigProbe  `json:"quantization_config"`
-	Quantization           rocmQuantizationConfigProbe  `json:"quantization"`
-	TaskSpecificParams     map[string]any               `json:"task_specific_params"`
-	TextConfig             rocmModelPackTextConfigProbe `json:"text_config"`
-	TieWordEmbeddings      *bool                        `json:"tie_word_embeddings"`
+	ModelType                string                         `json:"model_type"`
+	Architectures            []string                       `json:"architectures"`
+	DType                    string                         `json:"dtype"`
+	HiddenSize               int                            `json:"hidden_size"`
+	NumHiddenLayers          int                            `json:"num_hidden_layers"`
+	NumLayers                int                            `json:"num_layers"`
+	NumAttentionHeads        int                            `json:"num_attention_heads"`
+	NumKeyValueHeads         int                            `json:"num_key_value_heads"`
+	NumGlobalKVHeads         int                            `json:"num_global_key_value_heads"`
+	HeadDim                  int                            `json:"head_dim"`
+	GlobalHeadDim            int                            `json:"global_head_dim"`
+	GlobalPartialRotary      float64                        `json:"global_partial_rotary_factor"`
+	VocabSize                int                            `json:"vocab_size"`
+	VocabSizePerLayer        int                            `json:"vocab_size_per_layer_input"`
+	IntermediateSize         int                            `json:"intermediate_size"`
+	MaxPositionEmbeddings    int                            `json:"max_position_embeddings"`
+	MaxSequenceLength        int                            `json:"max_sequence_length"`
+	SeqLength                int                            `json:"seq_length"`
+	CanvasLength             int                            `json:"canvas_length"`
+	BackboneHiddenSize       int                            `json:"backbone_hidden_size"`
+	NumCentroids             int                            `json:"num_centroids"`
+	CentroidIntermediateTopK int                            `json:"centroid_intermediate_top_k"`
+	UseOrderedEmbeddings     *bool                          `json:"use_ordered_embeddings"`
+	SlidingWindow            int                            `json:"sliding_window"`
+	SlidingWindowPattern     int                            `json:"sliding_window_pattern"`
+	NumKVSharedLayers        *int                           `json:"num_kv_shared_layers"`
+	HiddenSizePerLayer       int                            `json:"hidden_size_per_layer_input"`
+	LayerTypes               []string                       `json:"layer_types"`
+	AttentionKEqV            bool                           `json:"attention_k_eq_v"`
+	RoPEParameters           map[string]rocmRoPEProbe       `json:"rope_parameters"`
+	RMSNormEps               float64                        `json:"rms_norm_eps"`
+	FinalLogitSoftcap        float64                        `json:"final_logit_softcapping"`
+	NumLocalExperts          int                            `json:"num_local_experts"`
+	NumExperts               int                            `json:"num_experts"`
+	NumExpertsPerTok         int                            `json:"num_experts_per_tok"`
+	UseRoutingBias           bool                           `json:"use_routing_bias"`
+	TopKExperts              int                            `json:"top_k_experts"`
+	DecoderSparseStep        int                            `json:"decoder_sparse_step"`
+	MoEIntermediateSize      int                            `json:"moe_intermediate_size"`
+	ExpertIntermediateSize   int                            `json:"expert_intermediate_size"`
+	ImageTokenID             int                            `json:"image_token_id"`
+	ImageTokenIndex          int                            `json:"image_token_index"`
+	BOITokenIndex            int                            `json:"boi_token_index"`
+	BOITokenID               int                            `json:"boi_token_id"`
+	BOATokenID               int                            `json:"boa_token_id"`
+	BOATokenIndex            int                            `json:"boa_token_index"`
+	EOITokenIndex            int                            `json:"eoi_token_index"`
+	EOITokenID               int                            `json:"eoi_token_id"`
+	EOATokenID               int                            `json:"eoa_token_id"`
+	EOATokenIndex            int                            `json:"eoa_token_index"`
+	AudioTokenID             int                            `json:"audio_token_id"`
+	AudioTokenIndex          int                            `json:"audio_token_index"`
+	VideoTokenID             int                            `json:"video_token_id"`
+	VisionSoftTokensPerImage int                            `json:"vision_soft_tokens_per_image"`
+	MMTokensPerImage         int                            `json:"mm_tokens_per_image"`
+	QLoRARank                int                            `json:"q_lora_rank"`
+	KVLoRARank               int                            `json:"kv_lora_rank"`
+	QKNoPEHeadDim            int                            `json:"qk_nope_head_dim"`
+	QKRoPEHeadDim            int                            `json:"qk_rope_head_dim"`
+	QKHeadDim                int                            `json:"qk_head_dim"`
+	VHeadDim                 int                            `json:"v_head_dim"`
+	UseDoubleWideMLP         bool                           `json:"use_double_wide_mlp"`
+	EnableMoEBlock           bool                           `json:"enable_moe_block"`
+	QuantizationConfig       rocmQuantizationConfigProbe    `json:"quantization_config"`
+	Quantization             rocmQuantizationConfigProbe    `json:"quantization"`
+	TaskSpecificParams       map[string]any                 `json:"task_specific_params"`
+	TextConfig               rocmModelPackTextConfigProbe   `json:"text_config"`
+	VisionConfig             rocmModelPackVisionConfigProbe `json:"vision_config"`
+	AudioConfig              rocmModelPackAudioConfigProbe  `json:"audio_config"`
+	TieWordEmbeddings        *bool                          `json:"tie_word_embeddings"`
 }
 
 type rocmModelPackTextConfigProbe struct {
-	ModelType              string                   `json:"model_type"`
-	Architectures          []string                 `json:"architectures"`
-	DType                  string                   `json:"dtype"`
-	HiddenSize             int                      `json:"hidden_size"`
-	NumHiddenLayers        int                      `json:"num_hidden_layers"`
-	NumLayers              int                      `json:"num_layers"`
-	NumAttentionHeads      int                      `json:"num_attention_heads"`
-	NumKeyValueHeads       int                      `json:"num_key_value_heads"`
-	NumGlobalKVHeads       int                      `json:"num_global_key_value_heads"`
-	HeadDim                int                      `json:"head_dim"`
-	GlobalHeadDim          int                      `json:"global_head_dim"`
-	GlobalPartialRotary    float64                  `json:"global_partial_rotary_factor"`
-	VocabSize              int                      `json:"vocab_size"`
-	VocabSizePerLayer      int                      `json:"vocab_size_per_layer_input"`
-	MaxPositionEmbeddings  int                      `json:"max_position_embeddings"`
-	MaxSequenceLength      int                      `json:"max_sequence_length"`
-	SeqLength              int                      `json:"seq_length"`
-	SlidingWindow          int                      `json:"sliding_window"`
-	SlidingWindowPattern   int                      `json:"sliding_window_pattern"`
-	NumKVSharedLayers      *int                     `json:"num_kv_shared_layers"`
-	HiddenSizePerLayer     int                      `json:"hidden_size_per_layer_input"`
-	LayerTypes             []string                 `json:"layer_types"`
-	AttentionKEqV          bool                     `json:"attention_k_eq_v"`
-	RoPEParameters         map[string]rocmRoPEProbe `json:"rope_parameters"`
-	RMSNormEps             float64                  `json:"rms_norm_eps"`
-	FinalLogitSoftcap      float64                  `json:"final_logit_softcapping"`
-	NumExperts             int                      `json:"num_experts"`
-	NumExpertsPerTok       int                      `json:"num_experts_per_tok"`
-	TopKExperts            int                      `json:"top_k_experts"`
-	MoEIntermediateSize    int                      `json:"moe_intermediate_size"`
-	ExpertIntermediateSize int                      `json:"expert_intermediate_size"`
-	UseDoubleWideMLP       bool                     `json:"use_double_wide_mlp"`
-	EnableMoEBlock         bool                     `json:"enable_moe_block"`
-	TieWordEmbeddings      *bool                    `json:"tie_word_embeddings"`
+	ModelType                string                   `json:"model_type"`
+	Architectures            []string                 `json:"architectures"`
+	DType                    string                   `json:"dtype"`
+	HiddenSize               int                      `json:"hidden_size"`
+	NumHiddenLayers          int                      `json:"num_hidden_layers"`
+	NumLayers                int                      `json:"num_layers"`
+	NumAttentionHeads        int                      `json:"num_attention_heads"`
+	NumKeyValueHeads         int                      `json:"num_key_value_heads"`
+	NumGlobalKVHeads         int                      `json:"num_global_key_value_heads"`
+	HeadDim                  int                      `json:"head_dim"`
+	GlobalHeadDim            int                      `json:"global_head_dim"`
+	GlobalPartialRotary      float64                  `json:"global_partial_rotary_factor"`
+	VocabSize                int                      `json:"vocab_size"`
+	VocabSizePerLayer        int                      `json:"vocab_size_per_layer_input"`
+	IntermediateSize         int                      `json:"intermediate_size"`
+	MaxPositionEmbeddings    int                      `json:"max_position_embeddings"`
+	MaxSequenceLength        int                      `json:"max_sequence_length"`
+	SeqLength                int                      `json:"seq_length"`
+	CanvasLength             int                      `json:"canvas_length"`
+	BackboneHiddenSize       int                      `json:"backbone_hidden_size"`
+	NumCentroids             int                      `json:"num_centroids"`
+	CentroidIntermediateTopK int                      `json:"centroid_intermediate_top_k"`
+	UseOrderedEmbeddings     *bool                    `json:"use_ordered_embeddings"`
+	SlidingWindow            int                      `json:"sliding_window"`
+	SlidingWindowPattern     int                      `json:"sliding_window_pattern"`
+	NumKVSharedLayers        *int                     `json:"num_kv_shared_layers"`
+	HiddenSizePerLayer       int                      `json:"hidden_size_per_layer_input"`
+	LayerTypes               []string                 `json:"layer_types"`
+	AttentionKEqV            bool                     `json:"attention_k_eq_v"`
+	RoPEParameters           map[string]rocmRoPEProbe `json:"rope_parameters"`
+	RMSNormEps               float64                  `json:"rms_norm_eps"`
+	FinalLogitSoftcap        float64                  `json:"final_logit_softcapping"`
+	NumExperts               int                      `json:"num_experts"`
+	NumExpertsPerTok         int                      `json:"num_experts_per_tok"`
+	UseRoutingBias           bool                     `json:"use_routing_bias"`
+	TopKExperts              int                      `json:"top_k_experts"`
+	DecoderSparseStep        int                      `json:"decoder_sparse_step"`
+	MoEIntermediateSize      int                      `json:"moe_intermediate_size"`
+	ExpertIntermediateSize   int                      `json:"expert_intermediate_size"`
+	QLoRARank                int                      `json:"q_lora_rank"`
+	KVLoRARank               int                      `json:"kv_lora_rank"`
+	QKNoPEHeadDim            int                      `json:"qk_nope_head_dim"`
+	QKRoPEHeadDim            int                      `json:"qk_rope_head_dim"`
+	QKHeadDim                int                      `json:"qk_head_dim"`
+	VHeadDim                 int                      `json:"v_head_dim"`
+	UseDoubleWideMLP         bool                     `json:"use_double_wide_mlp"`
+	EnableMoEBlock           bool                     `json:"enable_moe_block"`
+	TieWordEmbeddings        *bool                    `json:"tie_word_embeddings"`
+}
+
+type rocmModelPackVisionConfigProbe struct {
+	ModelType             string        `json:"model_type"`
+	DType                 string        `json:"dtype"`
+	ImageSize             int           `json:"image_size"`
+	PatchSize             int           `json:"patch_size"`
+	NumChannels           int           `json:"num_channels"`
+	HiddenSize            int           `json:"hidden_size"`
+	IntermediateSize      int           `json:"intermediate_size"`
+	NumHiddenLayers       int           `json:"num_hidden_layers"`
+	NumAttentionHeads     int           `json:"num_attention_heads"`
+	NumKeyValueHeads      int           `json:"num_key_value_heads"`
+	HeadDim               int           `json:"head_dim"`
+	GlobalHeadDim         int           `json:"global_head_dim"`
+	MaxPositionEmbeddings int           `json:"max_position_embeddings"`
+	HiddenActivation      string        `json:"hidden_activation"`
+	RMSNormEps            float64       `json:"rms_norm_eps"`
+	LayerNormEps          float64       `json:"layer_norm_eps"`
+	RoPEParameters        rocmRoPEProbe `json:"rope_parameters"`
+	PoolingKernelSize     int           `json:"pooling_kernel_size"`
+	PositionEmbeddingSize int           `json:"position_embedding_size"`
+	DefaultOutputLength   int           `json:"default_output_length"`
+	Standardize           bool          `json:"standardize"`
+	UseClippedLinears     bool          `json:"use_clipped_linears"`
+}
+
+type rocmModelPackAudioConfigProbe struct {
+	ModelType                   string  `json:"model_type"`
+	HiddenSize                  int     `json:"hidden_size"`
+	AudioEmbedDim               int     `json:"audio_embed_dim"`
+	AudioSamplesPerToken        int     `json:"audio_samples_per_token"`
+	NumHiddenLayers             int     `json:"num_hidden_layers"`
+	NumAttentionHeads           int     `json:"num_attention_heads"`
+	AttentionChunkSize          int     `json:"attention_chunk_size"`
+	AttentionContextLeft        int     `json:"attention_context_left"`
+	AttentionContextRight       int     `json:"attention_context_right"`
+	AttentionLogitCap           float64 `json:"attention_logit_cap"`
+	AttentionInvalidLogitsValue float64 `json:"attention_invalid_logits_value"`
+	ConvKernelSize              int     `json:"conv_kernel_size"`
+	OutputProjDims              int     `json:"output_proj_dims"`
+	RMSNormEps                  float64 `json:"rms_norm_eps"`
+	GradientClipping            float64 `json:"gradient_clipping"`
+	ResidualWeight              float64 `json:"residual_weight"`
+	HiddenAct                   string  `json:"hidden_act"`
+	UseClippedLinears           bool    `json:"use_clipped_linears"`
 }
 
 type rocmRoPEProbe struct {
@@ -125,10 +219,18 @@ type rocmTokenizerConfigProbe struct {
 
 type rocmQuantizationConfigProbe struct {
 	QuantMethod  string `json:"quant_method"`
+	Algorithm    string `json:"algorithm"`
 	Bits         int    `json:"bits"`
 	GroupSize    int    `json:"group_size"`
 	WeightFormat string `json:"weight_format"`
 	Format       string `json:"format"`
+	Scheme       string `json:"scheme"`
+	Type         string `json:"type"`
+	Iters        int    `json:"iters"`
+	NSamples     int    `json:"nsamples"`
+	SeqLen       int    `json:"seqlen"`
+	Sym          *bool  `json:"sym"`
+	Asym         *bool  `json:"asym"`
 	LoadIn4Bit   bool   `json:"load_in_4bit"`
 	LoadIn8Bit   bool   `json:"load_in_8bit"`
 }
@@ -233,26 +335,24 @@ func (b *rocmBackend) InspectModelPack(ctx context.Context, path string) (*infer
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	resolvedPath := path
-	if abs := core.PathAbs(path); abs.OK {
-		resolvedPath = abs.Value.(string)
+	fileManifest, err := rocmmodel.InspectModelPackFiles(path)
+	if err != nil {
+		return nil, core.E("rocm.InspectModelPack", "stat model pack", err)
 	}
-	stat := core.Stat(resolvedPath)
-	if !stat.OK {
-		return nil, core.E("rocm.InspectModelPack", "stat model pack", stat.Value.(error))
-	}
-	info := stat.Value.(core.FsFileInfo)
-	root := resolvedPath
-	if !info.IsDir() {
-		root = core.PathDir(resolvedPath)
-	}
+	resolvedPath := fileManifest.SourcePath
+	root := fileManifest.Root
 
 	inspection := &inference.ModelPackInspection{
 		Path:   resolvedPath,
 		Labels: map[string]string{"backend": "rocm", "native_runtime": "hip"},
 	}
-	weights := discoverROCmWeightFiles(resolvedPath, info)
-	inspection.Format = rocmModelPackFormat(weights)
+	weights := fileManifest.WeightPaths()
+	inspection.Format = fileManifest.Format
+	for key, value := range fileManifest.Labels {
+		if value != "" {
+			inspection.Labels[key] = value
+		}
+	}
 	inspection.Labels["weight_files"] = core.Sprintf("%d", len(weights))
 	inspection.Labels["format"] = inspection.Format
 	if len(weights) == 0 {
@@ -263,6 +363,11 @@ func (b *rocmBackend) InspectModelPack(ctx context.Context, path string) (*infer
 		inspection.Notes = append(inspection.Notes, "config.json could not be parsed: "+err.Error())
 	} else if cfg != nil {
 		applyROCmModelConfig(inspection, *cfg)
+	}
+	if processor, err := readROCmGemma4ProcessorConfig(root); err != nil {
+		inspection.Notes = append(inspection.Notes, "processor_config.json could not be parsed: "+err.Error())
+	} else if processor != nil {
+		applyROCmGemma4ProcessorConfigLabels(inspection, *processor)
 	}
 	weightMetadataValid := len(weights) > 0
 	for _, weight := range weights {
@@ -301,41 +406,24 @@ func (b *rocmBackend) InspectModelPack(ctx context.Context, path string) (*infer
 	if err := applyROCmTokenizerConfigInspection(inspection, root); err != nil {
 		inspection.Notes = append(inspection.Notes, "tokenizer_config.json could not be parsed: "+err.Error())
 	}
+	applyROCmInspectionModelProfile(inspection)
 	applyROCmArchitectureInspection(inspection, weightMetadataValid)
+	applyROCmGemma4ModelPackSupportLabels(inspection, resolvedPath)
 	applyROCmMemoryFitInspection(ctx, b, inspection)
-	inspection.Capabilities = append(inspection.Capabilities,
-		inference.SupportedCapability(inference.CapabilityModelFit, inference.CapabilityGroupRuntime),
-		inference.SupportedCapability(inference.CapabilityMemoryPlanning, inference.CapabilityGroupRuntime),
-	)
+	appendROCmInspectionCapability(inspection, inference.SupportedCapability(inference.CapabilityModelFit, inference.CapabilityGroupRuntime))
+	appendROCmInspectionCapability(inspection, inference.SupportedCapability(inference.CapabilityMemoryPlanning, inference.CapabilityGroupRuntime))
+	appendROCmInspectionCapability(inspection, inference.SupportedCapability(inference.CapabilityKVCachePlanning, inference.CapabilityGroupRuntime))
+	applyROCmGemma4ModelPackInspectionCapabilities(inspection)
 	inspection.Notes = append(inspection.Notes, "native ROCm decode kernels are not linked yet")
 	return inspection, nil
 }
 
 func discoverROCmWeightFiles(path string, info core.FsFileInfo) []string {
-	if !info.IsDir() {
-		if rocmIsWeightFile(path) {
-			return []string{path}
-		}
+	manifest, err := rocmmodel.InspectModelPackFiles(path)
+	if err != nil {
 		return nil
 	}
-	weights := []string{}
-	_ = core.PathWalkDir(path, func(current string, entry core.FsDirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if entry.IsDir() {
-			if current != path && core.HasPrefix(core.PathBase(current), ".") {
-				return core.PathSkipDir
-			}
-			return nil
-		}
-		if rocmIsWeightFile(current) {
-			weights = append(weights, current)
-		}
-		return nil
-	})
-	slices.Sort(weights)
-	return weights
+	return manifest.WeightPaths()
 }
 
 func rocmIsWeightFile(path string) bool {
@@ -344,25 +432,25 @@ func rocmIsWeightFile(path string) bool {
 }
 
 func rocmModelPackFormat(weights []string) string {
-	hasGGUF := false
-	hasSafetensors := false
+	gguf := 0
+	safetensors := 0
 	for _, weight := range weights {
 		switch core.Lower(core.PathExt(weight)) {
 		case ".gguf":
-			hasGGUF = true
+			gguf++
 		case ".safetensors":
-			hasSafetensors = true
+			safetensors++
 		}
 	}
 	switch {
-	case hasGGUF && hasSafetensors:
-		return "mixed"
-	case hasGGUF:
-		return "gguf"
-	case hasSafetensors:
-		return "safetensors"
+	case gguf > 0 && safetensors > 0:
+		return rocmmodel.ModelPackFormatMixed
+	case gguf > 0:
+		return rocmmodel.ModelPackFormatGGUF
+	case safetensors > 0:
+		return rocmmodel.ModelPackFormatSafetensors
 	default:
-		return "missing"
+		return rocmmodel.ModelPackFormatMissing
 	}
 }
 
@@ -379,6 +467,59 @@ func readROCmModelConfig(root string) (*rocmModelPackConfigProbe, error) {
 		return nil, result.Value.(error)
 	}
 	return &cfg, nil
+}
+
+func readROCmGemma4ProcessorConfig(root string) (*modelgemma4.ProcessorConfig, error) {
+	read := core.ReadFile(core.PathJoin(root, "processor_config.json"))
+	if !read.OK {
+		if core.IsNotExist(read.Value.(error)) {
+			return nil, nil
+		}
+		return nil, read.Value.(error)
+	}
+	cfg, err := modelgemma4.ParseProcessorConfig(read.Value.([]byte))
+	if err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+func applyROCmGemma4ProcessorConfigLabels(inspection *inference.ModelPackInspection, cfg modelgemma4.ProcessorConfig) {
+	if inspection == nil || !isROCmGemma4Architecture(inspection.Model.Architecture) {
+		return
+	}
+	labels := inspection.Labels
+	labels["processor_config"] = "true"
+	modelgemma4.ApplyProcessorConfigLabels(labels, cfg)
+	if cfg.ImageProcessor != nil || cfg.VideoProcessor != nil {
+		labels["multimodal_model"] = "true"
+		labels["gemma4_multimodal"] = "true"
+		labels["vision_processor_config"] = "true"
+		if labels["vision_runtime"] == "" {
+			labels["vision_runtime"] = hipKernelStatusNotLinked
+		}
+		if labels["vision_projector_runtime"] == "" {
+			labels["vision_projector_runtime"] = hipKernelStatusNotLinked
+		}
+		if labels["vision_reference"] == "" {
+			labels["vision_reference"] = "go_mlx_gemma4_vision"
+		}
+	}
+	if cfg.FeatureExtractor != nil {
+		labels["multimodal_model"] = "true"
+		labels["gemma4_multimodal"] = "true"
+		labels["audio_processor_config"] = "true"
+		if labels["audio_runtime"] == "" {
+			labels["audio_runtime"] = hipKernelStatusNotLinked
+		}
+		if labels["audio_projector_runtime"] == "" {
+			labels["audio_projector_runtime"] = hipKernelStatusNotLinked
+		}
+		labels["audio_frontend_runtime"] = hipKernelStatusNotLinked
+		if labels["audio_reference"] == "" {
+			labels["audio_reference"] = "go_mlx_gemma4_audio"
+		}
+	}
 }
 
 func applyROCmModelConfig(inspection *inference.ModelPackInspection, cfg rocmModelPackConfigProbe) {
@@ -400,16 +541,26 @@ func applyROCmModelConfig(inspection *inference.ModelPackInspection, cfg rocmMod
 	}
 	model.QuantType = firstNonEmptyString(model.QuantType, quantType)
 	inspection.Model = model
+	rocmApplyArchitectureResolutionLabels(inspection.Labels, cfg)
 	if experts := firstPositiveInt(cfg.NumLocalExperts, cfg.NumExperts, cfg.TextConfig.NumExperts); experts > 0 {
 		inspection.Labels["moe_experts"] = core.Sprintf("%d", experts)
 	}
 	if topK := firstPositiveInt(cfg.NumExpertsPerTok, cfg.TopKExperts, cfg.TextConfig.NumExpertsPerTok, cfg.TextConfig.TopKExperts); topK > 0 {
 		inspection.Labels["moe_top_k"] = core.Sprintf("%d", topK)
 	}
+	if sparseStep := firstPositiveInt(cfg.DecoderSparseStep, cfg.TextConfig.DecoderSparseStep); sparseStep > 0 {
+		inspection.Labels["moe_sparse_step"] = core.Sprintf("%d", sparseStep)
+	}
+	applyROCmMiniMaxM2ConfigLabels(inspection, cfg)
+	applyROCmMixtralConfigLabels(inspection, cfg)
 	if rocmConfigTiedWordEmbeddings(cfg) {
 		inspection.Labels["tied_word_embeddings"] = "true"
 	}
 	applyROCmAttentionConfigLabels(inspection, cfg)
+	applyROCmGemma4AssistantConfigLabels(inspection, cfg)
+	applyROCmMultimodalConfigLabels(inspection, cfg)
+	applyROCmDiffusionGemmaConfigLabels(inspection, cfg)
+	applyROCMAutoRoundQuantizationLabels(inspection, quant)
 	if rocmConfigHasEmbeddingTask(cfg) {
 		inspection.Labels["embedding_model"] = "true"
 		appendROCmInspectionCapability(inspection, inference.PlannedCapability(inference.CapabilityEmbeddings, inference.CapabilityGroupModel, "embedding model-pack metadata is recognised; native ROCm embedding kernels are pending"))
@@ -427,7 +578,7 @@ func applyROCmModelConfig(inspection *inference.ModelPackInspection, cfg rocmMod
 }
 
 func rocmQuantConfigEmpty(quant rocmQuantizationConfigProbe) bool {
-	return quant.QuantMethod == "" && quant.Bits == 0 && quant.GroupSize == 0 && quant.WeightFormat == "" && quant.Format == "" && !quant.LoadIn4Bit && !quant.LoadIn8Bit
+	return quant.QuantMethod == "" && quant.Algorithm == "" && quant.Bits == 0 && quant.GroupSize == 0 && quant.WeightFormat == "" && quant.Format == "" && quant.Scheme == "" && quant.Type == "" && quant.Iters == 0 && quant.NSamples == 0 && quant.SeqLen == 0 && quant.Sym == nil && quant.Asym == nil && !quant.LoadIn4Bit && !quant.LoadIn8Bit
 }
 
 func rocmConfigArchitecture(cfg rocmModelPackConfigProbe) string {
@@ -462,14 +613,30 @@ func rocmConfigTiedWordEmbeddings(cfg rocmModelPackConfigProbe) bool {
 
 func rocmConfigLayerTypes(cfg rocmModelPackConfigProbe) []string {
 	numLayers := firstPositiveInt(cfg.NumHiddenLayers, cfg.NumLayers, cfg.TextConfig.NumHiddenLayers, cfg.TextConfig.NumLayers)
+	architecture := normalizeROCmArchitecture(rocmConfigArchitecture(cfg))
+	isQwen36 := architecture == "qwen3_6" || architecture == "qwen3_6_moe"
 	var layerTypes []string
+	explicitPattern := false
 	switch {
 	case len(cfg.LayerTypes) > 0:
 		layerTypes = append([]string(nil), cfg.LayerTypes...)
+		explicitPattern = true
 	case len(cfg.TextConfig.LayerTypes) > 0:
 		layerTypes = append([]string(nil), cfg.TextConfig.LayerTypes...)
+		explicitPattern = true
 	default:
 		if numLayers <= 0 {
+			return nil
+		}
+		if uniform := rocmConfigUniformSequenceMixerKind(cfg); uniform != "" {
+			layerTypes = make([]string, numLayers)
+			for index := range layerTypes {
+				layerTypes[index] = uniform
+			}
+			explicitPattern = true
+			break
+		}
+		if rocmConfigComposedSequenceMixerModelType(cfg) != "" {
 			return nil
 		}
 		pattern := firstPositiveInt(cfg.SlidingWindowPattern, cfg.TextConfig.SlidingWindowPattern)
@@ -488,11 +655,50 @@ func rocmConfigLayerTypes(cfg rocmModelPackConfigProbe) []string {
 			layerTypes[len(layerTypes)-1] = "full_attention"
 		}
 	}
+	if explicitPattern && isQwen36 && numLayers > 0 && len(layerTypes) > 0 && len(layerTypes) < numLayers {
+		pattern := layerTypes
+		layerTypes = make([]string, numLayers)
+		for index := range layerTypes {
+			layerTypes[index] = pattern[index%len(pattern)]
+		}
+	}
 	if numLayers > 0 && len(layerTypes) >= numLayers {
 		layerTypes = layerTypes[:numLayers]
-		layerTypes[len(layerTypes)-1] = "full_attention"
+		if !explicitPattern || (!isQwen36 && !rocmLayerTypesIncludeFLAMixer(layerTypes)) {
+			layerTypes[len(layerTypes)-1] = "full_attention"
+		}
 	}
 	return layerTypes
+}
+
+func rocmConfigSequenceMixerPlanLayerTypes(cfg rocmModelPackConfigProbe) ([]string, string) {
+	return rocmmodel.SequenceMixerConfigPlanLayerTypes(rocmSequenceMixerConfigInput(cfg))
+}
+
+func rocmConfigSequenceMixerPlanError(cfg rocmModelPackConfigProbe) (string, error) {
+	return rocmmodel.SequenceMixerConfigPlanError(rocmSequenceMixerConfigInput(cfg))
+}
+
+func normalizeSequenceMixerLayerTypes(values []string) []string {
+	return rocmmodel.NormalizeSequenceMixerLayerTypes(values)
+}
+
+func rocmConfigUniformSequenceMixerKind(cfg rocmModelPackConfigProbe) string {
+	return rocmmodel.SequenceMixerConfigUniformKind(rocmSequenceMixerConfigInput(cfg))
+}
+
+func rocmConfigComposedSequenceMixerModelType(cfg rocmModelPackConfigProbe) string {
+	return rocmmodel.SequenceMixerConfigComposedModelType(rocmSequenceMixerConfigInput(cfg))
+}
+
+func rocmLayerTypesIncludeFLAMixer(layerTypes []string) bool {
+	for _, layerType := range layerTypes {
+		family, ok := SequenceMixerFamilyByKind(layerType)
+		if ok && family.Source == "fla" {
+			return true
+		}
+	}
+	return false
 }
 
 func rocmConfigKVSharedLayers(cfg rocmModelPackConfigProbe) (int, bool) {
@@ -504,6 +710,298 @@ func rocmConfigKVSharedLayers(cfg rocmModelPackConfigProbe) (int, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func applyROCmMiniMaxM2ConfigLabels(inspection *inference.ModelPackInspection, cfg rocmModelPackConfigProbe) {
+	if inspection == nil || normalizeROCmArchitecture(rocmConfigArchitecture(cfg)) != "minimax_m2" {
+		return
+	}
+	labels := inspection.Labels
+	labels["minimax_m2_sparse_plan"] = "staged_metadata"
+	if intermediate := firstPositiveInt(cfg.IntermediateSize, cfg.TextConfig.IntermediateSize); intermediate > 0 {
+		labels["minimax_m2_intermediate_size"] = core.Sprintf("%d", intermediate)
+	}
+	if experts := firstPositiveInt(cfg.NumLocalExperts, cfg.NumExperts, cfg.TextConfig.NumExperts); experts > 0 {
+		labels["minimax_m2_local_experts"] = core.Sprintf("%d", experts)
+	}
+	if topK := firstPositiveInt(cfg.NumExpertsPerTok, cfg.TopKExperts, cfg.TextConfig.NumExpertsPerTok, cfg.TextConfig.TopKExperts); topK > 0 {
+		labels["minimax_m2_experts_per_token"] = core.Sprintf("%d", topK)
+	}
+	if cfg.UseRoutingBias || cfg.TextConfig.UseRoutingBias {
+		labels["minimax_m2_routing_bias"] = "true"
+		labels["minimax_m2_required_router_bias_tensor"] = "model.layers.0.block_sparse_moe.e_score_correction_bias"
+	} else {
+		labels["minimax_m2_routing_bias"] = "false"
+	}
+	labels["minimax_m2_required_router_tensor"] = "model.layers.0.block_sparse_moe.gate.weight"
+	labels["minimax_m2_required_expert_tensors"] = "gate_proj,up_proj,down_proj"
+}
+
+func applyROCmMixtralConfigLabels(inspection *inference.ModelPackInspection, cfg rocmModelPackConfigProbe) {
+	if inspection == nil || normalizeROCmArchitecture(rocmConfigArchitecture(cfg)) != "mixtral" {
+		return
+	}
+	labels := inspection.Labels
+	labels["mixtral_sparse_plan"] = "metadata"
+	experts := firstPositiveInt(cfg.NumLocalExperts, cfg.NumExperts, cfg.TextConfig.NumExperts)
+	if experts == 0 {
+		experts = 8
+	}
+	topK := firstPositiveInt(cfg.NumExpertsPerTok, cfg.TopKExperts, cfg.TextConfig.NumExpertsPerTok, cfg.TextConfig.TopKExperts)
+	if topK == 0 {
+		topK = 2
+	}
+	if labels["moe_experts"] == "" {
+		labels["moe_experts"] = core.Sprintf("%d", experts)
+	}
+	if labels["moe_top_k"] == "" {
+		labels["moe_top_k"] = core.Sprintf("%d", topK)
+	}
+	labels["mixtral_local_experts"] = core.Sprintf("%d", experts)
+	labels["mixtral_experts_per_token"] = core.Sprintf("%d", topK)
+	if sparseStep := firstPositiveInt(cfg.DecoderSparseStep, cfg.TextConfig.DecoderSparseStep); sparseStep > 0 {
+		labels["mixtral_sparse_step"] = core.Sprintf("%d", sparseStep)
+	} else {
+		labels["mixtral_sparse_step"] = "all"
+	}
+	labels["mixtral_required_router_tensor"] = "model.layers.0.block_sparse_moe.gate.weight"
+	labels["mixtral_required_expert_tensors"] = "w1,w2,w3"
+}
+
+func applyROCmMultimodalConfigLabels(inspection *inference.ModelPackInspection, cfg rocmModelPackConfigProbe) {
+	if inspection == nil {
+		return
+	}
+	architecture := rocmConfigArchitecture(cfg)
+	labels := inspection.Labels
+	imageToken := firstPositiveInt(cfg.ImageTokenID, cfg.ImageTokenIndex)
+	audioToken := firstPositiveInt(cfg.AudioTokenID, cfg.AudioTokenIndex)
+	softTokens := firstPositiveInt(cfg.VisionSoftTokensPerImage, cfg.MMTokensPerImage, cfg.VisionConfig.DefaultOutputLength)
+	hasVision := rocmModelPackConfigHasVision(cfg)
+	hasAudio := rocmModelPackConfigHasAudio(cfg)
+	if !hasVision && !hasAudio {
+		return
+	}
+	labels["multimodal_model"] = "true"
+	if isROCmGemma4Architecture(architecture) {
+		labels["gemma4_multimodal"] = "true"
+	}
+	if hasVision {
+		labels["vision_runtime"] = hipKernelStatusNotLinked
+		labels["vision_projector_runtime"] = hipKernelStatusNotLinked
+		switch {
+		case isROCmGemma4Architecture(architecture):
+			labels["vision_reference"] = "go_mlx_gemma4_vision"
+		case normalizeROCmArchitecture(architecture) == "gemma3":
+			labels["gemma3_multimodal"] = "true"
+			labels["vision_reference"] = "go_mlx_gemma3_multimodal_wrapper"
+		default:
+			labels["vision_reference"] = "model_pack_multimodal_metadata"
+		}
+		if isROCmGemma4Architecture(architecture) {
+			modelgemma4.ApplyVisionConfigLabels(labels, rocmGemma4VisionConfigFromProbe(cfg))
+		} else {
+			if imageToken > 0 {
+				labels["image_token_id"] = core.Sprintf("%d", imageToken)
+			}
+			if cfg.BOITokenIndex > 0 {
+				labels["boi_token_index"] = core.Sprintf("%d", cfg.BOITokenIndex)
+			}
+			if cfg.BOITokenID > 0 {
+				labels["boi_token_id"] = core.Sprintf("%d", cfg.BOITokenID)
+			}
+			if cfg.EOITokenIndex > 0 {
+				labels["eoi_token_index"] = core.Sprintf("%d", cfg.EOITokenIndex)
+			}
+			if cfg.EOITokenID > 0 {
+				labels["eoi_token_id"] = core.Sprintf("%d", cfg.EOITokenID)
+			}
+			if cfg.VideoTokenID > 0 {
+				labels["video_token_id"] = core.Sprintf("%d", cfg.VideoTokenID)
+			}
+			if softTokens > 0 {
+				labels["vision_soft_tokens_per_image"] = core.Sprintf("%d", softTokens)
+			}
+			applyROCmVisionTowerLabels(labels, cfg.VisionConfig)
+		}
+		inspection.Notes = append(inspection.Notes, "multimodal vision metadata is recognised; native ROCm vision tower and projector kernels are pending")
+	}
+	if hasAudio {
+		labels["audio_runtime"] = hipKernelStatusNotLinked
+		labels["audio_projector_runtime"] = hipKernelStatusNotLinked
+		if isROCmGemma4Architecture(architecture) {
+			labels["audio_reference"] = "go_mlx_gemma4_audio"
+		} else {
+			labels["audio_reference"] = "model_pack_audio_metadata"
+		}
+		if isROCmGemma4Architecture(architecture) {
+			modelgemma4.ApplyAudioConfigLabels(labels, rocmGemma4AudioConfigFromProbe(cfg))
+		} else {
+			if audioToken > 0 {
+				labels["audio_token_id"] = core.Sprintf("%d", audioToken)
+			}
+			if cfg.BOATokenID > 0 {
+				labels["boa_token_id"] = core.Sprintf("%d", cfg.BOATokenID)
+			}
+			if cfg.BOATokenIndex > 0 {
+				labels["boa_token_index"] = core.Sprintf("%d", cfg.BOATokenIndex)
+			}
+			if cfg.EOATokenID > 0 {
+				labels["eoa_token_id"] = core.Sprintf("%d", cfg.EOATokenID)
+			}
+			if cfg.EOATokenIndex > 0 {
+				labels["eoa_token_index"] = core.Sprintf("%d", cfg.EOATokenIndex)
+			}
+			applyROCMAudioTowerLabels(labels, cfg.AudioConfig)
+		}
+		inspection.Notes = append(inspection.Notes, "multimodal audio metadata is recognised; native ROCm audio front-end, tower, and projector kernels are pending")
+	}
+}
+
+func applyROCmDiffusionGemmaConfigLabels(inspection *inference.ModelPackInspection, cfg rocmModelPackConfigProbe) {
+	if inspection == nil || normalizeROCmArchitecture(rocmConfigArchitecture(cfg)) != "diffusion_gemma" {
+		return
+	}
+	labels := inspection.Labels
+	labels["block_diffusion_model"] = "true"
+	labels["diffusion_runtime"] = hipKernelStatusNotLinked
+	labels["diffusion_sampler_runtime"] = hipKernelStatusNotLinked
+	labels["diffusion_trunk_runtime"] = "model_pack_metadata"
+	labels["diffusion_reference"] = "go_mlx_diffusion_gemma"
+	labels["diffusion_fallback"] = "refused"
+	labels["reactive_diffusion_fallback"] = "refused"
+	if canvasLength := firstPositiveInt(cfg.CanvasLength, cfg.TextConfig.CanvasLength); canvasLength > 0 {
+		labels["diffusion_canvas_length"] = core.Sprintf("%d", canvasLength)
+	}
+	modelgemma4.ApplyDiffusionPolicyLabels(labels, rocmGemma4DiffusionPolicyFromProbe(cfg))
+	inspection.Notes = append(inspection.Notes, "DiffusionGemma block-diffusion metadata is recognised; native ROCm canvas denoising sampler is not linked yet")
+}
+
+func applyROCmVisionTowerLabels(labels map[string]string, cfg rocmModelPackVisionConfigProbe) {
+	if labels == nil {
+		return
+	}
+	if cfg.ModelType != "" {
+		labels["vision_model_type"] = normalizeROCmLabelToken(cfg.ModelType)
+	}
+	if cfg.DType != "" {
+		labels["vision_dtype"] = rocmConfigDTypeQuantizationType(cfg.DType)
+		if labels["vision_dtype"] == "" {
+			labels["vision_dtype"] = core.Lower(cfg.DType)
+		}
+	}
+	if cfg.ImageSize > 0 {
+		labels["vision_image_size"] = core.Sprintf("%d", cfg.ImageSize)
+	}
+	if cfg.PatchSize > 0 {
+		labels["vision_patch_size"] = core.Sprintf("%d", cfg.PatchSize)
+	}
+	if cfg.NumChannels > 0 {
+		labels["vision_num_channels"] = core.Sprintf("%d", cfg.NumChannels)
+	}
+	if cfg.HiddenSize > 0 {
+		labels["vision_hidden_size"] = core.Sprintf("%d", cfg.HiddenSize)
+	}
+	if cfg.IntermediateSize > 0 {
+		labels["vision_intermediate_size"] = core.Sprintf("%d", cfg.IntermediateSize)
+	}
+	if cfg.NumHiddenLayers > 0 {
+		labels["vision_num_hidden_layers"] = core.Sprintf("%d", cfg.NumHiddenLayers)
+	}
+	if cfg.NumAttentionHeads > 0 {
+		labels["vision_attention_heads"] = core.Sprintf("%d", cfg.NumAttentionHeads)
+	}
+	if cfg.NumKeyValueHeads > 0 {
+		labels["vision_kv_heads"] = core.Sprintf("%d", cfg.NumKeyValueHeads)
+	}
+	if cfg.HeadDim > 0 {
+		labels["vision_head_dim"] = core.Sprintf("%d", cfg.HeadDim)
+	}
+	if cfg.GlobalHeadDim > 0 {
+		labels["vision_global_head_dim"] = core.Sprintf("%d", cfg.GlobalHeadDim)
+	}
+	if cfg.PoolingKernelSize > 0 {
+		labels["vision_pooling_kernel_size"] = core.Sprintf("%d", cfg.PoolingKernelSize)
+	}
+	if cfg.PositionEmbeddingSize > 0 {
+		labels["vision_position_embedding_size"] = core.Sprintf("%d", cfg.PositionEmbeddingSize)
+	}
+	if cfg.HiddenActivation != "" {
+		labels["vision_hidden_activation"] = cfg.HiddenActivation
+	}
+	if cfg.RMSNormEps > 0 {
+		labels["vision_rms_norm_eps"] = formatROCmFloat(cfg.RMSNormEps)
+	}
+	if cfg.RoPEParameters.RopeTheta > 0 {
+		labels["vision_rope_theta"] = formatROCmFloat(cfg.RoPEParameters.RopeTheta)
+	}
+	if cfg.RoPEParameters.RopeType != "" {
+		labels["vision_rope_type"] = cfg.RoPEParameters.RopeType
+	}
+	labels["vision_standardize"] = core.Sprintf("%t", cfg.Standardize)
+	labels["vision_use_clipped_linears"] = core.Sprintf("%t", cfg.UseClippedLinears)
+}
+
+func applyROCMAudioTowerLabels(labels map[string]string, cfg rocmModelPackAudioConfigProbe) {
+	if labels == nil {
+		return
+	}
+	if cfg.ModelType != "" {
+		labels["audio_model_type"] = normalizeROCmLabelToken(cfg.ModelType)
+	}
+	if cfg.HiddenSize > 0 {
+		labels["audio_hidden_size"] = core.Sprintf("%d", cfg.HiddenSize)
+	}
+	if cfg.AudioEmbedDim > 0 {
+		labels["audio_embed_dim"] = core.Sprintf("%d", cfg.AudioEmbedDim)
+	}
+	if cfg.AudioSamplesPerToken > 0 {
+		labels["audio_samples_per_token"] = core.Sprintf("%d", cfg.AudioSamplesPerToken)
+	}
+	if cfg.NumHiddenLayers > 0 {
+		labels["audio_num_hidden_layers"] = core.Sprintf("%d", cfg.NumHiddenLayers)
+	}
+	if cfg.NumAttentionHeads > 0 {
+		labels["audio_attention_heads"] = core.Sprintf("%d", cfg.NumAttentionHeads)
+	}
+	if cfg.AttentionChunkSize > 0 {
+		labels["audio_attention_chunk_size"] = core.Sprintf("%d", cfg.AttentionChunkSize)
+	}
+	if cfg.AttentionContextLeft > 0 {
+		labels["audio_attention_context_left"] = core.Sprintf("%d", cfg.AttentionContextLeft)
+	}
+	if cfg.AttentionContextRight > 0 {
+		labels["audio_attention_context_right"] = core.Sprintf("%d", cfg.AttentionContextRight)
+	}
+	if cfg.AttentionLogitCap > 0 {
+		labels["audio_attention_logit_cap"] = formatROCmFloat(cfg.AttentionLogitCap)
+	}
+	if cfg.AttentionInvalidLogitsValue != 0 {
+		labels["audio_attention_invalid_logits_value"] = formatROCmFloat(cfg.AttentionInvalidLogitsValue)
+	}
+	if cfg.ConvKernelSize > 0 {
+		labels["audio_conv_kernel_size"] = core.Sprintf("%d", cfg.ConvKernelSize)
+	}
+	if cfg.OutputProjDims > 0 {
+		labels["audio_output_proj_dims"] = core.Sprintf("%d", cfg.OutputProjDims)
+	}
+	if cfg.RMSNormEps > 0 {
+		labels["audio_rms_norm_eps"] = formatROCmFloat(cfg.RMSNormEps)
+	}
+	if cfg.GradientClipping > 0 {
+		labels["audio_gradient_clipping"] = formatROCmFloat(cfg.GradientClipping)
+	}
+	if cfg.ResidualWeight > 0 {
+		labels["audio_residual_weight"] = formatROCmFloat(cfg.ResidualWeight)
+	}
+	if cfg.HiddenAct != "" {
+		labels["audio_hidden_act"] = cfg.HiddenAct
+	}
+	labels["audio_use_clipped_linears"] = core.Sprintf("%t", cfg.UseClippedLinears)
+}
+
+func normalizeROCmLabelToken(value string) string {
+	return core.Replace(core.Lower(value), "-", "_")
 }
 
 func applyROCmAttentionConfigLabels(inspection *inference.ModelPackInspection, cfg rocmModelPackConfigProbe) {
@@ -524,11 +1022,21 @@ func applyROCmAttentionConfigLabels(inspection *inference.ModelPackInspection, c
 
 func rocmAttentionConfigLabels(cfg rocmModelPackConfigProbe) map[string]string {
 	out := map[string]string{}
+	gemma4Architecture := isROCmGemma4Architecture(rocmConfigArchitecture(cfg))
+	for key, value := range rocmDeepSeekMLALabels(cfg) {
+		out[key] = value
+	}
 	if slidingWindow := firstPositiveInt(cfg.SlidingWindow, cfg.TextConfig.SlidingWindow); slidingWindow > 0 {
 		out["sliding_window"] = core.Sprintf("%d", slidingWindow)
 	}
+	if pattern := firstPositiveInt(cfg.SlidingWindowPattern, cfg.TextConfig.SlidingWindowPattern); pattern > 0 {
+		out["sliding_window_pattern"] = core.Sprintf("%d", pattern)
+	}
 	if kvSharedLayers, ok := rocmConfigKVSharedLayers(cfg); ok {
 		out["attention_kv_shared_layers"] = core.Sprintf("%d", kvSharedLayers)
+	}
+	if gemma4Architecture {
+		rocmApplyGemma4ConfigLabels(out, rocmGemma4TextConfigFromProbe(cfg))
 	}
 	attentionHeads := firstPositiveInt(cfg.NumAttentionHeads, cfg.TextConfig.NumAttentionHeads)
 	kvHeads := firstPositiveInt(cfg.NumKeyValueHeads, cfg.TextConfig.NumKeyValueHeads)
@@ -553,12 +1061,6 @@ func rocmAttentionConfigLabels(cfg rocmModelPackConfigProbe) map[string]string {
 	if globalHeadDim > 0 {
 		out["attention_global_head_dim"] = core.Sprintf("%d", globalHeadDim)
 	}
-	if hiddenPerLayer := firstPositiveInt(cfg.HiddenSizePerLayer, cfg.TextConfig.HiddenSizePerLayer); hiddenPerLayer > 0 && isROCmGemma4Architecture(rocmConfigArchitecture(cfg)) {
-		out["gemma4_hidden_size_per_layer_input"] = core.Sprintf("%d", hiddenPerLayer)
-	}
-	if vocabPerLayer := firstPositiveInt(cfg.VocabSizePerLayer, cfg.TextConfig.VocabSizePerLayer); vocabPerLayer > 0 && isROCmGemma4Architecture(rocmConfigArchitecture(cfg)) {
-		out["gemma4_vocab_size_per_layer_input"] = core.Sprintf("%d", vocabPerLayer)
-	}
 	if attentionHeads > 0 && headDim > 0 {
 		out["attention_query_width"] = core.Sprintf("%d", attentionHeads*headDim)
 	}
@@ -577,21 +1079,6 @@ func rocmAttentionConfigLabels(cfg rocmModelPackConfigProbe) map[string]string {
 	if cap := firstPositiveFloat(cfg.FinalLogitSoftcap, cfg.TextConfig.FinalLogitSoftcap); cap > 0 {
 		out["final_logit_softcapping"] = formatROCmFloat(cap)
 	}
-	if cfg.UseDoubleWideMLP || cfg.TextConfig.UseDoubleWideMLP {
-		out["gemma4_use_double_wide_mlp"] = "true"
-	}
-	if cfg.EnableMoEBlock || cfg.TextConfig.EnableMoEBlock {
-		out["gemma4_enable_moe_block"] = "true"
-	}
-	if experts := firstPositiveInt(cfg.NumExperts, cfg.TextConfig.NumExperts); experts > 0 {
-		out["gemma4_num_experts"] = core.Sprintf("%d", experts)
-	}
-	if topK := firstPositiveInt(cfg.TopKExperts, cfg.NumExpertsPerTok, cfg.TextConfig.TopKExperts, cfg.TextConfig.NumExpertsPerTok); topK > 0 {
-		out["gemma4_top_k_experts"] = core.Sprintf("%d", topK)
-	}
-	if intermediate := firstPositiveInt(cfg.MoEIntermediateSize, cfg.ExpertIntermediateSize, cfg.TextConfig.MoEIntermediateSize, cfg.TextConfig.ExpertIntermediateSize); intermediate > 0 {
-		out["gemma4_moe_intermediate_size"] = core.Sprintf("%d", intermediate)
-	}
 	for layerType, params := range rocmNativeGemma4RoPEParameters(cfg) {
 		labelType := core.Replace(layerType, "_attention", "")
 		if params.RopeTheta > 0 {
@@ -608,19 +1095,31 @@ func rocmAttentionConfigLabels(cfg rocmModelPackConfigProbe) map[string]string {
 		}
 	}
 	fullLayers := 0
+	linearLayers := 0
 	slidingLayers := 0
 	layerTypes := rocmConfigLayerTypes(cfg)
 	if len(layerTypes) > 0 {
 		out["attention_layer_types"] = core.Join(",", layerTypes...)
 	}
+	sequenceLayerTypes, sequenceLayerTypesSource := rocmConfigSequenceMixerPlanLayerTypes(cfg)
+	if len(sequenceLayerTypes) > 0 {
+		rocmApplySequenceMixerConfigLabels(out, sequenceLayerTypes, sequenceLayerTypesSource)
+	} else if sequenceLayerTypesSource, err := rocmConfigSequenceMixerPlanError(cfg); err != nil {
+		rocmApplySequenceMixerConfigErrorLabels(out, sequenceLayerTypesSource, err)
+	}
 	for _, layerType := range layerTypes {
 		lower := core.Lower(layerType)
 		switch {
+		case core.Contains(lower, "linear"):
+			linearLayers++
 		case core.Contains(lower, "sliding"):
 			slidingLayers++
 		case core.Contains(lower, "full"):
 			fullLayers++
 		}
+	}
+	if linearLayers > 0 {
+		out["attention_linear_layers"] = core.Sprintf("%d", linearLayers)
 	}
 	if fullLayers > 0 {
 		out["attention_full_layers"] = core.Sprintf("%d", fullLayers)
@@ -628,8 +1127,70 @@ func rocmAttentionConfigLabels(cfg rocmModelPackConfigProbe) map[string]string {
 	if slidingLayers > 0 {
 		out["attention_sliding_layers"] = core.Sprintf("%d", slidingLayers)
 	}
+	architecture := normalizeROCmArchitecture(rocmConfigArchitecture(cfg))
+	if architecture == "qwen3_6" || architecture == "qwen3_6_moe" {
+		numLayers := firstPositiveInt(cfg.NumHiddenLayers, cfg.NumLayers, cfg.TextConfig.NumHiddenLayers, cfg.TextConfig.NumLayers)
+		slidingWindow := firstPositiveInt(cfg.SlidingWindow, cfg.TextConfig.SlidingWindow)
+		plan, err := BuildHybridAttentionCachePlan(numLayers, layerTypes, slidingWindow)
+		if err != nil {
+			return out
+		}
+		out["qwen36_hybrid_attention"] = "true"
+		out["attention_cacheless_layers"] = core.Sprintf("%d", plan.CachelessLayers)
+		out["qwen36_cacheless_layers"] = core.Sprintf("%d", plan.CachelessLayers)
+		out["qwen36_hybrid_cache_plan"] = "metadata"
+		out["qwen36_kv_cache_count"] = core.Sprintf("%d", plan.GlobalLayers)
+		out["qwen36_cache_index_by_layer"] = plan.CacheIndexCSV()
+		if slidingWindow > 0 {
+			out["qwen36_local_window"] = core.Sprintf("%d", slidingWindow)
+		}
+	}
 	if len(out) == 0 {
 		return nil
+	}
+	return out
+}
+
+func rocmDeepSeekMLALabels(cfg rocmModelPackConfigProbe) map[string]string {
+	if normalizeROCmArchitecture(rocmConfigArchitecture(cfg)) != "deepseek" {
+		return nil
+	}
+	kvLoRARank := firstPositiveInt(cfg.KVLoRARank, cfg.TextConfig.KVLoRARank)
+	qLoRARank := firstPositiveInt(cfg.QLoRARank, cfg.TextConfig.QLoRARank)
+	qkNoPEHeadDim := firstPositiveInt(cfg.QKNoPEHeadDim, cfg.TextConfig.QKNoPEHeadDim)
+	qkRoPEHeadDim := firstPositiveInt(cfg.QKRoPEHeadDim, cfg.TextConfig.QKRoPEHeadDim)
+	qkHeadDim := firstPositiveInt(cfg.QKHeadDim, cfg.TextConfig.QKHeadDim)
+	if qkHeadDim == 0 && (qkNoPEHeadDim > 0 || qkRoPEHeadDim > 0) {
+		qkHeadDim = qkNoPEHeadDim + qkRoPEHeadDim
+	}
+	vHeadDim := firstPositiveInt(cfg.VHeadDim, cfg.TextConfig.VHeadDim)
+	out := map[string]string{}
+	if qLoRARank > 0 {
+		out["deepseek_q_lora_rank"] = core.Sprintf("%d", qLoRARank)
+	}
+	if kvLoRARank > 0 {
+		out["deepseek_kv_lora_rank"] = core.Sprintf("%d", kvLoRARank)
+	}
+	if qkNoPEHeadDim > 0 {
+		out["deepseek_qk_nope_head_dim"] = core.Sprintf("%d", qkNoPEHeadDim)
+	}
+	if qkRoPEHeadDim > 0 {
+		out["deepseek_qk_rope_head_dim"] = core.Sprintf("%d", qkRoPEHeadDim)
+	}
+	if qkHeadDim > 0 {
+		out["deepseek_qk_head_dim"] = core.Sprintf("%d", qkHeadDim)
+	}
+	if vHeadDim > 0 {
+		out["deepseek_v_head_dim"] = core.Sprintf("%d", vHeadDim)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	out["deepseek_mla"] = "true"
+	if kvLoRARank > 0 && qkNoPEHeadDim > 0 && qkRoPEHeadDim > 0 && qkHeadDim == qkNoPEHeadDim+qkRoPEHeadDim && vHeadDim > 0 {
+		out["deepseek_mla_valid"] = "true"
+	} else {
+		out["deepseek_mla_valid"] = "false"
 	}
 	return out
 }
@@ -648,7 +1209,75 @@ func rocmQuantConfigBits(quant rocmQuantizationConfigProbe) int {
 }
 
 func rocmQuantConfigType(quant rocmQuantizationConfigProbe) string {
-	return normalizeROCmQuantizationAlias(firstNonEmptyString(quant.QuantMethod, quant.WeightFormat, quant.Format))
+	return normalizeROCmQuantizationAlias(firstNonEmptyString(quant.Algorithm, quant.QuantMethod, quant.WeightFormat, quant.Format, quant.Type))
+}
+
+func applyROCMAutoRoundQuantizationLabels(inspection *inference.ModelPackInspection, quant rocmQuantizationConfigProbe) {
+	if inspection == nil || !rocmQuantConfigIsAutoRound(quant) {
+		return
+	}
+	inspection.Labels["autoround_quantization"] = "true"
+	inspection.Labels["autoround_runtime"] = "planned_hip"
+	inspection.Labels["autoround_hip_kernel"] = hipKernelStatusNotLinked
+	if method := rocmQuantConfigType(quant); method != "" {
+		inspection.Labels["autoround_algorithm"] = method
+	}
+	if quant.Format != "" {
+		inspection.Labels["autoround_format"] = normalizeROCmQuantizationAlias(quant.Format)
+	}
+	if quant.WeightFormat != "" {
+		inspection.Labels["autoround_weight_format"] = normalizeROCmQuantizationAlias(quant.WeightFormat)
+	}
+	if quant.Scheme != "" {
+		inspection.Labels["autoround_scheme"] = core.Trim(quant.Scheme)
+	}
+	if quant.Bits > 0 {
+		inspection.Labels["autoround_bits"] = core.Sprintf("%d", quant.Bits)
+	}
+	if quant.GroupSize > 0 {
+		inspection.Labels["autoround_group_size"] = core.Sprintf("%d", quant.GroupSize)
+	}
+	if quant.Iters > 0 {
+		inspection.Labels["autoround_iters"] = core.Sprintf("%d", quant.Iters)
+	}
+	if quant.NSamples > 0 {
+		inspection.Labels["autoround_nsamples"] = core.Sprintf("%d", quant.NSamples)
+	}
+	if quant.SeqLen > 0 {
+		inspection.Labels["autoround_seqlen"] = core.Sprintf("%d", quant.SeqLen)
+	}
+	if quant.Sym != nil {
+		inspection.Labels["autoround_sym"] = boolLabel(*quant.Sym)
+	}
+	if quant.Asym != nil {
+		inspection.Labels["autoround_asym"] = boolLabel(*quant.Asym)
+	}
+	if profile, ok := rocmAutoRoundProfileForQuantConfig(quant); ok {
+		inspection.Labels["autoround_profile"] = profile.Name
+		inspection.Labels["autoround_profile_role"] = profile.ProductRole
+		inspection.Labels["autoround_profile_matched"] = "true"
+		inspection.Labels["autoround_profile_requires_bench"] = boolLabel(profile.RequiresBench)
+		inspection.Labels["autoround_profile_requires_calibration"] = boolLabel(profile.RequiresCalibration)
+	}
+	if plan, ok := rocmAutoRoundCalibrationPlanForQuantConfig(quant); ok {
+		ApplyProductionAutoRoundCalibrationPlanLabels(inspection.Labels, plan)
+	}
+}
+
+func rocmQuantConfigIsAutoRound(quant rocmQuantizationConfigProbe) bool {
+	return rocmQuantizationAliasIsAutoRound(quant.Algorithm, quant.QuantMethod, quant.WeightFormat, quant.Format, quant.Type)
+}
+
+func rocmAutoRoundProfileForQuantConfig(quant rocmQuantizationConfigProbe) (ProductionAutoRoundQuantizationProfile, bool) {
+	return productionAutoRoundQuantizationProfileForFields(quant.Scheme, firstNonEmptyString(quant.WeightFormat, quant.Format), quant.GroupSize)
+}
+
+func rocmAutoRoundCalibrationPlanForQuantConfig(quant rocmQuantizationConfigProbe) (ProductionAutoRoundCalibrationPlan, bool) {
+	profile, ok := rocmAutoRoundProfileForQuantConfig(quant)
+	if !ok {
+		return ProductionAutoRoundCalibrationPlan{}, false
+	}
+	return productionAutoRoundCalibrationPlan(profile, quant.NSamples, quant.SeqLen, quant.Iters), true
 }
 
 func rocmConfigDTypeQuantizationType(dtype string) string {
@@ -699,7 +1328,149 @@ func applyROCmSafetensorsInspection(inspection *inference.ModelPackInspection, p
 	model.Path = firstNonEmptyString(model.Path, path)
 	inspection.Model = model
 	mergeROCmSafetensorsSummaryLabels(inspection.Labels, summary)
+	if inspection.Model.Architecture == "" {
+		applyROCmDenseSafetensorsArchitectureInference(inspection, path)
+	}
+	if err := applyROCmMiniMaxM2SafetensorsPlanLabels(inspection, path); err != nil {
+		inspection.Notes = append(inspection.Notes, "MiniMax M2 safetensors staged plan could not be validated: "+err.Error())
+		return false
+	}
+	if err := applyROCmQwen3SafetensorsPlanLabels(inspection, path); err != nil {
+		inspection.Notes = append(inspection.Notes, "Qwen3 safetensors staged plan could not be validated: "+err.Error())
+		return false
+	}
+	if err := rocmApplySequenceMixerSafetensorsPlanLabels(inspection, path); err != nil {
+		inspection.Notes = append(inspection.Notes, "sequence mixer safetensors plan could not be validated: "+err.Error())
+		return false
+	}
 	return true
+}
+
+func applyROCmDenseSafetensorsArchitectureInference(inspection *inference.ModelPackInspection, path string) {
+	tensors, err := readROCmSafetensorsNativeTensors(path)
+	if err != nil {
+		inspection.Notes = append(inspection.Notes, "dense safetensors architecture inference could not read tensor names: "+err.Error())
+		return
+	}
+	names := make(map[string]bool, len(tensors))
+	for _, tensor := range tensors {
+		names[tensor.Name] = true
+	}
+	architecture := DetectDenseModelType(nil, names)
+	if architecture == "" || architecture == "qwen2" {
+		return
+	}
+	inspection.Model.Architecture = architecture
+	inspection.Labels["architecture_inferred_from_weights"] = "true"
+	inspection.Labels["architecture_inference_source"] = "dense_weight_names"
+}
+
+func applyROCmMiniMaxM2SafetensorsPlanLabels(inspection *inference.ModelPackInspection, path string) error {
+	if inspection == nil || normalizeROCmArchitecture(inspection.Model.Architecture) != "minimax_m2" {
+		return nil
+	}
+	tensors, err := readROCmSafetensorsNativeTensors(path)
+	if err != nil {
+		return err
+	}
+	names := make(map[string]bool, len(tensors))
+	for _, tensor := range tensors {
+		names[tensor.Name] = true
+	}
+	missing := rocmMiniMaxM2MissingLayer0TensorNames(names, inspection.Labels["minimax_m2_routing_bias"] == "true")
+	inspection.Labels["minimax_m2_layer0_required_tensor_count"] = core.Sprintf("%d", len(rocmMiniMaxM2Layer0RequiredTensorCandidates(inspection.Labels["minimax_m2_routing_bias"] == "true")))
+	if len(missing) == 0 {
+		inspection.Labels["minimax_m2_layer0_skeleton"] = "present"
+		return nil
+	}
+	inspection.Labels["minimax_m2_layer0_skeleton"] = "missing"
+	inspection.Labels["minimax_m2_layer0_missing_tensors"] = core.Join(",", missing...)
+	return nil
+}
+
+func rocmMiniMaxM2MissingLayer0TensorNames(names map[string]bool, routingBias bool) []string {
+	var missing []string
+	for _, candidates := range rocmMiniMaxM2Layer0RequiredTensorCandidates(routingBias) {
+		if rocmAnyTensorNamePresent(names, candidates) {
+			continue
+		}
+		missing = append(missing, candidates[0])
+	}
+	slices.Sort(missing)
+	return missing
+}
+
+func rocmMiniMaxM2Layer0RequiredTensorCandidates(routingBias bool) [][]string {
+	required := [][]string{
+		{"model.layers.0.self_attn.q_proj.weight", "model.layers.0.self_attn.qkv_proj.weight"},
+		{"model.layers.0.self_attn.k_proj.weight", "model.layers.0.self_attn.qkv_proj.weight"},
+		{"model.layers.0.self_attn.v_proj.weight", "model.layers.0.self_attn.qkv_proj.weight"},
+		{"model.layers.0.self_attn.o_proj.weight"},
+		{"model.layers.0.block_sparse_moe.gate.weight"},
+		{"model.layers.0.block_sparse_moe.experts.0.gate_proj.weight", "model.layers.0.mlp.experts.0.gate_proj.weight"},
+		{"model.layers.0.block_sparse_moe.experts.0.up_proj.weight", "model.layers.0.mlp.experts.0.up_proj.weight"},
+		{"model.layers.0.block_sparse_moe.experts.0.down_proj.weight", "model.layers.0.mlp.experts.0.down_proj.weight"},
+	}
+	if routingBias {
+		required = append(required, []string{"model.layers.0.block_sparse_moe.e_score_correction_bias"})
+	}
+	return required
+}
+
+func rocmAnyTensorNamePresent(names map[string]bool, candidates []string) bool {
+	for _, candidate := range candidates {
+		if names[candidate] {
+			return true
+		}
+	}
+	return false
+}
+
+func applyROCmQwen3SafetensorsPlanLabels(inspection *inference.ModelPackInspection, path string) error {
+	if inspection == nil || !rocmQwen3DenseArchitecture(inspection.Model.Architecture) {
+		return nil
+	}
+	tensors, err := readROCmSafetensorsNativeTensors(path)
+	if err != nil {
+		return err
+	}
+	names := make(map[string]bool, len(tensors))
+	for _, tensor := range tensors {
+		names[tensor.Name] = true
+	}
+	required := []string{
+		"model.layers.0.self_attn.q_norm.weight",
+		"model.layers.0.self_attn.k_norm.weight",
+	}
+	var missing []string
+	for _, name := range required {
+		if !HasResolvedDenseWeightName(names, name) {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) == len(required) {
+		return nil
+	}
+	inspection.Labels["qwen3_attention_qk_norm"] = "true"
+	inspection.Labels["qwen3_qk_norm_required_tensor_count"] = core.Sprintf("%d", len(required))
+	inspection.Labels["qwen3_q_norm_tensor"] = required[0]
+	inspection.Labels["qwen3_k_norm_tensor"] = required[1]
+	if len(missing) == 0 {
+		inspection.Labels["qwen3_qk_norm_skeleton"] = "present"
+		return nil
+	}
+	inspection.Labels["qwen3_qk_norm_skeleton"] = "missing"
+	inspection.Labels["qwen3_qk_norm_missing_tensors"] = core.Join(",", missing...)
+	return nil
+}
+
+func rocmQwen3DenseArchitecture(architecture string) bool {
+	switch normalizeROCmArchitecture(architecture) {
+	case "qwen3", "qwen3_next":
+		return true
+	default:
+		return false
+	}
 }
 
 func applyROCmSafetensorsIndexInspection(inspection *inference.ModelPackInspection, root string, weights []string) (bool, error) {
@@ -780,6 +1551,10 @@ func (b *rocmBackend) safetensorsNativeLoadConfig(ctx context.Context, path stri
 		}
 		tensors = append(tensors, weightTensors...)
 	}
+	sequenceMixerPlan, err := sequenceMixerLoadPlanFromInspection(inspection, tensors)
+	if err != nil {
+		return "", nativeLoadConfig{}, core.E("rocm.safetensorsNativeLoadConfig", "build sequence mixer load plan", err)
+	}
 	loadPath := path
 	if len(weightPaths) == 1 {
 		loadPath = weightPaths[0]
@@ -791,6 +1566,7 @@ func (b *rocmBackend) safetensorsNativeLoadConfig(ctx context.Context, path stri
 		AdapterPath:        loadConfig.AdapterPath,
 		ModelInfo:          modelInfoFromIdentity(inspection.Model),
 		ModelLabels:        cloneStringMap(inspection.Labels),
+		SequenceMixerPlan:  sequenceMixerPlan,
 		TokenizerPath:      inspection.Tokenizer.Path,
 		Gemma4TextConfig:   rocmNativeGemma4TextConfig(path),
 		Tensors:            tensors,
@@ -802,125 +1578,19 @@ func (b *rocmBackend) safetensorsNativeLoadConfig(ctx context.Context, path stri
 	return loadPath, cfg, nil
 }
 
-func rocmNativeGemma4TextConfig(path string) nativeGemma4TextConfig {
-	root, err := rocmModelPackRoot(path)
-	if err != nil {
-		return nativeGemma4TextConfig{}
-	}
-	cfg, err := readROCmModelConfig(root)
-	if err != nil || cfg == nil {
-		return nativeGemma4TextConfig{}
-	}
-	return rocmNativeGemma4TextConfigFromProbe(*cfg)
-}
-
-func rocmNativeGemma4TextConfigFromProbe(cfg rocmModelPackConfigProbe) nativeGemma4TextConfig {
-	layerTypes := rocmConfigLayerTypes(cfg)
-	numLayers := firstPositiveInt(cfg.NumHiddenLayers, cfg.NumLayers, cfg.TextConfig.NumHiddenLayers, cfg.TextConfig.NumLayers)
-	if numLayers > 0 && len(layerTypes) >= numLayers {
-		layerTypes = append([]string(nil), layerTypes[:numLayers]...)
-	} else {
-		layerTypes = nil
-	}
-	kvShared, kvSharedSet := rocmConfigKVSharedLayers(cfg)
-	return nativeGemma4TextConfig{
-		LayerTypes:              layerTypes,
-		KVSharedLayers:          kvShared,
-		KVSharedLayersSet:       kvSharedSet,
-		SlidingWindow:           firstPositiveInt(cfg.SlidingWindow, cfg.TextConfig.SlidingWindow),
-		HeadDim:                 firstPositiveInt(cfg.HeadDim, cfg.TextConfig.HeadDim),
-		GlobalHeadDim:           firstPositiveInt(cfg.GlobalHeadDim, cfg.TextConfig.GlobalHeadDim),
-		HiddenSizePerLayerInput: firstPositiveInt(cfg.HiddenSizePerLayer, cfg.TextConfig.HiddenSizePerLayer),
-		VocabSizePerLayerInput:  firstPositiveInt(cfg.VocabSizePerLayer, cfg.TextConfig.VocabSizePerLayer),
-		AttentionKEqV:           cfg.AttentionKEqV || cfg.TextConfig.AttentionKEqV,
-		FinalLogitSoftcap:       firstPositiveFloat(cfg.FinalLogitSoftcap, cfg.TextConfig.FinalLogitSoftcap),
-		UseDoubleWideMLP:        cfg.UseDoubleWideMLP || cfg.TextConfig.UseDoubleWideMLP,
-		EnableMoEBlock:          cfg.EnableMoEBlock || cfg.TextConfig.EnableMoEBlock,
-		NumExperts:              firstPositiveInt(cfg.NumExperts, cfg.TextConfig.NumExperts),
-		TopKExperts:             firstPositiveInt(cfg.TopKExperts, cfg.NumExpertsPerTok, cfg.TextConfig.TopKExperts, cfg.TextConfig.NumExpertsPerTok),
-		MoEIntermediateSize:     firstPositiveInt(cfg.MoEIntermediateSize, cfg.ExpertIntermediateSize, cfg.TextConfig.MoEIntermediateSize, cfg.TextConfig.ExpertIntermediateSize),
-		RoPEParameters:          rocmNativeGemma4RoPEParameters(cfg),
-	}
-}
-
 func rocmModelPackRoot(path string) (string, error) {
-	resolvedPath := path
-	if abs := core.PathAbs(path); abs.OK {
-		resolvedPath = abs.Value.(string)
-	}
-	stat := core.Stat(resolvedPath)
-	if !stat.OK {
-		return "", stat.Value.(error)
-	}
-	if stat.Value.(core.FsFileInfo).IsDir() {
-		return resolvedPath, nil
-	}
-	return core.PathDir(resolvedPath), nil
-}
-
-func rocmNativeGemma4RoPEParameters(cfg rocmModelPackConfigProbe) map[string]nativeGemma4RoPEParameters {
-	out := map[string]nativeGemma4RoPEParameters{}
-	for layerType, params := range cfg.TextConfig.RoPEParameters {
-		if layerType != "" {
-			out[layerType] = nativeGemma4RoPEParameters{
-				PartialRotaryFactor: params.PartialRotaryFactor,
-				RopeTheta:           params.RopeTheta,
-				RopeType:            params.RopeType,
-				Factor:              params.Factor,
-			}
-		}
-	}
-	for layerType, params := range cfg.RoPEParameters {
-		if layerType != "" {
-			out[layerType] = nativeGemma4RoPEParameters{
-				PartialRotaryFactor: params.PartialRotaryFactor,
-				RopeTheta:           params.RopeTheta,
-				RopeType:            params.RopeType,
-				Factor:              params.Factor,
-			}
-		}
-	}
-	if isROCmGemma4Architecture(rocmConfigArchitecture(cfg)) {
-		if factor := firstPositiveFloat(cfg.GlobalPartialRotary, cfg.TextConfig.GlobalPartialRotary); factor > 0 {
-			params := out["full_attention"]
-			if params.PartialRotaryFactor <= 0 {
-				params.PartialRotaryFactor = factor
-			}
-			if params.RopeTheta <= 0 {
-				params.RopeTheta = 1000000
-			}
-			if params.RopeType == "" {
-				params.RopeType = "proportional"
-			}
-			out["full_attention"] = params
-		}
-	}
-	for layerType, params := range out {
-		if params.RopeType == "proportional" && params.Factor <= 0 {
-			params.Factor = 1
-			out[layerType] = params
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
+	return rocmmodel.ResolveModelPackRoot(path)
 }
 
 func rocmSafetensorsWeightFiles(path string) ([]string, error) {
-	resolvedPath := path
-	if abs := core.PathAbs(path); abs.OK {
-		resolvedPath = abs.Value.(string)
+	manifest, err := rocmmodel.InspectModelPackFiles(path)
+	if err != nil {
+		return nil, err
 	}
-	stat := core.Stat(resolvedPath)
-	if !stat.OK {
-		return nil, stat.Value.(error)
-	}
-	weights := discoverROCmWeightFiles(resolvedPath, stat.Value.(core.FsFileInfo))
 	safetensors := []string{}
-	for _, weight := range weights {
-		if core.Lower(core.PathExt(weight)) == ".safetensors" {
-			safetensors = append(safetensors, weight)
+	for _, weight := range manifest.WeightFiles {
+		if weight.Format == rocmmodel.ModelPackFormatSafetensors {
+			safetensors = append(safetensors, weight.Path)
 		}
 	}
 	if len(safetensors) == 0 {
@@ -1381,11 +2051,35 @@ func applyROCmJANGInspection(inspection *inference.ModelPackInspection, jang roc
 	inspection.Labels["jang_profile"] = jang.Profile
 	inspection.Labels["jang_weight_format"] = jang.WeightFormat
 	inspection.Labels["jang_method"] = jang.Method
+	if jang.SourceName != "" {
+		inspection.Labels["jang_source_name"] = jang.SourceName
+	}
+	if jang.SourceOrg != "" {
+		inspection.Labels["jang_source_org"] = jang.SourceOrg
+	}
+	if jang.SourceArchitecture != "" {
+		inspection.Labels["jang_source_architecture"] = normalizeROCmArchitecture(jang.SourceArchitecture)
+	}
 	if jang.GroupSize > 0 {
 		inspection.Labels["jang_group_size"] = core.Sprintf("%d", jang.GroupSize)
 	}
 	if jang.BitsDefault > 0 {
 		inspection.Labels["jang_bits_default"] = core.Sprintf("%d", jang.BitsDefault)
+	}
+	if jang.AttentionBits > 0 {
+		inspection.Labels["jang_attention_bits"] = core.Sprintf("%d", jang.AttentionBits)
+	}
+	if jang.SharedExpertBits > 0 {
+		inspection.Labels["jang_shared_expert_bits"] = core.Sprintf("%d", jang.SharedExpertBits)
+	}
+	if jang.RoutedExpertBits > 0 {
+		inspection.Labels["jang_routed_expert_bits"] = core.Sprintf("%d", jang.RoutedExpertBits)
+	}
+	if jang.EmbedTokensBits > 0 {
+		inspection.Labels["jang_embed_tokens_bits"] = core.Sprintf("%d", jang.EmbedTokensBits)
+	}
+	if jang.LMHeadBits > 0 {
+		inspection.Labels["jang_lm_head_bits"] = core.Sprintf("%d", jang.LMHeadBits)
 	}
 	if jang.Capabilities.ReasoningParser != "" || jang.Capabilities.SupportsThinking {
 		inspection.Labels["reasoning_parser"] = firstNonEmptyString(jang.Capabilities.ReasoningParser, "native-family")
@@ -1398,8 +2092,8 @@ func applyROCmJANGInspection(inspection *inference.ModelPackInspection, jang roc
 	if jang.Capabilities.CacheType != "" {
 		inspection.Labels["cache_type"] = jang.Capabilities.CacheType
 	}
-	inspection.Capabilities = append(inspection.Capabilities, rocmMetadataOnlyCapability(inference.CapabilityJANGTQ, inference.CapabilityGroupRuntime, "JANG/JANGTQ model-pack metadata is recognised; native ROCm packed kernels are pending"))
-	inspection.Notes = append(inspection.Notes, "JANG/JANGTQ kernels are metadata-planned on ROCm")
+	inspection.Capabilities = append(inspection.Capabilities, rocmFixtureKernelCapability(inference.CapabilityJANGTQ, inference.CapabilityGroupRuntime, "JANG/JANGTQ model-pack metadata is recognised and the HIP projection fixture kernel is linked; packed-weight model integration is pending"))
+	inspection.Notes = append(inspection.Notes, "JANG/JANGTQ metadata is recognised on ROCm; the projection fixture kernel is linked and packed-weight model integration is pending")
 }
 
 func readROCmCodebookConfig(root string) (*rocmCodebookProfile, error) {
@@ -1423,8 +2117,8 @@ func applyROCmCodebookInspection(inspection *inference.ModelPackInspection, prof
 	if profile.IndexBits > 0 {
 		inspection.Labels["codebook_index_bits"] = core.Sprintf("%d", profile.IndexBits)
 	}
-	inspection.Capabilities = append(inspection.Capabilities, rocmMetadataOnlyCapability(inference.CapabilityCodebookVQ, inference.CapabilityGroupRuntime, "codebook/VQ model-pack metadata is recognised; native ROCm VQ kernels are pending"))
-	inspection.Notes = append(inspection.Notes, "codebook/VQ kernels are metadata-planned on ROCm")
+	inspection.Capabilities = append(inspection.Capabilities, rocmFixtureKernelCapability(inference.CapabilityCodebookVQ, inference.CapabilityGroupRuntime, "codebook/VQ model-pack metadata is recognised and the HIP lookup fixture kernel is linked; codebook-weight model integration is pending"))
+	inspection.Notes = append(inspection.Notes, "codebook/VQ metadata is recognised on ROCm; the lookup fixture kernel is linked and codebook-weight model integration is pending")
 }
 
 func applyROCmArchitectureInspection(inspection *inference.ModelPackInspection, weightMetadataValid bool) {
@@ -1434,11 +2128,30 @@ func applyROCmArchitectureInspection(inspection *inference.ModelPackInspection, 
 	inspection.Labels["architecture_detected"] = core.Sprintf("%t", architectureDetected)
 	inspection.Labels["architecture_supported"] = core.Sprintf("%t", architectureOK)
 	inspection.Labels["quantization_supported"] = core.Sprintf("%t", quantizationOK)
+	if isROCmDenseQuickWinArchitecture(inspection.Model.Architecture) {
+		inspection.Labels["dense_route_candidate"] = "true"
+		inspection.Labels["dense_route_status"] = "experimental"
+		inspection.Labels["dense_route_family"] = "loader_neutral"
+		inspection.Labels["dense_route_backend"] = "hip_small_decode"
+		inspection.Labels["dense_route_reference"] = "gemma4_mlx_affine_matvec"
+	}
+	if isROCmGemma4AssistantArchitecture(inspection.Model.Architecture) {
+		inspection.Labels["attached_drafter"] = "experimental_retained_plan"
+		inspection.Labels["mtp_role"] = "drafter"
+		inspection.Labels["mtp_target_family"] = "gemma4"
+		rocmAddGemma4AttachedDrafterCapabilityBaseLabels(inspection.Labels)
+		inspection.Labels["attached_drafter_official_pair_verified"] = "false"
+		inspection.Labels["attached_drafter_gemma4_family_pair_verified"] = "false"
+		inspection.Notes = append(inspection.Notes, "Gemma4 assistant pack is recognised as an attached MTP drafter with retained/no-replay plan evidence; native HIP packed assistant generation is pending")
+	}
 	inspection.Supported = inspection.Format != "missing" && weightMetadataValid && architectureDetected && architectureOK && quantizationOK
 	if isROCmMoEArchitecture(inspection.Model.Architecture) || inspection.Labels["moe_experts"] != "" || inspection.Labels["gemma4_enable_moe_block"] == "true" {
+		inspection.Labels["moe_text_runtime"] = hipKernelStatusNotLinked
+		inspection.Labels["moe_text_decode_family"] = rocmMoETextDecodeFamily(inspection.Model.Architecture)
+		inspection.Labels["moe_selected_expert_dispatch"] = hipKernelStatusNotLinked
 		inspection.Capabilities = append(inspection.Capabilities,
-			rocmMetadataOnlyCapability(inference.CapabilityMoERouting, inference.CapabilityGroupModel, "MoE architecture metadata is recognised; native router kernels are pending"),
-			rocmMetadataOnlyCapability(inference.CapabilityMoELazyExperts, inference.CapabilityGroupRuntime, "MoE lazy expert residency is required for 16GB-class ROCm devices"),
+			rocmFixtureKernelCapability(inference.CapabilityMoERouting, inference.CapabilityGroupModel, "MoE architecture metadata is recognised and the HIP router fixture kernel is linked; model integration is pending"),
+			rocmFixtureKernelCapability(inference.CapabilityMoELazyExperts, inference.CapabilityGroupRuntime, "MoE lazy expert residency is required for 16GB-class ROCm devices and the HIP residency fixture kernel is linked; expert paging integration is pending"),
 		)
 	}
 	if !architectureOK {
@@ -1449,6 +2162,17 @@ func applyROCmArchitectureInspection(inspection *inference.ModelPackInspection, 
 	}
 	if !quantizationOK {
 		inspection.Notes = append(inspection.Notes, "quantisation is not expected to fit the native ROCm path")
+	}
+}
+
+func rocmMoETextDecodeFamily(architecture string) string {
+	switch normalizeROCmArchitecture(architecture) {
+	case "gpt-oss":
+		return "gpt_oss"
+	case "qwen3_6_moe":
+		return "qwen3_moe"
+	default:
+		return normalizeROCmArchitecture(architecture)
 	}
 }
 
@@ -1511,8 +2235,15 @@ func rocmJANGQuantizationType(jang rocmJANGQuantizationInfo) string {
 }
 
 func normalizeROCmQuantizationAlias(value string) string {
-	lower := core.Lower(value)
+	lower := core.Lower(core.Trim(value))
+	lower = core.Replace(lower, "-", "_")
 	switch {
+	case core.Contains(lower, "auto_round_best"):
+		return "auto_round_best"
+	case core.Contains(lower, "auto_round_light"):
+		return "auto_round_light"
+	case core.Contains(lower, "auto_round"):
+		return "auto_round"
 	case core.Contains(lower, "jangtq"):
 		return "jangtq"
 	case core.Contains(lower, "mxtq"):
@@ -1520,6 +2251,23 @@ func normalizeROCmQuantizationAlias(value string) string {
 	default:
 		return lower
 	}
+}
+
+func rocmQuantizationAliasIsAutoRound(values ...string) bool {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		switch {
+		case strings.EqualFold(value, "auto_round"),
+			strings.EqualFold(value, "auto-round"),
+			strings.EqualFold(value, "autoround"),
+			strings.EqualFold(value, "auto_round_best"),
+			strings.EqualFold(value, "auto-round-best"),
+			strings.EqualFold(value, "auto_round_light"),
+			strings.EqualFold(value, "auto-round-light"):
+			return true
+		}
+	}
+	return false
 }
 
 func rocmJANGProfileBits(profile string) int {
@@ -1638,13 +2386,4 @@ func firstNonZeroInt32(values ...int32) int32 {
 		}
 	}
 	return 0
-}
-
-func firstNonEmptyString(values ...string) string {
-	for _, value := range values {
-		if value != "" {
-			return value
-		}
-	}
-	return ""
 }

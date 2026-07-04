@@ -42,15 +42,32 @@ type nativeHIPPinnedHostToDevice interface {
 	CopyPinnedHostToDevice(pointer nativeDevicePointer, host unsafe.Pointer, sizeBytes int) error
 }
 
+type nativeHIPLabeledPinnedHostToDevice interface {
+	CopyPinnedHostToDeviceLabeled(pointer nativeDevicePointer, host unsafe.Pointer, sizeBytes int, operation, label string) error
+}
+
 func hipCopyPinnedHostToDevice(driver nativeHIPDriver, pointer nativeDevicePointer, data []byte) error {
+	return hipCopyPinnedHostToDeviceLabeled(driver, pointer, data, "", "")
+}
+
+func hipCopyPinnedHostToDeviceLabeled(driver nativeHIPDriver, pointer nativeDevicePointer, data []byte, operation, label string) error {
 	if len(data) == 0 {
 		return nil
 	}
 	if pointer == 0 {
 		return core.E("rocm.hip.CopyPinnedHostToDevice", "device pointer is nil", nil)
 	}
-	pinned, ok := driver.(nativeHIPPinnedHostToDevice)
-	if ok {
+	if labeled, ok := driver.(nativeHIPLabeledPinnedHostToDevice); ok {
+		var view core.PinnedView
+		core.PinSlice(data, &view)
+		defer view.Release()
+		if err := labeled.CopyPinnedHostToDeviceLabeled(pointer, view.Ptr(), view.Bytes(), operation, label); err != nil {
+			return err
+		}
+		runtime.KeepAlive(data)
+		return nil
+	}
+	if pinned, ok := driver.(nativeHIPPinnedHostToDevice); ok {
 		var view core.PinnedView
 		core.PinSlice(data, &view)
 		defer view.Release()
@@ -59,6 +76,9 @@ func hipCopyPinnedHostToDevice(driver nativeHIPDriver, pointer nativeDevicePoint
 		}
 		runtime.KeepAlive(data)
 		return nil
+	}
+	if operation != "" || label != "" {
+		return hipCopyHostToDeviceLabeled(driver, pointer, data, operation, label)
 	}
 	return hipCopyHostToDevice(driver, pointer, data)
 }

@@ -3,9 +3,9 @@
 package rocm
 
 import (
-	// Note: strconv: numeric parsing of sysfs values; no core.ParseInt
 	"strconv"
 	"sync"
+	"syscall"
 
 	core "dappco.re/go"
 )
@@ -15,6 +15,10 @@ var rocmVRAMInfoSysfsCache = struct {
 	usedPath string
 	total    uint64
 }{}
+
+func warmROCmVRAMInfoCache() {
+	_, _ = GetVRAMInfo()
+}
 
 //	info, err := GetVRAMInfo()
 //	fmt.Printf("%d MiB free\n", info.Free>>20)
@@ -108,9 +112,41 @@ func readSysfsUint64(path string) (
 	uint64,
 	error,
 ) {
-	dataResult := core.ReadFile(path)
-	if !dataResult.OK {
-		return 0, dataResult.Value.(error)
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return 0, err
 	}
-	return strconv.ParseUint(core.Trim(string(dataResult.Value.([]byte))), 10, 64)
+	defer syscall.Close(fd)
+	var buf [64]byte
+	count, err := syscall.Read(fd, buf[:])
+	if count <= 0 {
+		if err != nil {
+			return 0, err
+		}
+		return 0, strconv.ErrSyntax
+	}
+	var value uint64
+	sawDigit := false
+	for _, b := range buf[:count] {
+		if b >= '0' && b <= '9' {
+			digit := uint64(b - '0')
+			if value > (^uint64(0)-digit)/10 {
+				return 0, strconv.ErrRange
+			}
+			value = value*10 + digit
+			sawDigit = true
+			continue
+		}
+		if sawDigit {
+			break
+		}
+		if b == ' ' || b == '\n' || b == '\r' || b == '\t' {
+			continue
+		}
+		return 0, strconv.ErrSyntax
+	}
+	if !sawDigit {
+		return 0, strconv.ErrSyntax
+	}
+	return value, nil
 }

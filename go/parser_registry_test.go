@@ -19,6 +19,18 @@ func TestParserRegistry_Good_QwenThinkTags(t *testing.T) {
 	core.AssertEqual(t, "hidden", result.Reasoning[0].Text)
 }
 
+func TestParserRegistry_Good_UsesArchitectureProfileParserID(t *testing.T) {
+	registry := NewParserRegistry("Qwen3_5MoeForConditionalGeneration")
+	if registry.architecture != "qwen3_6_moe" || registry.parserID != "qwen" {
+		t.Fatalf("registry = %+v, want canonical qwen3_6_moe with qwen parser id", registry)
+	}
+	result, err := registry.ParseReasoning(nil, "<think>hidden</think>visible")
+
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, "visible", result.VisibleText)
+	core.AssertEqual(t, "hidden", result.Reasoning[0].Text)
+}
+
 func TestParserRegistry_Good_GemmaChannels(t *testing.T) {
 	result, err := NewParserRegistry("gemma3").ParseReasoning(nil, "<analysis>hidden</analysis>visible")
 

@@ -171,9 +171,18 @@ func (req hipMoERouterRequest) launchArgs(buffers *hipMoERouterDeviceBuffers) (h
 }
 
 func (args hipMoERouterLaunchArgs) Binary() ([]byte, error) {
+	payload := make([]byte, hipMoERouterLaunchArgsBytes)
+	return args.BinaryInto(payload)
+}
+
+func (args hipMoERouterLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.LogitPointer == 0 || args.IDPointer == 0 || args.ProbPointer == 0 {
 		return nil, core.E("rocm.hip.MoERouterLaunch", "router logits and output pointers are required", nil)
 	}
+	if len(payload) < hipMoERouterLaunchArgsBytes {
+		return nil, core.E("rocm.hip.MoERouterLaunch", "launch arg payload buffer is too small", nil)
+	}
+	payload = payload[:hipMoERouterLaunchArgsBytes]
 	expertCount, err := rocmDeviceKVPositiveUint32("expert count", args.ExpertCount)
 	if err != nil {
 		return nil, err
@@ -207,7 +216,6 @@ func (args hipMoERouterLaunchArgs) Binary() ([]byte, error) {
 		return nil, core.E("rocm.hip.MoERouterLaunch", "layer exceeds uint32", nil)
 	}
 	layer := uint32(args.Layer)
-	payload := make([]byte, hipMoERouterLaunchArgsBytes)
 	binary.LittleEndian.PutUint32(payload[0:], hipMoERouterLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.LogitPointer))
@@ -237,18 +245,38 @@ func (buffers *hipMoERouterDeviceBuffers) Close() error {
 }
 
 func (buffers *hipMoERouterDeviceBuffers) ReadOutput() (hipMoERouterResult, error) {
-	if buffers == nil || buffers.IDs == nil || buffers.Probs == nil || buffers.Status == nil {
+	if buffers == nil {
 		return hipMoERouterResult{}, core.E("rocm.hip.MoERouterLaunch", "router output buffers are required", nil)
 	}
 	idPayload := make([]byte, buffers.IDs.SizeBytes())
+	probPayload := make([]byte, buffers.Probs.SizeBytes())
+	statusPayload := make([]byte, buffers.Status.SizeBytes())
+	routes := make([]rocmExpertRoute, buffers.TopK)
+	return buffers.ReadOutputInto(routes, idPayload, probPayload, statusPayload)
+}
+
+func (buffers *hipMoERouterDeviceBuffers) ReadOutputInto(routes []rocmExpertRoute, idPayload, probPayload, statusPayload []byte) (hipMoERouterResult, error) {
+	if buffers == nil || buffers.IDs == nil || buffers.Probs == nil || buffers.Status == nil {
+		return hipMoERouterResult{}, core.E("rocm.hip.MoERouterLaunch", "router output buffers are required", nil)
+	}
+	if len(routes) < buffers.TopK {
+		return hipMoERouterResult{}, core.E("rocm.hip.MoERouterLaunch", "router result buffer is too small", nil)
+	}
+	idBytes := int(buffers.IDs.SizeBytes())
+	probBytes := int(buffers.Probs.SizeBytes())
+	statusBytes := int(buffers.Status.SizeBytes())
+	if len(idPayload) < idBytes || len(probPayload) < probBytes || len(statusPayload) < statusBytes {
+		return hipMoERouterResult{}, core.E("rocm.hip.MoERouterLaunch", "router output payload buffer is too small", nil)
+	}
+	idPayload = idPayload[:idBytes]
+	probPayload = probPayload[:probBytes]
+	statusPayload = statusPayload[:statusBytes]
 	if err := buffers.IDs.driver.CopyDeviceToHost(buffers.IDs.Pointer(), idPayload); err != nil {
 		return hipMoERouterResult{}, core.E("rocm.hip.MoERouterLaunch", "copy router id output", err)
 	}
-	probPayload := make([]byte, buffers.Probs.SizeBytes())
 	if err := buffers.Probs.driver.CopyDeviceToHost(buffers.Probs.Pointer(), probPayload); err != nil {
 		return hipMoERouterResult{}, core.E("rocm.hip.MoERouterLaunch", "copy router probability output", err)
 	}
-	statusPayload := make([]byte, buffers.Status.SizeBytes())
 	if err := buffers.Status.driver.CopyDeviceToHost(buffers.Status.Pointer(), statusPayload); err != nil {
 		return hipMoERouterResult{}, core.E("rocm.hip.MoERouterLaunch", "copy router status", err)
 	}
@@ -259,7 +287,7 @@ func (buffers *hipMoERouterDeviceBuffers) ReadOutput() (hipMoERouterResult, erro
 	if status != hipMoERouterLaunchStatusOK {
 		return hipMoERouterResult{}, core.E("rocm.hip.MoERouterLaunch", core.Sprintf("router status marker mismatch: got 0x%08x want 0x%08x", status, hipMoERouterLaunchStatusOK), nil)
 	}
-	routes := make([]rocmExpertRoute, buffers.TopK)
+	routes = routes[:buffers.TopK]
 	for index := range routes {
 		id := int(int32(binary.LittleEndian.Uint32(idPayload[index*4:])))
 		if id < 0 || id >= len(buffers.InputLogits) {
@@ -377,9 +405,18 @@ func (req hipMoELazyExpertRequest) launchArgs(buffers *hipMoELazyExpertDeviceBuf
 }
 
 func (args hipMoELazyExpertLaunchArgs) Binary() ([]byte, error) {
+	payload := make([]byte, hipMoELazyLaunchArgsBytes)
+	return args.BinaryInto(payload)
+}
+
+func (args hipMoELazyExpertLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.IDPointer == 0 || args.ResidentPointer == 0 {
 		return nil, core.E("rocm.hip.MoELazyLaunch", "expert ID and resident output pointers are required", nil)
 	}
+	if len(payload) < hipMoELazyLaunchArgsBytes {
+		return nil, core.E("rocm.hip.MoELazyLaunch", "launch arg payload buffer is too small", nil)
+	}
+	payload = payload[:hipMoELazyLaunchArgsBytes]
 	selected, err := rocmDeviceKVPositiveUint32("selected expert count", args.SelectedCount)
 	if err != nil {
 		return nil, err
@@ -397,7 +434,6 @@ func (args hipMoELazyExpertLaunchArgs) Binary() ([]byte, error) {
 	if args.IDBytes > uint64(^uint32(0)) || args.ResidentBytes > uint64(^uint32(0)) {
 		return nil, core.E("rocm.hip.MoELazyLaunch", "lazy expert byte counts are out of uint32 range", nil)
 	}
-	payload := make([]byte, hipMoELazyLaunchArgsBytes)
 	binary.LittleEndian.PutUint32(payload[0:], hipMoELazyLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.IDPointer))
@@ -423,17 +459,30 @@ func (buffers *hipMoELazyExpertDeviceBuffers) Close() error {
 }
 
 func (buffers *hipMoELazyExpertDeviceBuffers) ReadOutput() (hipMoELazyExpertResult, error) {
+	if buffers == nil {
+		return hipMoELazyExpertResult{}, core.E("rocm.hip.MoELazyLaunch", "resident expert output buffer is required", nil)
+	}
+	payload := make([]byte, buffers.Resident.SizeBytes())
+	resident := make([]bool, buffers.TotalExperts)
+	return buffers.ReadOutputInto(resident, payload)
+}
+
+func (buffers *hipMoELazyExpertDeviceBuffers) ReadOutputInto(resident []bool, payload []byte) (hipMoELazyExpertResult, error) {
 	if buffers == nil || buffers.Resident == nil || buffers.Resident.Pointer() == 0 {
 		return hipMoELazyExpertResult{}, core.E("rocm.hip.MoELazyLaunch", "resident expert output buffer is required", nil)
 	}
 	if buffers.TotalExperts <= 0 || buffers.Resident.Count() != buffers.TotalExperts || buffers.Resident.SizeBytes() != uint64(buffers.TotalExperts) {
 		return hipMoELazyExpertResult{}, core.E("rocm.hip.MoELazyLaunch", "resident expert output byte count mismatch", nil)
 	}
-	payload := make([]byte, buffers.Resident.SizeBytes())
+	payloadBytes := int(buffers.Resident.SizeBytes())
+	if len(resident) < buffers.TotalExperts || len(payload) < payloadBytes {
+		return hipMoELazyExpertResult{}, core.E("rocm.hip.MoELazyLaunch", "resident expert output buffer is too small", nil)
+	}
+	payload = payload[:payloadBytes]
 	if err := buffers.Resident.driver.CopyDeviceToHost(buffers.Resident.Pointer(), payload); err != nil {
 		return hipMoELazyExpertResult{}, core.E("rocm.hip.MoELazyLaunch", "copy resident expert output", err)
 	}
-	resident := make([]bool, len(payload))
+	resident = resident[:buffers.TotalExperts]
 	for index, value := range payload {
 		if value != 0 && value != 1 {
 			return hipMoELazyExpertResult{}, core.E("rocm.hip.MoELazyLaunch", "resident expert output must contain binary flags", nil)

@@ -451,6 +451,66 @@ func TestHIPTrainingLoadedModelGRPOAdvantageHook_Bad(t *testing.T) {
 	core.AssertFalse(t, ok)
 }
 
+func TestHIPTrainingLoadedModelAdamWUpdateHook_Good(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	model := &hipLoadedModel{driver: driver, kernels: fakeOptimizerHIPKernelSet{}}
+	state, err := NewNativeAdamWState([]NativeAdamWParam{
+		{Name: "a", Values: []float32{1, 2}},
+		{Name: "b", Values: []float32{3}},
+	}, NativeAdamWConfig{LearningRate: 0.01, WeightDecay: 0.1, WeightDecaySet: true})
+	core.RequireNoError(t, err)
+	expected, err := NewNativeAdamWState([]NativeAdamWParam{
+		{Name: "a", Values: []float32{1, 2}},
+		{Name: "b", Values: []float32{3}},
+	}, NativeAdamWConfig{LearningRate: 0.01, WeightDecay: 0.1, WeightDecaySet: true})
+	core.RequireNoError(t, err)
+	gradients := [][]float32{{0.5, -0.25}, {0.125}}
+	core.RequireNoError(t, expected.StepInPlace(gradients))
+
+	ok, err := model.RunAdamWUpdate(context.Background(), state, gradients)
+	core.RequireNoError(t, err)
+	core.AssertTrue(t, ok)
+	core.AssertEqual(t, expected.Step, state.Step)
+	for index, want := range expected.Parameters() {
+		assertAdamWFloat32Near(t, want, state.Parameters()[index], 0.0001)
+	}
+	for index, want := range expected.FirstMoment() {
+		assertAdamWFloat32Near(t, want, state.FirstMoment()[index], 0.0001)
+	}
+	for index, want := range expected.SecondMoment() {
+		assertAdamWFloat32Near(t, want, state.SecondMoment()[index], 0.00001)
+	}
+	core.AssertEqual(t, 1, len(driver.launches))
+	core.AssertEqual(t, hipKernelNameAdamWUpdate, driver.launches[0].Name)
+}
+
+func TestHIPTrainingLoadedModelAdamWUpdateHook_Bad(t *testing.T) {
+	driver := &fakeHIPDriver{available: true}
+	state, err := NewNativeAdamWState([]NativeAdamWParam{
+		{Name: "w", Values: []float32{1, 2}},
+	}, NativeAdamWConfig{})
+	core.RequireNoError(t, err)
+
+	model := &hipLoadedModel{driver: driver, kernels: newDefaultHIPKernelSet()}
+	ok, err := model.RunAdamWUpdate(context.Background(), state, [][]float32{{0.1, 0.2}})
+	core.RequireNoError(t, err)
+	core.AssertFalse(t, ok)
+
+	model = &hipLoadedModel{driver: driver, kernels: fakeOptimizerHIPKernelSet{}}
+	ok, err = model.RunAdamWUpdate(context.Background(), state, [][]float32{{0.1}})
+	core.AssertError(t, err)
+	core.AssertTrue(t, ok)
+	core.AssertContains(t, err.Error(), "gradient length")
+
+	ok, err = model.RunAdamWUpdate(context.Background(), state, nil)
+	core.RequireNoError(t, err)
+	core.AssertFalse(t, ok)
+
+	ok, err = (*hipLoadedModel)(nil).RunAdamWUpdate(context.Background(), state, [][]float32{{0.1, 0.2}})
+	core.RequireNoError(t, err)
+	core.AssertFalse(t, ok)
+}
+
 func TestHIPTrainingLoadedModelFixtureHooksRequireSpecificKernelStatus_Ugly(t *testing.T) {
 	driver := &fakeHIPDriver{available: true}
 	model := &hipLoadedModel{driver: driver, kernels: fakeProjectionOnlyHIPKernelSet{}}
@@ -464,6 +524,13 @@ func TestHIPTrainingLoadedModelFixtureHooksRequireSpecificKernelStatus_Ugly(t *t
 	_, grpoOK, err := model.RunGRPOAdvantage(context.Background(), []float64{1, 2, 3})
 	core.RequireNoError(t, err)
 	core.AssertFalse(t, grpoOK)
+	state, err := NewNativeAdamWState([]NativeAdamWParam{
+		{Name: "w", Values: []float32{1, 2}},
+	}, NativeAdamWConfig{})
+	core.RequireNoError(t, err)
+	optimizerOK, err := model.RunAdamWUpdate(context.Background(), state, [][]float32{{0.1, 0.2}})
+	core.RequireNoError(t, err)
+	core.AssertFalse(t, optimizerOK)
 	core.AssertEqual(t, 0, len(driver.launches))
 }
 
@@ -475,5 +542,16 @@ func (fakeProjectionOnlyHIPKernelSet) Status() hipKernelStatus {
 	return hipKernelStatus{
 		Projection: hipKernelStatusLinked,
 		Reason:     "fake projection-only test kernel",
+	}
+}
+
+type fakeOptimizerHIPKernelSet struct {
+	hipKernelStub
+}
+
+func (fakeOptimizerHIPKernelSet) Status() hipKernelStatus {
+	return hipKernelStatus{
+		Optimizer: hipKernelStatusLinked,
+		Reason:    "fake optimizer test kernel",
 	}
 }

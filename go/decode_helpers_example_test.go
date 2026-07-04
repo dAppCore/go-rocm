@@ -33,3 +33,13 @@ func ExamplePromptLookupDecode() {
 	core.Println(result.Metrics.AcceptedTokens, result.Metrics.RejectedTokens)
 	// Output: 2 1
 }
+
+func ExampleAttachedDrafterDecode() {
+	target := newDecodeGemma4E2BQ6Target(&fakeNativeModel{tokens: []inference.Token{{ID: 1}, {ID: 2}}})
+	draft := newDecodeGemma4E2BBF16Assistant(&fakeNativeModel{tokens: []inference.Token{{ID: 1}, {ID: 9}}})
+
+	result, _ := AttachedDrafterDecode(context.Background(), target, draft, AttachedDrafterDecodeConfig{Prompt: "p", MaxTokens: 2})
+
+	core.Println(result.Metrics.AcceptedTokens, result.Metrics.RejectedTokens)
+	// Output: 1 1
+}

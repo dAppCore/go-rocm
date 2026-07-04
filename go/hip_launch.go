@@ -19,15 +19,33 @@ const (
 	hipKernelNameProjectionBatch                  = "rocm_projection_batch"
 	hipKernelNameMLXQ4Proj                        = "rocm_mlx_q4_projection"
 	hipKernelNameMLXQ4ProjCols256                 = "rocm_mlx_q4_projection_cols256"
+	hipKernelNameMLXQ4ProjQ6Row16                 = "rocm_mlx_q4_projection_q6_row16"
+	hipKernelNameMLXQ4ProjQ6Row32                 = "rocm_mlx_q4_projection_q6_row32"
+	hipKernelNameMLXQ4ProjQ6Row64                 = "rocm_mlx_q4_projection_q6_row64"
 	hipKernelNameMLXQ4ProjBatch                   = "rocm_mlx_q4_projection_batch"
+	hipKernelNameMLXQ4ProjBatchQ6Row16            = "rocm_mlx_q4_projection_batch_q6_row16"
 	hipKernelNameMLXQ4ProjGreedy                  = "rocm_mlx_q4_projection_greedy"
+	hipKernelNameMLXQ4ProjGreedyQ6Row64           = "rocm_mlx_q4_projection_greedy_q6_row64"
+	hipKernelNameMLXQ4ProjGreedyBatch             = "rocm_mlx_q4_projection_greedy_batch"
+	hipKernelNameMLXQ4ProjGreedyBatchQ6Row64      = "rocm_mlx_q4_projection_greedy_batch_q6_row64"
 	hipKernelNameMLXQ4ProjScores                  = "rocm_mlx_q4_projection_scores"
+	hipKernelNameMLXQ4ProjScoresQ6Row64           = "rocm_mlx_q4_projection_scores_q6_row64"
+	hipKernelNameMLXQ4ProjSelectedGreedy          = "rocm_mlx_q4_projection_selected_greedy"
+	hipKernelNameMLXQ4ProjSelectedGreedyQ6Row64   = "rocm_mlx_q4_projection_selected_greedy_q6_row64"
+	hipKernelNameOrderedEmbeddingCandidates       = "rocm_ordered_embedding_candidates"
 	hipKernelNamePackedTopK                       = "rocm_packed_topk"
+	hipKernelNamePackedTopKSample                 = "rocm_packed_topk_sample"
 	hipKernelNameMLXQ4TripleProj                  = "rocm_mlx_q4_triple_projection"
+	hipKernelNameMLXQ4TripleProjQ6Row16           = "rocm_mlx_q4_triple_projection_q6_row16"
+	hipKernelNameMLXQ4TripleProjQ6Row64           = "rocm_mlx_q4_triple_projection_q6_row64"
 	hipKernelNameMLXQ4PairProj                    = "rocm_mlx_q4_pair_projection"
 	hipKernelNameMLXQ4GELUTanhMul                 = "rocm_mlx_q4_gelu_tanh_multiply"
+	hipKernelNameMLXQ4GELUTanhMulQ6Cols1536       = "rocm_mlx_q4_gelu_tanh_multiply_q6_cols1536"
+	hipKernelNameMLXQ4GELUTanhMulQ6Cols1536Row32  = "rocm_mlx_q4_gelu_tanh_multiply_q6_cols1536_row32"
+	hipKernelNameMLXQ4GELUTanhMulQ6Cols1536Row64  = "rocm_mlx_q4_gelu_tanh_multiply_q6_cols1536_row64"
 	hipKernelNameMLXQ4GELUTanhMulBatch            = "rocm_mlx_q4_gelu_tanh_multiply_batch"
 	hipKernelNameMLXQ4GELUTanhProj                = "rocm_mlx_q4_gelu_tanh_projection"
+	hipKernelNameMLXQ4GELUTanhProjQ6Row16         = "rocm_mlx_q4_gelu_tanh_projection_q6_row16"
 	hipKernelNameMLXQ4GELUTanhProjBatch           = "rocm_mlx_q4_gelu_tanh_projection_batch"
 	hipKernelNameRMSNorm                          = "rocm_rms_norm"
 	hipKernelNameRMSNormResidualAdd               = "rocm_rms_norm_residual_add"
@@ -66,6 +84,8 @@ const (
 	hipKernelNameCrossEntropy                     = "rocm_cross_entropy_loss"
 	hipKernelNameDistillKL                        = "rocm_distillation_kl_loss"
 	hipKernelNameGRPOAdvantage                    = "rocm_grpo_advantage"
+	hipKernelNameAdamWUpdate                      = "rocm_adamw_update"
+	hipKernelNameAutoRoundQuantize                = "rocm_autoround_quantize"
 )
 
 type hipKernelLaunchConfig struct {
@@ -113,6 +133,24 @@ func hipBorrowLaunchPacket(size int) []byte {
 	}
 	pool.Unlock()
 	return make([]byte, size, size+1)
+}
+
+func hipPrewarmLaunchPacketPools(sizes []int, depth int) {
+	if depth <= 0 {
+		return
+	}
+	for _, size := range sizes {
+		if size <= 0 {
+			continue
+		}
+		packets := make([][]byte, 0, depth)
+		for range depth {
+			packets = append(packets, hipBorrowLaunchPacket(size))
+		}
+		for index := len(packets) - 1; index >= 0; index-- {
+			hipReleaseLaunchPacket(packets[index])
+		}
+	}
 }
 
 func hipReleaseLaunchPacket(packet []byte) {

@@ -85,23 +85,45 @@ func rocmReferenceLazyExpertResidency(routes []rocmExpertRoute, totalExperts int
 }
 
 func rocmReferenceJANGTQProjection(input []float32, packedWeights []byte, desc rocmJANGTQDescriptor, rows, cols int, scale float32, bias []float32) ([]float32, error) {
-	if err := validateROCmJANGTQDescriptor(desc); err != nil {
-		return nil, err
-	}
-	if scale <= 0 || math.IsNaN(float64(scale)) || math.IsInf(float64(scale), 0) {
-		return nil, core.E("rocm.JANGTQ.ReferenceProjection", "scale must be positive and finite", nil)
-	}
-	if err := validateHIPProjectionShape(len(input), rows*cols, len(bias), rows, cols); err != nil {
-		return nil, err
-	}
-	if !rocmFloat32SliceFinite(input) || !rocmFloat32SliceFinite(bias) {
-		return nil, core.E("rocm.JANGTQ.ReferenceProjection", "input and bias values must be finite", nil)
-	}
-	quantized, err := unpackROCmSignedBits(packedWeights, desc.Bits, rows*cols)
-	if err != nil {
-		return nil, err
+	if rows <= 0 {
+		return nil, core.E("rocm.JANGTQ.ReferenceProjection", "row count must be positive", nil)
 	}
 	output := make([]float32, rows)
+	if err := rocmReferenceJANGTQProjectionInto(output, input, packedWeights, nil, desc, rows, cols, scale, bias); err != nil {
+		return nil, err
+	}
+	return output, nil
+}
+
+func rocmReferenceJANGTQProjectionInto(output []float32, input []float32, packedWeights []byte, quantized []int8, desc rocmJANGTQDescriptor, rows, cols int, scale float32, bias []float32) error {
+	if err := validateROCmJANGTQDescriptor(desc); err != nil {
+		return err
+	}
+	if scale <= 0 || math.IsNaN(float64(scale)) || math.IsInf(float64(scale), 0) {
+		return core.E("rocm.JANGTQ.ReferenceProjection", "scale must be positive and finite", nil)
+	}
+	if err := validateHIPProjectionShape(len(input), rows*cols, len(bias), rows, cols); err != nil {
+		return err
+	}
+	if !rocmFloat32SliceFinite(input) || !rocmFloat32SliceFinite(bias) {
+		return core.E("rocm.JANGTQ.ReferenceProjection", "input and bias values must be finite", nil)
+	}
+	if len(output) != rows {
+		return core.E("rocm.JANGTQ.ReferenceProjection", "output row count mismatch", nil)
+	}
+	quantizedCount := rows * cols
+	if cap(quantized) < quantizedCount {
+		var err error
+		quantized, err = unpackROCmSignedBits(packedWeights, desc.Bits, quantizedCount)
+		if err != nil {
+			return err
+		}
+	} else {
+		quantized = quantized[:quantizedCount]
+		if err := unpackROCmSignedBitsInto(quantized, packedWeights, desc.Bits); err != nil {
+			return err
+		}
+	}
 	for row := 0; row < rows; row++ {
 		sum := float32(0)
 		if len(bias) > 0 {
@@ -112,7 +134,7 @@ func rocmReferenceJANGTQProjection(input []float32, packedWeights []byte, desc r
 		}
 		output[row] = sum
 	}
-	return output, nil
+	return nil
 }
 
 func validateROCmJANGTQDescriptor(desc rocmJANGTQDescriptor) error {
@@ -135,23 +157,36 @@ func rocmReferenceCodebookLookup(codes []uint8, codebook []float32, codeDim int)
 	if codeDim <= 0 {
 		return nil, core.E("rocm.Codebook.Lookup", "code dimension must be positive", nil)
 	}
-	if len(codebook) == 0 || len(codebook)%codeDim != 0 {
-		return nil, core.E("rocm.Codebook.Lookup", "codebook shape does not match code dimension", nil)
-	}
-	if !rocmFloat32SliceFinite(codebook) {
-		return nil, core.E("rocm.Codebook.Lookup", "codebook values must be finite", nil)
-	}
-	codeCount := len(codebook) / codeDim
-	out := make([]float32, 0, len(codes)*codeDim)
-	for _, code := range codes {
-		index := int(code)
-		if index >= codeCount {
-			return nil, core.E("rocm.Codebook.Lookup", core.Sprintf("code %d outside codebook size %d", index, codeCount), nil)
-		}
-		start := index * codeDim
-		out = append(out, codebook[start:start+codeDim]...)
+	out := make([]float32, len(codes)*codeDim)
+	if err := rocmReferenceCodebookLookupInto(out, codes, codebook, codeDim); err != nil {
+		return nil, err
 	}
 	return out, nil
+}
+
+func rocmReferenceCodebookLookupInto(out []float32, codes []uint8, codebook []float32, codeDim int) error {
+	if codeDim <= 0 {
+		return core.E("rocm.Codebook.Lookup", "code dimension must be positive", nil)
+	}
+	if len(codebook) == 0 || len(codebook)%codeDim != 0 {
+		return core.E("rocm.Codebook.Lookup", "codebook shape does not match code dimension", nil)
+	}
+	if !rocmFloat32SliceFinite(codebook) {
+		return core.E("rocm.Codebook.Lookup", "codebook values must be finite", nil)
+	}
+	if len(out) != len(codes)*codeDim {
+		return core.E("rocm.Codebook.Lookup", "output shape does not match codes and code dimension", nil)
+	}
+	codeCount := len(codebook) / codeDim
+	for codeIndex, code := range codes {
+		index := int(code)
+		if index >= codeCount {
+			return core.E("rocm.Codebook.Lookup", core.Sprintf("code %d outside codebook size %d", index, codeCount), nil)
+		}
+		start := index * codeDim
+		copy(out[codeIndex*codeDim:(codeIndex+1)*codeDim], codebook[start:start+codeDim])
+	}
+	return nil
 }
 
 func rocmReferenceResidualSummary(layer int, values []float32, sink inference.ProbeSink) (inference.ProbeResidualSummary, error) {
@@ -189,17 +224,24 @@ func rocmReferenceResidualSummary(layer int, values []float32, sink inference.Pr
 }
 
 func unpackROCmSignedBits(packed []byte, bits, count int) ([]int8, error) {
-	if bits != 2 && bits != 4 && bits != 8 {
-		return nil, core.E("rocm.JANGTQ.Unpack", core.Sprintf("unsupported bit width %d", bits), nil)
-	}
-	requiredBytes := (bits*count + 7) / 8
-	if len(packed) < requiredBytes {
-		return nil, core.E("rocm.JANGTQ.Unpack", core.Sprintf("packed weights need %d bytes, got %d", requiredBytes, len(packed)), nil)
-	}
 	out := make([]int8, count)
+	if err := unpackROCmSignedBitsInto(out, packed, bits); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func unpackROCmSignedBitsInto(out []int8, packed []byte, bits int) error {
+	if bits != 2 && bits != 4 && bits != 8 {
+		return core.E("rocm.JANGTQ.Unpack", core.Sprintf("unsupported bit width %d", bits), nil)
+	}
+	requiredBytes := (bits*len(out) + 7) / 8
+	if len(packed) < requiredBytes {
+		return core.E("rocm.JANGTQ.Unpack", core.Sprintf("packed weights need %d bytes, got %d", requiredBytes, len(packed)), nil)
+	}
 	mask := (1 << bits) - 1
 	signBit := 1 << (bits - 1)
-	for i := 0; i < count; i++ {
+	for i := range out {
 		bitOffset := i * bits
 		byteIndex := bitOffset / 8
 		shift := bitOffset % 8
@@ -213,7 +255,7 @@ func unpackROCmSignedBits(packed []byte, bits, count int) ([]int8, error) {
 		}
 		out[i] = int8(raw)
 	}
-	return out, nil
+	return nil
 }
 
 func softmaxFloat32(values []float32) []float32 {

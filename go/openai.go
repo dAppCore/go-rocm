@@ -5,6 +5,8 @@ package rocm
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
+	"time"
 
 	core "dappco.re/go"
 	"dappco.re/go/inference"
@@ -23,8 +25,8 @@ func NewOpenAIHandler(modelPath string, opts ...inference.LoadOption) http.Handl
 	return openaicompat.NewHandler(NewOpenAIResolver(modelPath, opts...))
 }
 
-// NewOpenAIResponsesHandler exposes the non-streaming OpenAI-compatible
-// Responses endpoint over a caller-provided resolver.
+// NewOpenAIResponsesHandler exposes the OpenAI-compatible Responses endpoint
+// over a caller-provided resolver.
 func NewOpenAIResponsesHandler(resolver openaicompat.Resolver) http.Handler {
 	return &openAIResponsesHandler{resolver: resolver}
 }
@@ -84,10 +86,6 @@ func (handler *openAIResponsesHandler) ServeHTTP(w http.ResponseWriter, r *http.
 		writeROCmOpenAIError(w, http.StatusBadRequest, "model is required", "model")
 		return
 	}
-	if req.Stream {
-		writeROCmOpenAIError(w, http.StatusNotImplemented, "streaming responses are not implemented by go-rocm yet", "stream")
-		return
-	}
 	messages := openaicompat.ResponseMessages(req)
 	if !hasROCmWireMessages(messages) {
 		writeROCmOpenAIError(w, http.StatusBadRequest, "input or instructions are required", "input")
@@ -103,12 +101,71 @@ func (handler *openAIResponsesHandler) ServeHTTP(w http.ResponseWriter, r *http.
 		writeROCmOpenAIError(w, http.StatusNotFound, err.Error(), "model")
 		return
 	}
+	if req.Stream {
+		serveROCmOpenAIResponseStream(w, r, model, req, messages, opts...)
+		return
+	}
 	text := collectROCmWireTokenText(model.Chat(r.Context(), messages, opts...))
 	if err := model.Err(); err != nil {
 		writeROCmOpenAIError(w, http.StatusInternalServerError, err.Error(), "model")
 		return
 	}
 	writeROCmOpenAIJSON(w, http.StatusOK, openaicompat.NewTextResponse("resp_rocm", req.Model, text, model.Metrics()))
+}
+
+func serveROCmOpenAIResponseStream(w http.ResponseWriter, r *http.Request, model inference.TextModel, req openaicompat.ResponseRequest, messages []inference.Message, opts ...inference.GenerateOption) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	writeEvent := func(event openaicompat.ResponseStreamEvent) {
+		writeROCmOpenAISSEData(w, core.JSONMarshalString(event))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	const id = "resp_rocm"
+	writeEvent(openaicompat.ResponseStreamEvent{
+		Type: "response.created",
+		Response: &openaicompat.Response{
+			ID:      id,
+			Object:  "response",
+			Created: time.Now().Unix(),
+			Model:   req.Model,
+		},
+	})
+
+	var text strings.Builder
+	for token := range model.Chat(r.Context(), messages, opts...) {
+		text.WriteString(token.Text)
+		writeEvent(openaicompat.ResponseStreamEvent{Type: "response.output_text.delta", Delta: token.Text})
+	}
+	if err := model.Err(); err != nil {
+		writeEvent(openaicompat.ResponseStreamEvent{Type: "response.error", Delta: err.Error()})
+		writeROCmOpenAISSEDone(w)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return
+	}
+	response := openaicompat.NewTextResponse(id, req.Model, text.String(), model.Metrics())
+	writeEvent(openaicompat.ResponseStreamEvent{Type: "response.completed", Response: &response})
+	writeROCmOpenAISSEDone(w)
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+func writeROCmOpenAISSEData(w http.ResponseWriter, payload string) {
+	_, _ = w.Write([]byte("data: "))
+	_, _ = w.Write([]byte(payload))
+	_, _ = w.Write([]byte("\n\n"))
+}
+
+func writeROCmOpenAISSEDone(w http.ResponseWriter) {
+	_, _ = w.Write([]byte("data: [DONE]\n\n"))
 }
 
 func writeROCmOpenAIJSON(w http.ResponseWriter, status int, value any) {

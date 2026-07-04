@@ -12,6 +12,7 @@ import (
 	core "dappco.re/go"
 	"dappco.re/go/inference"
 	"dappco.re/go/inference/state"
+	rocmmodel "dappco.re/go/rocm/model"
 )
 
 func TestCacheService_Good_WarmStatsClear(t *testing.T) {
@@ -39,6 +40,33 @@ func TestCacheService_Good_WarmStatsClear(t *testing.T) {
 	stats, err = service.ClearCache(context.Background(), nil)
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, 0, stats.Blocks)
+}
+
+func TestCacheService_Good_CacheProfileReflectsWarmBlocks(t *testing.T) {
+	service := NewBlockCacheService(BlockCacheConfig{CacheMode: rocmKVCacheModeQ8})
+
+	_, err := service.WarmCache(context.Background(), inference.CacheWarmRequest{
+		Tokens: []int32{1, 2, 3},
+	})
+	core.RequireNoError(t, err)
+	profile, err := service.CacheProfile(context.Background(), "gemma4_text")
+	core.RequireNoError(t, err)
+	stats, err := service.CacheStats(context.Background())
+	core.RequireNoError(t, err)
+
+	if !profile.Matched() ||
+		profile.Contract != rocmmodel.CacheProfileContract ||
+		profile.Architecture != "gemma4_text" ||
+		profile.TotalCaches != 1 ||
+		profile.QuantizedCaches != 1 ||
+		profile.MaxCacheTokens != 3 ||
+		profile.MaxCacheCapacity != defaultROCmKVBlockSize {
+		t.Fatalf("CacheProfile = %+v, want live q8 cache profile", profile)
+	}
+	core.AssertEqual(t, rocmmodel.CacheProfileContract, stats.Labels["engine_cache_profile_contract"])
+	core.AssertEqual(t, "1", stats.Labels["engine_cache_profile_total"])
+	core.AssertEqual(t, "1", stats.Labels["engine_cache_profile_quantized_count"])
+	core.AssertEqual(t, "3", stats.Labels["engine_cache_profile_max_cache_tokens"])
 }
 
 func TestCacheService_Good_StatsReportExplicitWarmMode(t *testing.T) {
@@ -499,6 +527,52 @@ func TestCacheService_Good_RestoresPortableKVSnapshotDiskRefOnColdWarm(t *testin
 	core.AssertEqual(t, "2", restored.Labels["kv_value_width"])
 	core.AssertEqual(t, rocmKVCacheModeQ8, restored.Stats.CacheMode)
 	core.AssertGreater(t, restored.Stats.DiskBytes, uint64(0))
+}
+
+func BenchmarkCacheValidateKVSnapshotTokens_KQ8VQ4Page(b *testing.B) {
+	tokens := make([]int32, 512)
+	for index := range tokens {
+		tokens[index] = int32(index + 1)
+	}
+	keys, values := cacheWarmKVTensors(tokens, 128, 128)
+	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 512)
+	if err != nil {
+		b.Fatalf("create KV cache: %v", err)
+	}
+	if err := cache.AppendVectors(0, 128, 128, keys, values); err != nil {
+		b.Fatalf("append KV cache vectors: %v", err)
+	}
+	b.SetBytes(int64((len(keys) + len(values)) * 4))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := validateCacheKVSnapshotTokens(cache, tokens); err != nil {
+			b.Fatalf("validate KV snapshot tokens: %v", err)
+		}
+	}
+}
+
+func BenchmarkCacheValidateKVSnapshotTokens_KQ8VQ4FourPages(b *testing.B) {
+	tokens := make([]int32, 2048)
+	for index := range tokens {
+		tokens[index] = int32(index + 1)
+	}
+	keys, values := cacheWarmKVTensors(tokens, 128, 128)
+	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 512)
+	if err != nil {
+		b.Fatalf("create KV cache: %v", err)
+	}
+	if err := cache.AppendVectors(0, 128, 128, keys, values); err != nil {
+		b.Fatalf("append KV cache vectors: %v", err)
+	}
+	b.SetBytes(int64((len(keys) + len(values)) * 4))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := validateCacheKVSnapshotTokens(cache, tokens); err != nil {
+			b.Fatalf("validate KV snapshot tokens: %v", err)
+		}
+	}
 }
 
 func TestCacheService_Good_MirrorsWarmKVSnapshotToHIPDevice(t *testing.T) {
@@ -996,12 +1070,33 @@ func TestCacheService_Ugly_ClearByLabelsOnlyClearsMatchingBlocks(t *testing.T) {
 
 func TestCacheService_Good_RocmModelImplementsCacheService(t *testing.T) {
 	var _ inference.CacheService = (*rocmModel)(nil)
+	var _ ROCmCacheProfileReporter = (*rocmModel)(nil)
 
 	model := &rocmModel{modelInfo: inference.ModelInfo{Architecture: "qwen3"}}
 	warmed, err := model.WarmCache(context.Background(), inference.CacheWarmRequest{Prompt: "hello world"})
 
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, 1, len(warmed.Blocks))
+}
+
+func TestCacheService_Good_RocmModelReportsCacheProfile(t *testing.T) {
+	model := &rocmModel{modelInfo: inference.ModelInfo{Architecture: "gemma4_text"}}
+
+	_, err := model.WarmCache(context.Background(), inference.CacheWarmRequest{
+		Mode:   rocmKVCacheModeKQ8VQ4,
+		Tokens: []int32{1, 2, 3, 4},
+	})
+	core.RequireNoError(t, err)
+	profile, err := model.CacheProfile(context.Background())
+	core.RequireNoError(t, err)
+
+	if !profile.Matched() ||
+		profile.Architecture != "gemma4_text" ||
+		profile.TotalCaches != 1 ||
+		profile.QuantizedCaches != 1 ||
+		profile.MaxCacheTokens != 4 {
+		t.Fatalf("rocmModel.CacheProfile = %+v, want model-scoped cache profile", profile)
+	}
 }
 
 func TestCacheService_Bad_RocmModelWarmCacheRecordsErr(t *testing.T) {

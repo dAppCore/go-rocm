@@ -8,16 +8,16 @@ import (
 )
 
 func init() {
-	inference.Register(unavailableROCmBackend{})
+	inference.Register(&rocmBackend{})
 }
 
-type unavailableROCmBackend struct{}
+type rocmBackend struct{}
 
-func (unavailableROCmBackend) Name() string { return "rocm" }
-func (unavailableROCmBackend) Available() bool {
+func (*rocmBackend) Name() string { return "rocm" }
+func (*rocmBackend) Available() bool {
 	return false
 }
-func (unavailableROCmBackend) LoadModel(string, ...inference.LoadOption) (inference.TextModel, error) {
+func (*rocmBackend) LoadModel(string, ...inference.LoadOption) (inference.TextModel, error) {
 	return nil, core.E("rocm.LoadModel", "native ROCm runtime is not available on this platform", nil)
 }
 

@@ -63,8 +63,14 @@ func NewStateSession(model inference.ModelIdentity, tokenizer inference.Tokenize
 	return &StateSession{
 		model:     cloneModelIdentity(model),
 		tokenizer: cloneTokenizerIdentity(tokenizer),
-		labels:    mergeStringMaps(map[string]string{"backend": "rocm"}, labels),
+		labels:    rocmStateSessionLabels(model, labels),
 	}
+}
+
+func rocmStateSessionLabels(model inference.ModelIdentity, labels map[string]string) map[string]string {
+	merged := mergeStringMaps(map[string]string{"backend": "rocm"}, labels)
+	merged = rocmApplyGemma4StateArtifactLabels(merged, model)
+	return merged
 }
 
 func newStateSessionWithRuntime(model inference.ModelIdentity, tokenizer inference.TokenizerIdentity, labels map[string]string, runtime any) *StateSession {
@@ -83,6 +89,18 @@ func (session *StateSession) Close() error {
 	}
 	session.runtime = nil
 	return nil
+}
+
+// ResetState releases retained decode state without unloading the native model.
+func (m *rocmModel) ResetState() error {
+	if m == nil {
+		return nil
+	}
+	m.stateMutex.Lock()
+	session := m.state
+	m.state = nil
+	m.stateMutex.Unlock()
+	return session.Close()
 }
 
 func cloneStateRefs(refs []inference.StateRef) []inference.StateRef {
@@ -112,6 +130,51 @@ func (session *StateSession) replaceRuntime(runtime any) error {
 	return nil
 }
 
+func (session *StateSession) takeGemma4Q4DeviceDecodeState(driver nativeHIPDriver, cfg hipGemma4Q4ForwardConfig) (*hipGemma4Q4DeviceDecodeState, error) {
+	if session == nil {
+		return nil, nil
+	}
+	switch runtime := session.runtime.(type) {
+	case *hipGemma4Q4DeviceDecodeState:
+		if runtime == nil {
+			return nil, nil
+		}
+		session.runtime = nil
+		return runtime, nil
+	case *hipGemma4Q4HostDecodeStateRuntime:
+		if runtime == nil {
+			return nil, nil
+		}
+		session.runtime = nil
+		device, err := hipMirrorGemma4Q4DecodeState(driver, cfg, runtime.state, runtime.mode)
+		if err != nil {
+			session.runtime = runtime
+			return nil, err
+		}
+		return device, nil
+	default:
+		return nil, nil
+	}
+}
+
+func (session *StateSession) hasRuntimeOwnedKV() bool {
+	if session == nil {
+		return false
+	}
+	switch runtime := session.runtime.(type) {
+	case *hipGemma4Q4DeviceDecodeState:
+		return runtime != nil && !runtime.closed && runtime.maxLayerTokenCount() > 0
+	case *hipGemma4Q4HostDecodeStateRuntime:
+		return runtime != nil && runtime.tokenCount > 0
+	case *rocmDeviceKVCache:
+		return runtime != nil && runtime.PageCount() > 0
+	case *rocmKVCache:
+		return runtime != nil && runtime.PageCount() > 0
+	default:
+		return false
+	}
+}
+
 func (session *StateSession) WakeState(ctx context.Context, req inference.AgentMemoryWakeRequest) (*inference.AgentMemoryWakeResult, error) {
 	if session == nil {
 		return nil, core.E("rocm.WakeState", "state session is nil", nil)
@@ -133,6 +196,7 @@ func (session *StateSession) WakeState(ctx context.Context, req inference.AgentM
 		return nil, core.E("rocm.WakeState", "entry or index URI is required", nil)
 	}
 	labels := mergeStringMaps(session.labels, req.Labels)
+	rocmAddStateBundleAdapterLabels(labels, req.Adapter)
 	if req.IndexURI != "" {
 		return session.wakeStateFromIndex(ctx, store, req, labels)
 	}
@@ -145,6 +209,25 @@ func (session *StateSession) WakeState(ctx context.Context, req inference.AgentM
 			return wake, nil
 		}
 		return nil, core.E("rocm.WakeState", "resolve state URI", err)
+	}
+	if runtime, ok, restoreLabels, err := wakeGemma4Q4HostDecodeStateFromChunk(ctx, store, chunk); err != nil {
+		return nil, err
+	} else if ok {
+		if err := session.replaceRuntime(runtime); err != nil {
+			return nil, core.E("rocm.WakeState", "close previous state runtime", err)
+		}
+		for key, value := range restoreLabels {
+			labels[key] = value
+		}
+		return &inference.AgentMemoryWakeResult{
+			Entry:        inference.AgentMemoryRef{URI: uri, IndexURI: req.IndexURI, Kind: "prefix", TokenCount: runtime.tokenCount, Labels: cloneStringMap(labels)},
+			Bundle:       inference.StateRef{Kind: "gemma4-q4-device-state", URI: firstNonEmptyString(req.EntryURI, uri), SizeBytes: uint64(len(chunk.Data)), Encoding: rocmGemma4Q4StateBundleEncoding, Labels: cloneStringMap(labels)},
+			Index:        inference.StateRef{Kind: "index", URI: req.IndexURI, Labels: cloneStringMap(labels)},
+			PrefixTokens: runtime.tokenCount,
+			BundleTokens: runtime.tokenCount,
+			BlocksRead:   len(runtime.state.Layers),
+			Labels:       cloneStringMap(labels),
+		}, nil
 	}
 	if cache, ok, restoreLabels, err := wakeKVCacheFromChunk(ctx, store, chunk); err != nil {
 		return nil, err
@@ -171,7 +254,7 @@ func (session *StateSession) WakeState(ctx context.Context, req inference.AgentM
 		return &inference.AgentMemoryWakeResult{
 			Entry:        inference.AgentMemoryRef{URI: uri, IndexURI: req.IndexURI, Kind: "prefix", TokenCount: tokens, Labels: cloneStringMap(labels)},
 			Bundle:       inference.StateRef{Kind: "kv", URI: firstNonEmptyString(req.EntryURI, uri), SizeBytes: uint64(len(chunk.Data)), Encoding: bundleEncoding, Labels: cloneStringMap(labels)},
-			Index:        inference.StateRef{Kind: "index", URI: req.IndexURI},
+			Index:        inference.StateRef{Kind: "index", URI: req.IndexURI, Labels: cloneStringMap(labels)},
 			PrefixTokens: tokens,
 			BundleTokens: tokens,
 			BlockSize:    blockSize,
@@ -211,6 +294,7 @@ func (session *StateSession) SleepState(ctx context.Context, req inference.Agent
 	}
 	req.Encoding = encoding
 	labels := mergeStringMaps(session.labels, req.Labels)
+	rocmAddStateBundleAdapterLabels(labels, req.Adapter)
 	ref, stateRefs, encoding, sizeBytes, tokens, blocks, err := session.sleepStatePayload(ctx, req, bundleURI, blockSize, labels)
 	if err != nil {
 		return nil, err
@@ -316,6 +400,9 @@ func (session *StateSession) checkWakeCompatibility(req inference.AgentMemoryWak
 	if err := checkROCmStateTokenizerCompatibility("rocm.WakeState", session.tokenizer, req.Tokenizer); err != nil {
 		return err
 	}
+	if err := checkROCmStateAdapterCompatibility("rocm.WakeState", session.model, req.Model, req.Adapter); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -324,6 +411,9 @@ func (session *StateSession) checkSleepCompatibility(req inference.AgentMemorySl
 		return err
 	}
 	if err := checkROCmStateTokenizerCompatibility("rocm.SleepState", session.tokenizer, req.Tokenizer); err != nil {
+		return err
+	}
+	if err := checkROCmStateAdapterCompatibility("rocm.SleepState", session.model, req.Model, req.Adapter); err != nil {
 		return err
 	}
 	return nil
@@ -336,7 +426,121 @@ func checkROCmStateModelCompatibility(operation string, sessionModel, reqModel i
 	if sessionModel.Architecture != "" && reqModel.Architecture != "" && normalizeROCmArchitecture(sessionModel.Architecture) != normalizeROCmArchitecture(reqModel.Architecture) {
 		return core.E(operation, "model architecture mismatch", nil)
 	}
+	if err := checkROCmGemma4StateModelCompatibility(operation, sessionModel, reqModel); err != nil {
+		return err
+	}
 	return nil
+}
+
+func checkROCmGemma4StateModelCompatibility(operation string, sessionModel, reqModel inference.ModelIdentity) error {
+	if modelIdentityIsZero(sessionModel) || modelIdentityIsZero(reqModel) {
+		return nil
+	}
+	if !rocmIsGemma4SizeQuantIdentity(sessionModel.Architecture) || !rocmIsGemma4SizeQuantIdentity(reqModel.Architecture) {
+		return nil
+	}
+	sessionLabels := rocmGemma4StateModelLabels(sessionModel)
+	reqLabels := rocmGemma4StateModelLabels(reqModel)
+	if err := checkROCmGemma4StateExplicitModelLabels(operation, sessionModel.Labels, sessionLabels); err != nil {
+		return err
+	}
+	if err := checkROCmGemma4StateExplicitModelLabels(operation, reqModel.Labels, reqLabels); err != nil {
+		return err
+	}
+	for _, key := range []string{
+		"gemma4_size",
+		"gemma4_quant_mode",
+		"gemma4_runtime",
+		"gemma4_generate_status",
+		"gemma4_pack_supported",
+		"gemma4_runnable_on_card",
+	} {
+		if err := checkROCmGemma4StateModelLabelPair(operation, key, sessionLabels, reqLabels); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func rocmGemma4StateModelLabels(model inference.ModelIdentity) map[string]string {
+	model = rocmGemma4ModelWithInferredPathQuant(model)
+	labels := cloneStringMap(model.Labels)
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	rocmApplyGemma4SizeQuantSupportLabels(labels, model)
+	return labels
+}
+
+func checkROCmGemma4StateExplicitModelLabels(operation string, labels, expected map[string]string) error {
+	if len(labels) == 0 || len(expected) == 0 {
+		return nil
+	}
+	for _, key := range []string{
+		"gemma4_size",
+		"gemma4_quant_mode",
+		"gemma4_runtime",
+		"gemma4_generate_status",
+		"gemma4_pack_supported",
+		"gemma4_runnable_on_card",
+	} {
+		actual := labels[key]
+		want := expected[key]
+		if actual == "" || want == "" {
+			continue
+		}
+		size := firstNonEmptyString(expected["gemma4_size"], labels["gemma4_size"])
+		if rocmGemma4StateLabelValue(key, actual, size) != rocmGemma4StateLabelValue(key, want, size) {
+			return core.E(operation, rocmGemma4StateLabelMismatchMessage(key), nil)
+		}
+	}
+	return nil
+}
+
+func checkROCmGemma4StateModelLabelPair(operation, key string, sessionLabels, reqLabels map[string]string) error {
+	sessionValue := sessionLabels[key]
+	reqValue := reqLabels[key]
+	if sessionValue == "" || reqValue == "" {
+		return nil
+	}
+	sessionSize := firstNonEmptyString(sessionLabels["gemma4_size"], reqLabels["gemma4_size"])
+	reqSize := firstNonEmptyString(reqLabels["gemma4_size"], sessionLabels["gemma4_size"])
+	if rocmGemma4StateLabelValue(key, sessionValue, sessionSize) != rocmGemma4StateLabelValue(key, reqValue, reqSize) {
+		return core.E(operation, rocmGemma4StateLabelMismatchMessage(key), nil)
+	}
+	return nil
+}
+
+func rocmGemma4StateLabelValue(key, value, size string) string {
+	switch key {
+	case "gemma4_size":
+		return rocmGemma4CanonicalSize(value)
+	case "gemma4_quant_mode":
+		return rocmGemma4CanonicalQuantMode(size, value)
+	case "gemma4_pack_supported", "gemma4_runnable_on_card":
+		return core.Lower(core.Trim(value))
+	default:
+		return core.Trim(value)
+	}
+}
+
+func rocmGemma4StateLabelMismatchMessage(key string) string {
+	switch key {
+	case "gemma4_size":
+		return "model Gemma4 size mismatch"
+	case "gemma4_quant_mode":
+		return "model Gemma4 quant mismatch"
+	case "gemma4_runtime":
+		return "model Gemma4 runtime mismatch"
+	case "gemma4_generate_status":
+		return "model Gemma4 generate status mismatch"
+	case "gemma4_pack_supported":
+		return "model Gemma4 pack support mismatch"
+	case "gemma4_runnable_on_card":
+		return "model Gemma4 runnable status mismatch"
+	default:
+		return "model Gemma4 metadata mismatch"
+	}
 }
 
 func checkROCmStateTokenizerCompatibility(operation string, sessionTokenizer, reqTokenizer inference.TokenizerIdentity) error {
@@ -349,6 +553,23 @@ func checkROCmStateTokenizerCompatibility(operation string, sessionTokenizer, re
 	return nil
 }
 
+func checkROCmStateAdapterCompatibility(operation string, sessionModel, reqModel inference.ModelIdentity, reqAdapter inference.AdapterIdentity) error {
+	if adapterIdentityIsZero(reqAdapter) {
+		return nil
+	}
+	if !modelIdentityIsZero(sessionModel) {
+		if err := checkROCmAdapterModelCompatibility(operation, sessionModel, reqAdapter); err != nil {
+			return err
+		}
+	}
+	if !modelIdentityIsZero(reqModel) {
+		if err := checkROCmAdapterModelCompatibility(operation, reqModel, reqAdapter); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (m *rocmModel) WakeState(ctx context.Context, req inference.AgentMemoryWakeRequest) (wake *inference.AgentMemoryWakeResult, err error) {
 	m.clearLastError()
 	defer func() {
@@ -356,6 +577,7 @@ func (m *rocmModel) WakeState(ctx context.Context, req inference.AgentMemoryWake
 			m.setLastFailure(err)
 		}
 	}()
+	req = m.agentMemoryWakeRequestWithActiveAdapter(req)
 	session := m.stateSession()
 	wake, err = session.WakeState(ctx, req)
 	if err != nil {
@@ -375,6 +597,7 @@ func (m *rocmModel) SleepState(ctx context.Context, req inference.AgentMemorySle
 			m.setLastFailure(err)
 		}
 	}()
+	req = m.agentMemorySleepRequestWithActiveAdapter(req)
 	return m.stateSession().SleepState(ctx, req)
 }
 
@@ -385,6 +608,7 @@ func (m *rocmModel) ForkState(ctx context.Context, req inference.AgentMemoryWake
 			m.setLastFailure(err)
 		}
 	}()
+	req = m.agentMemoryWakeRequestWithActiveAdapter(req)
 	forked, wake, err = m.stateSession().ForkState(ctx, req)
 	if err != nil {
 		return nil, nil, err
@@ -393,6 +617,22 @@ func (m *rocmModel) ForkState(ctx context.Context, req inference.AgentMemoryWake
 		m.remirrorWakeStateKV(session, wake)
 	}
 	return forked, wake, nil
+}
+
+func (m *rocmModel) agentMemoryWakeRequestWithActiveAdapter(req inference.AgentMemoryWakeRequest) inference.AgentMemoryWakeRequest {
+	if m == nil || !adapterIdentityIsZero(req.Adapter) {
+		return req
+	}
+	req.Adapter = m.ActiveAdapter()
+	return req
+}
+
+func (m *rocmModel) agentMemorySleepRequestWithActiveAdapter(req inference.AgentMemorySleepRequest) inference.AgentMemorySleepRequest {
+	if m == nil || !adapterIdentityIsZero(req.Adapter) {
+		return req
+	}
+	req.Adapter = m.ActiveAdapter()
+	return req
 }
 
 func (m *rocmModel) stateSession() *StateSession {
@@ -525,6 +765,7 @@ func rocmAnnotateWakeKVLabels(wake *inference.AgentMemoryWakeResult, labels map[
 	wake.Labels = mergeStringMaps(wake.Labels, labels)
 	wake.Entry.Labels = mergeStringMaps(wake.Entry.Labels, labels)
 	wake.Bundle.Labels = mergeStringMaps(wake.Bundle.Labels, labels)
+	wake.Index.Labels = mergeStringMaps(wake.Index.Labels, labels)
 }
 
 func closeROCmStateRuntime(runtime any) error {
@@ -563,6 +804,9 @@ func (session *StateSession) wakeStateFromIndex(ctx context.Context, store state
 		if err := checkROCmStateTokenizerCompatibility("rocm.WakeState", req.Tokenizer, index.Tokenizer); err != nil {
 			return nil, err
 		}
+		if err := checkROCmStateAdapterCompatibility("rocm.WakeState", index.Model, req.Model, req.Adapter); err != nil {
+			return nil, err
+		}
 	}
 	entry, ok := selectROCmKVStateIndexEntry(index, req.EntryURI)
 	if !ok {
@@ -577,6 +821,32 @@ func (session *StateSession) wakeStateFromIndex(ctx context.Context, store state
 		return nil, core.E("rocm.WakeState", "resolve state bundle URI", err)
 	}
 	prefixTokens := entry.PrefixTokens()
+	if runtime, ok, q4RestoreLabels, runtimeErr := wakeGemma4Q4HostDecodeStateFromChunk(ctx, store, chunk); runtimeErr != nil {
+		return nil, runtimeErr
+	} else if ok {
+		if err := session.replaceRuntime(runtime); err != nil {
+			return nil, core.E("rocm.WakeState", "close previous state runtime", err)
+		}
+		for key, value := range q4RestoreLabels {
+			labels[key] = value
+		}
+		for key, value := range entry.Labels {
+			if core.HasPrefix(key, "kv_") || key == "cache_mode" {
+				continue
+			}
+			labels[key] = value
+		}
+		labels["kv_index_restore"] = "state_index"
+		return &inference.AgentMemoryWakeResult{
+			Entry:        inference.AgentMemoryRef{URI: entry.URI, BundleURI: bundleURI, IndexURI: req.IndexURI, Title: entry.Title, Kind: "prefix", TokenCount: runtime.tokenCount, Labels: cloneStringMap(labels)},
+			Bundle:       inference.StateRef{Kind: "gemma4-q4-device-state", URI: bundleURI, SizeBytes: uint64(len(chunk.Data)), Encoding: rocmGemma4Q4StateBundleEncoding, Labels: cloneStringMap(labels)},
+			Index:        inference.StateRef{Kind: "index", URI: req.IndexURI, Encoding: rocmKVStateIndexEncoding, Labels: cloneStringMap(labels)},
+			PrefixTokens: runtime.tokenCount,
+			BundleTokens: runtime.tokenCount,
+			BlocksRead:   len(runtime.state.Layers),
+			Labels:       cloneStringMap(labels),
+		}, nil
+	}
 	cache, ok, restoreLabels, err := wakeKVCacheFromChunkWithPrefix(ctx, store, chunk, prefixTokens)
 	if err != nil {
 		return nil, err
@@ -610,7 +880,7 @@ func (session *StateSession) wakeStateFromIndex(ctx context.Context, store state
 	return &inference.AgentMemoryWakeResult{
 		Entry:        inference.AgentMemoryRef{URI: entry.URI, BundleURI: bundleURI, IndexURI: req.IndexURI, Title: entry.Title, Kind: "prefix", TokenCount: prefixTokens, Labels: cloneStringMap(labels)},
 		Bundle:       inference.StateRef{Kind: "kv", URI: bundleURI, SizeBytes: uint64(len(chunk.Data)), Encoding: bundleEncoding, Labels: cloneStringMap(labels)},
-		Index:        inference.StateRef{Kind: "index", URI: req.IndexURI, Encoding: rocmKVStateIndexEncoding},
+		Index:        inference.StateRef{Kind: "index", URI: req.IndexURI, Encoding: rocmKVStateIndexEncoding, Labels: cloneStringMap(labels)},
 		PrefixTokens: prefixTokens,
 		BundleTokens: index.TokenCount,
 		BlockSize:    firstPositiveInt(index.BlockSize, cache.blockSize),
@@ -783,7 +1053,8 @@ func wakeKVCacheFromChunkWithPrefix(ctx context.Context, store state.Store, chun
 	}
 	chunk.Data = data
 	if cache, ok, err := wakeKVCacheBlockBundleFromChunk(ctx, store, chunk, prefixTokens); ok || err != nil {
-		labels := map[string]string{"kv_restore_path": "block_stream"}
+		labels := rocmKVBlockBundleRestoreLabels(chunk.Data)
+		labels["kv_restore_path"] = "block_stream"
 		return cache, ok, labels, err
 	}
 	cache, err := newROCmKVCacheFromSnapshot(data)
@@ -794,19 +1065,8 @@ func wakeKVCacheFromChunkWithPrefix(ctx context.Context, store state.Store, chun
 		return nil, false, nil, core.E("rocm.WakeState", "restore KV cache snapshot", err)
 	}
 	if prefixTokens > 0 && prefixTokens < cache.TokenCount() {
-		keys, values, err := cache.Restore(0, prefixTokens)
+		prefix, err := cache.Prefix(prefixTokens)
 		if err != nil {
-			return nil, false, nil, err
-		}
-		prefix, err := newROCmKVCache(cache.mode, cache.blockSize)
-		if err != nil {
-			return nil, false, nil, err
-		}
-		keyWidth, valueWidth, ok := cache.LastVectorWidths()
-		if !ok {
-			return nil, false, nil, core.E("rocm.WakeState", "KV snapshot vector shape is missing", nil)
-		}
-		if err := prefix.AppendVectors(0, keyWidth, valueWidth, keys, values); err != nil {
 			return nil, false, nil, err
 		}
 		cache = prefix
@@ -814,9 +1074,21 @@ func wakeKVCacheFromChunkWithPrefix(ctx context.Context, store state.Store, chun
 	return cache, true, nil, nil
 }
 
+func rocmKVBlockBundleRestoreLabels(data []byte) map[string]string {
+	var bundle struct {
+		Labels map[string]string `json:"labels,omitempty"`
+	}
+	_ = json.Unmarshal(data, &bundle)
+	labels := cloneStringMap(bundle.Labels)
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	return labels
+}
+
 func wakeKVCacheBlockBundleFromChunk(ctx context.Context, store state.Store, chunk state.Chunk, prefixTokens int) (*rocmKVCache, bool, error) {
-	var bundle rocmKVBlockBundleSnapshot
-	if err := json.Unmarshal(chunk.Data, &bundle); err != nil || bundle.Kind != rocmKVBlockBundleKind {
+	bundle, err := parseROCmKVBlockBundleWakeHeader(chunk.Data)
+	if err != nil || bundle.Kind != rocmKVBlockBundleKind {
 		return nil, false, nil
 	}
 	targetTokens := bundle.TokenCount
@@ -830,48 +1102,24 @@ func wakeKVCacheBlockBundleFromChunk(ctx context.Context, store state.Store, chu
 	if err != nil {
 		return nil, true, err
 	}
+	cache.blocks = make([]rocmKVCacheBlock, 0, blocksForTokens(targetTokens, cache.blockSize))
 	nextStart := 0
-	for _, blockRef := range bundle.Blocks {
+	if bundle.BlocksIndex == 0 {
+		return nil, true, core.E("rocm.WakeState", "KV block bundle has no blocks", nil)
+	}
+	if err := forEachROCmKVBlockBundleWakeRef(chunk.Data, bundle.BlocksIndex, func(blockRef rocmKVBlockBundleWakeRef) (bool, error) {
 		if blockRef.TokenStart >= targetTokens {
-			break
+			return false, nil
 		}
-		blockData, release, err := borrowROCmKVBlockBundleRefBytes(ctx, store, blockRef)
-		if err != nil {
-			return nil, true, err
+		if err := restoreROCmKVCacheBundleBlock(ctx, store, cache, blockRef, targetTokens, &nextStart); err != nil {
+			return false, err
 		}
-		block, err := rocmKVCacheBlockFromBundlePayload(blockRef, blockData)
-		if release != nil {
-			release()
-		}
-		if err != nil {
-			return nil, true, err
-		}
-		if block.tokenStart != blockRef.TokenStart || block.tokenCount != blockRef.TokenCount {
-			return nil, true, core.E("rocm.WakeState", "KV block token range mismatch", nil)
-		}
-		if block.tokenStart != nextStart {
-			return nil, true, core.E("rocm.WakeState", "KV block token range mismatch", nil)
-		}
-		if err := cache.validateVectorShape(block.keyWidth, block.valueWidth); err != nil {
-			return nil, true, err
-		}
-		blockEnd := block.tokenStart + block.tokenCount
-		if blockEnd > targetTokens {
-			keys := block.key.decode()
-			values := block.value.decode()
-			keepTokens := targetTokens - block.tokenStart
-			err = cache.AppendVectors(block.tokenStart, block.keyWidth, block.valueWidth, keys[:keepTokens*block.keyWidth], values[:keepTokens*block.valueWidth])
-		} else {
-			cache.blocks, err = insertROCmKVCacheBlock(cache.blocks, block)
-			cache.setVectorShape(block.keyWidth, block.valueWidth)
-		}
-		if err != nil {
-			return nil, true, err
-		}
-		nextStart = min(blockEnd, targetTokens)
 		if nextStart == targetTokens {
-			break
+			return false, nil
 		}
+		return true, nil
+	}); err != nil {
+		return nil, true, err
 	}
 	if cache.TokenCount() != targetTokens {
 		return nil, true, core.E("rocm.WakeState", "KV block bundle token count mismatch", nil)
@@ -880,7 +1128,101 @@ func wakeKVCacheBlockBundleFromChunk(ctx context.Context, store state.Store, chu
 	return cache, true, nil
 }
 
-func borrowROCmKVBlockBundleRefBytes(ctx context.Context, store state.Store, ref rocmKVBlockBundleRef) ([]byte, func(), error) {
+func restoreROCmKVCacheBundleBlock(ctx context.Context, store state.Store, cache *rocmKVCache, blockRef rocmKVBlockBundleWakeRef, targetTokens int, nextStart *int) error {
+	blockData, release, err := borrowROCmKVBlockBundleRefBytes(ctx, store, blockRef)
+	if err != nil {
+		return err
+	}
+	if firstNonEmptyString(blockRef.Encoding, rocmKVSnapshotEncoding) == rocmKVBlockRawEncoding {
+		if release != nil {
+			retained := append([]byte(nil), blockData...)
+			release()
+			blockData = retained
+		}
+		return restoreROCmKVCacheRawBundleBlock(cache, blockRef, blockData, targetTokens, nextStart)
+	}
+	if release != nil {
+		defer release()
+	}
+	block, err := rocmKVCacheBlockFromBundlePayload(blockRef.fullBundleRef(), blockData)
+	if err != nil {
+		return err
+	}
+	if block.tokenStart != blockRef.TokenStart || block.tokenCount != blockRef.TokenCount {
+		return core.E("rocm.WakeState", "KV block token range mismatch", nil)
+	}
+	if nextStart == nil || block.tokenStart != *nextStart {
+		return core.E("rocm.WakeState", "KV block token range mismatch", nil)
+	}
+	if err := cache.validateVectorShape(block.keyWidth, block.valueWidth); err != nil {
+		return err
+	}
+	blockEnd := block.tokenStart + block.tokenCount
+	if blockEnd > targetTokens {
+		keepTokens := targetTokens - block.tokenStart
+		key, err := block.key.prefixRows(block.keyWidth, keepTokens)
+		if err != nil {
+			return core.E("rocm.WakeState", "prefix key block", err)
+		}
+		value, err := block.value.prefixRows(block.valueWidth, keepTokens)
+		if err != nil {
+			return core.E("rocm.WakeState", "prefix value block", err)
+		}
+		prefixBlock := rocmKVCacheBlock{
+			tokenStart: block.tokenStart,
+			tokenCount: keepTokens,
+			keyWidth:   block.keyWidth,
+			valueWidth: block.valueWidth,
+			key:        key,
+			value:      value,
+		}
+		cache.blocks, err = insertROCmKVCacheBlock(cache.blocks, prefixBlock)
+		cache.setVectorShape(block.keyWidth, block.valueWidth)
+	} else {
+		cache.blocks, err = insertROCmKVCacheBlock(cache.blocks, block)
+		cache.setVectorShape(block.keyWidth, block.valueWidth)
+	}
+	if err != nil {
+		return err
+	}
+	*nextStart = min(blockEnd, targetTokens)
+	return nil
+}
+
+func restoreROCmKVCacheRawBundleBlock(cache *rocmKVCache, blockRef rocmKVBlockBundleWakeRef, blockData []byte, targetTokens int, nextStart *int) error {
+	meta, keyPayload, valuePayload, err := rocmKVBlockRawPayloadParts(blockData)
+	if err != nil {
+		return err
+	}
+	if meta.tokenStart != blockRef.TokenStart || meta.tokenCount != blockRef.TokenCount {
+		return core.E("rocm.WakeState", "KV block token range mismatch", nil)
+	}
+	if nextStart == nil || meta.tokenStart != *nextStart {
+		return core.E("rocm.WakeState", "KV block token range mismatch", nil)
+	}
+	if err := cache.validateVectorShape(meta.keyWidth, meta.valueWidth); err != nil {
+		return err
+	}
+	blockEnd := meta.tokenStart + meta.tokenCount
+	var block rocmKVCacheBlock
+	if blockEnd > targetTokens {
+		block, err = rocmKVCacheBlockPrefixFromRawParts(meta, keyPayload, valuePayload, targetTokens-meta.tokenStart)
+	} else {
+		block, err = rocmKVCacheBlockFromRawParts(meta, keyPayload, valuePayload)
+	}
+	if err != nil {
+		return err
+	}
+	cache.blocks, err = insertROCmKVCacheBlock(cache.blocks, block)
+	if err != nil {
+		return err
+	}
+	cache.setVectorShape(block.keyWidth, block.valueWidth)
+	*nextStart = min(blockEnd, targetTokens)
+	return nil
+}
+
+func borrowROCmKVBlockBundleRefBytes(ctx context.Context, store state.Store, ref rocmKVBlockBundleWakeRef) ([]byte, func(), error) {
 	chunkRef := ref.State
 	if chunkRef.ChunkID == 0 && ref.ChunkID != 0 {
 		chunkRef.ChunkID = ref.ChunkID
@@ -892,10 +1234,14 @@ func borrowROCmKVBlockBundleRefBytes(ctx context.Context, store state.Store, ref
 		}
 		return borrowed.Data, borrowed.Release, nil
 	}
-	if ref.URI == "" {
+	uri := ref.URI
+	if uri == "" && len(ref.uriRaw) > 0 {
+		uri = string(ref.uriRaw)
+	}
+	if uri == "" {
 		return nil, nil, core.E("rocm.WakeState", "KV block URI is required", nil)
 	}
-	chunk, err := state.ResolveURI(ctx, store, ref.URI)
+	chunk, err := state.ResolveURI(ctx, store, uri)
 	if err != nil {
 		return nil, nil, core.E("rocm.WakeState", "resolve KV block URI", err)
 	}
@@ -928,8 +1274,8 @@ func wakeDeviceKVCacheBlockBundleFromChunk(ctx context.Context, store state.Stor
 	if len(data) == 0 {
 		return nil, false, nil
 	}
-	var bundle rocmKVBlockBundleSnapshot
-	if err := json.Unmarshal(data, &bundle); err != nil || bundle.Kind != rocmKVBlockBundleKind {
+	var bundle rocmKVBlockBundleWakeSnapshot
+	if err := bundle.UnmarshalJSON(data); err != nil || bundle.Kind != rocmKVBlockBundleKind {
 		return nil, false, nil
 	}
 	for _, ref := range bundle.Blocks {
@@ -982,6 +1328,13 @@ func wakeDeviceKVCacheBlockBundleFromChunk(ctx context.Context, store state.Stor
 }
 
 func (session *StateSession) sleepStatePayload(ctx context.Context, req inference.AgentMemorySleepRequest, entryURI string, blockSize int, labels map[string]string) (state.ChunkRef, []inference.StateRef, string, uint64, int, int, error) {
+	if runtime, ok := session.runtime.(*hipGemma4Q4DeviceDecodeState); ok && runtime != nil && runtime.LayerCount() > 0 {
+		writer, ok := req.Store.(state.BinaryWriter)
+		if !ok || writer == nil {
+			return state.ChunkRef{}, nil, "", 0, 0, 0, core.E("rocm.SleepState", "binary state store is missing", nil)
+		}
+		return sleepGemma4Q4DeviceDecodeStateBundle(ctx, req, writer, entryURI, labels, runtime)
+	}
 	if cache, ok := session.runtime.(*rocmDeviceKVCache); ok && cache != nil && cache.PageCount() > 0 {
 		writer, ok := req.Store.(state.BinaryWriter)
 		if !ok || writer == nil {

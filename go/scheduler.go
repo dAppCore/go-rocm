@@ -98,6 +98,10 @@ func (m *ScheduledModel) Schedule(ctx context.Context, req inference.ScheduledRe
 		m.setErr(err)
 		return inference.RequestHandle{}, nil, err
 	}
+	if err := m.validateScheduledGemma4Context(&req); err != nil {
+		m.setErr(err)
+		return inference.RequestHandle{}, nil, err
+	}
 	reqCtx, cancel := context.WithCancel(ctx)
 	work := &scheduledWork{
 		id:       req.ID,
@@ -209,7 +213,7 @@ func (m *ScheduledModel) Generate(ctx context.Context, prompt string, opts ...in
 			return
 		}
 		m.setErr(nil)
-		req := inference.ScheduledRequest{Prompt: prompt, Sampler: inference.SamplerConfigFromGenerateConfig(inference.ApplyGenerateOpts(opts))}
+		req := inference.ScheduledRequest{Prompt: prompt, Sampler: m.samplerConfigFromGenerateOptions(opts)}
 		_, stream, err := m.Schedule(ctx, req)
 		if err != nil {
 			m.setErr(err)
@@ -233,7 +237,7 @@ func (m *ScheduledModel) Chat(ctx context.Context, messages []inference.Message,
 			return
 		}
 		m.setErr(nil)
-		req := inference.ScheduledRequest{Messages: append([]inference.Message(nil), messages...), Sampler: inference.SamplerConfigFromGenerateConfig(inference.ApplyGenerateOpts(opts))}
+		req := inference.ScheduledRequest{Messages: append([]inference.Message(nil), messages...), Sampler: m.samplerConfigFromGenerateOptions(opts)}
 		_, stream, err := m.Schedule(ctx, req)
 		if err != nil {
 			m.setErr(err)
@@ -304,6 +308,75 @@ func (m *ScheduledModel) Info() inference.ModelInfo {
 		return inference.ModelInfo{}
 	}
 	return m.model.Info()
+}
+
+func (m *ScheduledModel) ModelIdentity() inference.ModelIdentity {
+	if m == nil || m.model == nil {
+		return inference.ModelIdentity{}
+	}
+	return rocmDecodeModelIdentity(m.model)
+}
+
+func (m *ScheduledModel) ModelProfile() ROCmModelProfile {
+	if m == nil || m.model == nil {
+		return ROCmModelProfile{}
+	}
+	if reporter, ok := m.model.(ROCmModelProfileReporter); ok {
+		profile := reporter.ModelProfile()
+		if profile.Matched() {
+			return profile.clone()
+		}
+	}
+	profile, ok := ResolveROCmModelProfileForModel(m.model)
+	if !ok {
+		return ROCmModelProfile{}
+	}
+	return profile
+}
+
+func (m *ScheduledModel) ModelRoutePlan() ROCmModelRoutePlan {
+	if m == nil || m.model == nil {
+		return ROCmModelRoutePlan{}
+	}
+	if reporter, ok := m.model.(ROCmModelRoutePlanReporter); ok {
+		plan := reporter.ModelRoutePlan()
+		if plan.Matched() {
+			return rocmModelRoutePlanWithLiveCacheProfile(plan, m.model)
+		}
+	}
+	profile := m.ModelProfile()
+	if !profile.Matched() {
+		return ROCmModelRoutePlan{}
+	}
+	return ROCmModelRoutePlanForProfileAndModel(profile, m.model)
+}
+
+func (m *ScheduledModel) Capabilities() inference.CapabilityReport {
+	if m == nil || m.model == nil {
+		return inference.CapabilityReport{Runtime: inference.RuntimeIdentity{Backend: "rocm"}}
+	}
+	report := rocmCapabilityReportForWrappedModel(m.model)
+	report.Model = m.ModelIdentity()
+	labels := map[string]string{
+		"wrapper":                 "scheduled_model",
+		"scheduler_wrapper":       "rocm",
+		"scheduler_output_buffer": core.Sprintf("%d", m.outputBuffer),
+	}
+	if m.queue != nil {
+		labels["scheduler_queue_size"] = core.Sprintf("%d", cap(m.queue))
+	}
+	m.mu.Lock()
+	closed := m.closed
+	m.mu.Unlock()
+	labels["scheduler_closed"] = core.Sprintf("%t", closed)
+	report.Labels = mergeStringMaps(report.Labels, labels)
+	schedulerCapability := inference.SupportedCapability(inference.CapabilityScheduler, inference.CapabilityGroupRuntime)
+	schedulerCapability.Labels = cloneStringMap(labels)
+	cancelCapability := inference.SupportedCapability(inference.CapabilityRequestCancel, inference.CapabilityGroupRuntime)
+	cancelCapability.Labels = cloneStringMap(labels)
+	rocmCapabilityReportSetCapability(&report, schedulerCapability)
+	rocmCapabilityReportSetCapability(&report, cancelCapability)
+	return report
 }
 
 func (m *ScheduledModel) Metrics() inference.GenerateMetrics {
@@ -478,6 +551,9 @@ func generateOptionsFromSampler(cfg inference.SamplerConfig) []inference.Generat
 	if cfg.TopP != 0 {
 		opts = append(opts, inference.WithTopP(cfg.TopP))
 	}
+	if cfg.MinP != 0 {
+		opts = append(opts, inference.WithMinP(cfg.MinP))
+	}
 	if cfg.RepeatPenalty != 0 {
 		opts = append(opts, inference.WithRepeatPenalty(cfg.RepeatPenalty))
 	}
@@ -488,6 +564,70 @@ func generateOptionsFromSampler(cfg inference.SamplerConfig) []inference.Generat
 		opts = append(opts, inference.WithLogits())
 	}
 	return opts
+}
+
+func (m *ScheduledModel) samplerConfigFromGenerateOptions(opts []inference.GenerateOption) inference.SamplerConfig {
+	cfg := cloneGenerateConfig(inference.ApplyGenerateOpts(opts))
+	if m != nil && scheduledModelIsGemma4(m.model) {
+		explicit := inference.GenerateConfig{}
+		for _, opt := range opts {
+			if opt != nil {
+				opt(&explicit)
+			}
+		}
+		if explicit.MaxTokens == 0 {
+			cfg.MaxTokens = 0
+		}
+	}
+	return inference.SamplerConfigFromGenerateConfig(cfg)
+}
+
+func (m *ScheduledModel) validateScheduledGemma4Context(req *inference.ScheduledRequest) error {
+	if m == nil || !scheduledModelIsGemma4(m.model) {
+		return nil
+	}
+	if req == nil {
+		return core.E("rocm.Schedule", "scheduled request is required", nil)
+	}
+	contextLength := scheduledModelContextLength(m.model)
+	promptTokens, promptKind := scheduledRequestPromptTokenCount(m.model, *req)
+	remaining := contextLength - promptTokens
+	if remaining <= 0 {
+		return core.E("rocm.Schedule", promptKind+" reaches model context window", nil)
+	}
+	if req.Sampler.MaxTokens > remaining {
+		return core.E("rocm.Schedule", "max tokens exceed remaining model context window", nil)
+	}
+	if req.Sampler.MaxTokens <= 0 {
+		req.Sampler.MaxTokens = remaining
+	}
+	return nil
+}
+
+func scheduledModelIsGemma4(model inference.TextModel) bool {
+	return isROCmGemma4Architecture(rocmDecodeModelIdentity(model).Architecture)
+}
+
+func scheduledModelContextLength(model inference.TextModel) int {
+	if identity := rocmDecodeModelIdentity(model); identity.ContextLength > 0 {
+		return identity.ContextLength
+	}
+	if provider, ok := model.(interface{ ContextLength() int }); ok {
+		if contextLength := provider.ContextLength(); contextLength > 0 {
+			return contextLength
+		}
+	}
+	return defaultContextLengthCap
+}
+
+func scheduledRequestPromptTokenCount(model inference.TextModel, req inference.ScheduledRequest) (int, string) {
+	if len(req.Messages) > 0 {
+		if rocmModel, ok := model.(*rocmModel); ok && rocmModel != nil {
+			return rocmModel.chatPromptTokenCount(req.Messages), "messages"
+		}
+		return rocmDecodePromptTokenCount(model, formatGemma4ChatTemplate(req.Messages)), "messages"
+	}
+	return rocmDecodePromptTokenCount(model, req.Prompt), "prompt"
 }
 
 func cloneSamplerConfig(cfg inference.SamplerConfig) inference.SamplerConfig {

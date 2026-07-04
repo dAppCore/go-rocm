@@ -285,6 +285,7 @@ type hipGreedySampleResult struct {
 type hipAttentionRequest struct {
 	Query           []float32
 	QueryDim        int
+	KeyHeads        int
 	Keys            []float32
 	Values          []float32
 	DeviceKV        *rocmDeviceKVCache
@@ -331,6 +332,7 @@ type hipAttentionHeadsLaunchArgs struct {
 	Dim               int
 	TokenCount        int
 	HeadCount         int
+	KeyHeads          int
 	QueryBytes        uint64
 	KeyBytes          uint64
 	ValueBytes        uint64
@@ -341,6 +343,7 @@ type hipAttentionHeadsLaunchArgs struct {
 	DescriptorPointer nativeDevicePointer
 	DescriptorBytes   uint64
 	SharedMemBytes    uint64
+	WindowSize        int
 }
 
 type hipAttentionHeadsBatchCausalLaunchArgs struct {
@@ -352,6 +355,7 @@ type hipAttentionHeadsBatchCausalLaunchArgs struct {
 	Dim               int
 	TokenCount        int
 	HeadCount         int
+	KeyHeads          int
 	QueryCount        int
 	QueryStartToken   int
 	QueryBytes        uint64
@@ -376,6 +380,7 @@ type hipAttentionHeadsChunkedLaunchArgs struct {
 	Dim               int
 	TokenCount        int
 	HeadCount         int
+	KeyHeads          int
 	ChunkSize         int
 	ChunkCount        int
 	QueryBytes        uint64
@@ -384,6 +389,7 @@ type hipAttentionHeadsChunkedLaunchArgs struct {
 	StatsBytes        uint64
 	OutputBytes       uint64
 	Scale             float32
+	WindowSize        int
 }
 
 type hipAttentionHeadsBatchChunkedLaunchArgs struct {
@@ -395,6 +401,7 @@ type hipAttentionHeadsBatchChunkedLaunchArgs struct {
 	Dim               int
 	TokenCount        int
 	HeadCount         int
+	KeyHeads          int
 	QueryCount        int
 	QueryStartToken   int
 	ChunkSize         int
@@ -406,6 +413,7 @@ type hipAttentionHeadsBatchChunkedLaunchArgs struct {
 	OutputBytes       uint64
 	Scale             float32
 	WindowSize        int
+	ChunkStartToken   int
 }
 
 type hipAttentionResult struct {
@@ -749,6 +757,10 @@ func (req hipRMSNormRequest) launchArgs(buffers *hipRMSNormDeviceBuffers) (hipRM
 }
 
 func (args hipRMSNormLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipRMSNormLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.InputPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.RMSNormLaunch", "input and output pointers are required", nil)
 	}
@@ -796,7 +808,12 @@ func (args hipRMSNormLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, core.E("rocm.hip.RMSNormLaunch", "output byte count", err)
 	}
-	payload := hipBorrowLaunchPacket(hipRMSNormLaunchArgsBytes)
+	if cap(payload) < hipRMSNormLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipRMSNormLaunchArgsBytes)
+	} else {
+		payload = payload[:hipRMSNormLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipRMSNormLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
@@ -813,6 +830,10 @@ func (args hipRMSNormLaunchArgs) Binary() ([]byte, error) {
 }
 
 func (args hipRMSNormResidualAddLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipRMSNormResidualAddLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.InputPointer == 0 || args.ResidualPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.RMSNormResidualAddLaunch", "input, residual, and output pointers are required", nil)
 	}
@@ -867,7 +888,12 @@ func (args hipRMSNormResidualAddLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, core.E("rocm.hip.RMSNormResidualAddLaunch", "output byte count", err)
 	}
-	payload := hipBorrowLaunchPacket(hipRMSNormResidualAddArgsBytes)
+	if cap(payload) < hipRMSNormResidualAddArgsBytes {
+		payload = hipBorrowLaunchPacket(hipRMSNormResidualAddArgsBytes)
+	} else {
+		payload = payload[:hipRMSNormResidualAddArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipRMSNormResidualAddArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
@@ -889,6 +915,10 @@ func (args hipRMSNormResidualAddLaunchArgs) Binary() ([]byte, error) {
 }
 
 func (args hipRMSNormResidualAddNormLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipRMSNormResidualAddNormLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.InputPointer == 0 || args.ResidualPointer == 0 || args.ResidualOutputPointer == 0 || args.NormOutputPointer == 0 {
 		return nil, core.E("rocm.hip.RMSNormResidualAddNormLaunch", "input, residual, residual output, and norm output pointers are required", nil)
 	}
@@ -929,7 +959,12 @@ func (args hipRMSNormResidualAddNormLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, core.E("rocm.hip.RMSNormResidualAddNormLaunch", "norm output byte count", err)
 	}
-	payload := hipBorrowLaunchPacket(hipRMSNormResAddNormArgsBytes)
+	if cap(payload) < hipRMSNormResAddNormArgsBytes {
+		payload = hipBorrowLaunchPacket(hipRMSNormResAddNormArgsBytes)
+	} else {
+		payload = payload[:hipRMSNormResAddNormArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipRMSNormResAddNormArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
@@ -994,6 +1029,10 @@ func hipRMSNormLaunchWeightBytes(operation, label string, pointer nativeDevicePo
 }
 
 func (args hipRMSNormHeadsLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipRMSNormHeadsLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.InputPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.RMSNormHeadsLaunch", "input and output pointers are required", nil)
 	}
@@ -1049,7 +1088,12 @@ func (args hipRMSNormHeadsLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, core.E("rocm.hip.RMSNormHeadsLaunch", "output byte count", err)
 	}
-	payload := hipBorrowLaunchPacket(hipRMSNormHeadsLaunchArgsBytes)
+	if cap(payload) < hipRMSNormHeadsLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipRMSNormHeadsLaunchArgsBytes)
+	} else {
+		payload = payload[:hipRMSNormHeadsLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipRMSNormHeadsLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
@@ -1067,6 +1111,10 @@ func (args hipRMSNormHeadsLaunchArgs) Binary() ([]byte, error) {
 }
 
 func (args hipRMSNormRoPEHeadsLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipRMSNormRoPEHeadsLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	const operation = "RMSNormRoPEHeadsLaunch"
 	if args.InputPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip."+operation, "input and output pointers are required", nil)
@@ -1132,7 +1180,12 @@ func (args hipRMSNormRoPEHeadsLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, core.E("rocm.hip."+operation, "output byte count", err)
 	}
-	payload := hipBorrowLaunchPacket(hipRMSNormRoPEHeadsLaunchArgsBytes)
+	if cap(payload) < hipRMSNormRoPEHeadsLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipRMSNormRoPEHeadsLaunchArgsBytes)
+	} else {
+		payload = payload[:hipRMSNormRoPEHeadsLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipRMSNormRoPEHeadsLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
@@ -1155,6 +1208,10 @@ func (args hipRMSNormRoPEHeadsLaunchArgs) Binary() ([]byte, error) {
 }
 
 func (args hipRMSNormRoPEHeadsBatchLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipRMSNormRoPEHeadsBatchLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	const operation = "RMSNormRoPEHeadsBatchLaunch"
 	if args.InputPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip."+operation, "input and output pointers are required", nil)
@@ -1225,7 +1282,12 @@ func (args hipRMSNormRoPEHeadsBatchLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, core.E("rocm.hip."+operation, "output byte count", err)
 	}
-	payload := hipBorrowLaunchPacket(hipRMSNormRoPEHeadsBatchLaunchArgsBytes)
+	if cap(payload) < hipRMSNormRoPEHeadsBatchLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipRMSNormRoPEHeadsBatchLaunchArgsBytes)
+	} else {
+		payload = payload[:hipRMSNormRoPEHeadsBatchLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipRMSNormRoPEHeadsBatchLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
@@ -1351,6 +1413,10 @@ func (req hipRoPERequest) launchArgs(buffers *hipRoPEDeviceBuffers) (hipRoPELaun
 }
 
 func (args hipRoPELaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipRoPELaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.InputPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.RoPELaunch", "input and output pointers are required", nil)
 	}
@@ -1393,7 +1459,12 @@ func (args hipRoPELaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, core.E("rocm.hip.RoPELaunch", "output byte count", err)
 	}
-	payload := hipBorrowLaunchPacket(hipRoPELaunchArgsBytes)
+	if cap(payload) < hipRoPELaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipRoPELaunchArgsBytes)
+	} else {
+		payload = payload[:hipRoPELaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipRoPELaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
@@ -1409,6 +1480,10 @@ func (args hipRoPELaunchArgs) Binary() ([]byte, error) {
 }
 
 func (args hipRoPEHeadsLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipRoPEHeadsLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.InputPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.RoPEHeadsLaunch", "input and output pointers are required", nil)
 	}
@@ -1459,7 +1534,12 @@ func (args hipRoPEHeadsLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, core.E("rocm.hip.RoPEHeadsLaunch", "output byte count", err)
 	}
-	payload := hipBorrowLaunchPacket(hipRoPEHeadsLaunchArgsBytes)
+	if cap(payload) < hipRoPEHeadsLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipRoPEHeadsLaunchArgsBytes)
+	} else {
+		payload = payload[:hipRoPEHeadsLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipRoPEHeadsLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
@@ -1613,6 +1693,10 @@ func (req hipGreedySampleRequest) launchArgs(buffers *hipGreedySampleDeviceBuffe
 }
 
 func (args hipGreedySampleLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipGreedySampleLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.LogitsPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.GreedyLaunch", "logits and output pointers are required", nil)
 	}
@@ -1627,7 +1711,12 @@ func (args hipGreedySampleLaunchArgs) Binary() ([]byte, error) {
 	if args.OutputBytes != hipGreedyResultBytes {
 		return nil, core.E("rocm.hip.GreedyLaunch", "output byte count mismatch", nil)
 	}
-	payload := hipBorrowLaunchPacket(hipGreedyLaunchArgsBytes)
+	if cap(payload) < hipGreedyLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipGreedyLaunchArgsBytes)
+	} else {
+		payload = payload[:hipGreedyLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipGreedyLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.LogitsPointer))
@@ -1639,6 +1728,10 @@ func (args hipGreedySampleLaunchArgs) Binary() ([]byte, error) {
 }
 
 func (args hipSoftcapGreedySampleLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipSoftcapGreedySampleLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.LogitsPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.SoftcapGreedyLaunch", "logits and output pointers are required", nil)
 	}
@@ -1656,7 +1749,12 @@ func (args hipSoftcapGreedySampleLaunchArgs) Binary() ([]byte, error) {
 	if args.Softcap < 0 || math.IsNaN(float64(args.Softcap)) || math.IsInf(float64(args.Softcap), 0) {
 		return nil, core.E("rocm.hip.SoftcapGreedyLaunch", "softcap must be non-negative and finite", nil)
 	}
-	payload := hipBorrowLaunchPacket(hipSoftcapGreedyLaunchArgsBytes)
+	if cap(payload) < hipSoftcapGreedyLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipSoftcapGreedyLaunchArgsBytes)
+	} else {
+		payload = payload[:hipSoftcapGreedyLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipSoftcapGreedyLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.LogitsPointer))
@@ -1701,10 +1799,21 @@ func (req hipAttentionRequest) queryDim() (int, error) {
 	return req.QueryDim, nil
 }
 
+func (req hipAttentionRequest) keyHeadsOrDefault() int {
+	if req.KeyHeads <= 0 {
+		return 1
+	}
+	return req.KeyHeads
+}
+
 func (req hipAttentionRequest) validate() error {
 	dim, err := req.queryDim()
 	if err != nil {
 		return err
+	}
+	keyHeads := req.keyHeadsOrDefault()
+	if keyHeads <= 0 {
+		return core.E("rocm.hip.AttentionLaunch", "key head count must be positive", nil)
 	}
 	if req.Scale < 0 || math.IsNaN(float64(req.Scale)) || math.IsInf(float64(req.Scale), 0) {
 		return core.E("rocm.hip.AttentionLaunch", "scale must be non-negative and finite", nil)
@@ -1720,7 +1829,7 @@ func (req hipAttentionRequest) validate() error {
 		if !ok {
 			return core.E("rocm.hip.AttentionLaunch", "device KV cache has no pages", nil)
 		}
-		if keyWidth != dim || valueWidth != dim {
+		if keyWidth != dim*keyHeads || valueWidth != dim*keyHeads {
 			return core.E("rocm.hip.AttentionLaunch", "device KV widths must match query dimension", nil)
 		}
 		return nil
@@ -1731,7 +1840,8 @@ func (req hipAttentionRequest) validate() error {
 	if len(req.Keys) == 0 || len(req.Values) == 0 {
 		return core.E("rocm.hip.AttentionLaunch", "keys and values are required", nil)
 	}
-	if len(req.Keys)%dim != 0 || len(req.Values)%dim != 0 {
+	kvDim := dim * keyHeads
+	if len(req.Keys)%kvDim != 0 || len(req.Values)%kvDim != 0 {
 		return core.E("rocm.hip.AttentionLaunch", "key/value tensor lengths must align with query dimension", nil)
 	}
 	if len(req.Keys) != len(req.Values) {
@@ -1751,7 +1861,7 @@ func (req hipAttentionRequest) shape() (int, int, error) {
 	if req.DeviceKV != nil {
 		return dim, req.DeviceKV.TokenCount(), nil
 	}
-	return dim, len(req.Keys) / dim, nil
+	return dim, len(req.Keys) / (dim * req.keyHeadsOrDefault()), nil
 }
 
 func (req hipAttentionRequest) deviceBuffers(driver nativeHIPDriver) (*hipAttentionDeviceBuffers, error) {
@@ -1866,6 +1976,10 @@ func (req hipAttentionRequest) launchArgs(buffers *hipAttentionDeviceBuffers) (h
 }
 
 func (args hipAttentionLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipAttentionLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.QueryPointer == 0 || args.OutputPointer == 0 || args.WeightPointer == 0 {
 		return nil, core.E("rocm.hip.AttentionLaunch", "query, output, and weight pointers are required", nil)
 	}
@@ -1915,7 +2029,12 @@ func (args hipAttentionLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, core.E("rocm.hip.AttentionLaunch", "weight byte count", err)
 	}
-	payload := hipBorrowLaunchPacket(hipAttentionLaunchArgsBytes)
+	if cap(payload) < hipAttentionLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipAttentionLaunchArgsBytes)
+	} else {
+		payload = payload[:hipAttentionLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipAttentionLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.QueryPointer))
@@ -1938,6 +2057,10 @@ func (args hipAttentionLaunchArgs) Binary() ([]byte, error) {
 }
 
 func (args hipAttentionHeadsLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipAttentionHeadsLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.QueryPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.AttentionHeadsLaunch", "query and output pointers are required", nil)
 	}
@@ -1965,6 +2088,13 @@ func (args hipAttentionHeadsLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	keyHeads, err := rocmDeviceKVPositiveUint32("key head count", firstPositiveInt(args.KeyHeads, 1))
+	if err != nil {
+		return nil, err
+	}
+	if keyHeads > headCount || headCount%keyHeads != 0 {
+		return nil, core.E("rocm.hip.AttentionHeadsLaunch", "key head count must divide query head count", nil)
+	}
 	queryBytes, err := hipAlignedFloat32Bytes("query", args.QueryBytes, dim*headCount)
 	if err != nil {
 		return nil, core.E("rocm.hip.AttentionHeadsLaunch", "query byte count", err)
@@ -1972,11 +2102,11 @@ func (args hipAttentionHeadsLaunchArgs) Binary() ([]byte, error) {
 	var keyBytes uint32
 	var valueBytes uint32
 	if args.KVSource == hipAttentionKVSourceContiguous {
-		keyBytes, err = hipAlignedFloat32Bytes("key", args.KeyBytes, dim*tokenCount)
+		keyBytes, err = hipAlignedFloat32Bytes("key", args.KeyBytes, dim*tokenCount*keyHeads)
 		if err != nil {
 			return nil, core.E("rocm.hip.AttentionHeadsLaunch", "key byte count", err)
 		}
-		valueBytes, err = hipAlignedFloat32Bytes("value", args.ValueBytes, dim*tokenCount)
+		valueBytes, err = hipAlignedFloat32Bytes("value", args.ValueBytes, dim*tokenCount*keyHeads)
 		if err != nil {
 			return nil, core.E("rocm.hip.AttentionHeadsLaunch", "value byte count", err)
 		}
@@ -1986,6 +2116,10 @@ func (args hipAttentionHeadsLaunchArgs) Binary() ([]byte, error) {
 	outputBytes, err := hipAlignedFloat32Bytes("output", args.OutputBytes, dim*headCount)
 	if err != nil {
 		return nil, core.E("rocm.hip.AttentionHeadsLaunch", "output byte count", err)
+	}
+	windowSize, err := rocmDeviceKVUint32("window size", args.WindowSize)
+	if err != nil {
+		return nil, err
 	}
 	var weightBytes uint32
 	if args.WeightPointer == 0 {
@@ -2001,7 +2135,12 @@ func (args hipAttentionHeadsLaunchArgs) Binary() ([]byte, error) {
 			return nil, core.E("rocm.hip.AttentionHeadsLaunch", "weight byte count", err)
 		}
 	}
-	payload := hipBorrowLaunchPacket(hipAttentionHeadsLaunchArgsBytes)
+	if cap(payload) < hipAttentionHeadsLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipAttentionHeadsLaunchArgsBytes)
+	} else {
+		payload = payload[:hipAttentionHeadsLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipAttentionHeadsLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.QueryPointer))
@@ -2022,10 +2161,16 @@ func (args hipAttentionHeadsLaunchArgs) Binary() ([]byte, error) {
 	binary.LittleEndian.PutUint64(payload[88:], uint64(args.DescriptorPointer))
 	binary.LittleEndian.PutUint64(payload[96:], args.DescriptorBytes)
 	binary.LittleEndian.PutUint64(payload[104:], args.SharedMemBytes)
+	binary.LittleEndian.PutUint32(payload[112:], windowSize)
+	binary.LittleEndian.PutUint32(payload[116:], keyHeads)
 	return payload, nil
 }
 
 func (args hipAttentionHeadsBatchCausalLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipAttentionHeadsBatchCausalLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.QueryPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "query and output pointers are required", nil)
 	}
@@ -2053,6 +2198,13 @@ func (args hipAttentionHeadsBatchCausalLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	keyHeads, err := rocmDeviceKVPositiveUint32("key head count", firstPositiveInt(args.KeyHeads, 1))
+	if err != nil {
+		return nil, err
+	}
+	if keyHeads > headCount || headCount%keyHeads != 0 {
+		return nil, core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "key head count must divide query head count", nil)
+	}
 	queryCount, err := rocmDeviceKVPositiveUint32("query count", args.QueryCount)
 	if err != nil {
 		return nil, err
@@ -2076,7 +2228,7 @@ func (args hipAttentionHeadsBatchCausalLaunchArgs) Binary() ([]byte, error) {
 	var keyBytes uint32
 	var valueBytes uint32
 	if args.KVSource == hipAttentionKVSourceContiguous {
-		kvElements := uint64(dim) * uint64(tokenCount)
+		kvElements := uint64(dim) * uint64(tokenCount) * uint64(keyHeads)
 		keyBytes, err = hipExactUint32Bytes("key", args.KeyBytes, kvElements*4)
 		if err != nil {
 			return nil, core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "key byte count", err)
@@ -2107,7 +2259,12 @@ func (args hipAttentionHeadsBatchCausalLaunchArgs) Binary() ([]byte, error) {
 			return nil, core.E("rocm.hip.AttentionHeadsBatchCausalLaunch", "weight byte count", err)
 		}
 	}
-	payload := hipBorrowLaunchPacket(hipAttentionHeadsBatchCausalLaunchArgsBytes)
+	if cap(payload) < hipAttentionHeadsBatchCausalLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipAttentionHeadsBatchCausalLaunchArgsBytes)
+	} else {
+		payload = payload[:hipAttentionHeadsBatchCausalLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipAttentionHeadsBatchCausalLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.QueryPointer))
@@ -2131,10 +2288,15 @@ func (args hipAttentionHeadsBatchCausalLaunchArgs) Binary() ([]byte, error) {
 	binary.LittleEndian.PutUint64(payload[104:], args.DescriptorBytes)
 	binary.LittleEndian.PutUint64(payload[112:], args.SharedMemBytes)
 	binary.LittleEndian.PutUint32(payload[120:], windowSize)
+	binary.LittleEndian.PutUint32(payload[124:], keyHeads)
 	return payload, nil
 }
 
 func (args hipAttentionHeadsChunkedLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipAttentionHeadsChunkedLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.QueryPointer == 0 || args.DescriptorPointer == 0 || args.PartialPointer == 0 || args.StatsPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "query, descriptor, workspace, and output pointers are required", nil)
 	}
@@ -2153,11 +2315,22 @@ func (args hipAttentionHeadsChunkedLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	keyHeads, err := rocmDeviceKVPositiveUint32("key head count", firstPositiveInt(args.KeyHeads, 1))
+	if err != nil {
+		return nil, err
+	}
+	if keyHeads > headCount || headCount%keyHeads != 0 {
+		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "key head count must divide query head count", nil)
+	}
 	chunkSize, err := rocmDeviceKVPositiveUint32("attention chunk size", args.ChunkSize)
 	if err != nil {
 		return nil, err
 	}
 	chunkCount, err := rocmDeviceKVPositiveUint32("attention chunk count", args.ChunkCount)
+	if err != nil {
+		return nil, err
+	}
+	windowSize, err := rocmDeviceKVUint32("window size", args.WindowSize)
 	if err != nil {
 		return nil, err
 	}
@@ -2185,7 +2358,12 @@ func (args hipAttentionHeadsChunkedLaunchArgs) Binary() ([]byte, error) {
 	if args.DescriptorBytes < rocmDeviceKVDescriptorHeaderBytes {
 		return nil, core.E("rocm.hip.AttentionHeadsChunkedLaunch", "device KV descriptor is required", nil)
 	}
-	payload := hipBorrowLaunchPacket(hipAttentionHeadsChunkedLaunchArgsBytes)
+	if cap(payload) < hipAttentionHeadsChunkedLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipAttentionHeadsChunkedLaunchArgsBytes)
+	} else {
+		payload = payload[:hipAttentionHeadsChunkedLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipAttentionHeadsChunkedLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.QueryPointer))
@@ -2204,10 +2382,16 @@ func (args hipAttentionHeadsChunkedLaunchArgs) Binary() ([]byte, error) {
 	binary.LittleEndian.PutUint32(payload[84:], statsBytes)
 	binary.LittleEndian.PutUint32(payload[88:], outputBytes)
 	binary.LittleEndian.PutUint32(payload[92:], math.Float32bits(args.Scale))
+	binary.LittleEndian.PutUint32(payload[96:], windowSize)
+	binary.LittleEndian.PutUint32(payload[100:], keyHeads)
 	return payload, nil
 }
 
 func (args hipAttentionHeadsBatchChunkedLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipAttentionHeadsBatchChunkedLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.QueryPointer == 0 || args.DescriptorPointer == 0 || args.PartialPointer == 0 || args.StatsPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "query, descriptor, workspace, and output pointers are required", nil)
 	}
@@ -2226,6 +2410,13 @@ func (args hipAttentionHeadsBatchChunkedLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	keyHeads, err := rocmDeviceKVPositiveUint32("key head count", firstPositiveInt(args.KeyHeads, 1))
+	if err != nil {
+		return nil, err
+	}
+	if keyHeads > headCount || headCount%keyHeads != 0 {
+		return nil, core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "key head count must divide query head count", nil)
+	}
 	queryCount, err := rocmDeviceKVPositiveUint32("query count", args.QueryCount)
 	if err != nil {
 		return nil, err
@@ -2235,6 +2426,10 @@ func (args hipAttentionHeadsBatchChunkedLaunchArgs) Binary() ([]byte, error) {
 		return nil, err
 	}
 	windowSize, err := rocmDeviceKVUint32("window size", args.WindowSize)
+	if err != nil {
+		return nil, err
+	}
+	chunkStartToken, err := rocmDeviceKVUint32("chunk start token", args.ChunkStartToken)
 	if err != nil {
 		return nil, err
 	}
@@ -2249,8 +2444,16 @@ func (args hipAttentionHeadsBatchChunkedLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if uint64(chunkCount) != (uint64(tokenCount)+uint64(chunkSize)-1)/uint64(chunkSize) {
-		return nil, core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "chunk count must cover token count", nil)
+	chunkEndToken := int(queryStartToken) + int(queryCount)
+	if chunkEndToken > int(tokenCount) {
+		chunkEndToken = int(tokenCount)
+	}
+	if int(chunkStartToken) > chunkEndToken {
+		return nil, core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "chunk start token exceeds active range", nil)
+	}
+	expectedChunkCount := (chunkEndToken - int(chunkStartToken) + int(chunkSize) - 1) / int(chunkSize)
+	if expectedChunkCount <= 0 || int(chunkCount) != expectedChunkCount {
+		return nil, core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "chunk count must cover active token range", nil)
 	}
 	queryElements := uint64(dim) * uint64(headCount) * uint64(queryCount)
 	queryBytes, err := hipExactUint32Bytes("query", args.QueryBytes, queryElements*4)
@@ -2274,7 +2477,12 @@ func (args hipAttentionHeadsBatchChunkedLaunchArgs) Binary() ([]byte, error) {
 	if args.DescriptorBytes < rocmDeviceKVDescriptorHeaderBytes {
 		return nil, core.E("rocm.hip.AttentionHeadsBatchChunkedLaunch", "device KV descriptor is required", nil)
 	}
-	payload := hipBorrowLaunchPacket(hipAttentionHeadsBatchChunkedLaunchArgsBytes)
+	if cap(payload) < hipAttentionHeadsBatchChunkedLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipAttentionHeadsBatchChunkedLaunchArgsBytes)
+	} else {
+		payload = payload[:hipAttentionHeadsBatchChunkedLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipAttentionHeadsBatchChunkedLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.QueryPointer))
@@ -2296,6 +2504,8 @@ func (args hipAttentionHeadsBatchChunkedLaunchArgs) Binary() ([]byte, error) {
 	binary.LittleEndian.PutUint32(payload[96:], outputBytes)
 	binary.LittleEndian.PutUint32(payload[100:], math.Float32bits(args.Scale))
 	binary.LittleEndian.PutUint32(payload[104:], windowSize)
+	binary.LittleEndian.PutUint32(payload[108:], chunkStartToken)
+	binary.LittleEndian.PutUint32(payload[112:], keyHeads)
 	return payload, nil
 }
 
@@ -2410,6 +2620,10 @@ func (req hipVectorAddRequest) launchArgs(buffers *hipVectorAddDeviceBuffers) (h
 }
 
 func (args hipVectorAddLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipVectorAddLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.LeftPointer == 0 || args.RightPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.VectorAddLaunch", "left, right, and output pointers are required", nil)
 	}
@@ -2429,7 +2643,12 @@ func (args hipVectorAddLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, core.E("rocm.hip.VectorAddLaunch", "output byte count", err)
 	}
-	payload := hipBorrowLaunchPacket(hipVectorAddLaunchArgsBytes)
+	if cap(payload) < hipVectorAddLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipVectorAddLaunchArgsBytes)
+	} else {
+		payload = payload[:hipVectorAddLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipVectorAddLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.LeftPointer))
@@ -2443,6 +2662,10 @@ func (args hipVectorAddLaunchArgs) Binary() ([]byte, error) {
 }
 
 func (args hipVectorAddScaledLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipVectorAddScaledLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.LeftPointer == 0 || args.RightPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.VectorAddScaledLaunch", "left, right, and output pointers are required", nil)
 	}
@@ -2465,7 +2688,12 @@ func (args hipVectorAddScaledLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, core.E("rocm.hip.VectorAddScaledLaunch", "output byte count", err)
 	}
-	payload := hipBorrowLaunchPacket(hipVectorAddScaledLaunchArgsBytes)
+	if cap(payload) < hipVectorAddScaledLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipVectorAddScaledLaunchArgsBytes)
+	} else {
+		payload = payload[:hipVectorAddScaledLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipVectorAddScaledLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.LeftPointer))
@@ -2559,6 +2787,10 @@ func (req hipVectorScaleRequest) launchArgs(buffers *hipVectorScaleDeviceBuffers
 }
 
 func (args hipVectorScaleLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipVectorScaleLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.InputPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.VectorScaleLaunch", "input and output pointers are required", nil)
 	}
@@ -2577,7 +2809,12 @@ func (args hipVectorScaleLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, core.E("rocm.hip.VectorScaleLaunch", "output byte count", err)
 	}
-	payload := hipBorrowLaunchPacket(hipVectorScaleLaunchArgsBytes)
+	if cap(payload) < hipVectorScaleLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipVectorScaleLaunchArgsBytes)
+	} else {
+		payload = payload[:hipVectorScaleLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipVectorScaleLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
@@ -2682,6 +2919,10 @@ func (req hipSwiGLURequest) launchArgs(buffers *hipSwiGLUDeviceBuffers) (hipSwiG
 }
 
 func (args hipSwiGLULaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipSwiGLULaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.GatePointer == 0 || args.UpPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.SwiGLULaunch", "gate, up, and output pointers are required", nil)
 	}
@@ -2701,7 +2942,12 @@ func (args hipSwiGLULaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, core.E("rocm.hip.SwiGLULaunch", "output byte count", err)
 	}
-	payload := hipBorrowLaunchPacket(hipSwiGLULaunchArgsBytes)
+	if cap(payload) < hipSwiGLULaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipSwiGLULaunchArgsBytes)
+	} else {
+		payload = payload[:hipSwiGLULaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipSwiGLULaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.GatePointer))
@@ -2823,6 +3069,10 @@ func hipGELUTanhMultiplyLaunchArgsForDeviceBuffers(buffers *hipGELUTanhMultiplyD
 }
 
 func (args hipGELUTanhMultiplyLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipGELUTanhMultiplyLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.GatePointer == 0 || args.UpPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.GELUTanhMultiplyLaunch", "gate, up, and output pointers are required", nil)
 	}
@@ -2842,7 +3092,12 @@ func (args hipGELUTanhMultiplyLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, core.E("rocm.hip.GELUTanhMultiplyLaunch", "output byte count", err)
 	}
-	payload := hipBorrowLaunchPacket(hipGELUTanhMulLaunchArgsBytes)
+	if cap(payload) < hipGELUTanhMulLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipGELUTanhMulLaunchArgsBytes)
+	} else {
+		payload = payload[:hipGELUTanhMulLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipGELUTanhMulLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.GatePointer))
@@ -3138,6 +3393,10 @@ func (req hipTinyPrefillRequest) launchArgs(buffers *hipTinyPrefillDeviceBuffers
 }
 
 func (args hipTinyPrefillLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipTinyPrefillLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.TokenPointer == 0 || args.EmbeddingPointer == 0 || args.OutputWeightPointer == 0 ||
 		args.LogitPointer == 0 || args.AttentionPointer == 0 || args.ResultPointer == 0 ||
 		args.KeyPointer == 0 || args.ValuePointer == 0 {
@@ -3189,7 +3448,12 @@ func (args hipTinyPrefillLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, core.E("rocm.hip.TinyPrefillLaunch", "value byte count", err)
 	}
-	payload := hipBorrowLaunchPacket(hipTinyPrefillLaunchArgsBytes)
+	if cap(payload) < hipTinyPrefillLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipTinyPrefillLaunchArgsBytes)
+	} else {
+		payload = payload[:hipTinyPrefillLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipTinyPrefillLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.TokenPointer))
@@ -3458,6 +3722,10 @@ func (req hipTinyDecodeRequest) launchArgs(buffers *hipTinyDecodeDeviceBuffers) 
 }
 
 func (args hipTinyDecodeLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipTinyDecodeLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.PriorKeyPointer == 0 || args.PriorValuePointer == 0 || args.EmbeddingPointer == 0 ||
 		args.OutputWeightPointer == 0 || args.LogitPointer == 0 || args.AttentionPointer == 0 ||
 		args.UpdatedKeyPointer == 0 || args.UpdatedValuePointer == 0 || args.ResultPointer == 0 {
@@ -3521,7 +3789,12 @@ func (args hipTinyDecodeLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, core.E("rocm.hip.TinyDecodeLaunch", "result byte count", err)
 	}
-	payload := hipBorrowLaunchPacket(hipTinyDecodeLaunchArgsBytes)
+	if cap(payload) < hipTinyDecodeLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipTinyDecodeLaunchArgsBytes)
+	} else {
+		payload = payload[:hipTinyDecodeLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipTinyDecodeLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.PriorKeyPointer))

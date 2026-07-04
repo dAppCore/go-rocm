@@ -34,13 +34,57 @@ func TestCoverage_NativeFallbackHelpers_Good(t *testing.T) {
 		{Role: "user", Content: "hello"},
 		{Role: "assistant", Content: "ok"},
 	}))
-	core.AssertEqual(t, "<bos><|turn>user\nhello<turn|>\n<|turn>model\n", formatGemma4ChatTemplate([]inference.Message{
+	core.AssertEqual(t, "<bos><|turn>user\nhello<turn|>\n<|turn>model\n<|channel>thought\n<channel|>", formatGemma4ChatTemplate([]inference.Message{
 		{Role: "user", Content: " hello "},
 	}))
-	core.AssertEqual(t, "<bos><|turn>system\nbe concise<turn|>\n<|turn>user\nhello<turn|>\n<|turn>model\n", formatGemma4ChatTemplate([]inference.Message{
+	core.AssertEqual(t, "<bos><|turn>system\nbe concise<turn|>\n<|turn>user\nhello<turn|>\n<|turn>model\n<|channel>thought\n<channel|>", formatGemma4ChatTemplate([]inference.Message{
 		{Role: "developer", Content: " be concise "},
 		{Role: "user", Content: "hello"},
 	}))
+	core.AssertEqual(t, "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nhello<turn|>\n<|turn>model\n", formatGemma4ChatTemplateWithConfig([]inference.Message{
+		{Role: "user", Content: "hello"},
+	}, gemma4ChatTemplateConfig{EnableThinking: true}))
+	core.AssertEqual(t, "<turn|>\n<|turn>user\nnext<turn|>\n<|turn>model\n<|channel>thought\n<channel|>", formatGemma4ChatTemplateWithConfig([]inference.Message{
+		{Role: "user", Content: "next"},
+	}, gemma4ChatTemplateConfig{Continuation: true, LargeVariant: true}))
+	core.AssertEqual(t, "<bos><|turn>user\nhi<turn|>\n<|turn>model\nvisible<turn|>\n", formatGemma4ChatTemplateWithConfig([]inference.Message{
+		{Role: "user", Content: "hi"},
+		{Role: "assistant", Content: "<|channel>thought\nprivate<channel|>visible"},
+	}, gemma4ChatTemplateConfig{NoGenerationPrompt: true}))
+	core.AssertEqual(t, "<bos><|turn>user\nhi<turn|>\n<|turn>model\none<turn|>\ntwo<turn|>\n<|turn>model\n<|channel>thought\n<channel|>", formatGemma4ChatTemplateWithConfig([]inference.Message{
+		{Role: "user", Content: "hi"},
+		{Role: "assistant", Content: "one"},
+		{Role: "assistant", Content: "two"},
+	}, gemma4ChatTemplateConfig{}))
+	templateCfg := gemma4ChatTemplateConfigForIdentity(inference.ModelIdentity{
+		Architecture: "gemma4_text",
+		Labels:       map[string]string{"gemma4_size": "31B"},
+	}, inference.GenerateConfig{}, true)
+	core.AssertTrue(t, templateCfg.EnableThinking)
+	core.AssertTrue(t, templateCfg.LargeVariant)
+	core.AssertTrue(t, templateCfg.Continuation)
+	templateCfg = gemma4ChatTemplateConfigForIdentity(inference.ModelIdentity{
+		Architecture: "gemma4_text",
+		Labels: map[string]string{
+			"attention_heads": "16",
+		},
+	}, inference.GenerateConfig{}, false)
+	core.AssertTrue(t, templateCfg.LargeVariant)
+	templateCfg = gemma4ChatTemplateConfigForIdentity(inference.ModelIdentity{
+		Architecture: "gemma4_text",
+		Labels: map[string]string{
+			"attention_heads": "8",
+			"gemma4_size":     "31B",
+		},
+	}, inference.GenerateConfig{}, false)
+	core.AssertFalse(t, templateCfg.LargeVariant)
+	disableThinking := false
+	templateCfg = gemma4ChatTemplateConfigForIdentity(inference.ModelIdentity{
+		Architecture: "gemma4_text",
+		Labels:       map[string]string{"gemma4_size": "E2B"},
+	}, inference.GenerateConfig{EnableThinking: &disableThinking}, false)
+	core.AssertFalse(t, templateCfg.EnableThinking)
+	core.AssertFalse(t, templateCfg.LargeVariant)
 	core.AssertEqual(t, "visible", stripGemma4ThinkingChannels("visible<|channel>hidden<channel|>"))
 
 	core.AssertEqual(t, "text", sampleText(inference.DatasetSample{Text: "text", Reasoning: "reason"}))
@@ -184,14 +228,22 @@ func TestCoverage_NativeBranchHelpers_GoodBad(t *testing.T) {
 	}}))
 
 	for input, want := range map[string]string{
-		"MiniMax M2":        "minimax_m2",
-		"qwen3-next":        "qwen3_next",
-		"qwen3 moe":         "qwen3_moe",
-		"deepseek-r1":       "deepseek_r1",
-		"gptoss":            "gpt-oss",
-		"Gemma4ForCausalLM": "gemma4_text",
-		"glm4":              "glm4",
-		"unknown model":     "unknown_model",
+		"MiniMax M2":                            "minimax_m2",
+		"Qwen3.5ForCausalLM":                    "qwen3_6",
+		"Qwen3_5MoeForConditionalGeneration":    "qwen3_6_moe",
+		"qwen3-next":                            "qwen3_next",
+		"qwen3 moe":                             "qwen3_moe",
+		"deepseek-r1":                           "deepseek_r1",
+		"gptoss":                                "gpt-oss",
+		"Gemma4AssistantForCausalLM":            "gemma4_assistant",
+		"Gemma3TextForCausalLM":                 "gemma3_text",
+		"Gemma4ForCausalLM":                     "gemma4_text",
+		"Gemma4UnifiedForConditionalGeneration": "gemma4_unified",
+		"gemma4_unified_text":                   "gemma4_unified_text",
+		"BertForSequenceClassification":         "bert_rerank",
+		"Phi4ForCausalLM":                       "phi",
+		"glm4":                                  "glm4",
+		"unknown model":                         "unknown_model",
 	} {
 		core.AssertEqual(t, want, normalizeROCmArchitecture(input))
 	}
@@ -279,9 +331,9 @@ func TestCoverage_RocmModelAccessorsAndTokenCounts_GoodBad(t *testing.T) {
 	core.AssertEqual(t, "user", messages[0].Role)
 	core.AssertEqual(t, 3, model.promptTokenCount("prompt"))
 	core.AssertEqual(t, 3, model.promptsTokenCount([]string{"first", "second prompt"}))
-	core.AssertEqual(t, 4, model.chatPromptTokenCount(messages))
+	core.AssertEqual(t, 2, model.chatPromptTokenCount(messages))
 	core.AssertEqual(t, 2, model.evalSampleTokenCount(inference.DatasetSample{Prompt: "question", Response: "answer"}))
-	core.AssertEqual(t, 4, model.evalSampleTokenCount(inference.DatasetSample{Messages: messages}))
+	core.AssertEqual(t, 2, model.evalSampleTokenCount(inference.DatasetSample{Messages: messages}))
 	core.AssertEqual(t, 1, model.evalSampleTokenCount(inference.DatasetSample{Reasoning: "reason"}))
 
 	native.chatTemplateErr = core.NewError("template failed")
@@ -378,7 +430,9 @@ func TestCoverage_CompatWireSuccessAndGuardBranches_GoodBad(t *testing.T) {
 
 	streamAnthropic := httptest.NewRecorder()
 	anthropicHandler.ServeHTTP(streamAnthropic, httptest.NewRequest(http.MethodPost, anthropic.DefaultMessagesPath, strings.NewReader(`{"model":"qwen","stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`)))
-	core.AssertEqual(t, http.StatusNotImplemented, streamAnthropic.Code)
+	core.AssertEqual(t, http.StatusOK, streamAnthropic.Code)
+	core.AssertEqual(t, "text/event-stream", streamAnthropic.Header().Get("Content-Type"))
+	core.AssertContains(t, streamAnthropic.Body.String(), "event: content_block_delta")
 
 	emptyAnthropic := httptest.NewRecorder()
 	anthropicHandler.ServeHTTP(emptyAnthropic, httptest.NewRequest(http.MethodPost, anthropic.DefaultMessagesPath, strings.NewReader(`{"model":"qwen","messages":[{"role":"user","content":[{"type":"text","text":"   "}]}]}`)))
@@ -405,7 +459,9 @@ func TestCoverage_CompatWireSuccessAndGuardBranches_GoodBad(t *testing.T) {
 
 	streamOllamaChat := httptest.NewRecorder()
 	ollamaMux.ServeHTTP(streamOllamaChat, httptest.NewRequest(http.MethodPost, ollama.DefaultChatPath, strings.NewReader(`{"model":"qwen","stream":true,"messages":[{"role":"user","content":"hello"}]}`)))
-	core.AssertEqual(t, http.StatusNotImplemented, streamOllamaChat.Code)
+	core.AssertEqual(t, http.StatusOK, streamOllamaChat.Code)
+	core.AssertContains(t, streamOllamaChat.Body.String(), `"message"`)
+	core.AssertContains(t, streamOllamaChat.Body.String(), `"done":true`)
 
 	emptyOllamaChat := httptest.NewRecorder()
 	ollamaMux.ServeHTTP(emptyOllamaChat, httptest.NewRequest(http.MethodPost, ollama.DefaultChatPath, strings.NewReader(`{"model":"qwen","messages":[{"role":"user","content":"   "}]}`)))
@@ -419,7 +475,9 @@ func TestCoverage_CompatWireSuccessAndGuardBranches_GoodBad(t *testing.T) {
 
 	streamOllamaGenerate := httptest.NewRecorder()
 	ollamaMux.ServeHTTP(streamOllamaGenerate, httptest.NewRequest(http.MethodPost, ollama.DefaultGeneratePath, strings.NewReader(`{"model":"qwen","prompt":"hello","stream":true}`)))
-	core.AssertEqual(t, http.StatusNotImplemented, streamOllamaGenerate.Code)
+	core.AssertEqual(t, http.StatusOK, streamOllamaGenerate.Code)
+	core.AssertContains(t, streamOllamaGenerate.Body.String(), `"response":"hi"`)
+	core.AssertContains(t, streamOllamaGenerate.Body.String(), `"done":true`)
 
 	emptyOllamaGenerate := httptest.NewRecorder()
 	ollamaMux.ServeHTTP(emptyOllamaGenerate, httptest.NewRequest(http.MethodPost, ollama.DefaultGeneratePath, strings.NewReader(`{"model":"qwen","prompt":"   "}`)))

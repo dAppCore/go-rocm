@@ -249,6 +249,23 @@ func TestHIPEmbeddingLookupLaunch_Good(t *testing.T) {
 	})
 	core.RequireNoError(t, err)
 	assertFloat32SlicesNear(t, []float32{3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 0, 1, 2, 3, 4, 5, 6, 7}, deviceQ4Got, 0)
+
+	q6Req := hipEmbeddingLookupRequest{
+		TokenIDs: []int32{1},
+		EmbeddingQ4: hipPackMLXAffineValuesForTest([]uint32{
+			0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+			16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+		}, 16, 6),
+		Q4Scales:    []uint16{0x3f80, 0x3f80},
+		Q4Biases:    []uint16{0, 0},
+		Q4GroupSize: 16,
+		QuantBits:   6,
+		VocabSize:   2,
+		HiddenSize:  16,
+	}
+	q6Got, err := hipRunEmbeddingLookupKernel(context.Background(), &fakeHIPDriver{available: true}, q6Req)
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31}, q6Got, 0)
 }
 
 func TestHIPRerankCosineLaunch_Good(t *testing.T) {
@@ -341,7 +358,7 @@ func TestHIPEmbeddingAndRerankLaunch_Bad(t *testing.T) {
 		BiasBytes:        4,
 	}).Binary()
 	core.AssertError(t, err)
-	core.AssertContains(t, err.Error(), "q4 embedding byte count")
+	core.AssertContains(t, err.Error(), "MLX affine embedding byte count")
 
 	_, err = (hipEmbeddingLookupLaunchArgs{
 		TokenPointer:     1,

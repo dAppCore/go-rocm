@@ -39,7 +39,7 @@ func Example_inspectModelPack() {
 func Example_planModelFit() {
 	report, err := (&rocmBackend{}).PlanModelFit(context.Background(), inference.ModelIdentity{
 		Architecture:  "gemma4_text",
-		QuantBits:     4,
+		QuantBits:     ProductionLaneProductDefaultQuantBits,
 		QuantGroup:    64,
 		ContextLength: 131072,
 		NumLayers:     35,
@@ -77,7 +77,7 @@ func exampleGemma4ModelPack() (string, func(), error) {
 			"sliding_window":512,
 			"layer_types":["full_attention","sliding_attention"]
 		},
-		"quantization_config":{"bits":4,"group_size":64,"weight_format":"mlx_q4"}
+		"quantization_config":{"bits":6,"group_size":64,"weight_format":"mlx_q6"}
 	}`
 	if result := core.WriteFile(core.PathJoin(dir, "config.json"), []byte(config), 0o644); !result.OK {
 		cleanup()

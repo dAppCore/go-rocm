@@ -1,7 +1,5 @@
 // SPDX-Licence-Identifier: EUPL-1.2
 
-//go:build linux && amd64 && !rocm_legacy_server
-
 package rocm
 
 import (
@@ -86,19 +84,28 @@ func hipReferenceQ8Projection(input []float32, weights []int8, scale float32, ro
 }
 
 func hipReferenceMLXQ4Projection(input []float32, weights []uint32, scales []uint16, biases []uint16, rows, cols, groupSize int) ([]float32, error) {
-	if err := validateHIPMLXQ4ProjectionShape(len(input), len(weights), len(scales), len(biases), rows, cols, groupSize); err != nil {
+	return hipReferenceMLXAffineProjection(input, weights, scales, biases, rows, cols, groupSize, hipMLXQ4ProjectionBits)
+}
+
+func hipReferenceMLXAffineProjection(input []float32, weights []uint32, scales []uint16, biases []uint16, rows, cols, groupSize, bits int) ([]float32, error) {
+	if err := validateHIPMLXAffineProjectionShape(len(input), len(weights), len(scales), len(biases), rows, cols, groupSize, bits); err != nil {
 		return nil, err
 	}
-	packedPerRow := cols / 8
+	packedPerRow, err := hipMLXAffinePackedCols(cols, bits)
+	if err != nil {
+		return nil, err
+	}
 	groupsPerRow := cols / groupSize
 	output := make([]float32, rows)
 	for row := 0; row < rows; row++ {
 		sum := float32(0)
 		for col := 0; col < cols; col++ {
-			word := weights[row*packedPerRow+col/8]
-			quantized := float32((word >> uint((col%8)*4)) & 0x0f)
+			quantized, err := hipMLXAffineUnpackValue(weights[row*packedPerRow:], col, bits)
+			if err != nil {
+				return nil, err
+			}
 			group := row*groupsPerRow + col/groupSize
-			weight := quantized*hipBFloat16ToFloat32(scales[group]) + hipBFloat16ToFloat32(biases[group])
+			weight := float32(quantized)*hipBFloat16ToFloat32(scales[group]) + hipBFloat16ToFloat32(biases[group])
 			sum += input[col] * weight
 		}
 		output[row] = sum
@@ -107,11 +114,16 @@ func hipReferenceMLXQ4Projection(input []float32, weights []uint32, scales []uin
 }
 
 func validateHIPMLXQ4ProjectionShape(inputLen, weightLen, scaleLen, biasLen, rows, cols, groupSize int) error {
+	return validateHIPMLXAffineProjectionShape(inputLen, weightLen, scaleLen, biasLen, rows, cols, groupSize, hipMLXQ4ProjectionBits)
+}
+
+func validateHIPMLXAffineProjectionShape(inputLen, weightLen, scaleLen, biasLen, rows, cols, groupSize, bits int) error {
 	if rows <= 0 || cols <= 0 || groupSize <= 0 {
 		return core.E("rocm.hip.ReferenceMLXQ4Projection", "rows, cols, and group size must be positive", nil)
 	}
-	if cols%8 != 0 {
-		return core.E("rocm.hip.ReferenceMLXQ4Projection", "cols must be divisible by 8 for q4 packing", nil)
+	packedPerRow, err := hipMLXAffinePackedCols(cols, bits)
+	if err != nil {
+		return err
 	}
 	if cols%groupSize != 0 {
 		return core.E("rocm.hip.ReferenceMLXQ4Projection", "cols must be divisible by group size", nil)
@@ -119,7 +131,6 @@ func validateHIPMLXQ4ProjectionShape(inputLen, weightLen, scaleLen, biasLen, row
 	if inputLen != cols {
 		return core.E("rocm.hip.ReferenceMLXQ4Projection", core.Sprintf("input length %d does not match cols %d", inputLen, cols), nil)
 	}
-	packedPerRow := cols / 8
 	if weightLen != rows*packedPerRow {
 		return core.E("rocm.hip.ReferenceMLXQ4Projection", core.Sprintf("weight length %d does not match rows*packed_cols %d", weightLen, rows*packedPerRow), nil)
 	}
@@ -128,6 +139,84 @@ func validateHIPMLXQ4ProjectionShape(inputLen, weightLen, scaleLen, biasLen, row
 		return core.E("rocm.hip.ReferenceMLXQ4Projection", core.Sprintf("scale/bias length %d/%d does not match row groups %d", scaleLen, biasLen, groupCount), nil)
 	}
 	return nil
+}
+
+func hipMLXQ4ProjectionBitsOrDefault(bits int) int {
+	if bits == 0 {
+		return hipMLXQ4ProjectionBits
+	}
+	return bits
+}
+
+func hipMLXAffineSupportedBits(bits int) bool {
+	switch hipMLXQ4ProjectionBitsOrDefault(bits) {
+	case 4, 6, 8:
+		return true
+	default:
+		return false
+	}
+}
+
+func hipMLXAffinePackedCols(cols, bits int) (int, error) {
+	bits = hipMLXQ4ProjectionBitsOrDefault(bits)
+	if !hipMLXAffineSupportedBits(bits) {
+		return 0, core.E("rocm.hip.ReferenceMLXQ4Projection", "only 4-, 6-, and 8-bit MLX affine projection is supported", nil)
+	}
+	if cols <= 0 {
+		return 0, core.E("rocm.hip.ReferenceMLXQ4Projection", "cols must be positive", nil)
+	}
+	totalBits := uint64(cols) * uint64(bits)
+	if totalBits%32 != 0 {
+		return 0, core.E("rocm.hip.ReferenceMLXQ4Projection", "cols*bits must be divisible by 32 for MLX affine packing", nil)
+	}
+	packed := totalBits / 32
+	if packed > uint64(int(^uint(0)>>1)) {
+		return 0, core.E("rocm.hip.ReferenceMLXQ4Projection", "packed column count is out of int range", nil)
+	}
+	return int(packed), nil
+}
+
+func hipMLXAffineColsFromPackedCols(packedCols, bits int) (int, error) {
+	bits = hipMLXQ4ProjectionBitsOrDefault(bits)
+	if !hipMLXAffineSupportedBits(bits) {
+		return 0, core.E("rocm.hip.ReferenceMLXQ4Projection", "only 4-, 6-, and 8-bit MLX affine projection is supported", nil)
+	}
+	if packedCols <= 0 {
+		return 0, core.E("rocm.hip.ReferenceMLXQ4Projection", "packed column count must be positive", nil)
+	}
+	totalBits := uint64(packedCols) * 32
+	if totalBits%uint64(bits) != 0 {
+		return 0, core.E("rocm.hip.ReferenceMLXQ4Projection", "packed columns do not align with MLX affine bit width", nil)
+	}
+	cols := totalBits / uint64(bits)
+	if cols > uint64(int(^uint(0)>>1)) {
+		return 0, core.E("rocm.hip.ReferenceMLXQ4Projection", "logical column count is out of int range", nil)
+	}
+	return int(cols), nil
+}
+
+func hipMLXAffineUnpackValue(rowWeights []uint32, col, bits int) (uint32, error) {
+	bits = hipMLXQ4ProjectionBitsOrDefault(bits)
+	if !hipMLXAffineSupportedBits(bits) {
+		return 0, core.E("rocm.hip.ReferenceMLXQ4Projection", "only 4-, 6-, and 8-bit MLX affine projection is supported", nil)
+	}
+	if col < 0 {
+		return 0, core.E("rocm.hip.ReferenceMLXQ4Projection", "column must be non-negative", nil)
+	}
+	bitOffset := uint64(col) * uint64(bits)
+	wordIndex := int(bitOffset / 32)
+	shift := uint(bitOffset % 32)
+	if wordIndex < 0 || wordIndex >= len(rowWeights) {
+		return 0, core.E("rocm.hip.ReferenceMLXQ4Projection", "packed column is outside row weights", nil)
+	}
+	value := rowWeights[wordIndex] >> shift
+	if shift+uint(bits) > 32 {
+		if wordIndex+1 >= len(rowWeights) {
+			return 0, core.E("rocm.hip.ReferenceMLXQ4Projection", "packed value crosses row boundary", nil)
+		}
+		value |= rowWeights[wordIndex+1] << (32 - shift)
+	}
+	return value & ((uint32(1) << uint(bits)) - 1), nil
 }
 
 func validateHIPProjectionShape(inputLen, weightLen, biasLen, rows, cols int) error {

@@ -5,6 +5,7 @@
 package rocm
 
 import (
+	"context"
 	"sync"
 
 	core "dappco.re/go"
@@ -26,19 +27,72 @@ type hipGemma4Q4DeviceLayerKVState struct {
 	borrowedDescriptorTable bool
 }
 
+type hipGemma4Q4DeviceOwnershipAction struct {
+	oldLayer *hipGemma4Q4DeviceLayerKVState
+	newCache *rocmDeviceKVCache
+	append   bool
+}
+
 var hipGemma4Q4DeviceLayerStatePool = struct {
 	sync.Mutex
 	layers [][]hipGemma4Q4DeviceLayerKVState
 }{}
 
-const hipGemma4Q4DeviceLayerStatePoolMax = 4096
+var hipGemma4Q4DeviceOwnershipActionPool = struct {
+	sync.Mutex
+	actions [][]hipGemma4Q4DeviceOwnershipAction
+}{}
 
-var hipGemma4Q4DeviceDecodeStatePool = sync.Pool{
-	New: func() any { return &hipGemma4Q4DeviceDecodeState{} },
+const (
+	hipGemma4Q4DeviceDecodeStatePoolMax     = 4096
+	hipGemma4Q4DeviceLayerStatePoolMax      = 4096
+	hipGemma4Q4DeviceOwnershipActionPoolMax = 4096
+)
+
+var hipGemma4Q4DeviceDecodeStatePool = struct {
+	sync.Mutex
+	states []*hipGemma4Q4DeviceDecodeState
+}{}
+
+func hipPrewarmGemma4Q4DeviceDecodeStatePool(layerCapacity, depth int) {
+	if layerCapacity <= 0 || depth <= 0 {
+		return
+	}
+	states := make([]*hipGemma4Q4DeviceDecodeState, 0, depth)
+	for range depth {
+		state := hipNewGemma4Q4DeviceDecodeState("", layerCapacity)
+		hipReleaseGemma4Q4DeviceLayerStates(state.layers)
+		state.layers = nil
+		state.closed = true
+		states = append(states, state)
+	}
+	for _, state := range states {
+		hipReleaseClosedGemma4Q4DeviceDecodeState(state)
+	}
+}
+
+func hipPrewarmGemma4Q4DeviceLayerStatePool(layerCapacity, depth int) {
+	if layerCapacity <= 0 || depth <= 0 {
+		return
+	}
+	for range depth {
+		hipReleaseGemma4Q4DeviceLayerStates(make([]hipGemma4Q4DeviceLayerKVState, 0, layerCapacity))
+	}
 }
 
 func hipNewGemma4Q4DeviceDecodeState(mode string, layerCapacity int) *hipGemma4Q4DeviceDecodeState {
-	state := hipGemma4Q4DeviceDecodeStatePool.Get().(*hipGemma4Q4DeviceDecodeState)
+	hipGemma4Q4DeviceDecodeStatePool.Lock()
+	count := len(hipGemma4Q4DeviceDecodeStatePool.states)
+	if count > 0 {
+		state := hipGemma4Q4DeviceDecodeStatePool.states[count-1]
+		hipGemma4Q4DeviceDecodeStatePool.states[count-1] = nil
+		hipGemma4Q4DeviceDecodeStatePool.states = hipGemma4Q4DeviceDecodeStatePool.states[:count-1]
+		hipGemma4Q4DeviceDecodeStatePool.Unlock()
+		*state = hipGemma4Q4DeviceDecodeState{mode: mode, layers: hipBorrowGemma4Q4DeviceLayerStates(layerCapacity)}
+		return state
+	}
+	hipGemma4Q4DeviceDecodeStatePool.Unlock()
+	state := &hipGemma4Q4DeviceDecodeState{}
 	*state = hipGemma4Q4DeviceDecodeState{mode: mode, layers: hipBorrowGemma4Q4DeviceLayerStates(layerCapacity)}
 	return state
 }
@@ -48,7 +102,11 @@ func hipReleaseClosedGemma4Q4DeviceDecodeState(state *hipGemma4Q4DeviceDecodeSta
 		return
 	}
 	*state = hipGemma4Q4DeviceDecodeState{}
-	hipGemma4Q4DeviceDecodeStatePool.Put(state)
+	hipGemma4Q4DeviceDecodeStatePool.Lock()
+	if len(hipGemma4Q4DeviceDecodeStatePool.states) < hipGemma4Q4DeviceDecodeStatePoolMax {
+		hipGemma4Q4DeviceDecodeStatePool.states = append(hipGemma4Q4DeviceDecodeStatePool.states, state)
+	}
+	hipGemma4Q4DeviceDecodeStatePool.Unlock()
 }
 
 func hipBorrowGemma4Q4DeviceLayerStates(layerCapacity int) []hipGemma4Q4DeviceLayerKVState {
@@ -79,6 +137,36 @@ func hipReleaseGemma4Q4DeviceLayerStates(layers []hipGemma4Q4DeviceLayerKVState)
 		hipGemma4Q4DeviceLayerStatePool.layers = append(hipGemma4Q4DeviceLayerStatePool.layers, layers[:0])
 	}
 	hipGemma4Q4DeviceLayerStatePool.Unlock()
+}
+
+func hipBorrowGemma4Q4DeviceOwnershipActions(layerCapacity int) []hipGemma4Q4DeviceOwnershipAction {
+	if layerCapacity <= 0 {
+		layerCapacity = 1
+	}
+	hipGemma4Q4DeviceOwnershipActionPool.Lock()
+	for index := len(hipGemma4Q4DeviceOwnershipActionPool.actions) - 1; index >= 0; index-- {
+		actions := hipGemma4Q4DeviceOwnershipActionPool.actions[index]
+		hipGemma4Q4DeviceOwnershipActionPool.actions[index] = nil
+		hipGemma4Q4DeviceOwnershipActionPool.actions = hipGemma4Q4DeviceOwnershipActionPool.actions[:index]
+		if cap(actions) >= layerCapacity {
+			hipGemma4Q4DeviceOwnershipActionPool.Unlock()
+			return actions[:0]
+		}
+	}
+	hipGemma4Q4DeviceOwnershipActionPool.Unlock()
+	return make([]hipGemma4Q4DeviceOwnershipAction, 0, layerCapacity)
+}
+
+func hipReleaseGemma4Q4DeviceOwnershipActions(actions []hipGemma4Q4DeviceOwnershipAction) {
+	if cap(actions) == 0 {
+		return
+	}
+	clear(actions[:cap(actions)])
+	hipGemma4Q4DeviceOwnershipActionPool.Lock()
+	if len(hipGemma4Q4DeviceOwnershipActionPool.actions) < hipGemma4Q4DeviceOwnershipActionPoolMax {
+		hipGemma4Q4DeviceOwnershipActionPool.actions = append(hipGemma4Q4DeviceOwnershipActionPool.actions, actions[:0])
+	}
+	hipGemma4Q4DeviceOwnershipActionPool.Unlock()
 }
 
 func (layer *hipGemma4Q4DeviceLayerKVState) Close() error {
@@ -185,12 +273,8 @@ func hipUpdateGemma4Q4DeviceDecodeState(driver nativeHIPDriver, cfg hipGemma4Q4F
 		return nil, core.E("rocm.hip.Gemma4Q4DeviceKV", "device KV mode mismatch", nil)
 	}
 	nextDevice := hipNewGemma4Q4DeviceDecodeState(mode, len(nextHost.Layers))
-	type ownershipAction struct {
-		oldLayer *hipGemma4Q4DeviceLayerKVState
-		newCache *rocmDeviceKVCache
-		append   bool
-	}
-	actions := make([]ownershipAction, 0, len(nextHost.Layers))
+	actions := hipBorrowGemma4Q4DeviceOwnershipActions(len(nextHost.Layers))
+	defer hipReleaseGemma4Q4DeviceOwnershipActions(actions)
 	success := false
 	defer func() {
 		if !success {
@@ -207,7 +291,7 @@ func hipUpdateGemma4Q4DeviceDecodeState(driver nativeHIPDriver, cfg hipGemma4Q4F
 			if err != nil {
 				return nil, err
 			}
-			table, err := nextCache.KernelDescriptorTable()
+			table, err := nextCache.KernelDescriptorTableFromAppendedToken(context.Background(), oldLayer.cache, oldLayer.descriptorTable)
 			if err != nil {
 				_ = nextCache.closePagesFrom(oldLayer.cache.PageCount())
 				return nil, err
@@ -220,7 +304,7 @@ func hipUpdateGemma4Q4DeviceDecodeState(driver nativeHIPDriver, cfg hipGemma4Q4F
 			}
 			nextDevice.layers = append(nextDevice.layers, hipGemma4Q4DeviceLayerKVState{cache: nextCache, descriptorTable: table, launch: launch})
 			nextDevice.appendLayers++
-			actions = append(actions, ownershipAction{oldLayer: oldLayer, newCache: nextCache, append: true})
+			actions = append(actions, hipGemma4Q4DeviceOwnershipAction{oldLayer: oldLayer, newCache: nextCache, append: true})
 			continue
 		}
 		layer, err := hipMirrorGemma4Q4LayerDecodeState(driver, layerCfg, nextHost.Layers[index], mode)
@@ -229,7 +313,7 @@ func hipUpdateGemma4Q4DeviceDecodeState(driver nativeHIPDriver, cfg hipGemma4Q4F
 		}
 		nextDevice.layers = append(nextDevice.layers, layer)
 		nextDevice.remirrorLayers++
-		actions = append(actions, ownershipAction{oldLayer: oldLayer})
+		actions = append(actions, hipGemma4Q4DeviceOwnershipAction{oldLayer: oldLayer})
 	}
 	for _, action := range actions {
 		if action.oldLayer.borrowedCache {
@@ -332,7 +416,7 @@ func hipMirrorGemma4Q4LayerDecodeState(driver nativeHIPDriver, cfg hipGemma4Q4La
 	if err != nil {
 		return hipGemma4Q4DeviceLayerKVState{}, err
 	}
-	table, err := device.KernelDescriptorTable()
+	table, err := device.kernelDescriptorTableLabeled("rocm.KVCache.DeviceDescriptor", "mirror_layer_decode_state")
 	if err != nil {
 		_ = device.Close()
 		return hipGemma4Q4DeviceLayerKVState{}, err
@@ -413,6 +497,25 @@ func hipGemma4Q4DeviceLayerCaches(state *hipGemma4Q4DeviceDecodeState, scratch [
 	}
 	for index := range scratch {
 		scratch[index] = state.layerCache(index)
+	}
+	return scratch
+}
+
+func hipGemma4Q4DeviceLayerDescriptorTables(state *hipGemma4Q4DeviceDecodeState, scratch []*rocmDeviceKVDescriptorTable, layerCount int) []*rocmDeviceKVDescriptorTable {
+	if state == nil {
+		return nil
+	}
+	if layerCount <= 0 {
+		layerCount = state.LayerCount()
+	}
+	if cap(scratch) < layerCount {
+		scratch = make([]*rocmDeviceKVDescriptorTable, layerCount)
+	} else {
+		scratch = scratch[:layerCount]
+		clear(scratch)
+	}
+	for index := range scratch {
+		scratch[index] = state.layerDescriptorTable(index)
 	}
 	return scratch
 }

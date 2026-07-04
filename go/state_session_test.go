@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	core "dappco.re/go"
@@ -90,6 +91,21 @@ func TestStateSession_Bad_WakeRejectsModelArchitectureMismatch(t *testing.T) {
 
 	core.AssertError(t, err)
 	core.AssertContains(t, err.Error(), "model architecture mismatch")
+}
+
+func TestStateSession_Bad_WakeRejectsGemma4ModelSizeMismatch(t *testing.T) {
+	sessionModel := gemma4StateModelIdentityForTest("/models/lmstudio-community-gemma-4-e4b-it-6bit", 26, 2304)
+	reqModel := gemma4StateModelIdentityForTest("/models/lmstudio-community-gemma-4-e2b-it-6bit", 35, 1536)
+	session := NewStateSession(sessionModel, inference.TokenizerIdentity{}, nil)
+
+	_, err := session.WakeState(context.Background(), inference.AgentMemoryWakeRequest{
+		Store:    state.NewInMemoryStore(nil),
+		EntryURI: "state://entry",
+		Model:    reqModel,
+	})
+
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "model Gemma4 size mismatch")
 }
 
 func TestStateSession_Good_WakeAllowsMismatchWithSkip(t *testing.T) {
@@ -404,6 +420,116 @@ func TestStateSession_Good_SleepWakeRuntimeOwnedKVBlockBundle(t *testing.T) {
 	assertFloat32SlicesNear(t, []float32{3, 2, 1, 0, -1, -2}, values, 0.02)
 }
 
+func TestStateSession_Good_Gemma4Q6ProductionLabelsSurviveSleepWake(t *testing.T) {
+	store := state.NewInMemoryStore(nil)
+	model := inference.ModelIdentity{
+		Architecture: "gemma4_text",
+		Path:         ProductionLaneCurrentModelID,
+		NumLayers:    productionLaneGemma4E2BLayers,
+		HiddenSize:   productionLaneGemma4E2BHiddenSize,
+		VocabSize:    productionLaneGemma4E2BVocabSize,
+		QuantBits:    ProductionLaneProductDefaultQuantBits,
+		QuantGroup:   64,
+	}
+	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 2)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(0, 1, 1, []float32{1, 0, 0}, []float32{0, 1, 0}))
+	sleeping := newStateSessionWithRuntime(model, inference.TokenizerIdentity{}, nil, cache)
+
+	sleep, err := sleeping.SleepState(context.Background(), inference.AgentMemorySleepRequest{
+		Store:    store,
+		EntryURI: "state://entry/gemma4-q6",
+		Model:    model,
+		Encoding: rocmKVBlockBundleEncoding,
+	})
+
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, "gemma4_mlx_affine", sleep.Labels["production_quant_policy"])
+	core.AssertEqual(t, "default", sleep.Labels["production_quant_tier"])
+	core.AssertEqual(t, ProductionLaneCurrentModelID, sleep.Labels["production_quant_model"])
+	core.AssertEqual(t, "100", sleep.Entry.StateRefs[0].Labels["production_quant_min_visible_tokens_per_sec"])
+
+	woken := NewStateSession(model, inference.TokenizerIdentity{}, nil)
+	wake, err := woken.WakeState(context.Background(), inference.AgentMemoryWakeRequest{
+		Store:    store,
+		EntryURI: "state://entry/gemma4-q6",
+		Model:    model,
+	})
+
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, "runtime_owned", wake.Labels["kv_restore"])
+	core.AssertEqual(t, "gemma4_mlx_affine", wake.Labels["production_quant_policy"])
+	core.AssertEqual(t, "default", wake.Labels["production_quant_tier"])
+	core.AssertEqual(t, ProductionLaneCurrentModelID, wake.Entry.Labels["production_quant_model"])
+	core.AssertEqual(t, "100", wake.Bundle.Labels["production_quant_min_visible_tokens_per_sec"])
+}
+
+func TestStateSession_Good_Gemma4AdapterLabelsSurviveSleepWakeFork(t *testing.T) {
+	store := state.NewInMemoryStore(nil)
+	model := inference.ModelIdentity{
+		Path:         "/models/lmstudio-community-gemma-4-e4b-it-6bit",
+		Architecture: "gemma4_text",
+		NumLayers:    26,
+		HiddenSize:   2304,
+		VocabSize:    262144,
+	}
+	adapter := rocmAdapterIdentityForModel(inference.AdapterIdentity{
+		Path:   "domain.safetensors",
+		Format: "lora",
+		Hash:   "adapter-hash",
+	}, model)
+	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 2)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(0, 1, 1, []float32{1, 0, 0}, []float32{0, 1, 0}))
+	sleeping := newStateSessionWithRuntime(model, inference.TokenizerIdentity{}, nil, cache)
+
+	sleep, err := sleeping.SleepState(context.Background(), inference.AgentMemorySleepRequest{
+		Store:    store,
+		EntryURI: "state://entry/gemma4-lora",
+		Model:    model,
+		Adapter:  adapter,
+		Encoding: rocmKVBlockBundleEncoding,
+	})
+
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, "metadata_only", sleep.Labels["state_adapter"])
+	core.AssertEqual(t, "E4B", sleep.Labels["adapter_base_gemma4_size"])
+	core.AssertEqual(t, "q6", sleep.Labels["adapter_base_gemma4_quant_mode"])
+	core.AssertEqual(t, "64", sleep.Labels["adapter_base_gemma4_quant_group"])
+	core.AssertEqual(t, Gemma4RuntimeMLXAffine, sleep.Entry.StateRefs[0].Labels["adapter_base_gemma4_runtime"])
+	core.AssertEqual(t, Gemma4GenerateLinked, sleep.Bundle.Labels["adapter_base_gemma4_generate_status"])
+
+	woken := NewStateSession(model, inference.TokenizerIdentity{}, nil)
+	wake, err := woken.WakeState(context.Background(), inference.AgentMemoryWakeRequest{
+		Store:    store,
+		EntryURI: sleep.Bundle.URI,
+		Model:    model,
+	})
+
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, "runtime_owned", wake.Labels["kv_restore"])
+	core.AssertEqual(t, "E4B", wake.Labels["adapter_base_gemma4_size"])
+	core.AssertEqual(t, "q6", wake.Entry.Labels["adapter_base_gemma4_quant_mode"])
+	core.AssertEqual(t, "64", wake.Entry.Labels["adapter_base_gemma4_quant_group"])
+	core.AssertEqual(t, Gemma4GenerateLinked, wake.Bundle.Labels["adapter_base_gemma4_generate_status"])
+
+	forked, forkWake, err := NewStateSession(model, inference.TokenizerIdentity{}, nil).ForkState(context.Background(), inference.AgentMemoryWakeRequest{
+		Store:    store,
+		IndexURI: sleep.Index.URI,
+		EntryURI: sleep.Entry.URI,
+		Model:    model,
+	})
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, "true", forkWake.Labels["fork"])
+	core.AssertEqual(t, "E4B", forkWake.Labels["adapter_base_gemma4_size"])
+	core.AssertEqual(t, "q6", forkWake.Bundle.Labels["adapter_base_gemma4_quant_mode"])
+	core.AssertEqual(t, "64", forkWake.Bundle.Labels["adapter_base_gemma4_quant_group"])
+	forkedSession, ok := forked.(*StateSession)
+	core.RequireTrue(t, ok)
+	_, ok = forkedSession.runtime.(*rocmKVCache)
+	core.RequireTrue(t, ok)
+}
+
 func TestStateSession_Good_WakeKVBlockBundleBorrowsChunkRefs(t *testing.T) {
 	store := &borrowRecordingStateStore{InMemoryStore: state.NewInMemoryStore(nil)}
 	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 2)
@@ -440,6 +566,145 @@ func TestStateSession_Good_WakeKVBlockBundleBorrowsChunkRefs(t *testing.T) {
 	core.AssertEqual(t, len(manifest.Blocks), len(store.borrowRefs))
 	core.AssertEqual(t, manifest.Blocks[0].State.ChunkID, store.borrowRefs[0].ChunkID)
 	core.AssertEqual(t, true, store.borrowRefs[0].HasFrameOffset)
+}
+
+func TestStateSession_Good_WakeKVBlockBundleRetainsReleasedRawBytes(t *testing.T) {
+	store := &releasingBorrowStateStore{InMemoryStore: state.NewInMemoryStore(nil)}
+	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 2)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(
+		0,
+		2,
+		2,
+		[]float32{1, 0, 0, 1},
+		[]float32{0.75, -0.5, 0.25, 1},
+	))
+	session := newStateSessionWithRuntime(inference.ModelIdentity{Hash: "model-a"}, inference.TokenizerIdentity{}, nil, cache)
+	_, err = session.SleepState(context.Background(), inference.AgentMemorySleepRequest{
+		Store:    store,
+		EntryURI: "state://entry/kv-release",
+		Model:    inference.ModelIdentity{Hash: "model-a"},
+		Encoding: rocmKVBlockBundleEncoding,
+	})
+	core.RequireNoError(t, err)
+
+	woken := NewStateSession(inference.ModelIdentity{Hash: "model-a"}, inference.TokenizerIdentity{}, nil)
+	wake, err := woken.WakeState(context.Background(), inference.AgentMemoryWakeRequest{
+		Store:    store,
+		EntryURI: "state://entry/kv-release",
+		Model:    inference.ModelIdentity{Hash: "model-a"},
+	})
+
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, "block_stream", wake.Labels["kv_restore_path"])
+	core.AssertEqual(t, 1, store.releaseCalls)
+	restored, ok := woken.runtime.(*rocmKVCache)
+	core.RequireTrue(t, ok)
+	keys, values, err := restored.Restore(0, 2)
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{1, 0, 0, 1}, keys, 0.02)
+	assertFloat32SlicesNear(t, []float32{0.75, -0.5, 0.25, 1}, values, 0.15)
+}
+
+func BenchmarkStateSessionWakeKVBlockBundlePrefixTrim_KQ8VQ4Page(b *testing.B) {
+	store := state.NewInMemoryStore(nil)
+	keys, values := benchmarkROCmKVVectors(512, 128, 128)
+	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 512)
+	if err != nil {
+		b.Fatalf("create KV cache: %v", err)
+	}
+	if err := cache.AppendVectors(0, 128, 128, keys, values); err != nil {
+		b.Fatalf("append KV cache vectors: %v", err)
+	}
+	session := newStateSessionWithRuntime(inference.ModelIdentity{Hash: "model-a"}, inference.TokenizerIdentity{}, nil, cache)
+	sleep, err := session.SleepState(context.Background(), inference.AgentMemorySleepRequest{
+		Store:    store,
+		EntryURI: "state://entry/kv-prefix-bench",
+		Model:    inference.ModelIdentity{Hash: "model-a"},
+		Encoding: rocmKVBlockBundleEncoding,
+	})
+	if err != nil {
+		b.Fatalf("sleep KV block bundle: %v", err)
+	}
+	chunk, err := store.ResolveURI(context.Background(), sleep.Bundle.URI)
+	if err != nil {
+		b.Fatalf("resolve KV block bundle: %v", err)
+	}
+
+	b.SetBytes(int64(384 * 128 * 2 * 4))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		woken, ok, err := wakeKVCacheBlockBundleFromChunk(context.Background(), store, chunk, 384)
+		if err != nil {
+			b.Fatalf("wake KV block bundle prefix: %v", err)
+		}
+		if !ok || woken.TokenCount() != 384 || woken.PageCount() != 1 {
+			b.Fatalf("woken prefix ok=%v tokens=%d pages=%d, want true/384/1", ok, woken.TokenCount(), woken.PageCount())
+		}
+	}
+}
+
+func BenchmarkStateSessionWakeKVJSONBlockBundlePrefixTrim_KQ8VQ4Page(b *testing.B) {
+	store := state.NewInMemoryStore(nil)
+	keys, values := benchmarkROCmKVVectors(512, 128, 128)
+	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 512)
+	if err != nil {
+		b.Fatalf("create KV cache: %v", err)
+	}
+	if err := cache.AppendVectors(0, 128, 128, keys, values); err != nil {
+		b.Fatalf("append KV cache vectors: %v", err)
+	}
+	blockPayload, err := cache.snapshotBlock(cache.blocks[0])
+	if err != nil {
+		b.Fatalf("snapshot KV block: %v", err)
+	}
+	blockURI := "state://entry/kv-json-prefix-bench/block/0"
+	blockRef, err := store.PutBytes(context.Background(), blockPayload, state.PutOptions{
+		URI:   blockURI,
+		Kind:  "kv-block",
+		Track: rocmKVSnapshotEncoding,
+	})
+	if err != nil {
+		b.Fatalf("write KV block: %v", err)
+	}
+	manifest := rocmKVBlockBundleSnapshot{
+		Version:    1,
+		Kind:       rocmKVBlockBundleKind,
+		Mode:       rocmKVCacheModeKQ8VQ4,
+		BlockSize:  512,
+		TokenCount: 512,
+		Blocks: []rocmKVBlockBundleRef{{
+			Index:      0,
+			URI:        blockURI,
+			ChunkID:    blockRef.ChunkID,
+			State:      blockRef,
+			TokenStart: 0,
+			TokenCount: 512,
+			KeyWidth:   128,
+			ValueWidth: 128,
+			SizeBytes:  uint64(len(blockPayload)),
+			Encoding:   rocmKVSnapshotEncoding,
+		}},
+	}
+	manifestPayload, err := json.Marshal(manifest)
+	if err != nil {
+		b.Fatalf("marshal KV block bundle: %v", err)
+	}
+	chunk := state.Chunk{Data: manifestPayload}
+
+	b.SetBytes(int64(384 * 128 * 2 * 4))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		woken, ok, err := wakeKVCacheBlockBundleFromChunk(context.Background(), store, chunk, 384)
+		if err != nil {
+			b.Fatalf("wake JSON KV block bundle prefix: %v", err)
+		}
+		if !ok || woken.TokenCount() != 384 || woken.PageCount() != 1 {
+			b.Fatalf("woken prefix ok=%v tokens=%d pages=%d, want true/384/1", ok, woken.TokenCount(), woken.PageCount())
+		}
+	}
 }
 
 func TestStateSession_Bad_SleepStateRuntimeOwnedKVWriteFailureKeepsRuntime(t *testing.T) {
@@ -534,6 +799,62 @@ func TestStateSession_Good_SleepStateSerializesHIPDeviceKVSnapshot(t *testing.T)
 	core.RequireNoError(t, err)
 	assertFloat32SlicesNear(t, []float32{1, 0.5, -1, 0}, keys, 0.01)
 	assertFloat32SlicesNear(t, []float32{0.75, -0.5, 0.25, 1, -1, 0.5}, values, 0.15)
+}
+
+func TestStateSession_Good_SleepWakeGemma4Q4DeviceStateBundle(t *testing.T) {
+	store := state.NewInMemoryStore(nil)
+	driver := &fakeHIPDriver{available: true}
+	runtime := hipNewGemma4Q4DeviceDecodeState(rocmKVCacheModeKQ8VQ4, 2)
+	for layerIndex := 0; layerIndex < 2; layerIndex++ {
+		cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 2)
+		core.RequireNoError(t, err)
+		offset := float32(layerIndex)
+		core.RequireNoError(t, cache.AppendVectors(
+			0,
+			2,
+			2,
+			[]float32{1 + offset, 0, 0, 1 + offset},
+			[]float32{0.75 + offset, -0.5, 0.25, 1 + offset},
+		))
+		device, err := cache.MirrorToDevice(driver)
+		core.RequireNoError(t, err)
+		table, err := device.kernelDescriptorTableLabeled("rocm.StateSession.Gemma4Q4", "test_roundtrip")
+		core.RequireNoError(t, err)
+		launch, err := device.KernelLaunchDescriptor(table)
+		core.RequireNoError(t, err)
+		runtime.layers = append(runtime.layers, hipGemma4Q4DeviceLayerKVState{cache: device, descriptorTable: table, launch: launch})
+	}
+	model := inference.ModelIdentity{Architecture: "gemma4_text", QuantBits: 4, Labels: map[string]string{"gemma4_size": "E2B"}}
+	session := newStateSessionWithRuntime(model, inference.TokenizerIdentity{}, nil, runtime)
+	defer session.Close()
+
+	sleep, err := session.SleepState(context.Background(), inference.AgentMemorySleepRequest{
+		Store:    store,
+		EntryURI: "state://entry/gemma4-q4",
+	})
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, rocmGemma4Q4StateBundleEncoding, sleep.Encoding)
+	core.AssertEqual(t, "layer_block_bundles", sleep.Labels["gemma4_q4_state_bundle"])
+	core.AssertEqual(t, 2, sleep.TokenCount)
+	core.AssertEqual(t, 2, sleep.BlocksWritten)
+
+	woken := NewStateSession(model, inference.TokenizerIdentity{}, nil)
+	defer woken.Close()
+	wake, err := woken.WakeState(context.Background(), inference.AgentMemoryWakeRequest{
+		Store:    store,
+		EntryURI: "state://entry/gemma4-q4",
+	})
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, rocmGemma4Q4StateBundleEncoding, wake.Bundle.Encoding)
+	core.AssertEqual(t, "gemma4_q4_layer_block_stream", wake.Labels["kv_restore_path"])
+	restored, ok := woken.runtime.(*hipGemma4Q4HostDecodeStateRuntime)
+	core.RequireTrue(t, ok)
+	core.AssertEqual(t, 2, restored.tokenCount)
+	core.AssertEqual(t, 2, len(restored.state.Layers))
+	assertFloat32SlicesNear(t, []float32{1, 0, 0, 1}, restored.state.Layers[0].Keys, 0.02)
+	assertFloat32SlicesNear(t, []float32{0.75, -0.5, 0.25, 1}, restored.state.Layers[0].Values, 0.15)
+	assertFloat32SlicesNear(t, []float32{2, 0, 0, 2}, restored.state.Layers[1].Keys, 0.02)
+	assertFloat32SlicesNear(t, []float32{1.75, -0.5, 0.25, 2}, restored.state.Layers[1].Values, 0.15)
 }
 
 func TestStateSession_Bad_SleepStateDeviceKVWriteFailureKeepsRuntime(t *testing.T) {
@@ -814,6 +1135,135 @@ func TestStateSession_Bad_SleepRejectsModelHashMismatch(t *testing.T) {
 	core.AssertContains(t, err.Error(), "model hash mismatch")
 }
 
+func TestStateSession_Bad_SleepRejectsGemma4ModelQuantMismatch(t *testing.T) {
+	store := state.NewInMemoryStore(nil)
+	sessionModel := gemma4StateModelIdentityForTest("/models/lmstudio-community-gemma-4-e2b-it-8bit", 35, 1536)
+	reqModel := gemma4StateModelIdentityForTest("/models/lmstudio-community-gemma-4-e2b-it-6bit", 35, 1536)
+	session := NewStateSession(sessionModel, inference.TokenizerIdentity{}, nil)
+
+	_, err := session.SleepState(context.Background(), inference.AgentMemorySleepRequest{
+		Store:    store,
+		EntryURI: "state://entry/new",
+		Model:    reqModel,
+	})
+
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "model Gemma4 quant mismatch")
+}
+
+func TestStateSession_Bad_SleepRejectsGemma4AdapterBaseMismatch(t *testing.T) {
+	store := state.NewInMemoryStore(nil)
+	model := inference.ModelIdentity{
+		Path:         "/models/lmstudio-community-gemma-4-e4b-it-6bit",
+		Architecture: "gemma4_text",
+		NumLayers:    26,
+		HiddenSize:   2304,
+		VocabSize:    262144,
+	}
+	session := NewStateSession(model, inference.TokenizerIdentity{}, nil)
+
+	_, err := session.SleepState(context.Background(), inference.AgentMemorySleepRequest{
+		Store:    store,
+		EntryURI: "state://entry/new",
+		Model:    model,
+		Adapter: inference.AdapterIdentity{
+			Path:   "domain.safetensors",
+			Format: "lora",
+			Labels: map[string]string{
+				"adapter_base_architecture":      "gemma4_text",
+				"adapter_base_gemma4_size":       "E2B",
+				"adapter_base_gemma4_quant_mode": "q6",
+			},
+		},
+	})
+
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "adapter base Gemma4 size mismatch")
+}
+
+func TestStateSession_Bad_WakeRejectsGemma4AdapterBaseMismatch(t *testing.T) {
+	model := inference.ModelIdentity{
+		Path:         "/models/lmstudio-community-gemma-4-e4b-it-6bit",
+		Architecture: "gemma4_text",
+		NumLayers:    26,
+		HiddenSize:   2304,
+		VocabSize:    262144,
+	}
+	session := NewStateSession(model, inference.TokenizerIdentity{}, nil)
+
+	_, err := session.WakeState(context.Background(), inference.AgentMemoryWakeRequest{
+		EntryURI: "state://entry/new",
+		Model:    model,
+		Adapter: inference.AdapterIdentity{
+			Path:   "domain.safetensors",
+			Format: "lora",
+			Labels: map[string]string{
+				"adapter_base_architecture":      "gemma4_text",
+				"adapter_base_gemma4_size":       "E2B",
+				"adapter_base_gemma4_quant_mode": "q6",
+			},
+		},
+	})
+
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "adapter base Gemma4 size mismatch")
+}
+
+func TestStateSession_Bad_WakeRejectsGemma4AdapterBaseQuantGroupMismatch(t *testing.T) {
+	model := inference.ModelIdentity{
+		Path:         "/models/lmstudio-community-gemma-4-e4b-it-6bit",
+		Architecture: "gemma4_text",
+		NumLayers:    26,
+		HiddenSize:   2304,
+		VocabSize:    262144,
+	}
+	session := NewStateSession(model, inference.TokenizerIdentity{}, nil)
+
+	_, err := session.WakeState(context.Background(), inference.AgentMemoryWakeRequest{
+		EntryURI: "state://entry/new",
+		Model:    model,
+		Adapter: inference.AdapterIdentity{
+			Path:   "domain.safetensors",
+			Format: "lora",
+			Labels: map[string]string{
+				"adapter_base_architecture":       "gemma4_text",
+				"adapter_base_gemma4_size":        "E4B",
+				"adapter_base_gemma4_quant_mode":  "q6",
+				"adapter_base_gemma4_quant_group": "32",
+			},
+		},
+	})
+
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "adapter base Gemma4 quant group mismatch")
+}
+
+func TestStateSession_Bad_WakeRejectsIncompleteGemma4AdapterBaseIdentity(t *testing.T) {
+	model := inference.ModelIdentity{
+		Path:         "/models/lmstudio-community-gemma-4-e4b-it-6bit",
+		Architecture: "gemma4_text",
+		NumLayers:    26,
+		HiddenSize:   2304,
+		VocabSize:    262144,
+	}
+	session := NewStateSession(model, inference.TokenizerIdentity{}, nil)
+
+	_, err := session.WakeState(context.Background(), inference.AgentMemoryWakeRequest{
+		EntryURI: "state://entry/new",
+		Model:    model,
+		Adapter: inference.AdapterIdentity{
+			Path:   "domain.safetensors",
+			Format: "lora",
+			Labels: map[string]string{
+				"adapter_base_gemma4_generate_status": Gemma4GenerateLinked,
+			},
+		},
+	})
+
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "adapter base Gemma4 identity is incomplete")
+}
+
 func TestStateSession_Bad_WakeRejectsMalformedKVSnapshot(t *testing.T) {
 	store := state.NewInMemoryStore(nil)
 	_, err := store.PutBytes(context.Background(), []byte(`{"version":1,"mode":"q8","block_size":2,"blocks":[{"token_start":0,"token_count":1,"key":{"encoding":"q8","length":1,"scale":0,"q8":[1]},"value":{"encoding":"q8","length":1,"scale":1,"q8":[1]}}]}`), state.PutOptions{URI: "state://entry/bad-kv"})
@@ -1038,6 +1488,65 @@ func TestStateSession_Good_RocmModelCapturesMetadataStateBundle(t *testing.T) {
 	core.AssertEqual(t, "use_sleep_state", bundle.Labels["state_bundle_kv_refs"])
 }
 
+func TestStateSession_Good_Gemma4CaptureStateUsesRemainingMaxTokens(t *testing.T) {
+	model := &rocmModel{
+		modelPath: "/models/lmstudio-community-gemma-4-e4b-it-6bit",
+		modelType: "gemma4_text",
+		modelInfo: inference.ModelInfo{
+			Architecture: "gemma4_text",
+			NumLayers:    26,
+			HiddenSize:   2304,
+			VocabSize:    262144,
+		},
+		native: &fakeNativeModel{},
+	}
+
+	bundle, err := model.CaptureState(context.Background(), "one two three", inference.WithTemperature(0.25))
+
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, "gemma4_text", bundle.Model.Architecture)
+	core.AssertEqual(t, "q6", bundle.Model.QuantType)
+	core.AssertEqual(t, 6, bundle.Model.QuantBits)
+	core.AssertEqual(t, "E4B", bundle.Model.Labels["gemma4_size"])
+	core.AssertEqual(t, "q6", bundle.Model.Labels["gemma4_quant_mode"])
+	core.AssertEqual(t, "E4B", bundle.Labels["gemma4_size"])
+	core.AssertEqual(t, "q6", bundle.Labels["gemma4_quant_mode"])
+	core.AssertEqual(t, Gemma4RuntimeMLXAffine, bundle.Labels["gemma4_runtime"])
+	core.AssertEqual(t, Gemma4GenerateLinked, bundle.Labels["gemma4_generate_status"])
+	core.AssertEqual(t, "gemma4_mlx_affine", bundle.Labels["production_quant_policy"])
+	core.AssertEqual(t, ROCmStateContextRegistryContract, bundle.Labels["engine_state_context_route_contract"])
+	core.AssertEqual(t, "true", bundle.Labels["engine_state_context_prompt_replay_refused"])
+	core.AssertEqual(t, ROCmLoRAAdapterRegistryContract, bundle.Labels["engine_lora_route_contract"])
+	core.AssertEqual(t, "gemma4", bundle.Labels["engine_lora_target_policy"])
+	core.AssertEqual(t, ROCmAttachedDrafterRegistryContract, bundle.Labels["engine_attached_drafter_route_contract"])
+	core.AssertEqual(t, "target", bundle.Labels["engine_attached_drafter_role"])
+	core.AssertEqual(t, defaultContextLengthCap-3, bundle.Sampler.MaxTokens)
+	core.AssertEqual(t, float32(0.25), bundle.Sampler.Temperature)
+
+	negativeBundle, err := model.CaptureState(context.Background(), "one two three", inference.WithMaxTokens(-1))
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, defaultContextLengthCap-3, negativeBundle.Sampler.MaxTokens)
+}
+
+func TestStateSession_Bad_Gemma4CaptureStateRejectsMaxTokensPastWindow(t *testing.T) {
+	model := &rocmModel{
+		modelPath: "/models/lmstudio-community-gemma-4-e4b-it-6bit",
+		modelType: "gemma4_text",
+		modelInfo: inference.ModelInfo{
+			Architecture: "gemma4_text",
+			NumLayers:    26,
+			HiddenSize:   2304,
+			VocabSize:    262144,
+		},
+		native: &fakeNativeModel{},
+	}
+
+	_, err := model.CaptureState(context.Background(), strings.Repeat("x ", defaultContextLengthCap-1), inference.WithMaxTokens(2))
+
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "remaining model context window")
+}
+
 func TestStateSession_Bad_RocmModelCaptureStateRejectsNilModel(t *testing.T) {
 	var model *rocmModel
 
@@ -1138,6 +1647,34 @@ func TestStateSession_Bad_RocmModelRestoreStateRejectsIncompatibleModel(t *testi
 
 	core.AssertError(t, err)
 	core.AssertContains(t, err.Error(), "model architecture mismatch")
+}
+
+func TestStateSession_Bad_RocmModelRestoreStateRejectsGemma4RunnableMismatch(t *testing.T) {
+	model := &rocmModel{
+		modelPath: "/models/lmstudio-community-gemma-4-31b-it-6bit",
+		modelType: "gemma4_text",
+		modelInfo: inference.ModelInfo{
+			Architecture: "gemma4_text",
+			NumLayers:    64,
+			HiddenSize:   4096,
+			VocabSize:    262144,
+		},
+	}
+	bundleModel := gemma4StateModelIdentityForTest("/models/lmstudio-community-gemma-4-31b-it-6bit", 64, 4096)
+	bundleModel.Labels = map[string]string{
+		"gemma4_size":             "31B",
+		"gemma4_quant_mode":       "q6-status",
+		"gemma4_runtime":          Gemma4RuntimePlanned,
+		"gemma4_generate_status":  Gemma4GeneratePlannedOnly,
+		"gemma4_pack_supported":   "true",
+		"gemma4_runnable_on_card": "true",
+	}
+
+	err := model.RestoreState(context.Background(), &inference.StateBundle{Model: bundleModel})
+
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "model Gemma4 runnable status mismatch")
+	core.AssertNil(t, model.state)
 }
 
 func TestStateSession_Bad_RocmModelRestoreStateRejectsNilBundle(t *testing.T) {
@@ -1462,6 +1999,147 @@ func TestStateSession_Good_RocmModelAdapterChangeResetsState(t *testing.T) {
 	core.AssertContains(t, err.Error(), "KV runtime is required")
 }
 
+func TestStateSession_Good_RocmModelSleepStateDefaultsActiveGemma4Adapter(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		path    string
+		size    string
+		mode    string
+		group   string
+		runtime string
+		status  string
+	}{
+		{name: "linked_q4", path: "/models/lmstudio-community-gemma-4-e2b-it-4bit", size: "E2B", mode: "q4", group: "64", runtime: Gemma4RuntimeMLXAffine, status: Gemma4GenerateLinked},
+		{name: "planned_mxfp8", path: "/models/lmstudio-community-gemma-4-e4b-it-mxfp8", size: "E4B", mode: "mxfp8", group: "32", runtime: Gemma4RuntimePlanned, status: Gemma4GeneratePlannedOnly},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := state.NewInMemoryStore(nil)
+			cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 2)
+			core.RequireNoError(t, err)
+			core.RequireNoError(t, cache.AppendVectors(0, 1, 1, []float32{1, 0, 0}, []float32{0, 1, 0}))
+			model := &rocmModel{
+				modelPath: tc.path,
+				modelType: "gemma4_text",
+				modelInfo: inference.ModelInfo{
+					Architecture: "gemma4_text",
+					VocabSize:    262144,
+				},
+				native: &fakeNativeModel{
+					adapter: inference.AdapterIdentity{
+						Path:   "domain.safetensors",
+						Format: "lora",
+					},
+				},
+			}
+			model.state = newStateSessionWithRuntime(model.modelIdentity(), inference.TokenizerIdentity{}, nil, cache)
+
+			sleep, err := model.SleepState(context.Background(), inference.AgentMemorySleepRequest{
+				Store:    store,
+				EntryURI: "state://entry/model-active-adapter-" + tc.name,
+				Encoding: rocmKVBlockBundleEncoding,
+			})
+
+			core.RequireNoError(t, err)
+			core.AssertEqual(t, "metadata_only", sleep.Labels["state_adapter"])
+			core.AssertEqual(t, tc.size, sleep.Labels["adapter_base_gemma4_size"])
+			core.AssertEqual(t, tc.mode, sleep.Labels["adapter_base_gemma4_quant_mode"])
+			core.AssertEqual(t, tc.group, sleep.Labels["adapter_base_gemma4_quant_group"])
+			core.AssertEqual(t, tc.runtime, sleep.Entry.StateRefs[0].Labels["adapter_base_gemma4_runtime"])
+			core.AssertEqual(t, tc.status, sleep.Entry.StateRefs[0].Labels["adapter_base_gemma4_generate_status"])
+		})
+	}
+}
+
+func TestStateSession_Good_Gemma4RetainedKVRefsCarryIdentityLabels(t *testing.T) {
+	store := state.NewInMemoryStore(nil)
+	cache, err := newROCmKVCache(rocmKVCacheModeKQ8VQ4, 2)
+	core.RequireNoError(t, err)
+	core.RequireNoError(t, cache.AppendVectors(0, 3, 3, []float32{1, 0, 0, 1, 2, 0}, []float32{0, 1, 0, 1, 0, 2}))
+	model := &rocmModel{
+		modelPath: "/models/lmstudio-community-gemma-4-e4b-it-6bit",
+		modelType: "gemma4_text",
+		modelInfo: inference.ModelInfo{
+			Architecture: "gemma4_text",
+			NumLayers:    26,
+			HiddenSize:   2304,
+			VocabSize:    262144,
+		},
+	}
+	identity := model.modelIdentity()
+	sleeping := newStateSessionWithRuntime(identity, inference.TokenizerIdentity{}, nil, cache)
+	source, err := sleeping.SleepState(context.Background(), inference.AgentMemorySleepRequest{
+		Store:    store,
+		EntryURI: "state://entry/gemma4-source",
+		Model:    identity,
+		Encoding: rocmKVBlockBundleEncoding,
+	})
+	core.RequireNoError(t, err)
+
+	wake, err := model.WakeState(context.Background(), inference.AgentMemoryWakeRequest{
+		Store:    store,
+		IndexURI: source.Entry.IndexURI,
+		Model:    identity,
+	})
+	core.RequireNoError(t, err)
+	assertGemma4RetainedKVLabels(t, wake.Labels, rocmKVCacheModeKQ8VQ4)
+	assertGemma4RetainedKVLabels(t, wake.Entry.Labels, rocmKVCacheModeKQ8VQ4)
+	assertGemma4RetainedKVLabels(t, wake.Bundle.Labels, rocmKVCacheModeKQ8VQ4)
+	assertGemma4RetainedKVLabels(t, wake.Index.Labels, rocmKVCacheModeKQ8VQ4)
+
+	roundtrip, err := model.SleepState(context.Background(), inference.AgentMemorySleepRequest{
+		Store:    store,
+		EntryURI: "state://entry/gemma4-roundtrip",
+		Model:    identity,
+		Encoding: rocmKVBlockBundleEncoding,
+	})
+	core.RequireNoError(t, err)
+	assertGemma4RetainedKVLabels(t, roundtrip.Labels, rocmKVCacheModeKQ8VQ4)
+	assertGemma4RetainedKVLabels(t, roundtrip.Entry.Labels, rocmKVCacheModeKQ8VQ4)
+	assertGemma4RetainedKVLabels(t, roundtrip.Bundle.Labels, rocmKVCacheModeKQ8VQ4)
+	assertGemma4RetainedKVLabels(t, roundtrip.Index.Labels, rocmKVCacheModeKQ8VQ4)
+	core.RequireTrue(t, len(roundtrip.Entry.StateRefs) == 1)
+	assertGemma4RetainedKVLabels(t, roundtrip.Entry.StateRefs[0].Labels, rocmKVCacheModeKQ8VQ4)
+
+	forked, forkWake, err := model.ForkState(context.Background(), inference.AgentMemoryWakeRequest{
+		Store:    store,
+		IndexURI: source.Entry.IndexURI,
+		Model:    identity,
+	})
+	core.RequireNoError(t, err)
+	core.RequireTrue(t, forked != nil)
+	assertGemma4RetainedKVLabels(t, forkWake.Labels, rocmKVCacheModeKQ8VQ4)
+	assertGemma4RetainedKVLabels(t, forkWake.Index.Labels, rocmKVCacheModeKQ8VQ4)
+}
+
+func assertGemma4RetainedKVLabels(t *testing.T, labels map[string]string, cacheMode string) {
+	t.Helper()
+	core.AssertEqual(t, "E4B", labels["gemma4_size"])
+	core.AssertEqual(t, "q6", labels["gemma4_quant_mode"])
+	core.AssertEqual(t, Gemma4RuntimeMLXAffine, labels["gemma4_runtime"])
+	core.AssertEqual(t, Gemma4GenerateLinked, labels["gemma4_generate_status"])
+	core.AssertEqual(t, "gemma4_mlx_affine", labels["production_quant_policy"])
+	core.AssertEqual(t, cacheMode, labels["cache_mode"])
+	core.AssertEqual(t, ROCmStateContextRegistryContract, labels["engine_state_context_route_contract"])
+	core.AssertEqual(t, "true", labels["engine_state_context_prompt_replay_refused"])
+	core.AssertEqual(t, "true", labels["engine_state_context_runtime_owned_kv"])
+	core.AssertEqual(t, ROCmLoRAAdapterRegistryContract, labels["engine_lora_route_contract"])
+	core.AssertEqual(t, "gemma4", labels["engine_lora_target_policy"])
+	core.AssertEqual(t, ROCmAttachedDrafterRegistryContract, labels["engine_attached_drafter_route_contract"])
+	core.AssertEqual(t, "target", labels["engine_attached_drafter_role"])
+	core.AssertEqual(t, hipKernelStatusNotLinked, labels["engine_attached_drafter_native_attachment"])
+	core.AssertEqual(t, "forbidden", labels["engine_attached_drafter_prompt_replay_fallback"])
+}
+
+func gemma4StateModelIdentityForTest(path string, layers, hiddenSize int) inference.ModelIdentity {
+	return inference.ModelIdentity{
+		Path:         path,
+		Architecture: "gemma4_text",
+		NumLayers:    layers,
+		HiddenSize:   hiddenSize,
+		VocabSize:    262144,
+	}
+}
+
 func seedStateSessionKV(t *testing.T, store *state.InMemoryStore, entryURI string, model inference.ModelIdentity, tokenizer inference.TokenizerIdentity) *inference.AgentMemorySleepResult {
 	t.Helper()
 	cache, err := newROCmKVCache(rocmKVCacheModeQ8, defaultROCmStateBlockSize)
@@ -1498,6 +2176,11 @@ type borrowRecordingStateStore struct {
 	borrowRefs []state.ChunkRef
 }
 
+type releasingBorrowStateStore struct {
+	*state.InMemoryStore
+	releaseCalls int
+}
+
 type failingStateRuntime struct {
 	err        error
 	closeCalls int
@@ -1532,4 +2215,21 @@ func (store *borrowRecordingStateStore) BorrowRefBytes(ctx context.Context, ref 
 		return state.BorrowedChunk{}, err
 	}
 	return state.BorrowedChunk{Ref: chunk.Ref, Data: chunk.Data}, nil
+}
+
+func (store *releasingBorrowStateStore) BorrowRefBytes(ctx context.Context, ref state.ChunkRef) (state.BorrowedChunk, error) {
+	chunk, err := state.ResolveRefBytes(ctx, store.InMemoryStore, ref)
+	if err != nil {
+		return state.BorrowedChunk{}, err
+	}
+	return state.BorrowedChunk{
+		Ref:  chunk.Ref,
+		Data: chunk.Data,
+		Release: func() {
+			store.releaseCalls++
+			for i := range chunk.Data {
+				chunk.Data[i] = 0xff
+			}
+		},
+	}, nil
 }

@@ -126,9 +126,18 @@ func (req hipCodebookLookupRequest) launchArgs(buffers *hipCodebookDeviceBuffers
 }
 
 func (args hipCodebookLaunchArgs) Binary() ([]byte, error) {
+	payload := make([]byte, hipCodebookLaunchArgsBytes)
+	return args.BinaryInto(payload)
+}
+
+func (args hipCodebookLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.CodePointer == 0 || args.CodebookPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.CodebookLaunch", "code, codebook, and output pointers are required", nil)
 	}
+	if len(payload) < hipCodebookLaunchArgsBytes {
+		return nil, core.E("rocm.hip.CodebookLaunch", "launch arg payload buffer is too small", nil)
+	}
+	payload = payload[:hipCodebookLaunchArgsBytes]
 	codeCount, err := rocmDeviceKVPositiveUint32("code count", args.CodeCount)
 	if err != nil {
 		return nil, err
@@ -163,7 +172,6 @@ func (args hipCodebookLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, core.E("rocm.hip.CodebookLaunch", "output byte count", err)
 	}
-	payload := make([]byte, hipCodebookLaunchArgsBytes)
 	binary.LittleEndian.PutUint32(payload[0:], hipCodebookLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.CodePointer))
@@ -192,6 +200,16 @@ func (buffers *hipCodebookDeviceBuffers) Close() error {
 }
 
 func (buffers *hipCodebookDeviceBuffers) ReadOutput() ([]float32, error) {
+	if buffers == nil {
+		return nil, core.E("rocm.hip.CodebookLaunch", "codebook output buffer is required", nil)
+	}
+	outputCount := buffers.CodeCount * buffers.CodeDim
+	payload := make([]byte, outputCount*4)
+	values := make([]float32, outputCount)
+	return buffers.ReadOutputInto(values, payload)
+}
+
+func (buffers *hipCodebookDeviceBuffers) ReadOutputInto(values []float32, payload []byte) ([]float32, error) {
 	if buffers == nil || buffers.Output == nil || buffers.Output.Pointer() == 0 {
 		return nil, core.E("rocm.hip.CodebookLaunch", "codebook output buffer is required", nil)
 	}
@@ -199,11 +217,14 @@ func (buffers *hipCodebookDeviceBuffers) ReadOutput() ([]float32, error) {
 	if buffers.CodeCount <= 0 || buffers.CodeDim <= 0 || buffers.Output.Count() != outputCount || buffers.Output.SizeBytes() != uint64(outputCount*4) {
 		return nil, core.E("rocm.hip.CodebookLaunch", "codebook output byte count mismatch", nil)
 	}
-	payload := make([]byte, buffers.Output.SizeBytes())
+	if len(payload) < int(buffers.Output.SizeBytes()) {
+		return nil, core.E("rocm.hip.CodebookLaunch", "codebook output payload buffer is too small", nil)
+	}
+	payload = payload[:buffers.Output.SizeBytes()]
 	if err := buffers.Output.driver.CopyDeviceToHost(buffers.Output.Pointer(), payload); err != nil {
 		return nil, core.E("rocm.hip.CodebookLaunch", "copy codebook output", err)
 	}
-	values, err := hipFloat32PayloadValues(payload)
+	values, err := hipFloat32PayloadValuesInto(values, payload)
 	if err != nil {
 		return nil, err
 	}

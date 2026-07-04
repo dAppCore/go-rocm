@@ -32,3 +32,15 @@ func TestVram_GetVRAMInfo_Ugly(t *testing.T) {
 		core.AssertContains(t, err.Error(), "rocm.GetVRAMInfo")
 	}
 }
+
+func BenchmarkGetVRAMInfo_Cached(b *testing.B) {
+	if _, err := GetVRAMInfo(); err != nil {
+		b.Skipf("GetVRAMInfo unavailable: %v", err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := GetVRAMInfo(); err != nil {
+			b.Fatalf("GetVRAMInfo: %v", err)
+		}
+	}
+}

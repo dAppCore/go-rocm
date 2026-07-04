@@ -58,13 +58,20 @@ func hipReferenceEmbeddingLookup(table []float32, vocabSize, hiddenSize int, tok
 }
 
 func hipReferenceMLXQ4EmbeddingLookup(weights []uint32, scales []uint16, biases []uint16, vocabSize, hiddenSize, groupSize int, tokenIDs []int32) ([]float32, error) {
-	if err := validateHIPMLXQ4ProjectionShape(hiddenSize, len(weights), len(scales), len(biases), vocabSize, hiddenSize, groupSize); err != nil {
+	return hipReferenceMLXAffineEmbeddingLookup(weights, scales, biases, vocabSize, hiddenSize, groupSize, tokenIDs, hipMLXQ4ProjectionBits)
+}
+
+func hipReferenceMLXAffineEmbeddingLookup(weights []uint32, scales []uint16, biases []uint16, vocabSize, hiddenSize, groupSize int, tokenIDs []int32, bits int) ([]float32, error) {
+	if err := validateHIPMLXAffineProjectionShape(hiddenSize, len(weights), len(scales), len(biases), vocabSize, hiddenSize, groupSize, bits); err != nil {
 		return nil, err
 	}
 	if len(tokenIDs) == 0 {
 		return nil, core.E("rocm.hip.ReferenceMLXQ4EmbeddingLookup", "token ids are required", nil)
 	}
-	packedPerRow := hiddenSize / 8
+	packedPerRow, err := hipMLXAffinePackedCols(hiddenSize, bits)
+	if err != nil {
+		return nil, err
+	}
 	groupsPerRow := hiddenSize / groupSize
 	out := make([]float32, 0, len(tokenIDs)*hiddenSize)
 	for _, id := range tokenIDs {
@@ -73,10 +80,12 @@ func hipReferenceMLXQ4EmbeddingLookup(weights []uint32, scales []uint16, biases 
 		}
 		row := int(id)
 		for dim := 0; dim < hiddenSize; dim++ {
-			word := weights[row*packedPerRow+dim/8]
-			quantized := float32((word >> uint((dim%8)*4)) & 0x0f)
+			quantized, err := hipMLXAffineUnpackValue(weights[row*packedPerRow:], dim, bits)
+			if err != nil {
+				return nil, err
+			}
 			group := row*groupsPerRow + dim/groupSize
-			out = append(out, quantized*hipBFloat16ToFloat32(scales[group])+hipBFloat16ToFloat32(biases[group]))
+			out = append(out, float32(quantized)*hipBFloat16ToFloat32(scales[group])+hipBFloat16ToFloat32(biases[group]))
 		}
 	}
 	return out, nil

@@ -15,9 +15,11 @@ import (
 
 // rocmModel implements inference.TextModel using a llama-server subprocess.
 type rocmModel struct {
-	server    *server
-	modelType string
-	modelInfo inference.ModelInfo
+	server        *server
+	modelPath     string
+	modelType     string
+	modelInfo     inference.ModelInfo
+	contextLength int
 
 	stateMutex  sync.Mutex
 	lastError   error
@@ -221,7 +223,161 @@ func (m *rocmModel) BatchGenerate(ctx context.Context, prompts []string, opts ..
 func (m *rocmModel) ModelType() string { return m.modelType }
 
 // Info returns metadata about the loaded model.
-func (m *rocmModel) Info() inference.ModelInfo { return m.modelInfo }
+func (m *rocmModel) Info() inference.ModelInfo {
+	if m == nil {
+		return inference.ModelInfo{}
+	}
+	info := m.modelInfo
+	architecture := firstNonEmptyString(info.Architecture, m.ModelType())
+	if info == (inference.ModelInfo{}) && architecture == "" && m.modelPath == "" {
+		return inference.ModelInfo{}
+	}
+	identity := inference.ModelIdentity{
+		Path:          m.modelPath,
+		Architecture:  architecture,
+		VocabSize:     info.VocabSize,
+		NumLayers:     info.NumLayers,
+		HiddenSize:    info.HiddenSize,
+		QuantBits:     info.QuantBits,
+		QuantGroup:    info.QuantGroup,
+		ContextLength: m.contextLength,
+	}
+	return modelInfoFromIdentity(rocmGemma4ModelWithInferredPathQuant(identity))
+}
+
+func modelInfoFromIdentity(model inference.ModelIdentity) inference.ModelInfo {
+	return inference.ModelInfo{
+		Architecture: normalizeROCmArchitecture(model.Architecture),
+		VocabSize:    model.VocabSize,
+		NumLayers:    model.NumLayers,
+		HiddenSize:   model.HiddenSize,
+		QuantBits:    model.QuantBits,
+		QuantGroup:   model.QuantGroup,
+	}
+}
+
+func (m *rocmModel) ModelIdentity() inference.ModelIdentity {
+	if m == nil {
+		return inference.ModelIdentity{}
+	}
+	return rocmCloneModelIdentity(m.modelIdentity())
+}
+
+func (m *rocmModel) modelIdentity() inference.ModelIdentity {
+	info := m.Info()
+	if info.Architecture == "" {
+		info.Architecture = m.ModelType()
+	}
+	return rocmGemma4ModelWithInferredPathQuant(inference.ModelIdentity{
+		Path:          m.modelPath,
+		Architecture:  normalizeROCmArchitecture(info.Architecture),
+		VocabSize:     info.VocabSize,
+		NumLayers:     info.NumLayers,
+		HiddenSize:    info.HiddenSize,
+		QuantBits:     info.QuantBits,
+		QuantGroup:    info.QuantGroup,
+		ContextLength: m.contextLength,
+	})
+}
+
+func (m *rocmModel) ModelProfile() ROCmModelProfile {
+	if m == nil {
+		return ROCmModelProfile{}
+	}
+	identity := m.modelIdentity()
+	profile, ok := ResolveROCmModelProfile(identity.Path, identity)
+	if !ok {
+		return ROCmModelProfile{}
+	}
+	return profile
+}
+
+func (m *rocmModel) ModelRoutePlan() ROCmModelRoutePlan {
+	profile := m.ModelProfile()
+	if !profile.Matched() {
+		return ROCmModelRoutePlan{}
+	}
+	plan := ROCmModelRoutePlanForProfile(profile)
+	return rocmModelRoutePlanWithLiveCacheProfile(plan, m)
+}
+
+func (m *rocmModel) Capabilities() inference.CapabilityReport {
+	if m == nil {
+		return inference.CapabilityReport{Runtime: inference.RuntimeIdentity{Backend: "rocm"}}
+	}
+	identity := m.modelIdentity()
+	profile := m.ModelProfile()
+	available := m.server != nil && m.server.alive()
+	runtimeStatus := "unavailable"
+	if available {
+		runtimeStatus = "available"
+	}
+	labels := rocmLegacyMergeStringMaps(map[string]string{
+		"backend":                      "rocm",
+		"native_runtime":               "llama_server",
+		"runtime_status":               runtimeStatus,
+		"production_requires_env_gate": "false",
+		"production_requires_cli_flag": "false",
+	}, identity.Labels)
+	if profile.Matched() {
+		labels = ApplyROCmModelProfileLabels(labels, profile)
+		labels = ApplyROCmModelRoutePlanLabels(labels, ROCmModelRoutePlanForProfileAndModel(profile, m))
+	}
+	capabilities := []inference.Capability{
+		inference.SupportedCapability(inference.CapabilityModelLoad, inference.CapabilityGroupRuntime),
+		inference.SupportedCapability(inference.CapabilityGenerate, inference.CapabilityGroupModel),
+		inference.SupportedCapability(inference.CapabilityChat, inference.CapabilityGroupModel),
+		inference.SupportedCapability(inference.CapabilityClassify, inference.CapabilityGroupModel),
+		inference.SupportedCapability(inference.CapabilityBatchGenerate, inference.CapabilityGroupModel),
+	}
+	if profile.Matched() {
+		for _, id := range profile.EngineFeatures.EnabledCapabilities() {
+			capabilities = rocmLegacySetCapability(capabilities, inference.SupportedCapability(id, inference.CapabilityGroupModel))
+		}
+	}
+	for index := range capabilities {
+		capabilities[index].Labels = cloneStringMap(labels)
+	}
+	return inference.CapabilityReport{
+		Runtime: inference.RuntimeIdentity{
+			Backend:       "rocm",
+			NativeRuntime: false,
+			Labels: map[string]string{
+				"native_runtime":               "llama_server",
+				"production_requires_env_gate": "false",
+				"production_requires_cli_flag": "false",
+			},
+		},
+		Model:        rocmCloneModelIdentity(identity),
+		Available:    available,
+		Capabilities: capabilities,
+		Labels:       cloneStringMap(labels),
+	}
+}
+
+func rocmLegacySetCapability(capabilities []inference.Capability, capability inference.Capability) []inference.Capability {
+	if capability.ID == "" {
+		return capabilities
+	}
+	for index := range capabilities {
+		if capabilities[index].ID == capability.ID {
+			capabilities[index] = capability
+			return capabilities
+		}
+	}
+	return append(capabilities, capability)
+}
+
+func rocmLegacyMergeStringMaps(left, right map[string]string) map[string]string {
+	out := cloneStringMap(left)
+	if out == nil {
+		out = map[string]string{}
+	}
+	for key, value := range right {
+		out[key] = value
+	}
+	return out
+}
 
 // Metrics returns performance metrics from the last inference operation.
 func (m *rocmModel) Metrics() inference.GenerateMetrics {

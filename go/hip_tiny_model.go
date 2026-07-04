@@ -6,10 +6,10 @@ package rocm
 
 import (
 	"context"
+	"encoding/binary"
 	"iter"
 	"math"
 	"math/rand"
-	"os"
 	"strconv"
 	"strings"
 
@@ -594,7 +594,7 @@ func (kernels hipNativeProjectionKernelSet) Generate(ctx context.Context, model 
 	if tokenPromptErr != nil {
 		return emptyTokenSeq, func() error { return tokenPromptErr }
 	}
-	if tokenPrompt {
+	if tokenPrompt && hipLoadedGemma4Q4GenerateLinked(model) {
 		if model == nil {
 			return emptyTokenSeq, func() error { return core.E(hipGemma4Q4Layer0Operation, "loaded model is required", nil) }
 		}
@@ -631,11 +631,11 @@ func (kernels hipNativeProjectionKernelSet) Chat(ctx context.Context, model *hip
 	if err := validateROCmChatMessages("rocm.hip.Chat", messages); err != nil {
 		return emptyTokenSeq, func() error { return err }
 	}
-	prompt, err := model.ApplyChatTemplate(messages)
+	prompt, err := model.applyChatTemplateWithGenerateConfig(messages, cfg)
 	if err != nil {
 		return emptyTokenSeq, func() error { return err }
 	}
-	if _, ok, q4Err := model.loadedGemma4Q4PackageForwardConfig(); ok {
+	if _, ok, q4Err := model.loadedGemma4Q4PackageForwardConfig(); ok && hipLoadedGemma4Q4GenerateLinked(model) {
 		if q4Err != nil {
 			return emptyTokenSeq, func() error { return q4Err }
 		}
@@ -660,7 +660,7 @@ func (kernels hipNativeProjectionKernelSet) Classify(ctx context.Context, model 
 		if hasClassifier {
 			return model.classifyWithSequenceClassifier(ctx, prompts, cfg, classifier)
 		}
-		if q4Cfg, ok, q4Err := model.loadedGemma4Q4PackageForwardConfig(); ok {
+		if q4Cfg, ok, q4Err := model.loadedGemma4Q4PackageForwardConfig(); ok && hipLoadedGemma4Q4GenerateLinked(model) {
 			if q4Err != nil {
 				return nil, q4Err
 			}
@@ -751,7 +751,7 @@ func (kernels hipNativeProjectionKernelSet) BatchGenerate(ctx context.Context, m
 	if err := validateROCmPromptBatch("rocm.hip.BatchGenerate", prompts); err != nil {
 		return nil, err
 	}
-	if q4Cfg, ok, q4Err := model.loadedGemma4Q4PackageForwardConfig(); ok {
+	if q4Cfg, ok, q4Err := model.loadedGemma4Q4PackageForwardConfig(); ok && hipLoadedGemma4Q4GenerateLinked(model) {
 		if q4Err != nil {
 			return nil, q4Err
 		}
@@ -796,7 +796,7 @@ func hipGemma4Q4BatchGenerate(ctx context.Context, model *hipLoadedModel, q4Cfg 
 func (kernels hipNativeProjectionKernelSet) Prefill(ctx context.Context, model *hipLoadedModel, req hipPrefillRequest) (hipPrefillResult, error) {
 	tinyCfg, err := model.loadedTinyLMConfig()
 	if err != nil {
-		if q4Cfg, ok, q4Err := model.loadedGemma4Q4PackageForwardConfig(); ok {
+		if q4Cfg, ok, q4Err := model.loadedGemma4Q4PackageForwardConfig(); ok && hipLoadedGemma4Q4GenerateLinked(model) {
 			if q4Err != nil {
 				return hipPrefillResult{}, q4Err
 			}
@@ -857,7 +857,7 @@ func (kernels hipNativeProjectionKernelSet) Prefill(ctx context.Context, model *
 }
 
 func (kernels hipNativeProjectionKernelSet) Decode(ctx context.Context, model *hipLoadedModel, req hipDecodeRequest) (hipDecodeResult, error) {
-	if q4Cfg, ok, q4Err := model.loadedGemma4Q4PackageForwardConfig(); ok {
+	if q4Cfg, ok, q4Err := model.loadedGemma4Q4PackageForwardConfig(); ok && hipLoadedGemma4Q4GenerateLinked(model) {
 		if q4Err != nil {
 			return hipDecodeResult{}, q4Err
 		}
@@ -873,7 +873,7 @@ func (kernels hipNativeProjectionKernelSet) Decode(ctx context.Context, model *h
 	if err := req.validate(); err != nil {
 		return hipDecodeResult{}, err
 	}
-	priorKeys, priorValues, err := req.KV.Restore(0, req.KV.TokenCount())
+	priorKeys, priorValues, err := model.restoreLoadedTinyDecodePriorKV(req, tinyCfg.HiddenSize)
 	if err != nil {
 		return hipDecodeResult{}, err
 	}
@@ -918,7 +918,7 @@ func (kernels hipNativeProjectionKernelSet) Decode(ctx context.Context, model *h
 	var deviceKV *rocmDeviceKVCache
 	var descriptorTable *rocmDeviceKVDescriptorTable
 	if req.DeviceKV != nil {
-		device, table, err := hipAppendDecodeDeviceKV(req, output.UpdatedKeys[keyStart:], output.UpdatedValues[valueStart:], labels)
+		device, table, err := hipAppendDecodeDeviceKV(ctx, req, output.UpdatedKeys[keyStart:], output.UpdatedValues[valueStart:], labels)
 		if err != nil {
 			return hipDecodeResult{}, err
 		}
@@ -933,6 +933,32 @@ func (kernels hipNativeProjectionKernelSet) Decode(ctx context.Context, model *h
 		DescriptorTable: descriptorTable,
 		Labels:          labels,
 	}, nil
+}
+
+func (model *hipLoadedModel) restoreLoadedTinyDecodePriorKV(req hipDecodeRequest, hiddenSize int) ([]float32, []float32, error) {
+	if model == nil {
+		return nil, nil, core.E("rocm.hip.TinyLoadedDecode", "loaded model is required", nil)
+	}
+	if req.KV == nil {
+		return nil, nil, core.E("rocm.hip.TinyLoadedDecode", "KV cache is required", nil)
+	}
+	tokenCount := req.KV.TokenCount()
+	if tokenCount <= 0 {
+		return nil, nil, core.E("rocm.hip.TinyLoadedDecode", "KV cache must contain prior tokens", nil)
+	}
+	if hiddenSize <= 0 {
+		return nil, nil, core.E("rocm.hip.TinyLoadedDecode", "hidden size must be positive", nil)
+	}
+	count := tokenCount * hiddenSize
+	if cap(model.tinyPriorKeys) < count {
+		model.tinyPriorKeys = make([]float32, count)
+	}
+	if cap(model.tinyPriorValues) < count {
+		model.tinyPriorValues = make([]float32, count)
+	}
+	model.tinyPriorKeys = model.tinyPriorKeys[:count]
+	model.tinyPriorValues = model.tinyPriorValues[:count]
+	return req.KV.RestoreInto(0, tokenCount, model.tinyPriorKeys, model.tinyPriorValues)
 }
 
 func hipTinyGenerateSeq(ctx context.Context, model *hipLoadedModel, cfg hipLoadedTinyLMConfig, prompt string, generate inference.GenerateConfig) (iter.Seq[inference.Token], func() error) {
@@ -1012,15 +1038,43 @@ func hipTinyGenerateSeq(ctx context.Context, model *hipLoadedModel, cfg hipLoade
 }
 
 func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg hipGemma4Q4ForwardConfig, promptTokens []int32, generate inference.GenerateConfig) (iter.Seq[inference.Token], func() error) {
+	return hipGemma4Q4GenerateTokenSeqWithEngineConfig(ctx, model, cfg, promptTokens, generate, model.gemma4Q4EngineConfig())
+}
+
+func hipGemma4Q4GenerateTokenSeqWithEngineConfig(ctx context.Context, model *hipLoadedModel, cfg hipGemma4Q4ForwardConfig, promptTokens []int32, generate inference.GenerateConfig, engineConfig hipGemma4Q4EngineConfig) (iter.Seq[inference.Token], func() error) {
+	return hipGemma4Q4GenerateTokenSeqWithState(ctx, model, cfg, promptTokens, generate, engineConfig, nil, nil)
+}
+
+func hipGemma4Q4GenerateTokenSeqWithState(ctx context.Context, model *hipLoadedModel, cfg hipGemma4Q4ForwardConfig, promptTokens []int32, generate inference.GenerateConfig, engineConfig hipGemma4Q4EngineConfig, initialDeviceState *hipGemma4Q4DeviceDecodeState, retainDeviceState func(*hipGemma4Q4DeviceDecodeState) error) (iter.Seq[inference.Token], func() error) {
 	var runErr error
 	return func(yield func(inference.Token) bool) {
+		deviceState := initialDeviceState
+		deviceStateRetained := false
+		defer func() {
+			if runErr == nil && retainDeviceState != nil && deviceState != nil {
+				if err := retainDeviceState(deviceState); err != nil {
+					runErr = err
+				} else {
+					deviceStateRetained = true
+				}
+			}
+			if deviceStateRetained {
+				return
+			}
+			if err := deviceState.Close(); err != nil && runErr == nil {
+				runErr = err
+			}
+		}()
 		if err := hipContextErr(ctx); err != nil {
 			runErr = err
 			return
 		}
-		if generate.MaxTokens <= 0 {
+		resolvedGenerate, err := hipGemma4Q4ResolveGenerateContext(model, promptTokens, generate)
+		if err != nil {
+			runErr = err
 			return
 		}
+		generate = resolvedGenerate
 		if model == nil {
 			runErr = core.E(hipGemma4Q4Layer0Operation, "loaded model is required", nil)
 			return
@@ -1030,6 +1084,18 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 			MaxNewTokens:   generate.MaxTokens,
 			Position:       0,
 			Epsilon:        1e-6,
+			EngineConfig:   engineConfig,
+		}
+		if initialDeviceState != nil {
+			if initialDeviceState.closed {
+				runErr = core.E(hipGemma4Q4Layer0Operation, "initial Gemma4 q4 device KV state is closed", nil)
+				return
+			}
+			if initialDeviceState.LayerCount() != len(cfg.Layers) {
+				runErr = core.E(hipGemma4Q4Layer0Operation, "initial Gemma4 q4 device KV layer count mismatch", nil)
+				return
+			}
+			req.Position = initialDeviceState.maxLayerTokenCount()
 		}
 		if err := cfg.validate(); err != nil {
 			runErr = err
@@ -1041,47 +1107,62 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 			runErr = err
 			return
 		}
-		ubatchTokens, err := hipGemma4Q4PrefillUBatchTokens()
+		ubatchTokens, err := engineConfig.prefillUBatchTokens()
 		if err != nil {
 			runErr = err
 			return
 		}
-		prefillPlan, err := hipGemma4Q4PlanPromptPrefill(promptTokens, req.Position, ubatchTokens)
-		if err != nil {
-			runErr = err
-			return
-		}
-		deviceKVMode, err := hipGemma4Q4GenerateDeviceKVMode()
-		if err != nil {
-			runErr = err
-			return
-		}
-		finalGreedyBuffer, err := hipAllocateByteBuffer(model.driver, "rocm.hip.Gemma4Q4Generate", "Gemma4 q4 final greedy result", hipMLXQ4ProjectionBestBytes, 1)
-		if err != nil {
-			runErr = err
-			return
-		}
+		prefillPlanBatches := hipBorrowGemma4Q4PrefillUBatches(hipGemma4Q4PrefillBatchCount(len(promptTokens), ubatchTokens))
 		defer func() {
-			if err := finalGreedyBuffer.Close(); err != nil && runErr == nil {
-				runErr = err
-			}
+			hipReleaseGemma4Q4PrefillUBatches(prefillPlanBatches)
 		}()
+		prefillPlan, prefillPlanBatches, err := hipGemma4Q4PlanPromptPrefillInto(promptTokens, req.Position, ubatchTokens, prefillPlanBatches)
+		if err != nil {
+			runErr = err
+			return
+		}
+		deviceKVMode, err := engineConfig.deviceKVMode()
+		if err != nil {
+			runErr = err
+			return
+		}
+		deviceTopKSampling := hipGemma4Q4DeviceTopKSamplingRequested(generate)
+		deviceCandidateSampling := hipGemma4Q4DeviceCandidateSamplingRequested(generate)
 		var attentionWorkspace *hipAttentionHeadsChunkedWorkspace
-		if hipGemma4Q4ChunkedAttentionEnabled(len(promptTokens)) {
-			attentionWorkspace = &hipAttentionHeadsChunkedWorkspace{}
+		if engineConfig.attentionWorkspaceNeeded(len(promptTokens), generate) {
+			attentionWorkspace = hipBorrowAttentionHeadsChunkedWorkspace()
+			if err := hipGemma4Q4EnsureAttentionWorkspaceDecodeCapacity(model.driver, attentionWorkspace, cfg, req.Position+len(promptTokens)+generate.MaxTokens); err != nil {
+				_ = hipRecycleAttentionHeadsChunkedWorkspace(attentionWorkspace)
+				runErr = err
+				return
+			}
 			defer func() {
-				if err := attentionWorkspace.Close(); err != nil && runErr == nil {
+				if err := hipRecycleAttentionHeadsChunkedWorkspace(attentionWorkspace); err != nil && runErr == nil {
+					runErr = err
+				}
+			}()
+		}
+		var finalGreedyBuffer *hipDeviceByteBuffer
+		if attentionWorkspace != nil {
+			attentionWorkspace.EnsureProjectionGreedyBestCapacity(generate.MaxTokens + 2)
+			finalGreedyBuffer, err = attentionWorkspace.BorrowProjectionGreedyBest(model.driver)
+			if err != nil {
+				runErr = err
+				return
+			}
+		} else {
+			finalGreedyBuffer, err = hipAllocateByteBuffer(model.driver, "rocm.hip.Gemma4Q4Generate", "Gemma4 q4 final greedy result", hipMLXQ4ProjectionBestBytes, 1)
+			if err != nil {
+				runErr = err
+				return
+			}
+			defer func() {
+				if err := finalGreedyBuffer.Close(); err != nil && runErr == nil {
 					runErr = err
 				}
 			}()
 		}
 		state := hipGemma4Q4DecodeState{}
-		var deviceState *hipGemma4Q4DeviceDecodeState
-		defer func() {
-			if err := deviceState.Close(); err != nil && runErr == nil {
-				runErr = err
-			}
-		}()
 		position := req.Position
 		var current hipGemma4Q4ForwardResult
 		haveCurrent := false
@@ -1090,10 +1171,17 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 		if trackHistory {
 			history = make([]int32, 0, generate.MaxTokens)
 		}
-		deviceCandidateSampling := hipGemma4Q4DeviceCandidateSamplingRequested(generate)
 		useBatchedPrefill := hipGemma4Q4CanUseBatchedGeneratePrefill(cfg) && !hostSampling
+		if attentionWorkspace != nil {
+			if err := hipGemma4Q4EnsureAttentionWorkspacePrefillCapacity(model.driver, attentionWorkspace, cfg, prefillPlan, useBatchedPrefill); err != nil {
+				runErr = err
+				return
+			}
+		}
 		var priorLayerKVScratch []*rocmDeviceKVCache
-		for _, ubatch := range prefillPlan.Batches {
+		var priorLayerDescriptorScratch []*rocmDeviceKVDescriptorTable
+		for batchIndex := 0; batchIndex < prefillPlan.LenBatches(); batchIndex++ {
+			ubatch := prefillPlan.Batch(batchIndex)
 			if !useBatchedPrefill {
 				for index, promptToken := range ubatch.Tokens {
 					if err := hipContextErr(ctx); err != nil {
@@ -1101,25 +1189,34 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 						return
 					}
 					outputToken := ubatch.OutputToken(index)
+					sampleDraw := 0.0
+					if outputToken && deviceTopKSampling {
+						sampleDraw = rand.Float64()
+					}
 					var err error
 					current, state, err = hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx, model.driver, cfg, state, hipGemma4Q4ForwardRequest{
-						TokenID:             promptToken,
-						Position:            ubatch.Position + index,
-						Epsilon:             req.Epsilon,
-						DeviceKVAttention:   true,
-						DeviceKVMode:        deviceKVMode,
-						PriorDeviceState:    deviceState,
-						ReturnDeviceState:   true,
-						DeviceFinalSample:   outputToken && !hostSampling,
-						DeviceFinalScores:   outputToken && deviceCandidateSampling,
-						FinalCandidateCount: generate.TopK,
-						SkipFinalSample:     !outputToken,
-						FinalGreedyBuffer:   finalGreedyBuffer,
-						SuppressTokens:      suppressTokens,
-						AttentionWorkspace:  attentionWorkspace,
-						OmitDebugTensors:    true,
-						OmitLabels:          true,
-						OmitHostState:       true,
+						TokenID:               promptToken,
+						Position:              ubatch.Position + index,
+						Epsilon:               req.Epsilon,
+						DeviceKVAttention:     true,
+						DeviceKVMode:          deviceKVMode,
+						EngineConfig:          engineConfig,
+						PriorDeviceState:      deviceState,
+						ReturnDeviceState:     true,
+						DeviceFinalSample:     outputToken && !hostSampling,
+						DeviceFinalScores:     outputToken && deviceCandidateSampling,
+						DeviceFinalTopKSample: outputToken && deviceTopKSampling,
+						FinalCandidateCount:   generate.TopK,
+						FinalTemperature:      generate.Temperature,
+						FinalTopP:             generate.TopP,
+						FinalDraw:             sampleDraw,
+						SkipFinalSample:       !outputToken,
+						FinalGreedyBuffer:     finalGreedyBuffer,
+						SuppressTokens:        suppressTokens,
+						AttentionWorkspace:    attentionWorkspace,
+						OmitDebugTensors:      true,
+						OmitLabels:            true,
+						OmitHostState:         true,
 					}, false)
 					if err != nil {
 						runErr = err
@@ -1134,7 +1231,7 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 					current.DeviceState = nil
 					hipReleaseClosedGemma4Q4DeviceDecodeState(previousDeviceState)
 					if outputToken {
-						if hostSampling {
+						if hostSampling && !deviceTopKSampling {
 							if len(current.Candidates) > 0 {
 								current.Greedy, err = hipGemma4Q4HostSampleSortedCandidateResultWorkspace(current.Candidates, generate, history, rand.Float64(), attentionWorkspace)
 							} else {
@@ -1155,11 +1252,14 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 				return
 			}
 			var priorLayerKV []*rocmDeviceKVCache
+			var priorLayerDescriptorTables []*rocmDeviceKVDescriptorTable
 			if deviceState != nil {
 				priorLayerKVScratch = hipGemma4Q4DeviceLayerCaches(deviceState, priorLayerKVScratch, len(cfg.Layers))
 				priorLayerKV = priorLayerKVScratch
+				priorLayerDescriptorScratch = hipGemma4Q4DeviceLayerDescriptorTables(deviceState, priorLayerDescriptorScratch, len(cfg.Layers))
+				priorLayerDescriptorTables = priorLayerDescriptorScratch
 			}
-			forward, err := hipRunGemma4Q4PrefillForwardBatchWithPriorWorkspace(ctx, model.driver, cfg, ubatch.Tokens, ubatch.Position, req.Epsilon, deviceKVMode, priorLayerKV, nil, ubatch.OutputTokens, finalGreedyBuffer, attentionWorkspace)
+			forward, err := hipRunGemma4Q4PrefillForwardBatchWithPriorDescriptorWorkspaceOutputRowWithEngineConfig(ctx, model.driver, cfg, ubatch.Tokens, ubatch.Position, req.Epsilon, deviceKVMode, priorLayerKV, priorLayerDescriptorTables, nil, ubatch.OutputTokens, ubatch.OutputRow, finalGreedyBuffer, attentionWorkspace, engineConfig)
 			if err != nil {
 				runErr = err
 				return
@@ -1167,6 +1267,7 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 			if len(forward.Greedy) > 0 {
 				greedyOut := forward.Greedy[len(forward.Greedy)-1]
 				current.Greedy = greedyOut.Greedy
+				current.GreedyDevice = finalGreedyBuffer
 				if hipTokenIsSuppressed(int32(current.Greedy.TokenID), suppressTokens) {
 					last := cfg.Layers[len(cfg.Layers)-1]
 					current.Greedy, err = hipRunGemma4Q4PrefillFinalGreedyForRowSuppressWorkspace(ctx, model.driver, last, forward.FinalHidden, len(ubatch.Tokens), greedyOut.Row, req.Epsilon, finalGreedyBuffer, suppressTokens, attentionWorkspace)
@@ -1175,6 +1276,7 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 						runErr = err
 						return
 					}
+					current.GreedyDevice = finalGreedyBuffer
 				}
 				haveCurrent = true
 			}
@@ -1222,32 +1324,45 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 			if trackHistory {
 				history = append(history, tokenID)
 			}
+			if generated == 0 && hipGemma4Q4DeviceGreedyUnrollEnabled(generate, hostSampling, deviceCandidateSampling, deviceTopKSampling, attentionWorkspace, current) {
+				state, deviceState, position, runErr = hipGemma4Q4GenerateDeviceGreedyUnrolled(ctx, model, cfg, state, deviceState, current, generate, engineConfig, deviceKVMode, suppressTokens, attentionWorkspace, position, yield)
+				return
+			}
 			if generated == generate.MaxTokens-1 {
 				return
 			}
 			var tokenIDDeviceBuffer *hipDeviceByteBuffer
-			if !hostSampling {
-				tokenIDDeviceBuffer = finalGreedyBuffer
+			if !hostSampling || deviceTopKSampling {
+				tokenIDDeviceBuffer = current.GreedyDevice
+			}
+			sampleDraw := 0.0
+			if deviceTopKSampling {
+				sampleDraw = rand.Float64()
 			}
 			var err error
 			current, state, err = hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx, model.driver, cfg, state, hipGemma4Q4ForwardRequest{
-				TokenID:             tokenID,
-				Position:            position,
-				Epsilon:             req.Epsilon,
-				DeviceKVAttention:   true,
-				DeviceKVMode:        deviceKVMode,
-				PriorDeviceState:    deviceState,
-				ReturnDeviceState:   true,
-				DeviceFinalSample:   !hostSampling,
-				DeviceFinalScores:   deviceCandidateSampling,
-				FinalCandidateCount: generate.TopK,
-				FinalGreedyBuffer:   finalGreedyBuffer,
-				TokenIDDeviceBuffer: tokenIDDeviceBuffer,
-				SuppressTokens:      suppressTokens,
-				AttentionWorkspace:  attentionWorkspace,
-				OmitDebugTensors:    true,
-				OmitLabels:          true,
-				OmitHostState:       true,
+				TokenID:               tokenID,
+				Position:              position,
+				Epsilon:               req.Epsilon,
+				DeviceKVAttention:     true,
+				DeviceKVMode:          deviceKVMode,
+				EngineConfig:          engineConfig,
+				PriorDeviceState:      deviceState,
+				ReturnDeviceState:     true,
+				DeviceFinalSample:     !hostSampling,
+				DeviceFinalScores:     deviceCandidateSampling,
+				DeviceFinalTopKSample: deviceTopKSampling,
+				FinalCandidateCount:   generate.TopK,
+				FinalTemperature:      generate.Temperature,
+				FinalTopP:             generate.TopP,
+				FinalDraw:             sampleDraw,
+				FinalGreedyBuffer:     finalGreedyBuffer,
+				TokenIDDeviceBuffer:   tokenIDDeviceBuffer,
+				SuppressTokens:        suppressTokens,
+				AttentionWorkspace:    attentionWorkspace,
+				OmitDebugTensors:      true,
+				OmitLabels:            true,
+				OmitHostState:         true,
 			}, false)
 			if err != nil {
 				runErr = err
@@ -1261,7 +1376,7 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 			deviceState = current.DeviceState
 			current.DeviceState = nil
 			hipReleaseClosedGemma4Q4DeviceDecodeState(previousDeviceState)
-			if hostSampling {
+			if hostSampling && !deviceTopKSampling {
 				if len(current.Candidates) > 0 {
 					current.Greedy, err = hipGemma4Q4HostSampleSortedCandidateResultWorkspace(current.Candidates, generate, history, rand.Float64(), attentionWorkspace)
 				} else {
@@ -1271,55 +1386,523 @@ func hipGemma4Q4GenerateTokenSeq(ctx context.Context, model *hipLoadedModel, cfg
 					runErr = err
 					return
 				}
+				current.GreedyDevice = nil
 			}
 			position++
 		}
 	}, func() error { return runErr }
 }
 
-func hipGemma4Q4GenerateDeviceKVMode() (string, error) {
-	raw := strings.ToLower(strings.TrimSpace(os.Getenv("GO_ROCM_GEMMA4_Q4_DEVICE_KV_MODE")))
-	if raw == "" {
-		return rocmKVCacheModeKQ8VQ4, nil
-	}
-	if !isROCmKVCacheMode(raw) {
-		return "", core.E(hipGemma4Q4Layer0Operation, core.Sprintf("unsupported Gemma4 q4 device KV cache mode %q", raw), nil)
-	}
-	return raw, nil
+func hipGemma4Q4DeviceGreedyUnrollEnabled(generate inference.GenerateConfig, hostSampling, deviceCandidateSampling, deviceTopKSampling bool, workspace *hipAttentionHeadsChunkedWorkspace, current hipGemma4Q4ForwardResult) bool {
+	return generate.MaxTokens > 1 &&
+		len(generate.StopTokens) == 0 &&
+		!hostSampling &&
+		!deviceCandidateSampling &&
+		!deviceTopKSampling &&
+		workspace != nil &&
+		current.GreedyDevice != nil &&
+		current.GreedyDevice.Pointer() != 0
 }
 
-const hipGemma4Q4ChunkedAttentionAutoPromptTokens = 4000
-
-func hipGemma4Q4ChunkedAttentionEnabled(promptTokens int) bool {
-	raw := strings.ToLower(strings.TrimSpace(os.Getenv("GO_ROCM_GEMMA4_Q4_CHUNKED_ATTENTION")))
-	switch raw {
-	case "1", "true", "yes", "on":
-		return true
-	case "auto":
-		return promptTokens >= hipGemma4Q4ChunkedAttentionAutoPromptTokens
-	case "0", "false", "no", "off":
-		return false
-	case "":
-		return true
-	default:
-		return false
+func hipGemma4Q4GenerateDeviceGreedyUnrolled(ctx context.Context, model *hipLoadedModel, cfg hipGemma4Q4ForwardConfig, state hipGemma4Q4DecodeState, deviceState *hipGemma4Q4DeviceDecodeState, current hipGemma4Q4ForwardResult, generate inference.GenerateConfig, engineConfig hipGemma4Q4EngineConfig, deviceKVMode string, suppressTokens []int32, workspace *hipAttentionHeadsChunkedWorkspace, position int, yield func(inference.Token) bool) (hipGemma4Q4DecodeState, *hipGemma4Q4DeviceDecodeState, int, error) {
+	tokenDevices := make([]*hipDeviceByteBuffer, 0, generate.MaxTokens-1)
+	currentDevice := current.GreedyDevice
+	for generated := 1; generated < generate.MaxTokens; generated++ {
+		if err := hipContextErr(ctx); err != nil {
+			return state, deviceState, position, err
+		}
+		inputDevice := hipCloneDeviceByteBufferView(currentDevice)
+		forward, nextState, err := hipRunGemma4Q4SingleTokenForwardWithStateInternal(ctx, model.driver, cfg, state, hipGemma4Q4ForwardRequest{
+			TokenID:              0,
+			Position:             position,
+			Epsilon:              1e-6,
+			DeviceKVAttention:    true,
+			DeviceKVMode:         deviceKVMode,
+			EngineConfig:         engineConfig,
+			PriorDeviceState:     deviceState,
+			ReturnDeviceState:    true,
+			DeviceFinalSample:    true,
+			DeferFinalSampleRead: true,
+			TokenIDDeviceBuffer:  inputDevice,
+			SuppressTokens:       suppressTokens,
+			AttentionWorkspace:   workspace,
+			OmitDebugTensors:     true,
+			OmitLabels:           true,
+			OmitHostState:        true,
+		}, false)
+		if err != nil {
+			return state, deviceState, position, err
+		}
+		if forward.DeviceState == nil {
+			return state, deviceState, position, core.E(hipGemma4Q4Layer0Operation, "forward did not return device KV state", nil)
+		}
+		if forward.GreedyDevice == nil || forward.GreedyDevice.Pointer() == 0 {
+			_ = forward.DeviceState.Close()
+			return state, deviceState, position, core.E(hipGemma4Q4Layer0Operation, "deferred forward did not return greedy token device buffer", nil)
+		}
+		previousDeviceState := deviceState
+		deviceState = forward.DeviceState
+		forward.DeviceState = nil
+		hipReleaseClosedGemma4Q4DeviceDecodeState(previousDeviceState)
+		state = nextState
+		currentDevice = forward.GreedyDevice
+		tokenDevices = append(tokenDevices, hipCloneDeviceByteBufferView(currentDevice))
+		position++
 	}
+	tokenIDs, err := hipReadGreedyDeviceTokenIDs(model.driver, tokenDevices, cfg.Layers[0].VocabSize)
+	if err != nil {
+		return state, deviceState, position, err
+	}
+	for _, tokenID := range tokenIDs {
+		if !yield(inference.Token{ID: tokenID, Text: hipGeneratedTokenText(model, tokenID)}) {
+			return state, deviceState, position, nil
+		}
+	}
+	return state, deviceState, position, nil
+}
+
+func hipCloneDeviceByteBufferView(buffer *hipDeviceByteBuffer) *hipDeviceByteBuffer {
+	if buffer == nil {
+		return nil
+	}
+	clone := *buffer
+	return &clone
+}
+
+func hipReadGreedyDeviceTokenIDs(driver nativeHIPDriver, buffers []*hipDeviceByteBuffer, vocabSize int) ([]int32, error) {
+	if len(buffers) == 0 {
+		return nil, nil
+	}
+	tokenIDs := make([]int32, len(buffers))
+	first := buffers[0]
+	contiguous := first != nil && first.Pointer() != 0 && first.SizeBytes() == hipMLXQ4ProjectionBestBytes
+	for index, buffer := range buffers {
+		if buffer == nil || buffer.Pointer() == 0 || buffer.SizeBytes() != hipMLXQ4ProjectionBestBytes {
+			return nil, core.E(hipGemma4Q4Layer0Operation, "greedy token device buffer shape mismatch", nil)
+		}
+		if contiguous && buffer.Pointer() != first.Pointer()+nativeDevicePointer(index*hipMLXQ4ProjectionBestBytes) {
+			contiguous = false
+		}
+	}
+	if contiguous {
+		payload := make([]byte, len(buffers)*hipMLXQ4ProjectionBestBytes)
+		if err := driver.CopyDeviceToHost(first.Pointer(), payload); err != nil {
+			return nil, core.E(hipGemma4Q4Layer0Operation, "copy deferred greedy token sequence", err)
+		}
+		for index := range buffers {
+			tokenID, err := hipUnpackGreedyBestTokenID(binary.LittleEndian.Uint32(payload[index*hipMLXQ4ProjectionBestBytes:]), vocabSize)
+			if err != nil {
+				return nil, err
+			}
+			tokenIDs[index] = int32(tokenID)
+		}
+		return tokenIDs, nil
+	}
+	for index, buffer := range buffers {
+		packedLow, err := hipReadDeviceUint32(driver, buffer.Pointer())
+		if err != nil {
+			return nil, core.E(hipGemma4Q4Layer0Operation, "copy deferred greedy token", err)
+		}
+		tokenID, err := hipUnpackGreedyBestTokenID(packedLow, vocabSize)
+		if err != nil {
+			return nil, err
+		}
+		tokenIDs[index] = int32(tokenID)
+	}
+	return tokenIDs, nil
+}
+
+func hipGemma4Q4EnsureAttentionWorkspaceDecodeCapacity(driver nativeHIPDriver, workspace *hipAttentionHeadsChunkedWorkspace, cfg hipGemma4Q4ForwardConfig, tokenCount int) error {
+	if workspace == nil || tokenCount <= 0 {
+		return nil
+	}
+	maxHeads := 0
+	maxDim := 0
+	for _, layer := range cfg.Layers {
+		if layer.QueryHeads <= 0 || layer.HeadDim <= 0 || layer.HeadDim > hipAttentionHeadsChunkedBlockSize {
+			continue
+		}
+		if layer.QueryHeads > maxHeads {
+			maxHeads = layer.QueryHeads
+		}
+		if layer.HeadDim > maxDim {
+			maxDim = layer.HeadDim
+		}
+	}
+	if maxHeads <= 0 || maxDim <= 0 {
+		return nil
+	}
+	minTokenCount := hipAttentionHeadsSharedMaxTokens
+	if maxDim == hipAttentionHeadsChunkedBlockSize {
+		minTokenCount = 512
+	}
+	if tokenCount <= minTokenCount {
+		return nil
+	}
+	return workspace.Ensure(driver, maxHeads, maxDim, tokenCount, hipAttentionHeadsChunkSize)
+}
+
+const hipGemma4Q4AttentionWorkspacePrewarmDecodeTokens = 2048
+const hipGemma4Q4AttentionWorkspacePrewarmTopK = 64
+
+func hipGemma4Q4AttentionWorkspacePrewarmTokenCount(contextSize int) int {
+	if contextSize <= hipGemma4Q4AttentionWorkspacePrewarmDecodeTokens {
+		return hipGemma4Q4AttentionWorkspacePrewarmDecodeTokens + 2
+	}
+	return contextSize + hipGemma4Q4AttentionWorkspacePrewarmDecodeTokens
+}
+
+func hipPrewarmGemma4Q4AttentionWorkspaceDeviceBuffers(driver nativeHIPDriver, cfg hipGemma4Q4ForwardConfig, contextSize int) error {
+	if driver == nil || !driver.Available() || len(cfg.Layers) == 0 {
+		return nil
+	}
+	prefillTokens := hipGemma4Q4PrefillDefaultUBatchTokens
+	if prefillTokens <= 0 {
+		prefillTokens = 1
+	}
+	promptTokens := make([]int32, prefillTokens)
+	prefillPlan, err := hipGemma4Q4PlanPromptPrefill(promptTokens, 0, prefillTokens)
+	if err != nil {
+		return err
+	}
+	workspace := hipBorrowAttentionHeadsChunkedWorkspace()
+	workspace.EnsureProjectionGreedyBestCapacity(hipGemma4Q4AttentionWorkspacePrewarmDecodeTokens + 2)
+	if _, err := workspace.BorrowProjectionGreedyBest(driver); err != nil {
+		_ = hipRecycleAttentionHeadsChunkedWorkspace(workspace)
+		return err
+	}
+	if err := hipGemma4Q4EnsureAttentionWorkspacePrefillCapacity(driver, workspace, cfg, prefillPlan, true); err != nil {
+		_ = hipRecycleAttentionHeadsChunkedWorkspace(workspace)
+		return err
+	}
+	if contextSize > prefillTokens {
+		retainedPrefillPlan, err := hipGemma4Q4PlanPromptPrefill(promptTokens, contextSize, prefillTokens)
+		if err != nil {
+			_ = hipRecycleAttentionHeadsChunkedWorkspace(workspace)
+			return err
+		}
+		if err := hipGemma4Q4EnsureAttentionWorkspacePrefillCapacity(driver, workspace, cfg, retainedPrefillPlan, true); err != nil {
+			_ = hipRecycleAttentionHeadsChunkedWorkspace(workspace)
+			return err
+		}
+	}
+	if err := hipGemma4Q4EnsureAttentionWorkspaceDecodeHotCapacity(driver, workspace, cfg); err != nil {
+		_ = hipRecycleAttentionHeadsChunkedWorkspace(workspace)
+		return err
+	}
+	if err := hipGemma4Q4EnsureAttentionWorkspaceSamplingCapacity(driver, workspace, cfg, hipGemma4Q4AttentionWorkspacePrewarmTopK); err != nil {
+		_ = hipRecycleAttentionHeadsChunkedWorkspace(workspace)
+		return err
+	}
+	if err := hipGemma4Q4EnsureAttentionWorkspaceDecodeCapacity(driver, workspace, cfg, hipGemma4Q4AttentionWorkspacePrewarmTokenCount(contextSize)); err != nil {
+		_ = hipRecycleAttentionHeadsChunkedWorkspace(workspace)
+		return err
+	}
+	workspace.resetBorrowedViews()
+	if hipReleaseAttentionHeadsChunkedWorkspace(workspace) {
+		return nil
+	}
+	return hipRecycleAttentionHeadsChunkedWorkspace(workspace)
+}
+
+func hipGemma4Q4EnsureAttentionWorkspaceSamplingCapacity(driver nativeHIPDriver, workspace *hipAttentionHeadsChunkedWorkspace, cfg hipGemma4Q4ForwardConfig, topK int) error {
+	if workspace == nil || topK <= 0 || len(cfg.Layers) == 0 {
+		return nil
+	}
+	if _, err := workspace.EnsureTokenIDBuffer(driver); err != nil {
+		return err
+	}
+	maxVocabRows := 0
+	for _, layer := range cfg.Layers {
+		if layer.VocabSize > maxVocabRows {
+			maxVocabRows = layer.VocabSize
+		}
+	}
+	if maxVocabRows <= 0 {
+		return nil
+	}
+	partialCount := hipPackedTopKOutputCount(maxVocabRows, topK)
+	if partialCount <= 0 {
+		return nil
+	}
+	if _, err := workspace.EnsureProjectionTopKOutput(driver, partialCount); err != nil {
+		return err
+	}
+	workCount := hipPackedTopKOutputCount(partialCount, topK)
+	if partialCount > topK {
+		if _, err := workspace.EnsureProjectionTopKWorkOutput(driver, workCount); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func hipPackedTopKOutputCount(inputCount, topK int) int {
+	if inputCount <= 0 || topK <= 0 {
+		return 0
+	}
+	return ((inputCount + hipPackedTopKChunkSize - 1) / hipPackedTopKChunkSize) * topK
+}
+
+func hipGemma4Q4EnsureAttentionWorkspaceDecodeHotCapacity(driver nativeHIPDriver, workspace *hipAttentionHeadsChunkedWorkspace, cfg hipGemma4Q4ForwardConfig) error {
+	if workspace == nil || len(cfg.Layers) == 0 {
+		return nil
+	}
+	maxHiddenRows := 0
+	maxPerLayerRows := 0
+	for _, layer := range cfg.Layers {
+		maxHiddenRows = max(maxHiddenRows, layer.HiddenSize)
+		maxHiddenRows = max(maxHiddenRows, layer.Embedding.HiddenSize)
+		maxHiddenRows = max(maxHiddenRows, layer.InputNorm.Count)
+		maxHiddenRows = max(maxHiddenRows, layer.PostAttentionNorm.Count)
+		maxHiddenRows = max(maxHiddenRows, layer.PreFeedForwardNorm.Count)
+		maxHiddenRows = max(maxHiddenRows, layer.PostFeedForwardNorm.Count)
+		maxHiddenRows = max(maxHiddenRows, layer.FinalNorm.Count)
+		if layer.PerLayerInput.hasGlobalPrecompute() && layer.PerLayerInput.ModelProjection.Rows > maxPerLayerRows {
+			maxPerLayerRows = layer.PerLayerInput.ModelProjection.Rows
+		}
+	}
+	if maxHiddenRows > 0 {
+		hiddenCount := maxHiddenRows * 2
+		if _, err := workspace.EnsureScaledEmbedding(driver, hiddenCount); err != nil {
+			return err
+		}
+		if _, err := workspace.EnsurePrefillInputNormOutput(driver, hiddenCount); err != nil {
+			return err
+		}
+		if _, err := workspace.EnsureIntermediateOutput(driver, hiddenCount); err != nil {
+			return err
+		}
+		if _, err := workspace.EnsureFinalHiddenOutput(driver, hiddenCount, 0); err != nil {
+			return err
+		}
+		if _, err := workspace.EnsureNextInputOutput(driver, hiddenCount, 0); err != nil {
+			return err
+		}
+	}
+	if maxPerLayerRows > 0 {
+		if _, err := workspace.EnsurePerLayerScaled(driver, maxPerLayerRows); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func hipGemma4Q4EnsureAttentionWorkspacePrefillCapacity(driver nativeHIPDriver, workspace *hipAttentionHeadsChunkedWorkspace, cfg hipGemma4Q4ForwardConfig, plan hipGemma4Q4PrefillPlan, useBatchedPrefill bool) error {
+	if workspace == nil {
+		return nil
+	}
+	maxGateRows := 0
+	maxHiddenRows := 0
+	maxHeadDim := 0
+	maxQueryRows := 0
+	maxProjectionRows := 0
+	maxKeyRows := 0
+	maxValueRows := 0
+	maxQKVRows := 0
+	maxPerLayerOutputRows := 0
+	maxVocabRows := 0
+	for _, layer := range cfg.Layers {
+		if layer.GateProjection.Rows > maxGateRows {
+			maxGateRows = layer.GateProjection.Rows
+		}
+		if layer.VocabSize > maxVocabRows {
+			maxVocabRows = layer.VocabSize
+		}
+		if layer.PerLayerInput.hasLayerApply() && layer.PerLayerInput.InputGate.Rows > maxGateRows {
+			maxGateRows = layer.PerLayerInput.InputGate.Rows
+		}
+		if layer.PerLayerInput.hasGlobalPrecompute() && layer.PerLayerInput.ModelProjection.Rows > maxPerLayerOutputRows {
+			maxPerLayerOutputRows = layer.PerLayerInput.ModelProjection.Rows
+		}
+		if layer.HiddenSize > maxHiddenRows {
+			maxHiddenRows = layer.HiddenSize
+		}
+		if layer.HeadDim > maxHeadDim {
+			maxHeadDim = layer.HeadDim
+		}
+		if layer.QueryProjection.Rows > maxQueryRows {
+			maxQueryRows = layer.QueryProjection.Rows
+		}
+		if layer.KeyProjection.Rows > maxKeyRows {
+			maxKeyRows = layer.KeyProjection.Rows
+		}
+		if !layer.AttentionKEqV && layer.ValueProjection.Rows > maxValueRows {
+			maxValueRows = layer.ValueProjection.Rows
+		}
+		if rows := hipGemma4Q4ProjectionWorkspaceRows(layer); rows > maxProjectionRows {
+			maxProjectionRows = rows
+		}
+		if rows := hipGemma4Q4FusedDecodeQKVOutputRows(layer); rows > maxQKVRows {
+			maxQKVRows = rows
+		}
+	}
+	if maxGateRows <= 0 {
+		return nil
+	}
+	maxTokens := 1
+	if useBatchedPrefill {
+		for batchIndex := 0; batchIndex < plan.LenBatches(); batchIndex++ {
+			batch := plan.Batch(batchIndex)
+			if len(batch.Tokens) > maxTokens {
+				maxTokens = len(batch.Tokens)
+			}
+		}
+	}
+	if _, err := workspace.EnsureActivationOutput(driver, maxTokens*maxGateRows); err != nil {
+		return err
+	}
+	if maxHiddenRows > 0 {
+		hiddenCount := maxTokens * maxHiddenRows
+		if _, err := workspace.EnsureScaledEmbedding(driver, hiddenCount); err != nil {
+			return err
+		}
+		if _, err := workspace.EnsurePrefillInputNormOutput(driver, hiddenCount); err != nil {
+			return err
+		}
+		if _, err := workspace.EnsureRMSResidualOutput(driver, hiddenCount); err != nil {
+			return err
+		}
+		if _, err := workspace.EnsureRMSNormOutput(driver, hiddenCount); err != nil {
+			return err
+		}
+		if _, err := workspace.EnsureIntermediateOutput(driver, hiddenCount); err != nil {
+			return err
+		}
+		if _, err := workspace.EnsureFinalHiddenOutput(driver, hiddenCount, 0); err != nil {
+			return err
+		}
+	}
+	if maxProjectionRows > 0 {
+		if _, err := workspace.EnsureProjectionOutput(driver, maxTokens*maxProjectionRows); err != nil {
+			return err
+		}
+	}
+	if maxPerLayerOutputRows > 0 {
+		if _, err := workspace.EnsurePerLayerProjected(driver, maxTokens*maxPerLayerOutputRows); err != nil {
+			return err
+		}
+		if _, err := workspace.EnsurePerLayerOutput(driver, maxTokens*maxPerLayerOutputRows); err != nil {
+			return err
+		}
+	}
+	if maxKeyRows > 0 {
+		if _, err := workspace.EnsureKVProjectionOutput(driver, maxTokens*maxKeyRows, 0); err != nil {
+			return err
+		}
+	}
+	if maxValueRows > 0 {
+		if _, err := workspace.EnsureKVProjectionOutput(driver, maxTokens*maxValueRows, 1); err != nil {
+			return err
+		}
+	}
+	if maxHeadDim > 0 {
+		headCount := maxTokens * maxHeadDim
+		if _, err := workspace.EnsureKeyRMSRoPEOutput(driver, headCount); err != nil {
+			return err
+		}
+		if _, err := workspace.EnsureRMSNoScaleOutput(driver, headCount); err != nil {
+			return err
+		}
+	}
+	if maxQueryRows > 0 {
+		if _, err := workspace.EnsureBatchAttentionOutput(driver, maxTokens*maxQueryRows); err != nil {
+			return err
+		}
+		if _, err := workspace.EnsureRMSRoPEOutput(driver, maxTokens*maxQueryRows); err != nil {
+			return err
+		}
+	}
+	if maxQKVRows > 0 {
+		if _, err := workspace.EnsureQKVOutput(driver, maxQKVRows); err != nil {
+			return err
+		}
+	}
+	if maxVocabRows > 0 {
+		if _, err := workspace.EnsureProjectionScoreOutput(driver, maxVocabRows); err != nil {
+			return err
+		}
+	}
+	maxPlanTokens := plan.NextPosition()
+	if useBatchedPrefill && maxPlanTokens >= hipAttentionHeadsChunkSize {
+		maxAttentionHeadRows := 0
+		maxAttentionDim := 0
+		maxAttentionTokens := 0
+		maxAttentionPartialCount := 0
+		attentionQueryTokens := hipGemma4Q4PrefillAttentionQueryChunkTokens()
+		for _, layer := range cfg.Layers {
+			if layer.QueryHeads <= 0 || layer.HeadDim <= 0 || layer.HeadDim > hipAttentionHeadsChunkedBlockSize {
+				continue
+			}
+			tokenCount := maxPlanTokens
+			if layer.SlidingWindow > 0 && tokenCount > layer.SlidingWindow+maxTokens {
+				tokenCount = layer.SlidingWindow + maxTokens
+			}
+			if tokenCount < hipAttentionHeadsChunkSize {
+				continue
+			}
+			queryTokens := maxTokens
+			if attentionQueryTokens > 0 && queryTokens > attentionQueryTokens {
+				queryTokens = attentionQueryTokens
+			}
+			headRows := layer.QueryHeads * queryTokens
+			chunkCount := (tokenCount + hipAttentionHeadsChunkSize - 1) / hipAttentionHeadsChunkSize
+			partialCount := headRows * chunkCount * layer.HeadDim
+			if partialCount > maxAttentionPartialCount {
+				maxAttentionPartialCount = partialCount
+				maxAttentionHeadRows = headRows
+				maxAttentionDim = layer.HeadDim
+				maxAttentionTokens = tokenCount
+			}
+		}
+		if maxAttentionPartialCount > 0 {
+			if err := workspace.Ensure(driver, maxAttentionHeadRows, maxAttentionDim, maxAttentionTokens, hipAttentionHeadsChunkSize); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func hipGemma4Q4ProjectionWorkspaceRows(layer hipGemma4Q4Layer0Config) int {
+	rows := max(layer.QueryProjection.Rows, layer.OutputProjection.Rows, layer.DownProjection.Rows)
+	if layer.PerLayerInput.hasLayerApply() && layer.PerLayerInput.Projection.Rows > rows {
+		rows = layer.PerLayerInput.Projection.Rows
+	}
+	return rows
+}
+
+func hipGemma4Q4FusedDecodeQKVOutputRows(layer hipGemma4Q4Layer0Config) int {
+	if !layer.AttentionKEqV &&
+		layer.QueryProjection.Cols == layer.KeyProjection.Cols && layer.QueryProjection.Cols == layer.ValueProjection.Cols &&
+		layer.QueryProjection.GroupSize == layer.KeyProjection.GroupSize && layer.QueryProjection.GroupSize == layer.ValueProjection.GroupSize {
+		return layer.QueryProjection.Rows + layer.KeyProjection.Rows + layer.ValueProjection.Rows
+	}
+	if layer.AttentionKEqV &&
+		layer.QueryProjection.Cols == layer.KeyProjection.Cols &&
+		layer.QueryProjection.GroupSize == layer.KeyProjection.GroupSize {
+		return layer.QueryProjection.Rows + layer.KeyProjection.Rows
+	}
+	return 0
 }
 
 func hipGemma4Q4TokenPromptIDs(prompt string, vocabSize int) ([]int32, bool, error) {
 	const prefix = "tokens:"
 	trimmed := strings.TrimSpace(prompt)
-	if !strings.HasPrefix(strings.ToLower(trimmed), prefix) {
+	if !hipGemma4Q4HasASCIIFoldedPrefix(trimmed, prefix) {
 		return nil, false, nil
 	}
 	body := strings.TrimSpace(trimmed[len(prefix):])
 	if body == "" {
 		return nil, true, core.E(hipGemma4Q4Layer0Operation, "token prompt must contain at least one token ID", nil)
 	}
-	parts := strings.Split(body, ",")
-	tokens := make([]int32, 0, len(parts))
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
+	tokens := make([]int32, 0, hipGemma4Q4TokenPromptPartCount(body))
+	for start := 0; start <= len(body); {
+		end := start
+		for end < len(body) && body[end] != ',' {
+			end++
+		}
+		part := strings.TrimSpace(body[start:end])
 		if part == "" {
 			return nil, true, core.E(hipGemma4Q4Layer0Operation, "token prompt contains an empty token ID", nil)
 		}
@@ -1328,15 +1911,29 @@ func hipGemma4Q4TokenPromptIDs(prompt string, vocabSize int) ([]int32, bool, err
 			return nil, true, core.E(hipGemma4Q4Layer0Operation, core.Sprintf("token prompt ID %q is outside vocabulary", part), nil)
 		}
 		tokens = append(tokens, int32(value))
+		if end == len(body) {
+			break
+		}
+		start = end + 1
 	}
 	return tokens, true, nil
+}
+
+func hipGemma4Q4TokenPromptPartCount(body string) int {
+	count := 1
+	for index := 0; index < len(body); index++ {
+		if body[index] == ',' {
+			count++
+		}
+	}
+	return count
 }
 
 func hipGemma4Q4TextPromptIDs(prompt string, model *hipLoadedModel) ([]int32, bool, error) {
 	const prefix = "text:"
 	leftTrimmed := strings.TrimLeft(prompt, " \t\r\n\v\f")
-	prefixed := strings.HasPrefix(strings.ToLower(leftTrimmed), prefix)
-	if !prefixed && !hipGemma4Q4ExperimentalTextGenerateEnabled(model) {
+	prefixed := hipGemma4Q4HasASCIIFoldedPrefix(leftTrimmed, prefix)
+	if !prefixed && !hipLoadedGemma4Q4GenerateLinked(model) {
 		return nil, false, nil
 	}
 	body := prompt
@@ -1356,14 +1953,24 @@ func hipGemma4Q4TextPromptIDs(prompt string, model *hipLoadedModel) ([]int32, bo
 	return tokens, true, nil
 }
 
-func hipGemma4Q4ExperimentalTextGenerateEnabled(model *hipLoadedModel) bool {
-	if model == nil ||
-		!isROCmGemma4Architecture(model.modelInfo.Architecture) ||
-		model.modelInfo.QuantBits != 4 {
+func hipGemma4Q4HasASCIIFoldedPrefix(text, prefix string) bool {
+	if len(text) < len(prefix) {
 		return false
 	}
-	raw := strings.ToLower(strings.TrimSpace(os.Getenv("GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE")))
-	return raw == "1" || raw == "true" || raw == "yes"
+	for index := range prefix {
+		got := text[index]
+		want := prefix[index]
+		if got >= 'A' && got <= 'Z' {
+			got += 'a' - 'A'
+		}
+		if want >= 'A' && want <= 'Z' {
+			want += 'a' - 'A'
+		}
+		if got != want {
+			return false
+		}
+	}
+	return true
 }
 
 func modelVocabSize(model *hipLoadedModel) int {
@@ -1582,14 +2189,12 @@ func hipMirrorTinyKV(driver nativeHIPDriver, cache *rocmKVCache, labels map[stri
 		_ = device.Close()
 		return nil, nil, err
 	}
-	for key, value := range device.Stats().Labels {
-		labels[key] = value
-	}
+	device.addStatsLabels(labels)
 	hipAddDescriptorTableLabels(labels, table)
 	return device, table, nil
 }
 
-func hipAppendDecodeDeviceKV(req hipDecodeRequest, key, value []float32, labels map[string]string) (*rocmDeviceKVCache, *rocmDeviceKVDescriptorTable, error) {
+func hipAppendDecodeDeviceKV(ctx context.Context, req hipDecodeRequest, key, value []float32, labels map[string]string) (*rocmDeviceKVCache, *rocmDeviceKVDescriptorTable, error) {
 	if req.DeviceKV == nil {
 		return nil, nil, nil
 	}
@@ -1599,30 +2204,44 @@ func hipAppendDecodeDeviceKV(req hipDecodeRequest, key, value []float32, labels 
 	if err != nil {
 		return nil, nil, err
 	}
-	table, err := device.KernelDescriptorTable()
+	var table *rocmDeviceKVDescriptorTable
+	var descriptorUpdate string
+	if req.DescriptorTable != nil {
+		table, err = device.KernelDescriptorTableFromAppendedToken(ctx, req.DeviceKV, req.DescriptorTable)
+		if err == nil {
+			descriptorUpdate = "append_in_place"
+		}
+	}
+	if table == nil && err == nil {
+		table, err = device.KernelDescriptorTable()
+		if err == nil {
+			descriptorUpdate = "rebuild"
+		}
+	}
 	if err != nil {
 		_ = device.closePagesFrom(sourcePageCount)
 		return nil, nil, err
 	}
 	if err := req.DeviceKV.transferPagesTo(device); err != nil {
-		_ = table.Close()
+		if table != req.DescriptorTable {
+			_ = table.Close()
+		}
 		_ = device.closePagesFrom(sourcePageCount)
 		return nil, nil, err
 	}
-	if req.DescriptorTable != nil {
+	if req.DescriptorTable != nil && table != req.DescriptorTable {
 		_ = req.DescriptorTable.Close()
 	}
-	for key, value := range device.Stats().Labels {
-		labels[key] = value
-	}
+	device.addStatsLabels(labels)
 	hipAddDescriptorTableLabels(labels, table)
 	labels["kv_device_update"] = "append_token"
 	labels["kv_device_update_pages"] = "1"
-	labels["kv_device_update_from_pages"] = core.Sprintf("%d", sourcePageCount)
-	labels["kv_device_update_from_tokens"] = core.Sprintf("%d", sourceTokenCount)
-	labels["kv_device_update_to_pages"] = core.Sprintf("%d", device.PageCount())
-	labels["kv_device_update_to_tokens"] = core.Sprintf("%d", device.TokenCount())
+	labels["kv_device_update_from_pages"] = rocmDeviceKVLabelInt(sourcePageCount)
+	labels["kv_device_update_from_tokens"] = rocmDeviceKVLabelInt(sourceTokenCount)
+	labels["kv_device_update_to_pages"] = rocmDeviceKVLabelInt(device.PageCount())
+	labels["kv_device_update_to_tokens"] = rocmDeviceKVLabelInt(device.TokenCount())
 	labels["kv_device_update_descriptor_refresh"] = "success"
+	labels["kv_device_update_descriptor_path"] = descriptorUpdate
 	return device, table, nil
 }
 
@@ -1630,10 +2249,10 @@ func hipAddDescriptorTableLabels(labels map[string]string, table *rocmDeviceKVDe
 	if labels == nil || table == nil {
 		return
 	}
-	labels["kv_descriptor_bytes"] = core.Sprintf("%d", table.SizeBytes())
-	labels["kv_descriptor_pages"] = core.Sprintf("%d", table.pageCount)
+	labels["kv_descriptor_bytes"] = rocmDeviceKVLabelUint64(table.SizeBytes())
+	labels["kv_descriptor_pages"] = rocmDeviceKVLabelInt(table.pageCount)
 	labels["kv_descriptor_table"] = "hip_device"
-	labels["kv_descriptor_version"] = core.Sprintf("%d", table.version)
+	labels["kv_descriptor_version"] = rocmDeviceKVLabelUint64(uint64(table.version))
 }
 
 func hipValidateTinyTokenIDs(tokenIDs []int32, vocabSize int) error {
@@ -1682,6 +2301,11 @@ func hipGemma4Q4DefaultSuppressTokenIDs(model *hipLoadedModel) []int32 {
 	}
 	model.q4ConfigMu.Lock()
 	defer model.q4ConfigMu.Unlock()
+	suppress := hipGemma4Q4DefaultSuppressTokenIDsLocked(model)
+	return suppress[:len(suppress):len(suppress)]
+}
+
+func hipGemma4Q4DefaultSuppressTokenIDsLocked(model *hipLoadedModel) []int32 {
 	if len(model.q4Suppress) == 0 {
 		model.q4Suppress = hipTokenTextIDs(model.tokenText, []string{
 			"<pad>",
@@ -1708,7 +2332,7 @@ func hipGemma4Q4DefaultSuppressTokenIDs(model *hipLoadedModel) []int32 {
 			"<|video|>",
 		})
 	}
-	return model.q4Suppress[:len(model.q4Suppress):len(model.q4Suppress)]
+	return model.q4Suppress
 }
 
 func hipGemma4Q4DefaultStopTokenIDs(model *hipLoadedModel) []int32 {
@@ -1717,6 +2341,11 @@ func hipGemma4Q4DefaultStopTokenIDs(model *hipLoadedModel) []int32 {
 	}
 	model.q4ConfigMu.Lock()
 	defer model.q4ConfigMu.Unlock()
+	stop := hipGemma4Q4DefaultStopTokenIDsLocked(model)
+	return stop[:len(stop):len(stop)]
+}
+
+func hipGemma4Q4DefaultStopTokenIDsLocked(model *hipLoadedModel) []int32 {
 	if len(model.q4Stop) == 0 {
 		model.q4Stop = hipTokenTextIDs(model.tokenText, []string{
 			"<eos>",
@@ -1724,31 +2353,56 @@ func hipGemma4Q4DefaultStopTokenIDs(model *hipLoadedModel) []int32 {
 			"<|tool_response>",
 		})
 	}
-	return model.q4Stop[:len(model.q4Stop):len(model.q4Stop)]
+	return model.q4Stop
+}
+
+func hipPrewarmGemma4Q4TokenFilters(model *hipLoadedModel) {
+	_ = hipGemma4Q4GenerationSuppressTokenIDs(model, nil)
 }
 
 func hipGemma4Q4GenerationSuppressTokenIDs(model *hipLoadedModel, stopTokens []int32) []int32 {
-	suppressTokens := hipGemma4Q4DefaultSuppressTokenIDs(model)
 	if len(stopTokens) > 0 {
-		return suppressTokens
+		return hipGemma4Q4DefaultSuppressTokenIDs(model)
 	}
-	for _, id := range hipGemma4Q4DefaultStopTokenIDs(model) {
-		if !hipTokenIsSuppressed(id, suppressTokens) {
-			suppressTokens = append(suppressTokens, id)
+	if model == nil || model.tokenText == nil || !isROCmGemma4Architecture(model.modelInfo.Architecture) {
+		return nil
+	}
+	model.q4ConfigMu.Lock()
+	defer model.q4ConfigMu.Unlock()
+	if !model.q4SuppressStopOK {
+		suppressTokens := hipGemma4Q4DefaultSuppressTokenIDsLocked(model)
+		stopTokens := hipGemma4Q4DefaultStopTokenIDsLocked(model)
+		needCapacity := len(suppressTokens) + len(stopTokens)
+		if cap(model.q4SuppressStop) < needCapacity {
+			model.q4SuppressStop = make([]int32, 0, needCapacity)
+		} else {
+			model.q4SuppressStop = model.q4SuppressStop[:0]
 		}
+		model.q4SuppressStop = append(model.q4SuppressStop, suppressTokens...)
+		for _, id := range stopTokens {
+			if !hipTokenIsSuppressed(id, model.q4SuppressStop) {
+				model.q4SuppressStop = append(model.q4SuppressStop, id)
+			}
+		}
+		model.q4SuppressStopOK = true
 	}
-	return suppressTokens
+	return model.q4SuppressStop[:len(model.q4SuppressStop):len(model.q4SuppressStop)]
 }
 
 func hipGemma4Q4HostSamplingRequested(generate inference.GenerateConfig) bool {
 	return generate.Temperature > 0 ||
 		generate.TopK > 0 ||
 		generate.TopP > 0 ||
+		generate.MinP != 0 ||
 		generate.RepeatPenalty > 1
 }
 
 func hipGemma4Q4DeviceCandidateSamplingRequested(generate inference.GenerateConfig) bool {
-	return hipGemma4Q4HostSamplingRequested(generate) && generate.TopK > 0 && generate.RepeatPenalty <= 1
+	return false
+}
+
+func hipGemma4Q4DeviceTopKSamplingRequested(generate inference.GenerateConfig) bool {
+	return hipGemma4Q4HostSamplingRequested(generate) && generate.TopK > 0 && generate.MinP == 0 && generate.RepeatPenalty <= 1
 }
 
 func hipGemma4Q4RepeatHistoryRequired(generate inference.GenerateConfig) bool {
@@ -1780,7 +2434,7 @@ func hipGemma4Q4HostSampleResult(logits []float32, generate inference.GenerateCo
 			}
 		}
 	}
-	if generate.Temperature <= 0 && generate.TopK <= 0 && generate.TopP <= 0 {
+	if generate.Temperature <= 0 && generate.TopK <= 0 && generate.TopP <= 0 && generate.MinP == 0 {
 		tokenID, score, err := hipReferenceGreedySampleSuppress(working, nil)
 		if err != nil {
 			return hipGreedySampleResult{}, err
@@ -1800,6 +2454,10 @@ func hipGemma4Q4HostSampleResult(logits []float32, generate inference.GenerateCo
 	}
 	if topP <= 0 || topP > 1 || math.IsNaN(float64(topP)) || math.IsInf(float64(topP), 0) {
 		return hipGreedySampleResult{}, core.E("rocm.hip.Gemma4Q4HostSampler", "top-p must be in (0, 1]", nil)
+	}
+	minP, err := hipGemma4Q4HostSampleMinP(generate)
+	if err != nil {
+		return hipGreedySampleResult{}, err
 	}
 	candidates := make([]hipReferenceCandidate, 0, len(working))
 	for index, value := range working {
@@ -1842,6 +2500,7 @@ func hipGemma4Q4HostSampleResult(logits []float32, generate inference.GenerateCo
 			}
 		}
 	}
+	limit = hipGemma4Q4HostSampleMinPLimit(weights, limit, minP)
 	selectedTotal := 0.0
 	for _, weight := range weights[:limit] {
 		selectedTotal += weight
@@ -1899,6 +2558,10 @@ func hipGemma4Q4HostSampleCandidateResultScratchOrder(candidates []hipGreedySamp
 	if len(candidates) == 0 {
 		return hipGreedySampleResult{}, working, weights, core.E("rocm.hip.Gemma4Q4HostSampler", "candidates are required", nil)
 	}
+	if sorted && generate.RepeatPenalty <= 1 {
+		result, nextWeights, err := hipGemma4Q4HostSampleSortedGreedyCandidates(candidates, generate, draw, weights)
+		return result, working, nextWeights, err
+	}
 	working = working[:0]
 	if cap(working) < len(candidates) {
 		working = make([]hipReferenceCandidate, 0, len(candidates))
@@ -1930,7 +2593,7 @@ func hipGemma4Q4HostSampleCandidateResultScratchOrder(candidates []hipGreedySamp
 			}
 		}
 	}
-	if generate.Temperature <= 0 && generate.TopP <= 0 {
+	if generate.Temperature <= 0 && generate.TopP <= 0 && generate.MinP == 0 {
 		if !sorted || hipGemma4Q4RepeatHistoryRequired(generate) {
 			sortHIPReferenceCandidates(working)
 		}
@@ -1950,6 +2613,10 @@ func hipGemma4Q4HostSampleCandidateResultScratchOrder(candidates []hipGreedySamp
 	}
 	if topP <= 0 || topP > 1 || math.IsNaN(float64(topP)) || math.IsInf(float64(topP), 0) {
 		return hipGreedySampleResult{}, working, weights, core.E("rocm.hip.Gemma4Q4HostSampler", "top-p must be in (0, 1]", nil)
+	}
+	minP, err := hipGemma4Q4HostSampleMinP(generate)
+	if err != nil {
+		return hipGreedySampleResult{}, working, weights, err
 	}
 	if !sorted || hipGemma4Q4RepeatHistoryRequired(generate) {
 		sortHIPReferenceCandidates(working)
@@ -1980,6 +2647,7 @@ func hipGemma4Q4HostSampleCandidateResultScratchOrder(candidates []hipGreedySamp
 			}
 		}
 	}
+	limit = hipGemma4Q4HostSampleMinPLimit(weights, limit, minP)
 	selectedTotal := 0.0
 	for _, weight := range weights[:limit] {
 		selectedTotal += weight
@@ -2001,6 +2669,137 @@ func hipGemma4Q4HostSampleCandidateResultScratchOrder(candidates []hipGreedySamp
 	}
 	candidate := working[limit-1]
 	return hipGreedySampleResult{TokenID: candidate.index, Score: candidate.value}, working, weights, nil
+}
+
+func hipGemma4Q4HostSampleSortedGreedyCandidates(candidates []hipGreedySampleResult, generate inference.GenerateConfig, draw float64, weights []float64) (hipGreedySampleResult, []float64, error) {
+	firstValid := -1
+	if generate.Temperature <= 0 && generate.TopP <= 0 && generate.MinP == 0 {
+		for index, candidate := range candidates {
+			if candidate.TokenID >= 0 && !math.IsNaN(float64(candidate.Score)) && !math.IsInf(float64(candidate.Score), 0) {
+				firstValid = index
+				return candidate, weights, nil
+			}
+		}
+		return hipGreedySampleResult{}, weights, core.E("rocm.hip.Gemma4Q4HostSampler", "all candidates are invalid", nil)
+	}
+	temperature := generate.Temperature
+	if temperature == 0 {
+		temperature = 1
+	}
+	if temperature <= 0 || math.IsNaN(float64(temperature)) || math.IsInf(float64(temperature), 0) {
+		return hipGreedySampleResult{}, weights, core.E("rocm.hip.Gemma4Q4HostSampler", "temperature must be positive and finite", nil)
+	}
+	topP := generate.TopP
+	if topP == 0 {
+		topP = 1
+	}
+	if topP <= 0 || topP > 1 || math.IsNaN(float64(topP)) || math.IsInf(float64(topP), 0) {
+		return hipGreedySampleResult{}, weights, core.E("rocm.hip.Gemma4Q4HostSampler", "top-p must be in (0, 1]", nil)
+	}
+	minP, err := hipGemma4Q4HostSampleMinP(generate)
+	if err != nil {
+		return hipGreedySampleResult{}, weights, err
+	}
+	for index, candidate := range candidates {
+		if candidate.TokenID >= 0 && !math.IsNaN(float64(candidate.Score)) && !math.IsInf(float64(candidate.Score), 0) {
+			firstValid = index
+			break
+		}
+	}
+	if firstValid < 0 {
+		return hipGreedySampleResult{}, weights, core.E("rocm.hip.Gemma4Q4HostSampler", "all candidates are invalid", nil)
+	}
+	if cap(weights) < len(candidates) {
+		weights = make([]float64, 0, len(candidates))
+	} else {
+		weights = weights[:0]
+	}
+	maxValue := float64(candidates[firstValid].Score) / float64(temperature)
+	total := 0.0
+	for _, candidate := range candidates {
+		if candidate.TokenID < 0 || math.IsNaN(float64(candidate.Score)) || math.IsInf(float64(candidate.Score), 0) {
+			continue
+		}
+		weight := math.Exp(float64(candidate.Score)/float64(temperature) - maxValue)
+		weights = append(weights, weight)
+		total += weight
+	}
+	if total <= 0 || math.IsNaN(total) || math.IsInf(total, 0) {
+		return hipGreedySampleResult{}, weights, core.E("rocm.hip.Gemma4Q4HostSampler", "sampling distribution is invalid", nil)
+	}
+	limit := len(weights)
+	if topP < 1 {
+		cumulative := 0.0
+		for index, weight := range weights {
+			cumulative += weight
+			if cumulative/total >= float64(topP) {
+				limit = index + 1
+				break
+			}
+		}
+	}
+	limit = hipGemma4Q4HostSampleMinPLimit(weights, limit, minP)
+	selectedTotal := 0.0
+	for _, weight := range weights[:limit] {
+		selectedTotal += weight
+	}
+	if draw < 0 {
+		draw = 0
+	}
+	if draw >= 1 {
+		draw = math.Nextafter(1, 0)
+	}
+	target := draw * selectedTotal
+	cumulative := 0.0
+	weightIndex := 0
+	var last hipGreedySampleResult
+	for _, candidate := range candidates {
+		if candidate.TokenID < 0 || math.IsNaN(float64(candidate.Score)) || math.IsInf(float64(candidate.Score), 0) {
+			continue
+		}
+		if weightIndex >= limit {
+			break
+		}
+		last = candidate
+		cumulative += weights[weightIndex]
+		if target <= cumulative {
+			return candidate, weights, nil
+		}
+		weightIndex++
+	}
+	return last, weights, nil
+}
+
+func hipGemma4Q4HostSampleMinP(generate inference.GenerateConfig) (float64, error) {
+	minP := generate.MinP
+	if minP == 0 {
+		return 0, nil
+	}
+	if minP < 0 || minP > 1 || math.IsNaN(float64(minP)) || math.IsInf(float64(minP), 0) {
+		return 0, core.E("rocm.hip.Gemma4Q4HostSampler", "min-p must be in [0, 1]", nil)
+	}
+	return float64(minP), nil
+}
+
+func hipGemma4Q4HostSampleMinPLimit(weights []float64, limit int, minP float64) int {
+	if minP <= 0 || len(weights) == 0 {
+		return limit
+	}
+	if limit <= 0 {
+		return 0
+	}
+	if limit > len(weights) {
+		limit = len(weights)
+	}
+	threshold := weights[0] * minP
+	next := 0
+	for next < limit && weights[next] >= threshold {
+		next++
+	}
+	if next == 0 {
+		return 1
+	}
+	return next
 }
 
 func hipTokenTextIDs(decoder *hipTokenTextDecoder, texts []string) []int32 {

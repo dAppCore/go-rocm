@@ -53,6 +53,48 @@ func TestOpenAI_NewOpenAIServiceMux_Bad_CacheWarmRejectsEmptyInput(t *testing.T)
 	}
 }
 
+func TestOpenAI_NewOpenAIServiceMux_Good_ROCmModelEmbeddingUsesNativePath(t *testing.T) {
+	model := &rocmModel{
+		modelInfo: inference.ModelInfo{Architecture: "bert", HiddenSize: 2, VocabSize: 3, QuantBits: 32},
+		native: &fakeNativeEmbeddingModel{fakeNativeModel: &fakeNativeModel{kernelStatus: hipKernelStatus{
+			Embedding: hipKernelStatusLinked,
+			Rerank:    hipKernelStatusLinked,
+			KVCache:   hipKernelStatusPlanned,
+		}}},
+	}
+	mux := NewOpenAIServiceMux(openaicompat.NewStaticResolver(map[string]inference.TextModel{"bert": model}))
+	req := httptest.NewRequest(http.MethodPost, openaicompat.DefaultEmbeddingsPath, strings.NewReader(`{"model":"bert","input":["hello"],"normalize":true}`))
+	rec := httptest.NewRecorder()
+
+	mux.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK || !strings.Contains(body, `"model":"bert"`) || !strings.Contains(body, `"embedding":[1,0]`) {
+		t.Fatalf("embedding status = %d body=%s, want native ROCm embedding response", rec.Code, body)
+	}
+}
+
+func TestOpenAI_NewOpenAIServiceMux_Good_ROCmModelRerankUsesNativePath(t *testing.T) {
+	model := &rocmModel{
+		modelInfo: inference.ModelInfo{Architecture: "bert", HiddenSize: 2, VocabSize: 3, QuantBits: 32},
+		native: &fakeNativeEmbeddingModel{fakeNativeModel: &fakeNativeModel{kernelStatus: hipKernelStatus{
+			Embedding: hipKernelStatusLinked,
+			Rerank:    hipKernelStatusLinked,
+			KVCache:   hipKernelStatusPlanned,
+		}}},
+	}
+	mux := NewOpenAIServiceMux(openaicompat.NewStaticResolver(map[string]inference.TextModel{"bert": model}))
+	req := httptest.NewRequest(http.MethodPost, openaicompat.DefaultRerankPath, strings.NewReader(`{"model":"bert","query":"core","documents":["a","b"],"top_n":1}`))
+	rec := httptest.NewRecorder()
+
+	mux.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK || !strings.Contains(body, `"model":"bert"`) || !strings.Contains(body, `"index":1`) || !strings.Contains(body, `"score":0.9`) {
+		t.Fatalf("rerank status = %d body=%s, want native ROCm rerank response", rec.Code, body)
+	}
+}
+
 func TestOpenAI_NewOpenAIServiceMux_Bad_ROCmModelEmbeddingReportsKernelNotLinked(t *testing.T) {
 	model := &rocmModel{
 		modelInfo: inference.ModelInfo{Architecture: "bert"},

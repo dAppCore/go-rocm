@@ -195,9 +195,18 @@ func (req hipLoRAProjectionRequest) launchArgs(buffers *hipLoRADeviceBuffers) (h
 }
 
 func (args hipLoRALaunchArgs) Binary() ([]byte, error) {
+	payload := make([]byte, hipLoRALaunchArgsBytes)
+	return args.BinaryInto(payload)
+}
+
+func (args hipLoRALaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.InputPointer == 0 || args.BaseWeightPointer == 0 || args.LoRAAPointer == 0 || args.LoRABPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.LoRALaunch", "input, base, LoRA, and output pointers are required", nil)
 	}
+	if len(payload) < hipLoRALaunchArgsBytes {
+		return nil, core.E("rocm.hip.LoRALaunch", "launch arg payload buffer is too small", nil)
+	}
+	payload = payload[:hipLoRALaunchArgsBytes]
 	if !hipQ8ScaleIsPositiveFinite(args.Alpha) {
 		return nil, core.E("rocm.hip.LoRALaunch", "alpha must be positive and finite", nil)
 	}
@@ -264,7 +273,6 @@ func (args hipLoRALaunchArgs) Binary() ([]byte, error) {
 	} else if args.BiasPointer != 0 || args.BiasBytes != 0 {
 		return nil, core.E("rocm.hip.LoRALaunch", "bias metadata supplied without bias flag", nil)
 	}
-	payload := make([]byte, hipLoRALaunchArgsBytes)
 	binary.LittleEndian.PutUint32(payload[0:], hipLoRALaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
@@ -310,17 +318,30 @@ func (buffers *hipLoRADeviceBuffers) Close() error {
 }
 
 func (buffers *hipLoRADeviceBuffers) ReadOutput() ([]float32, error) {
+	if buffers == nil {
+		return nil, core.E("rocm.hip.LoRALaunch", "LoRA output buffer is required", nil)
+	}
+	payload := make([]byte, buffers.Rows*4)
+	values := make([]float32, buffers.Rows)
+	return buffers.ReadOutputInto(values, payload)
+}
+
+func (buffers *hipLoRADeviceBuffers) ReadOutputInto(values []float32, payload []byte) ([]float32, error) {
 	if buffers == nil || buffers.Output == nil || buffers.Output.Pointer() == 0 {
 		return nil, core.E("rocm.hip.LoRALaunch", "LoRA output buffer is required", nil)
 	}
 	if buffers.Rows <= 0 || buffers.Output.Count() != buffers.Rows || buffers.Output.SizeBytes() != uint64(buffers.Rows*4) {
 		return nil, core.E("rocm.hip.LoRALaunch", "LoRA output byte count mismatch", nil)
 	}
-	payload := make([]byte, buffers.Output.SizeBytes())
+	outputBytes := int(buffers.Output.SizeBytes())
+	if len(payload) < outputBytes {
+		return nil, core.E("rocm.hip.LoRALaunch", "LoRA output payload buffer is too small", nil)
+	}
+	payload = payload[:outputBytes]
 	if err := buffers.Output.driver.CopyDeviceToHost(buffers.Output.Pointer(), payload); err != nil {
 		return nil, core.E("rocm.hip.LoRALaunch", "copy LoRA output", err)
 	}
-	values, err := hipFloat32PayloadValues(payload)
+	values, err := hipFloat32PayloadValuesInto(values, payload)
 	if err != nil {
 		return nil, err
 	}

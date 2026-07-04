@@ -15,6 +15,7 @@ type hipDeviceTokenBuffer struct {
 	pointer   nativeDevicePointer
 	count     int
 	sizeBytes uint64
+	borrowed  bool
 	closed    bool
 }
 
@@ -22,7 +23,19 @@ func hipTokenIDsPayload(tokenIDs []int32) ([]byte, error) {
 	if len(tokenIDs) == 0 {
 		return nil, core.E("rocm.hip.Tokens", "token IDs are required", nil)
 	}
-	payload := make([]byte, len(tokenIDs)*4)
+	return hipTokenIDsPayloadInto(nil, tokenIDs)
+}
+
+func hipTokenIDsPayloadInto(payload []byte, tokenIDs []int32) ([]byte, error) {
+	if len(tokenIDs) == 0 {
+		return nil, core.E("rocm.hip.Tokens", "token IDs are required", nil)
+	}
+	byteCount := len(tokenIDs) * 4
+	if cap(payload) < byteCount {
+		payload = make([]byte, byteCount)
+	} else {
+		payload = payload[:byteCount]
+	}
 	for index, id := range tokenIDs {
 		if id < 0 {
 			return nil, core.E("rocm.hip.Tokens", "token IDs must be non-negative", nil)
@@ -43,11 +56,11 @@ func hipUploadTokenIDs(driver nativeHIPDriver, tokenIDs []int32) (*hipDeviceToke
 	if err != nil {
 		return nil, err
 	}
-	pointer, err := driver.Malloc(uint64(len(payload)))
+	pointer, err := hipMallocLabeled(driver, "rocm.hip.Tokens", "token buffer", uint64(len(payload)))
 	if err != nil {
 		return nil, core.E("rocm.hip.Tokens", "allocate token buffer", err)
 	}
-	if err := hipCopyHostToDevice(driver, pointer, payload); err != nil {
+	if err := hipCopyHostToDeviceLabeled(driver, pointer, payload, "rocm.hip.Tokens", "token buffer"); err != nil {
 		_ = driver.Free(pointer)
 		return nil, core.E("rocm.hip.Tokens", "copy token buffer", err)
 	}
@@ -74,7 +87,7 @@ func hipWriteSingleTokenID(driver nativeHIPDriver, pointer nativeDevicePointer, 
 	}
 	var payload [4]byte
 	binary.LittleEndian.PutUint32(payload[:], uint32(tokenID))
-	if err := hipCopyHostToDevice(driver, pointer, payload[:]); err != nil {
+	if err := hipCopyHostToDeviceLabeled(driver, pointer, payload[:], "rocm.hip.Tokens", "single token buffer"); err != nil {
 		return core.E("rocm.hip.Tokens", "copy token buffer", err)
 	}
 	return nil
@@ -106,6 +119,11 @@ func (buffer *hipDeviceTokenBuffer) Close() error {
 		return nil
 	}
 	if buffer.pointer != 0 {
+		if buffer.borrowed {
+			buffer.pointer = 0
+			buffer.closed = true
+			return nil
+		}
 		if buffer.driver == nil {
 			return core.E("rocm.hip.Tokens", "HIP driver is nil", nil)
 		}

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	core "dappco.re/go"
+	"dappco.re/go/inference"
 )
 
 func TestEmbeddingReferenceMeanPool_Good(t *testing.T) {
@@ -140,4 +141,48 @@ func TestRerankReference_Bad_RejectsZeroVectors(t *testing.T) {
 
 	core.AssertError(t, err)
 	core.AssertContains(t, err.Error(), "zero vector")
+}
+
+func TestHIPLoadedModelIdentity_Good_UsesEngineProfileLabelsAndContext(t *testing.T) {
+	model := &hipLoadedModel{
+		modelInfo: inference.ModelInfo{
+			Architecture: "gemma4_text",
+			VocabSize:    ProductionMTPAssistantTokenOrderingVocabSize,
+			NumLayers:    productionLaneGemma4E2BLayers,
+			HiddenSize:   productionLaneGemma4E2BHiddenSize,
+			QuantBits:    6,
+			QuantGroup:   64,
+		},
+		contextSize: 8192,
+		modelLabels: map[string]string{
+			"gemma4_size":       "E2B",
+			"gemma4_quant_mode": "q6",
+			"runtime_label":     "loaded",
+		},
+		engineProfile: ROCmModelProfile{
+			Model: inference.ModelIdentity{
+				Path:   "/models/lmstudio-community-gemma-4-e2b-it-6bit",
+				Labels: map[string]string{"profile_label": "kept", "runtime_label": "profile"},
+			},
+		},
+	}
+
+	identity := hipLoadedModelIdentity(model)
+	if identity.Path != "/models/lmstudio-community-gemma-4-e2b-it-6bit" ||
+		identity.Architecture != "gemma4_text" ||
+		identity.ContextLength != 8192 ||
+		identity.QuantBits != 6 ||
+		identity.QuantGroup != 64 ||
+		identity.QuantType != "q6" ||
+		identity.Labels["profile_label"] != "kept" ||
+		identity.Labels["runtime_label"] != "loaded" ||
+		identity.Labels["gemma4_size"] != "E2B" ||
+		identity.Labels["gemma4_quant_mode"] != "q6" ||
+		identity.Labels["gemma4_generate_status"] == "" {
+		t.Fatalf("hipLoadedModelIdentity = %+v, want loaded Gemma4 profile identity with context and labels", identity)
+	}
+	identity.Labels["runtime_label"] = "mutated"
+	if next := hipLoadedModelIdentity(model); next.Labels["runtime_label"] == "mutated" {
+		t.Fatalf("hipLoadedModelIdentity returned aliased labels: %+v", next.Labels)
+	}
 }

@@ -33,8 +33,13 @@ func (m *rocmModel) CaptureState(ctx context.Context, prompt string, opts ...inf
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	cfg := inference.ApplyGenerateOpts(opts)
+	cfg := m.applyGenerateOpts(opts)
+	promptTokens, err := m.resolveGenerateGemma4Context(prompt, &cfg, "rocm.CaptureState")
+	if err != nil {
+		return nil, err
+	}
 	metrics := m.Metrics()
+	model := m.modelIdentity()
 	labels := map[string]string{
 		"backend":              "rocm",
 		"state_bundle":         "metadata_only",
@@ -43,15 +48,18 @@ func (m *rocmModel) CaptureState(ctx context.Context, prompt string, opts ...inf
 	for key, value := range m.kernelStatus().Labels() {
 		labels[key] = value
 	}
+	labels = rocmApplyGemma4StateArtifactLabels(labels, model)
+	adapter := m.ActiveAdapter()
+	rocmAddStateBundleAdapterLabels(labels, adapter)
 	return &inference.StateBundle{
 		Version:         "rocm-state-bundle-v1",
 		CreatedAtUnix:   time.Now().Unix(),
-		Model:           m.modelIdentity(),
-		Adapter:         m.ActiveAdapter(),
+		Model:           model,
+		Adapter:         adapter,
 		Sampler:         rocmSamplerConfig(cfg),
 		Runtime:         inference.RuntimeIdentity{Backend: "rocm", NativeRuntime: true, Labels: m.kernelStatus().Labels()},
 		PromptHash:      rocmPromptHash(prompt),
-		PromptTokens:    len(m.Encode(prompt)),
+		PromptTokens:    promptTokens,
 		GeneratedTokens: metrics.GeneratedTokens,
 		Labels:          labels,
 	}, nil
@@ -82,6 +90,9 @@ func (m *rocmModel) RestoreState(ctx context.Context, bundle *inference.StateBun
 	if err := checkROCmStateModelCompatibility("rocm.RestoreState", m.modelIdentity(), bundle.Model); err != nil {
 		return err
 	}
+	if err := checkROCmAdapterModelCompatibility("rocm.RestoreState", m.modelIdentity(), bundle.Adapter); err != nil {
+		return err
+	}
 	labels := mergeStringMaps(bundle.Labels, map[string]string{
 		"backend":          "rocm",
 		"kv_restore":       "metadata_only",
@@ -89,6 +100,7 @@ func (m *rocmModel) RestoreState(ctx context.Context, bundle *inference.StateBun
 		"state_bundle_kv":  "use_wake_state",
 		"state_bundle_ref": core.Sprintf("%d", len(bundle.KVRefs)),
 	})
+	rocmAddStateBundleAdapterLabels(labels, bundle.Adapter)
 	next := NewStateSession(bundle.Model, bundle.Tokenizer, labels)
 	m.stateMutex.Lock()
 	previous := m.state
@@ -109,6 +121,7 @@ func rocmSamplerConfig(cfg inference.GenerateConfig) inference.SamplerConfig {
 		Temperature:   cfg.Temperature,
 		TopK:          cfg.TopK,
 		TopP:          cfg.TopP,
+		MinP:          cfg.MinP,
 		RepeatPenalty: cfg.RepeatPenalty,
 		StopTokens:    append([]int32(nil), cfg.StopTokens...),
 		ReturnLogits:  cfg.ReturnLogits,

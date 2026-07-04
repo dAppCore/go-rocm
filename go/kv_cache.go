@@ -110,6 +110,47 @@ type rocmKVBlockBundleRef struct {
 	Labels     map[string]string `json:"labels,omitempty"`
 }
 
+type rocmKVBlockBundleWakeSnapshot struct {
+	Kind       string                     `json:"kind"`
+	Mode       string                     `json:"mode"`
+	BlockSize  int                        `json:"block_size"`
+	TokenCount int                        `json:"token_count"`
+	Blocks     []rocmKVBlockBundleWakeRef `json:"blocks,omitempty"`
+}
+
+type rocmKVBlockBundleWakeRef struct {
+	Index      int    `json:"index"`
+	URI        string `json:"uri"`
+	uriRaw     []byte
+	ChunkID    int            `json:"chunk_id,omitempty"`
+	State      state.ChunkRef `json:"state,omitempty"`
+	TokenStart int            `json:"token_start"`
+	TokenCount int            `json:"token_count"`
+	KeyWidth   int            `json:"key_width,omitempty"`
+	ValueWidth int            `json:"value_width,omitempty"`
+	SizeBytes  uint64         `json:"size_bytes,omitempty"`
+	Encoding   string         `json:"encoding,omitempty"`
+}
+
+func (ref rocmKVBlockBundleWakeRef) fullBundleRef() rocmKVBlockBundleRef {
+	uri := ref.URI
+	if uri == "" && len(ref.uriRaw) > 0 {
+		uri = string(ref.uriRaw)
+	}
+	return rocmKVBlockBundleRef{
+		Index:      ref.Index,
+		URI:        uri,
+		ChunkID:    ref.ChunkID,
+		State:      ref.State,
+		TokenStart: ref.TokenStart,
+		TokenCount: ref.TokenCount,
+		KeyWidth:   ref.KeyWidth,
+		ValueWidth: ref.ValueWidth,
+		SizeBytes:  ref.SizeBytes,
+		Encoding:   ref.Encoding,
+	}
+}
+
 type rocmKVEncodedTensorSnapshot struct {
 	Encoding  string    `json:"encoding"`
 	Length    int       `json:"length"`
@@ -297,6 +338,69 @@ func (cache *rocmKVCache) Clone() (*rocmKVCache, error) {
 	return clone, nil
 }
 
+func (cache *rocmKVCache) Prefix(tokenCount int) (*rocmKVCache, error) {
+	if cache == nil {
+		return nil, core.E("rocm.KVCache.Prefix", "cache is nil", nil)
+	}
+	if tokenCount <= 0 {
+		return nil, core.E("rocm.KVCache.Prefix", "token count must be positive", nil)
+	}
+	if tokenCount > cache.TokenCount() {
+		return nil, core.E("rocm.KVCache.Prefix", "token count exceeds cache", nil)
+	}
+	if tokenCount == cache.TokenCount() {
+		return cache.Clone()
+	}
+	keyWidth, valueWidth, ok := cache.restoreVectorWidths()
+	if !ok {
+		return nil, core.E("rocm.KVCache.Prefix", "cache vector shape is not available", nil)
+	}
+	prefix := &rocmKVCache{
+		mode:       cache.mode,
+		blockSize:  cache.blockSize,
+		keyWidth:   keyWidth,
+		valueWidth: valueWidth,
+		blocks:     make([]rocmKVCacheBlock, 0, len(cache.blocks)),
+	}
+	cursor := 0
+	for _, block := range cache.blocks {
+		if block.tokenStart != cursor {
+			return nil, core.E("rocm.KVCache.Prefix", "cache block range is not available", nil)
+		}
+		blockEnd := block.tokenStart + block.tokenCount
+		if blockEnd <= tokenCount {
+			prefix.blocks = append(prefix.blocks, block.clone())
+			cursor = blockEnd
+			if cursor == tokenCount {
+				return prefix, nil
+			}
+			continue
+		}
+		partialTokens := tokenCount - block.tokenStart
+		if partialTokens <= 0 {
+			break
+		}
+		key, err := block.key.prefixRows(block.keyWidth, partialTokens)
+		if err != nil {
+			return nil, core.E("rocm.KVCache.Prefix", "prefix partial key block", err)
+		}
+		value, err := block.value.prefixRows(block.valueWidth, partialTokens)
+		if err != nil {
+			return nil, core.E("rocm.KVCache.Prefix", "prefix partial value block", err)
+		}
+		prefix.blocks = append(prefix.blocks, rocmKVCacheBlock{
+			tokenStart: block.tokenStart,
+			tokenCount: partialTokens,
+			keyWidth:   block.keyWidth,
+			valueWidth: block.valueWidth,
+			key:        key,
+			value:      value,
+		})
+		return prefix, nil
+	}
+	return nil, core.E("rocm.KVCache.Prefix", "cache block range is not available", nil)
+}
+
 func (cache *rocmKVCache) Restore(tokenStart, tokenCount int) ([]float32, []float32, error) {
 	if cache == nil {
 		return nil, nil, core.E("rocm.KVCache.Restore", "cache is nil", nil)
@@ -304,9 +408,36 @@ func (cache *rocmKVCache) Restore(tokenStart, tokenCount int) ([]float32, []floa
 	if tokenStart < 0 || tokenCount <= 0 {
 		return nil, nil, core.E("rocm.KVCache.Restore", "token range must be positive", nil)
 	}
+	if len(cache.blocks) == 0 {
+		cache.misses++
+		return nil, nil, core.E("rocm.KVCache.Restore", "cache block range is not available", nil)
+	}
+	keyWidth, valueWidth, ok := cache.restoreVectorWidths()
+	if !ok {
+		return nil, nil, core.E("rocm.KVCache.Restore", "cache vector shape is not available", nil)
+	}
+	keys := make([]float32, tokenCount*keyWidth)
+	values := make([]float32, tokenCount*valueWidth)
+	return cache.RestoreInto(tokenStart, tokenCount, keys, values)
+}
+
+func (cache *rocmKVCache) RestoreInto(tokenStart, tokenCount int, keys, values []float32) ([]float32, []float32, error) {
+	if cache == nil {
+		return nil, nil, core.E("rocm.KVCache.Restore", "cache is nil", nil)
+	}
+	if tokenStart < 0 || tokenCount <= 0 {
+		return nil, nil, core.E("rocm.KVCache.Restore", "token range must be positive", nil)
+	}
+	keyWidth, valueWidth, ok := cache.restoreVectorWidths()
+	if !ok {
+		return nil, nil, core.E("rocm.KVCache.Restore", "cache vector shape is not available", nil)
+	}
+	if len(keys) < tokenCount*keyWidth || len(values) < tokenCount*valueWidth {
+		return nil, nil, core.E("rocm.KVCache.Restore", "restore output buffers are too small", nil)
+	}
+	keys = keys[:tokenCount*keyWidth]
+	values = values[:tokenCount*valueWidth]
 	end := tokenStart + tokenCount
-	keys := make([]float32, 0, tokenCount)
-	values := make([]float32, 0, tokenCount)
 	cursor := tokenStart
 	for _, block := range cache.blocks {
 		blockEnd := block.tokenStart + block.tokenCount
@@ -316,15 +447,18 @@ func (cache *rocmKVCache) Restore(tokenStart, tokenCount int) ([]float32, []floa
 		if block.tokenStart > cursor {
 			break
 		}
-		blockKeys := block.key.decodeRows(block.keyWidth)
-		blockValues := block.value.decodeRows(block.valueWidth)
 		startOffset := cursor - block.tokenStart
 		endOffset := block.tokenCount
 		if blockEnd > end {
 			endOffset = end - block.tokenStart
 		}
-		keys = append(keys, blockKeys[startOffset*block.keyWidth:endOffset*block.keyWidth]...)
-		values = append(values, blockValues[startOffset*block.valueWidth:endOffset*block.valueWidth]...)
+		outputTokenOffset := cursor - tokenStart
+		if err := block.key.decodeRowsRangeInto(keys[outputTokenOffset*block.keyWidth:], block.keyWidth, startOffset, endOffset); err != nil {
+			return nil, nil, core.E("rocm.KVCache.Restore", "decode key block", err)
+		}
+		if err := block.value.decodeRowsRangeInto(values[outputTokenOffset*block.valueWidth:], block.valueWidth, startOffset, endOffset); err != nil {
+			return nil, nil, core.E("rocm.KVCache.Restore", "decode value block", err)
+		}
 		cursor = block.tokenStart + endOffset
 		if cursor == end {
 			cache.hits++
@@ -334,6 +468,16 @@ func (cache *rocmKVCache) Restore(tokenStart, tokenCount int) ([]float32, []floa
 	}
 	cache.misses++
 	return nil, nil, core.E("rocm.KVCache.Restore", "cache block range is not available", nil)
+}
+
+func (cache *rocmKVCache) restoreVectorWidths() (int, int, bool) {
+	if cache == nil {
+		return 0, 0, false
+	}
+	if cache.keyWidth > 0 && cache.valueWidth > 0 {
+		return cache.keyWidth, cache.valueWidth, true
+	}
+	return cache.LastVectorWidths()
 }
 
 func (cache *rocmKVCache) Stats() inference.CacheStats {
@@ -357,6 +501,7 @@ func (cache *rocmKVCache) Stats() inference.CacheStats {
 		labels["kv_key_width"] = core.Sprintf("%d", keyWidth)
 		labels["kv_value_width"] = core.Sprintf("%d", valueWidth)
 	}
+	labels = rocmApplyCacheProfileLabels(labels, cache.CacheProfile(""))
 	return inference.CacheStats{
 		Blocks:        len(cache.blocks),
 		MemoryBytes:   cache.MemoryBytes(),
@@ -545,6 +690,99 @@ func (tensor rocmKVEncodedTensor) clone() rocmKVEncodedTensor {
 	}
 }
 
+func (tensor rocmKVEncodedTensor) prefixRows(rowWidth, rows int) (rocmKVEncodedTensor, error) {
+	if rowWidth <= 0 || rows <= 0 || tensor.length <= 0 || tensor.length%rowWidth != 0 {
+		return rocmKVEncodedTensor{}, core.E("rocm.KVCache.Prefix", "tensor row shape mismatch", nil)
+	}
+	rowCount := tensor.length / rowWidth
+	if rows > rowCount {
+		return rocmKVEncodedTensor{}, core.E("rocm.KVCache.Prefix", "tensor prefix row count mismatch", nil)
+	}
+	if rows == rowCount {
+		return tensor.clone(), nil
+	}
+	prefixLength := rows * rowWidth
+	switch tensor.encoding {
+	case rocmKVEncodingFP16:
+		if len(tensor.f16) < prefixLength {
+			return rocmKVEncodedTensor{}, core.E("rocm.KVCache.Prefix", "fp16 tensor length mismatch", nil)
+		}
+		return rocmKVEncodedTensor{
+			encoding:  tensor.encoding,
+			length:    prefixLength,
+			scale:     tensor.scale,
+			f16:       tensor.f16[:prefixLength],
+			sizeBytes: uint64(prefixLength * 2),
+		}, nil
+	case rocmKVEncodingQ8:
+		if len(tensor.q8) < prefixLength {
+			return rocmKVEncodedTensor{}, core.E("rocm.KVCache.Prefix", "q8 tensor length mismatch", nil)
+		}
+		return rocmKVEncodedTensor{
+			encoding:  tensor.encoding,
+			length:    prefixLength,
+			scale:     tensor.scale,
+			q8:        tensor.q8[:prefixLength],
+			sizeBytes: uint64(4 + prefixLength),
+		}, nil
+	case rocmKVEncodingQ8Rows, rocmKVEncodingQ8RowsI:
+		if len(tensor.q8) < prefixLength || len(tensor.scales) < rows {
+			return rocmKVEncodedTensor{}, core.E("rocm.KVCache.Prefix", "q8 row tensor length mismatch", nil)
+		}
+		sizeBytes := uint64(rows*4 + prefixLength)
+		if tensor.encoding == rocmKVEncodingQ8RowsI {
+			sizeBytes = uint64(rows * (4 + rowWidth))
+		}
+		return rocmKVEncodedTensor{
+			encoding:  tensor.encoding,
+			length:    prefixLength,
+			scales:    tensor.scales[:rows],
+			q8:        tensor.q8[:prefixLength],
+			sizeBytes: sizeBytes,
+		}, nil
+	case rocmKVEncodingQ4:
+		packedLength := (prefixLength + 1) / 2
+		if len(tensor.packedQ4) < packedLength {
+			return rocmKVEncodedTensor{}, core.E("rocm.KVCache.Prefix", "q4 tensor length mismatch", nil)
+		}
+		packed := tensor.packedQ4[:packedLength]
+		if prefixLength%2 == 1 {
+			packed = append([]byte(nil), packed...)
+			packed[len(packed)-1] &= 0x0f
+		}
+		return rocmKVEncodedTensor{
+			encoding:  tensor.encoding,
+			length:    prefixLength,
+			scale:     tensor.scale,
+			packedQ4:  packed,
+			sizeBytes: uint64(4 + packedLength),
+		}, nil
+	case rocmKVEncodingQ4Rows, rocmKVEncodingQ4RowsI:
+		packedLength := (prefixLength + 1) / 2
+		if len(tensor.packedQ4) < packedLength || len(tensor.scales) < rows {
+			return rocmKVEncodedTensor{}, core.E("rocm.KVCache.Prefix", "q4 row tensor length mismatch", nil)
+		}
+		packed := tensor.packedQ4[:packedLength]
+		if prefixLength%2 == 1 {
+			packed = append([]byte(nil), packed...)
+			packed[len(packed)-1] &= 0x0f
+		}
+		sizeBytes := uint64(rows*4 + packedLength)
+		if tensor.encoding == rocmKVEncodingQ4RowsI {
+			sizeBytes = uint64(rows * (4 + (rowWidth+1)/2))
+		}
+		return rocmKVEncodedTensor{
+			encoding:  tensor.encoding,
+			length:    prefixLength,
+			scales:    tensor.scales[:rows],
+			packedQ4:  packed,
+			sizeBytes: sizeBytes,
+		}, nil
+	default:
+		return rocmKVEncodedTensor{}, core.E("rocm.KVCache.Prefix", core.Sprintf("unsupported tensor encoding %q", tensor.encoding), nil)
+	}
+}
+
 func (snapshot rocmKVEncodedTensorSnapshot) toTensor() (rocmKVEncodedTensor, error) {
 	if snapshot.Length <= 0 {
 		return rocmKVEncodedTensor{}, core.E("rocm.KVCache.Snapshot", "tensor length must be positive", nil)
@@ -708,43 +946,122 @@ func (tensor rocmKVEncodedTensor) decodeRows(rowWidth int) []float32 {
 		rowWidth = tensor.length
 	}
 	out := make([]float32, tensor.length)
+	_ = tensor.decodeRowsRangeInto(out, rowWidth, 0, tensor.length/rowWidth)
+	return out
+}
+
+func (tensor rocmKVEncodedTensor) decodeRowsRangeInto(out []float32, rowWidth, startRow, endRow int) error {
 	switch tensor.encoding {
 	case rocmKVEncodingFP16:
-		for i, value := range tensor.f16 {
-			out[i] = hipFloat16ToFloat32(value)
-		}
+		return tensor.decodeRowsRangeFP16Into(out, rowWidth, startRow, endRow)
 	case rocmKVEncodingQ8:
-		for i, value := range tensor.q8 {
-			out[i] = float32(value) * tensor.scale
-		}
+		return tensor.decodeRowsRangeQ8Into(out, rowWidth, startRow, endRow)
 	case rocmKVEncodingQ8Rows, rocmKVEncodingQ8RowsI:
-		for i, value := range tensor.q8 {
-			row := i / rowWidth
-			if row >= 0 && row < len(tensor.scales) {
-				out[i] = float32(value) * tensor.scales[row]
-			}
-		}
+		return tensor.decodeRowsRangeQ8RowsInto(out, rowWidth, startRow, endRow)
 	case rocmKVEncodingQ4:
-		for i := 0; i < tensor.length; i++ {
-			packed := tensor.packedQ4[i/2]
-			if i%2 == 1 {
-				packed >>= 4
-			}
-			out[i] = float32(unpackSignedQ4(packed&0x0f)) * tensor.scale
-		}
+		return tensor.decodeRowsRangeQ4Into(out, rowWidth, startRow, endRow)
 	case rocmKVEncodingQ4Rows, rocmKVEncodingQ4RowsI:
-		for i := 0; i < tensor.length; i++ {
-			packed := tensor.packedQ4[i/2]
-			if i%2 == 1 {
-				packed >>= 4
-			}
-			row := i / rowWidth
-			if row >= 0 && row < len(tensor.scales) {
-				out[i] = float32(unpackSignedQ4(packed&0x0f)) * tensor.scales[row]
-			}
-		}
+		return tensor.decodeRowsRangeQ4RowsInto(out, rowWidth, startRow, endRow)
+	default:
+		return core.E("rocm.KVCache.Decode", core.Sprintf("unsupported tensor encoding %q", tensor.encoding), nil)
 	}
-	return out
+}
+
+func (tensor rocmKVEncodedTensor) decodeRowsRangeShape(rowWidth, startRow, endRow int, out []float32) (int, int, error) {
+	if rowWidth <= 0 || tensor.length <= 0 || tensor.length%rowWidth != 0 {
+		return 0, 0, core.E("rocm.KVCache.Decode", "row shape mismatch", nil)
+	}
+	rowCount := tensor.length / rowWidth
+	if startRow < 0 || endRow < startRow || endRow > rowCount {
+		return 0, 0, core.E("rocm.KVCache.Decode", "row range mismatch", nil)
+	}
+	count := (endRow - startRow) * rowWidth
+	if len(out) < count {
+		return 0, 0, core.E("rocm.KVCache.Decode", "decode output buffer is too small", nil)
+	}
+	return startRow * rowWidth, count, nil
+}
+
+func (tensor rocmKVEncodedTensor) decodeRowsRangeFP16Into(out []float32, rowWidth, startRow, endRow int) error {
+	start, count, err := tensor.decodeRowsRangeShape(rowWidth, startRow, endRow, out)
+	if err != nil {
+		return err
+	}
+	if len(tensor.f16) < start+count {
+		return core.E("rocm.KVCache.Decode", "fp16 tensor length mismatch", nil)
+	}
+	for i, value := range tensor.f16[start : start+count] {
+		out[i] = hipFloat16ToFloat32(value)
+	}
+	return nil
+}
+
+func (tensor rocmKVEncodedTensor) decodeRowsRangeQ8Into(out []float32, rowWidth, startRow, endRow int) error {
+	start, count, err := tensor.decodeRowsRangeShape(rowWidth, startRow, endRow, out)
+	if err != nil {
+		return err
+	}
+	if len(tensor.q8) < start+count {
+		return core.E("rocm.KVCache.Decode", "q8 tensor length mismatch", nil)
+	}
+	for i, value := range tensor.q8[start : start+count] {
+		out[i] = float32(value) * tensor.scale
+	}
+	return nil
+}
+
+func (tensor rocmKVEncodedTensor) decodeRowsRangeQ8RowsInto(out []float32, rowWidth, startRow, endRow int) error {
+	start, count, err := tensor.decodeRowsRangeShape(rowWidth, startRow, endRow, out)
+	if err != nil {
+		return err
+	}
+	if len(tensor.q8) < start+count || len(tensor.scales) < endRow {
+		return core.E("rocm.KVCache.Decode", "q8 row tensor length mismatch", nil)
+	}
+	for i, value := range tensor.q8[start : start+count] {
+		row := startRow + i/rowWidth
+		out[i] = float32(value) * tensor.scales[row]
+	}
+	return nil
+}
+
+func (tensor rocmKVEncodedTensor) decodeRowsRangeQ4Into(out []float32, rowWidth, startRow, endRow int) error {
+	start, count, err := tensor.decodeRowsRangeShape(rowWidth, startRow, endRow, out)
+	if err != nil {
+		return err
+	}
+	if len(tensor.packedQ4) < (start+count+1)/2 {
+		return core.E("rocm.KVCache.Decode", "q4 tensor length mismatch", nil)
+	}
+	for i := 0; i < count; i++ {
+		index := start + i
+		packed := tensor.packedQ4[index/2]
+		if index%2 == 1 {
+			packed >>= 4
+		}
+		out[i] = float32(unpackSignedQ4(packed&0x0f)) * tensor.scale
+	}
+	return nil
+}
+
+func (tensor rocmKVEncodedTensor) decodeRowsRangeQ4RowsInto(out []float32, rowWidth, startRow, endRow int) error {
+	start, count, err := tensor.decodeRowsRangeShape(rowWidth, startRow, endRow, out)
+	if err != nil {
+		return err
+	}
+	if len(tensor.packedQ4) < (start+count+1)/2 || len(tensor.scales) < endRow {
+		return core.E("rocm.KVCache.Decode", "q4 row tensor length mismatch", nil)
+	}
+	for i := 0; i < count; i++ {
+		index := start + i
+		packed := tensor.packedQ4[index/2]
+		if index%2 == 1 {
+			packed >>= 4
+		}
+		row := startRow + i/rowWidth
+		out[i] = float32(unpackSignedQ4(packed&0x0f)) * tensor.scales[row]
+	}
+	return nil
 }
 
 func rocmQuantScale(values []float32, maxQuant int) float32 {

@@ -41,6 +41,22 @@ func TestHIPTransformerReferenceEmbeddingLookup_Good(t *testing.T) {
 	)
 	core.RequireNoError(t, err)
 	assertFloat32SlicesNear(t, []float32{3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 0, 1, 2, 3, 4, 5, 6, 7}, q4Output, 0)
+
+	q6Output, err := hipReferenceMLXAffineEmbeddingLookup(
+		hipPackMLXAffineValuesForTest([]uint32{
+			0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+			16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+		}, 16, 6),
+		[]uint16{0x3f80, 0x3f80},
+		[]uint16{0x0000, 0x0000},
+		2,
+		16,
+		16,
+		[]int32{1},
+		6,
+	)
+	core.RequireNoError(t, err)
+	assertFloat32SlicesNear(t, []float32{16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31}, q6Output, 0)
 }
 
 func TestHIPTransformerReferenceTinyPrefill_Good(t *testing.T) {
@@ -354,6 +370,26 @@ func TestHIPTransformerReferenceSamplerBadInputsAndTies_Bad(t *testing.T) {
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, 2, sampled.TokenID)
 
+	minPSampled, err := hipGemma4Q4HostSampleResult(
+		[]float32{1, 5, 4},
+		inference.GenerateConfig{Temperature: 1, TopP: 1, MinP: 0.5, RepeatPenalty: 1},
+		nil,
+		nil,
+		0.99,
+	)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 1, minPSampled.TokenID)
+
+	_, err = hipGemma4Q4HostSampleResult(
+		[]float32{1, 5, 4},
+		inference.GenerateConfig{Temperature: 1, MinP: -0.1},
+		nil,
+		nil,
+		0,
+	)
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "min-p")
+
 	penalized, err := hipGemma4Q4HostSampleResult(
 		[]float32{1, 5, 4},
 		inference.GenerateConfig{RepeatPenalty: 2},
@@ -394,6 +430,24 @@ func TestHIPTransformerReferenceSamplerBadInputsAndTies_Bad(t *testing.T) {
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, candidateSampled, sortedSampled)
 
+	candidateMinPSampled, err := hipGemma4Q4HostSampleCandidateResult(
+		[]hipGreedySampleResult{{TokenID: 1, Score: 5}, {TokenID: 2, Score: 4}},
+		inference.GenerateConfig{Temperature: 1, TopP: 1, MinP: 0.5, RepeatPenalty: 1},
+		nil,
+		0.99,
+	)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, 1, candidateMinPSampled.TokenID)
+	sortedMinPSampled, err := hipGemma4Q4HostSampleSortedCandidateResultWorkspace(
+		[]hipGreedySampleResult{{TokenID: 1, Score: 5}, {TokenID: 2, Score: 4}},
+		inference.GenerateConfig{Temperature: 1, TopP: 1, MinP: 0.5, RepeatPenalty: 1},
+		nil,
+		0.99,
+		nil,
+	)
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, candidateMinPSampled, sortedMinPSampled)
+
 	candidatePenalized, err := hipGemma4Q4HostSampleCandidateResult(
 		[]hipGreedySampleResult{{TokenID: 1, Score: 5}, {TokenID: 2, Score: 4}},
 		inference.GenerateConfig{RepeatPenalty: 2},
@@ -411,7 +465,9 @@ func TestHIPTransformerReferenceSamplerBadInputsAndTies_Bad(t *testing.T) {
 	)
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, candidatePenalized, sortedPenalized)
-	core.AssertTrue(t, hipGemma4Q4DeviceCandidateSamplingRequested(inference.GenerateConfig{Temperature: 1, TopK: 2, TopP: 1, RepeatPenalty: 1}), "top-k sampling can use device candidates without repeat penalty")
+	core.AssertTrue(t, hipGemma4Q4DeviceTopKSamplingRequested(inference.GenerateConfig{Temperature: 1, TopK: 2, TopP: 1, RepeatPenalty: 1}), "top-k sampling can stay on device without repeat penalty")
+	core.AssertTrue(t, !hipGemma4Q4DeviceTopKSamplingRequested(inference.GenerateConfig{Temperature: 1, TopK: 2, TopP: 1, MinP: 0.1, RepeatPenalty: 1}), "min-p is a host sampler contract until device sampling supports it")
+	core.AssertTrue(t, !hipGemma4Q4DeviceCandidateSamplingRequested(inference.GenerateConfig{Temperature: 1, TopK: 2, TopP: 1, RepeatPenalty: 1}), "host candidate copy path is not the default neutral top-k route")
 	core.AssertTrue(t, !hipGemma4Q4DeviceCandidateSamplingRequested(inference.GenerateConfig{Temperature: 1, TopK: 2, TopP: 1, RepeatPenalty: 2}), "repeat penalty changes the top-k set and must use full logits")
 	core.AssertTrue(t, !hipGemma4Q4RepeatHistoryRequired(inference.GenerateConfig{Temperature: 1, TopK: 2, TopP: 1, RepeatPenalty: 1}), "repeat history is unused when repeat penalty is neutral")
 	core.AssertTrue(t, hipGemma4Q4RepeatHistoryRequired(inference.GenerateConfig{RepeatPenalty: 2}), "repeat history is required when repeat penalty is active")
@@ -433,6 +489,12 @@ func TestHIPTransformerReferenceSamplerBadInputsAndTies_Bad(t *testing.T) {
 	if len(intoPackedTop) > 0 && &intoPackedTop[0] != &scratchBacking[0] {
 		t.Fatalf("hipTopPackedScoresBytesInto did not reuse caller-provided capacity")
 	}
+	sortedPayload := make([]byte, len(expectedPackedTop)*hipMLXQ4ProjectionBestBytes)
+	for index, value := range expectedPackedTop {
+		binary.LittleEndian.PutUint64(sortedPayload[index*hipMLXQ4ProjectionBestBytes:], value)
+	}
+	sortedPackedTop := hipSortedPackedScoresBytesInto(sortedPayload, 2, scratchPackedTop)
+	core.AssertEqual(t, expectedPackedTop, sortedPackedTop)
 
 	probs, err := hipReferenceTopKProbabilities([]float32{1, 2, 2}, 1, 1)
 	core.RequireNoError(t, err)
@@ -570,6 +632,22 @@ func BenchmarkHIPTopPackedScoresBytesInto_VocabTopK64(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		top = hipTopPackedScoresBytesInto(payload, 64, top)
+		benchmarkHIPTopPackedScoreSink ^= top[0]
+	}
+}
+
+func BenchmarkHIPSortedPackedScoresBytesInto_TopK64(b *testing.B) {
+	const topK = 64
+	payload := make([]byte, topK*hipMLXQ4ProjectionBestBytes)
+	for index := 0; index < topK; index++ {
+		binary.LittleEndian.PutUint64(payload[index*hipMLXQ4ProjectionBestBytes:], hipPackGreedyBest(float32(topK-index), index))
+	}
+	top := make([]uint64, 0, topK)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		top = hipSortedPackedScoresBytesInto(payload, topK, top)
 		benchmarkHIPTopPackedScoreSink ^= top[0]
 	}
 }

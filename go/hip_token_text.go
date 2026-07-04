@@ -9,21 +9,28 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	core "dappco.re/go"
 )
 
 type hipTokenTextDecoder struct {
-	vocab         map[string]int32
-	pieces        map[int32]string
-	decodedPieces []string
-	mergeRanks    map[string]int
-	special       map[int32]bool
-	specialText   map[string]int32
-	bosID         int32
-	hasBOS        bool
-	unknownID     int32
-	hasUnknown    bool
+	vocab          map[string]int32
+	pieces         map[int32]string
+	decodedPieces  []string
+	mergeRanks     map[string]int
+	mergePairRanks map[hipTokenTextMergePair]int
+	special        map[int32]bool
+	specialText    map[string]int32
+	bosID          int32
+	hasBOS         bool
+	unknownID      int32
+	hasUnknown     bool
+}
+
+type hipTokenTextMergePair struct {
+	left  string
+	right string
 }
 
 type hipTokenTextDecoderJSON struct {
@@ -66,6 +73,7 @@ func loadHIPTokenTextDecoder(path string) (*hipTokenTextDecoder, error) {
 		special:     make(map[int32]bool),
 		specialText: make(map[string]int32),
 	}
+	decoder.mergePairRanks = hipTokenTextMergePairRanks(decoder.mergeRanks)
 	for piece, id := range payload.Model.Vocab {
 		decoder.vocab[piece] = id
 		decoder.pieces[id] = piece
@@ -150,6 +158,24 @@ func hipTokenTextMergeRanks(raw json.RawMessage) map[string]int {
 		}
 	}
 	return ranks
+}
+
+func hipTokenTextMergePairRanks(ranks map[string]int) map[hipTokenTextMergePair]int {
+	if len(ranks) == 0 {
+		return nil
+	}
+	pairs := make(map[hipTokenTextMergePair]int, len(ranks))
+	for key, rank := range ranks {
+		separator := strings.IndexByte(key, ' ')
+		if separator <= 0 || separator >= len(key)-1 {
+			continue
+		}
+		pairs[hipTokenTextMergePair{
+			left:  key[:separator],
+			right: key[separator+1:],
+		}] = rank
+	}
+	return pairs
 }
 
 func hipTokenTextMergeRankCapacity(raw json.RawMessage) int {
@@ -291,7 +317,12 @@ func (decoder *hipTokenTextDecoder) Encode(text string) []int32 {
 	if decoder == nil || text == "" {
 		return nil
 	}
-	tokens := []int32{}
+	tokenCapacity := len(text)/4 + 1
+	if tokenCapacity < 4 {
+		tokenCapacity = 4
+	}
+	tokens := make([]int32, 0, tokenCapacity)
+	var symbols []string
 	if decoder.shouldPrependBOS(text) {
 		tokens = append(tokens, decoder.bosID)
 	}
@@ -314,7 +345,7 @@ func (decoder *hipTokenTextDecoder) Encode(text string) []int32 {
 		}
 		segment := remaining[:end]
 		remaining = remaining[end:]
-		tokens = append(tokens, decoder.encodeSegment(segment)...)
+		tokens, symbols = decoder.encodeSegmentInto(segment, tokens, symbols)
 	}
 	return tokens
 }
@@ -337,35 +368,52 @@ func (decoder *hipTokenTextDecoder) specialPrefix(text string) (int32, int, bool
 }
 
 func (decoder *hipTokenTextDecoder) encodeSegment(segment string) []int32 {
+	tokens, _ := decoder.encodeSegmentInto(segment, nil, nil)
+	return tokens
+}
+
+func (decoder *hipTokenTextDecoder) encodeSegmentInto(segment string, tokens []int32, symbols []string) ([]int32, []string) {
 	normalized := strings.ReplaceAll(segment, " ", "\u2581")
-	symbols := hipTokenTextSymbols(normalized)
+	symbols = hipTokenTextSymbolsInto(normalized, symbols[:0])
 	symbols = decoder.bpeMerge(symbols)
-	tokens := make([]int32, 0, len(symbols))
 	for _, symbol := range symbols {
 		if id, ok := decoder.vocab[symbol]; ok {
 			tokens = append(tokens, id)
 			continue
 		}
-		tokens = append(tokens, decoder.byteFallbackTokens(symbol)...)
+		tokens = decoder.appendByteFallbackTokens(tokens, symbol)
 	}
-	return tokens
+	return tokens, symbols[:0]
 }
 
 func hipTokenTextSymbols(text string) []string {
-	symbols := make([]string, 0, len(text))
-	for _, r := range text {
-		symbols = append(symbols, string(r))
+	return hipTokenTextSymbolsInto(text, nil)
+}
+
+func hipTokenTextSymbolsInto(text string, symbols []string) []string {
+	if cap(symbols) < len(text) {
+		symbols = make([]string, 0, len(text))
+	}
+	for index := 0; index < len(text); {
+		_, width := utf8.DecodeRuneInString(text[index:])
+		if width <= 0 {
+			width = 1
+		}
+		symbols = append(symbols, text[index:index+width])
+		index += width
 	}
 	return symbols
 }
 
 func (decoder *hipTokenTextDecoder) bpeMerge(symbols []string) []string {
+	if decoder.mergePairRanks == nil && len(decoder.mergeRanks) > 0 {
+		decoder.mergePairRanks = hipTokenTextMergePairRanks(decoder.mergeRanks)
+	}
 	for len(symbols) > 1 {
 		bestRank := -1
 		bestIndex := -1
 		for index := 0; index < len(symbols)-1; index++ {
-			key := symbols[index] + " " + symbols[index+1]
-			rank, ok := decoder.mergeRanks[key]
+			rank, ok := decoder.mergePairRanks[hipTokenTextMergePair{left: symbols[index], right: symbols[index+1]}]
 			if ok && (bestRank < 0 || rank < bestRank) {
 				bestRank = rank
 				bestIndex = index
@@ -384,8 +432,12 @@ func (decoder *hipTokenTextDecoder) bpeMerge(symbols []string) []string {
 }
 
 func (decoder *hipTokenTextDecoder) byteFallbackTokens(symbol string) []int32 {
-	tokens := []int32{}
-	for _, b := range []byte(symbol) {
+	return decoder.appendByteFallbackTokens(nil, symbol)
+}
+
+func (decoder *hipTokenTextDecoder) appendByteFallbackTokens(tokens []int32, symbol string) []int32 {
+	for index := 0; index < len(symbol); index++ {
+		b := symbol[index]
 		key := core.Sprintf("<0x%02X>", b)
 		if id, ok := decoder.vocab[key]; ok {
 			tokens = append(tokens, id)

@@ -15,36 +15,50 @@ import (
 )
 
 const (
-	hipProjectionLaunchArgsVersion             uint32 = 1
-	hipProjectionLaunchArgsBytes                      = 96
-	hipProjectionBatchLaunchArgsVersion        uint32 = 1
-	hipProjectionBatchLaunchArgsBytes                 = 104
-	hipMLXQ4ProjectionLaunchArgsVersion        uint32 = 1
-	hipMLXQ4ProjectionLaunchArgsBytes                 = 96
-	hipMLXQ4ProjectionBatchLaunchArgsVersion   uint32 = 1
-	hipMLXQ4ProjectionBatchLaunchArgsBytes            = 96
-	hipMLXQ4TripleProjLaunchArgsVersion        uint32 = 1
-	hipMLXQ4TripleProjLaunchArgsBytes                 = 168
-	hipMLXQ4GELUTanhMulLaunchArgsVersion       uint32 = 1
-	hipMLXQ4GELUTanhMulLaunchArgsBytes                = 128
-	hipMLXQ4GELUTanhMulBatchLaunchArgsVersion  uint32 = 1
-	hipMLXQ4GELUTanhMulBatchLaunchArgsBytes           = 128
-	hipMLXQ4GELUTanhProjLaunchArgsVersion      uint32 = 1
-	hipMLXQ4GELUTanhProjLaunchArgsBytes               = 96
-	hipMLXQ4GELUTanhProjBatchLaunchArgsVersion uint32 = 1
-	hipMLXQ4GELUTanhProjBatchLaunchArgsBytes          = 104
-	hipPackedTopKLaunchArgsVersion             uint32 = 1
-	hipPackedTopKLaunchArgsBytes                      = 48
-	hipMLXQ4ProjectionBits                            = 4
-	hipMLXQ4ProjectionBlockSize                uint32 = 256
-	hipMLXQ4ProjectionRowsPerBlock                    = 8
-	hipMLXQ4ProjectionCols256RowsPerBlock             = 32
-	hipMLXQ4ProjectionBatchTokensPerBlock             = 8
-	hipMLXQ4ProjectionGreedyRowsPerBlock              = 32
-	hipMLXQ4ProjectionBestBytes                       = 8
-	hipPackedTopKMaxK                                 = 128
-	hipPackedTopKBlockSize                     uint32 = 256
-	hipPackedTopKChunkSize                            = 512
+	hipProjectionLaunchArgsVersion                 uint32 = 1
+	hipProjectionLaunchArgsBytes                          = 96
+	hipProjectionBatchLaunchArgsVersion            uint32 = 1
+	hipProjectionBatchLaunchArgsBytes                     = 104
+	hipMLXQ4ProjectionLaunchArgsVersion            uint32 = 1
+	hipMLXQ4ProjectionLaunchArgsBytes                     = 96
+	hipMLXQ4ProjectionBatchLaunchArgsVersion       uint32 = 1
+	hipMLXQ4ProjectionBatchLaunchArgsBytes                = 96
+	hipMLXQ4ProjectionGreedyBatchLaunchArgsVersion uint32 = 1
+	hipMLXQ4ProjectionGreedyBatchLaunchArgsBytes          = 104
+	hipMLXQ4TripleProjLaunchArgsVersion            uint32 = 1
+	hipMLXQ4TripleProjLaunchArgsBytes                     = 168
+	hipMLXQ4GELUTanhMulLaunchArgsVersion           uint32 = 1
+	hipMLXQ4GELUTanhMulLaunchArgsBytes                    = 128
+	hipMLXQ4GELUTanhMulBatchLaunchArgsVersion      uint32 = 1
+	hipMLXQ4GELUTanhMulBatchLaunchArgsBytes               = 128
+	hipMLXQ4GELUTanhProjLaunchArgsVersion          uint32 = 1
+	hipMLXQ4GELUTanhProjLaunchArgsBytes                   = 96
+	hipMLXQ4GELUTanhProjBatchLaunchArgsVersion     uint32 = 1
+	hipMLXQ4GELUTanhProjBatchLaunchArgsBytes              = 104
+	hipPackedTopKLaunchArgsVersion                 uint32 = 1
+	hipPackedTopKLaunchArgsBytes                          = 48
+	hipPackedTopKSampleLaunchArgsVersion           uint32 = 1
+	hipPackedTopKSampleLaunchArgsBytes                    = 56
+	hipOrderedEmbeddingCandidatesLaunchArgsVersion uint32 = 1
+	hipOrderedEmbeddingCandidatesLaunchArgsBytes          = 80
+	hipOrderedEmbeddingCandidatesBlockSize         uint32 = 256
+	hipMLXQ4ProjectionBits                                = 4
+	hipMLXQ4ProjectionBlockSize                    uint32 = 256
+	hipMLXQ4ProjectionRowsPerBlock                        = 8
+	hipMLXQ4ProjectionCols256RowsPerBlock                 = 32
+	hipMLXQ4ProjectionQ6Row16RowsPerBlock                 = 16
+	hipMLXQ4ProjectionQ6Row32RowsPerBlock                 = 32
+	hipMLXQ4ProjectionQ6Row64RowsPerBlock                 = 64
+	hipMLXQ4GELUTanhQ6Cols1536RowsPerBlock                = 16
+	hipMLXQ4GELUTanhQ6Cols1536Row32RowsPerBlock           = 32
+	hipMLXQ4GELUTanhQ6Cols1536Row64RowsPerBlock           = 64
+	hipMLXQ4ProjectionBatchTokensPerBlock                 = 8
+	hipMLXQ4ProjectionGreedyRowsPerBlock                  = 32
+	hipMLXQ4ProjectionGreedyQ6RowsPerBlock                = 64
+	hipMLXQ4ProjectionBestBytes                           = 8
+	hipPackedTopKMaxK                                     = 128
+	hipPackedTopKBlockSize                         uint32 = 256
+	hipPackedTopKChunkSize                                = 4096
 )
 
 const (
@@ -72,8 +86,19 @@ type hipDeviceByteBufferPoolEntry struct {
 	pointer nativeDevicePointer
 }
 
+type hipDeviceByteBufferPoolSingleSlot struct {
+	sizeBytes uint64
+	entries   [hipDeviceByteBufferPoolSingleSlotCapacity]hipDeviceByteBufferPoolEntry
+	count     uint8
+}
+
+type hipDeviceAllocationLabelRecorder interface {
+	RecordDeviceAllocationLabel(sizeBytes uint64, operation, label string)
+}
+
 var hipDeviceByteBufferPool = struct {
 	sync.Mutex
+	single  [hipDeviceByteBufferPoolSingleSlots]hipDeviceByteBufferPoolSingleSlot
 	entries map[uint64][]hipDeviceByteBufferPoolEntry
 	bytes   uint64
 }{
@@ -81,8 +106,10 @@ var hipDeviceByteBufferPool = struct {
 }
 
 const (
-	hipDeviceByteBufferPoolMaxBytes   = 768 << 20
-	hipDeviceByteBufferPoolMaxPerSize = 512
+	hipDeviceByteBufferPoolMaxBytes           = 768 << 20
+	hipDeviceByteBufferPoolMaxPerSize         = 512
+	hipDeviceByteBufferPoolSingleSlots        = 64
+	hipDeviceByteBufferPoolSingleSlotCapacity = 3
 )
 
 func hipProjectionUint32Bytes(operation, label string, value uint64) error {
@@ -145,6 +172,7 @@ type hipMLXQ4ProjectionRequest struct {
 	Rows      int
 	Cols      int
 	GroupSize int
+	Bits      int
 }
 
 type hipMLXQ4ProjectionDeviceBuffers struct {
@@ -156,6 +184,7 @@ type hipMLXQ4ProjectionDeviceBuffers struct {
 	Rows      int
 	Cols      int
 	GroupSize int
+	Bits      int
 }
 
 type hipMLXQ4DeviceWeightConfig struct {
@@ -168,6 +197,7 @@ type hipMLXQ4DeviceWeightConfig struct {
 	Rows          int
 	Cols          int
 	GroupSize     int
+	Bits          int
 }
 
 type hipMLXQ4ProjectionLaunchArgs struct {
@@ -200,6 +230,35 @@ type hipPackedTopKLaunchArgs struct {
 	OutputBytes   uint64
 }
 
+type hipPackedTopKSampleLaunchArgs struct {
+	InputPointer  nativeDevicePointer
+	OutputPointer nativeDevicePointer
+	InputCount    int
+	TopK          int
+	InputBytes    uint64
+	OutputBytes   uint64
+	Temperature   float32
+	TopP          float32
+	Draw          float64
+}
+
+type hipOrderedEmbeddingCandidatesLaunchArgs struct {
+	TopKPointer               nativeDevicePointer
+	TokenOrderingPointer      nativeDevicePointer
+	OutputPointer             nativeDevicePointer
+	SuppressPointer           nativeDevicePointer
+	TopKCount                 int
+	NumCentroids              int
+	TokensPerCentroid         int
+	TokenOrderingElementBytes int
+	TokenOrderingCount        int
+	OutputCount               int
+	SuppressCount             int
+	TopKBytes                 uint64
+	TokenOrderingBytes        uint64
+	OutputBytes               uint64
+}
+
 type hipMLXQ4ProjectionBatchLaunchArgs struct {
 	InputPointer  nativeDevicePointer
 	WeightPointer nativeDevicePointer
@@ -216,6 +275,26 @@ type hipMLXQ4ProjectionBatchLaunchArgs struct {
 	ScaleBytes    uint64
 	BiasBytes     uint64
 	OutputBytes   uint64
+}
+
+type hipMLXQ4ProjectionGreedyBatchLaunchArgs struct {
+	InputPointer    nativeDevicePointer
+	WeightPointer   nativeDevicePointer
+	ScalePointer    nativeDevicePointer
+	BiasPointer     nativeDevicePointer
+	OutputPointer   nativeDevicePointer
+	SuppressPointer nativeDevicePointer
+	Rows            int
+	Cols            int
+	Batch           int
+	GroupSize       int
+	Bits            int
+	SuppressCount   int
+	InputBytes      uint64
+	WeightBytes     uint64
+	ScaleBytes      uint64
+	BiasBytes       uint64
+	OutputBytes     uint64
 }
 
 type hipMLXQ4GELUTanhMulLaunchArgs struct {
@@ -423,7 +502,11 @@ func (req hipProjectionRequest) projectionDeviceBuffers(driver nativeHIPDriver) 
 }
 
 func (req hipMLXQ4ProjectionRequest) validate() error {
-	return validateHIPMLXQ4ProjectionShape(len(req.Input), len(req.Weight), len(req.Scales), len(req.Biases), req.Rows, req.Cols, req.GroupSize)
+	return validateHIPMLXAffineProjectionShape(len(req.Input), len(req.Weight), len(req.Scales), len(req.Biases), req.Rows, req.Cols, req.GroupSize, req.Bits)
+}
+
+func (cfg hipMLXQ4DeviceWeightConfig) quantBits() int {
+	return hipMLXQ4ProjectionBitsOrDefault(cfg.Bits)
 }
 
 func (cfg hipMLXQ4DeviceWeightConfig) validate(input []float32) error {
@@ -445,7 +528,7 @@ func (cfg hipMLXQ4DeviceWeightConfig) validateInputCount(inputCount int) error {
 		cfg.BiasBytes/2 > uint64(int(^uint(0)>>1)) {
 		return core.E("rocm.hip.MLXQ4ProjectionLaunch", "MLX q4 projection device element counts are out of int range", nil)
 	}
-	return validateHIPMLXQ4ProjectionShape(inputCount, int(cfg.WeightBytes/4), int(cfg.ScaleBytes/2), int(cfg.BiasBytes/2), cfg.Rows, cfg.Cols, cfg.GroupSize)
+	return validateHIPMLXAffineProjectionShape(inputCount, int(cfg.WeightBytes/4), int(cfg.ScaleBytes/2), int(cfg.BiasBytes/2), cfg.Rows, cfg.Cols, cfg.GroupSize, cfg.quantBits())
 }
 
 func (cfg hipMLXQ4DeviceWeightConfig) validateBatchInputCount(inputCount int, batch int) error {
@@ -469,7 +552,7 @@ func (cfg hipMLXQ4DeviceWeightConfig) validateBatchInputCount(inputCount int, ba
 		cfg.BiasBytes/2 > uint64(int(^uint(0)>>1)) {
 		return core.E("rocm.hip.MLXQ4ProjectionBatchLaunch", "MLX q4 projection device element counts are out of int range", nil)
 	}
-	return validateHIPMLXQ4ProjectionShape(cfg.Cols, int(cfg.WeightBytes/4), int(cfg.ScaleBytes/2), int(cfg.BiasBytes/2), cfg.Rows, cfg.Cols, cfg.GroupSize)
+	return validateHIPMLXAffineProjectionShape(cfg.Cols, int(cfg.WeightBytes/4), int(cfg.ScaleBytes/2), int(cfg.BiasBytes/2), cfg.Rows, cfg.Cols, cfg.GroupSize, cfg.quantBits())
 }
 
 func (req hipMLXQ4ProjectionRequest) deviceBuffers(driver nativeHIPDriver) (*hipMLXQ4ProjectionDeviceBuffers, error) {
@@ -484,7 +567,7 @@ func (req hipMLXQ4ProjectionRequest) deviceBuffers(driver nativeHIPDriver) (*hip
 	if err != nil {
 		return nil, err
 	}
-	buffers := &hipMLXQ4ProjectionDeviceBuffers{Input: input, Rows: req.Rows, Cols: req.Cols, GroupSize: req.GroupSize}
+	buffers := &hipMLXQ4ProjectionDeviceBuffers{Input: input, Rows: req.Rows, Cols: req.Cols, GroupSize: req.GroupSize, Bits: hipMLXQ4ProjectionBitsOrDefault(req.Bits)}
 	success := false
 	defer func() {
 		if !success {
@@ -538,7 +621,11 @@ func (req hipMLXQ4ProjectionRequest) launchArgs(buffers *hipMLXQ4ProjectionDevic
 	if buffers == nil || buffers.Input == nil || buffers.Weight == nil || buffers.Scales == nil || buffers.Biases == nil || buffers.Output == nil {
 		return hipMLXQ4ProjectionLaunchArgs{}, core.E("rocm.hip.MLXQ4ProjectionLaunch", "MLX q4 projection device buffers are required", nil)
 	}
-	packedPerRow := req.Cols / 8
+	bits := hipMLXQ4ProjectionBitsOrDefault(req.Bits)
+	packedPerRow, err := hipMLXAffinePackedCols(req.Cols, bits)
+	if err != nil {
+		return hipMLXQ4ProjectionLaunchArgs{}, err
+	}
 	groupsPerRow := req.Cols / req.GroupSize
 	if buffers.Input.Count() != req.Cols ||
 		buffers.Weight.Count() != req.Rows*packedPerRow ||
@@ -547,7 +634,8 @@ func (req hipMLXQ4ProjectionRequest) launchArgs(buffers *hipMLXQ4ProjectionDevic
 		buffers.Output.Count() != req.Rows ||
 		buffers.Rows != req.Rows ||
 		buffers.Cols != req.Cols ||
-		buffers.GroupSize != req.GroupSize {
+		buffers.GroupSize != req.GroupSize ||
+		buffers.Bits != bits {
 		return hipMLXQ4ProjectionLaunchArgs{}, core.E("rocm.hip.MLXQ4ProjectionLaunch", "MLX q4 projection device buffer shape mismatch", nil)
 	}
 	return hipMLXQ4ProjectionLaunchArgs{
@@ -559,7 +647,7 @@ func (req hipMLXQ4ProjectionRequest) launchArgs(buffers *hipMLXQ4ProjectionDevic
 		Rows:          req.Rows,
 		Cols:          req.Cols,
 		GroupSize:     req.GroupSize,
-		Bits:          hipMLXQ4ProjectionBits,
+		Bits:          bits,
 		InputBytes:    buffers.Input.SizeBytes(),
 		WeightBytes:   buffers.Weight.SizeBytes(),
 		ScaleBytes:    buffers.Scales.SizeBytes(),
@@ -615,6 +703,10 @@ func (req hipProjectionRequest) projectionLaunchArgs(buffers *hipProjectionDevic
 }
 
 func (args hipProjectionLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipProjectionLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.InputPointer == 0 || args.WeightPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.ProjectionLaunch", "input, weight, and output pointers are required", nil)
 	}
@@ -671,7 +763,12 @@ func (args hipProjectionLaunchArgs) Binary() ([]byte, error) {
 	} else if args.BiasPointer != 0 || args.BiasBytes != 0 {
 		return nil, core.E("rocm.hip.ProjectionLaunch", "bias metadata supplied without bias flag", nil)
 	}
-	payload := hipBorrowLaunchPacket(hipProjectionLaunchArgsBytes)
+	if cap(payload) < hipProjectionLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipProjectionLaunchArgsBytes)
+	} else {
+		payload = payload[:hipProjectionLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipProjectionLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
@@ -692,6 +789,10 @@ func (args hipProjectionLaunchArgs) Binary() ([]byte, error) {
 }
 
 func (args hipProjectionBatchLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipProjectionBatchLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.InputPointer == 0 || args.WeightPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.ProjectionBatchLaunch", "input, weight, and output pointers are required", nil)
 	}
@@ -742,7 +843,12 @@ func (args hipProjectionBatchLaunchArgs) Binary() ([]byte, error) {
 	} else if args.BiasPointer != 0 || args.BiasBytes != 0 {
 		return nil, core.E("rocm.hip.ProjectionBatchLaunch", "bias metadata supplied without bias flag", nil)
 	}
-	payload := hipBorrowLaunchPacket(hipProjectionBatchLaunchArgsBytes)
+	if cap(payload) < hipProjectionBatchLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipProjectionBatchLaunchArgsBytes)
+	} else {
+		payload = payload[:hipProjectionBatchLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipProjectionBatchLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
@@ -763,18 +869,34 @@ func (args hipProjectionBatchLaunchArgs) Binary() ([]byte, error) {
 }
 
 func (args hipMLXQ4ProjectionLaunchArgs) Binary() ([]byte, error) {
-	return args.binary(hipMLXQ4ProjectionOutputFull)
+	return args.BinaryInto(nil)
+}
+
+func (args hipMLXQ4ProjectionLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
+	return args.binaryInto(hipMLXQ4ProjectionOutputFull, payload)
 }
 
 func (args hipMLXQ4ProjectionLaunchArgs) GreedyBinary() ([]byte, error) {
-	return args.binary(hipMLXQ4ProjectionOutputBest)
+	return args.GreedyBinaryInto(nil)
+}
+
+func (args hipMLXQ4ProjectionLaunchArgs) GreedyBinaryInto(payload []byte) ([]byte, error) {
+	return args.binaryInto(hipMLXQ4ProjectionOutputBest, payload)
 }
 
 func (args hipMLXQ4ProjectionLaunchArgs) ScoresBinary() ([]byte, error) {
-	return args.binary(hipMLXQ4ProjectionOutputScores)
+	return args.ScoresBinaryInto(nil)
+}
+
+func (args hipMLXQ4ProjectionLaunchArgs) ScoresBinaryInto(payload []byte) ([]byte, error) {
+	return args.binaryInto(hipMLXQ4ProjectionOutputScores, payload)
 }
 
 func (args hipPackedTopKLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipPackedTopKLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.InputPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.PackedTopKLaunch", "input and output pointers are required", nil)
 	}
@@ -816,7 +938,12 @@ func (args hipPackedTopKLaunchArgs) Binary() ([]byte, error) {
 	if err := hipProjectionUint32Bytes("rocm.hip.PackedTopKLaunch", "output bytes", args.OutputBytes); err != nil {
 		return nil, err
 	}
-	payload := hipBorrowLaunchPacket(hipPackedTopKLaunchArgsBytes)
+	if cap(payload) < hipPackedTopKLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipPackedTopKLaunchArgsBytes)
+	} else {
+		payload = payload[:hipPackedTopKLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipPackedTopKLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
@@ -830,13 +957,178 @@ func (args hipPackedTopKLaunchArgs) Binary() ([]byte, error) {
 	return payload, nil
 }
 
+func (args hipPackedTopKSampleLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipOrderedEmbeddingCandidatesLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipOrderedEmbeddingCandidatesLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
+	if args.TopKPointer == 0 || args.TokenOrderingPointer == 0 || args.OutputPointer == 0 {
+		return nil, core.E("rocm.hip.OrderedEmbeddingCandidatesLaunch", "top-k, token ordering, and output pointers are required", nil)
+	}
+	topK, err := rocmDeviceKVPositiveUint32("ordered embedding top-k count", args.TopKCount)
+	if err != nil {
+		return nil, err
+	}
+	if args.TopKCount > hipPackedTopKMaxK {
+		return nil, core.E("rocm.hip.OrderedEmbeddingCandidatesLaunch", "top-k exceeds kernel maximum", nil)
+	}
+	centroids, err := rocmDeviceKVPositiveUint32("ordered embedding centroids", args.NumCentroids)
+	if err != nil {
+		return nil, err
+	}
+	tokensPerCentroid, err := rocmDeviceKVPositiveUint32("ordered embedding tokens per centroid", args.TokensPerCentroid)
+	if err != nil {
+		return nil, err
+	}
+	orderingCount, err := rocmDeviceKVPositiveUint32("ordered embedding token-ordering count", args.TokenOrderingCount)
+	if err != nil {
+		return nil, err
+	}
+	outputCount, err := rocmDeviceKVPositiveUint32("ordered embedding output count", args.OutputCount)
+	if err != nil {
+		return nil, err
+	}
+	suppressCount := uint32(0)
+	if args.SuppressCount > 0 {
+		if args.SuppressPointer == 0 {
+			return nil, core.E("rocm.hip.OrderedEmbeddingCandidatesLaunch", "suppress pointer is required when suppress count is set", nil)
+		}
+		suppressCount, err = rocmDeviceKVPositiveUint32("ordered embedding suppress count", args.SuppressCount)
+		if err != nil {
+			return nil, err
+		}
+	}
+	elementBytes := uint32(args.TokenOrderingElementBytes)
+	if args.TokenOrderingElementBytes != 4 && args.TokenOrderingElementBytes != 8 {
+		return nil, core.E("rocm.hip.OrderedEmbeddingCandidatesLaunch", "token-ordering element bytes must be 4 or 8", nil)
+	}
+	if args.TokenOrderingCount != args.NumCentroids*args.TokensPerCentroid {
+		return nil, core.E("rocm.hip.OrderedEmbeddingCandidatesLaunch", "token-ordering count mismatch", nil)
+	}
+	if args.OutputCount != args.TopKCount*args.TokensPerCentroid {
+		return nil, core.E("rocm.hip.OrderedEmbeddingCandidatesLaunch", "output count mismatch", nil)
+	}
+	if args.TopKBytes != uint64(args.TopKCount*hipMLXQ4ProjectionBestBytes) {
+		return nil, core.E("rocm.hip.OrderedEmbeddingCandidatesLaunch", "top-k byte count mismatch", nil)
+	}
+	if args.TokenOrderingBytes != uint64(args.TokenOrderingCount*args.TokenOrderingElementBytes) {
+		return nil, core.E("rocm.hip.OrderedEmbeddingCandidatesLaunch", "token-ordering byte count mismatch", nil)
+	}
+	if args.OutputBytes != uint64(args.OutputCount*4) {
+		return nil, core.E("rocm.hip.OrderedEmbeddingCandidatesLaunch", "output byte count mismatch", nil)
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.OrderedEmbeddingCandidatesLaunch", "top-k bytes", args.TopKBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.OrderedEmbeddingCandidatesLaunch", "token-ordering bytes", args.TokenOrderingBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.OrderedEmbeddingCandidatesLaunch", "output bytes", args.OutputBytes); err != nil {
+		return nil, err
+	}
+	if cap(payload) < hipOrderedEmbeddingCandidatesLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipOrderedEmbeddingCandidatesLaunchArgsBytes)
+	} else {
+		payload = payload[:hipOrderedEmbeddingCandidatesLaunchArgsBytes]
+		clear(payload)
+	}
+	binary.LittleEndian.PutUint32(payload[0:], hipOrderedEmbeddingCandidatesLaunchArgsVersion)
+	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
+	binary.LittleEndian.PutUint64(payload[8:], uint64(args.TopKPointer))
+	binary.LittleEndian.PutUint64(payload[16:], uint64(args.TokenOrderingPointer))
+	binary.LittleEndian.PutUint64(payload[24:], uint64(args.OutputPointer))
+	binary.LittleEndian.PutUint64(payload[32:], uint64(args.SuppressPointer))
+	binary.LittleEndian.PutUint32(payload[40:], topK)
+	binary.LittleEndian.PutUint32(payload[44:], centroids)
+	binary.LittleEndian.PutUint32(payload[48:], tokensPerCentroid)
+	binary.LittleEndian.PutUint32(payload[52:], elementBytes)
+	binary.LittleEndian.PutUint32(payload[56:], orderingCount)
+	binary.LittleEndian.PutUint32(payload[60:], outputCount)
+	binary.LittleEndian.PutUint32(payload[64:], suppressCount)
+	binary.LittleEndian.PutUint32(payload[68:], uint32(args.TopKBytes))
+	binary.LittleEndian.PutUint32(payload[72:], uint32(args.TokenOrderingBytes))
+	binary.LittleEndian.PutUint32(payload[76:], uint32(args.OutputBytes))
+	return payload, nil
+}
+
+func (args hipPackedTopKSampleLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
+	if args.InputPointer == 0 || args.OutputPointer == 0 {
+		return nil, core.E("rocm.hip.PackedTopKSampleLaunch", "input and output pointers are required", nil)
+	}
+	inputCount, err := rocmDeviceKVPositiveUint32("packed top-k sample input count", args.InputCount)
+	if err != nil {
+		return nil, err
+	}
+	topK, err := rocmDeviceKVPositiveUint32("packed top-k sample top-k", args.TopK)
+	if err != nil {
+		return nil, err
+	}
+	if args.TopK > hipPackedTopKMaxK || args.TopK > args.InputCount {
+		return nil, core.E("rocm.hip.PackedTopKSampleLaunch", "top-k exceeds input or kernel maximum", nil)
+	}
+	if args.InputBytes != uint64(args.InputCount*hipMLXQ4ProjectionBestBytes) {
+		return nil, core.E("rocm.hip.PackedTopKSampleLaunch", "input byte count mismatch", nil)
+	}
+	if args.OutputBytes != hipMLXQ4ProjectionBestBytes {
+		return nil, core.E("rocm.hip.PackedTopKSampleLaunch", "output byte count mismatch", nil)
+	}
+	if args.Temperature < 0 || math.IsNaN(float64(args.Temperature)) || math.IsInf(float64(args.Temperature), 0) {
+		return nil, core.E("rocm.hip.PackedTopKSampleLaunch", "temperature must be non-negative and finite", nil)
+	}
+	if args.TopP < 0 || args.TopP > 1 || math.IsNaN(float64(args.TopP)) || math.IsInf(float64(args.TopP), 0) {
+		return nil, core.E("rocm.hip.PackedTopKSampleLaunch", "top-p must be in [0, 1]", nil)
+	}
+	if math.IsNaN(args.Draw) || math.IsInf(args.Draw, 0) {
+		return nil, core.E("rocm.hip.PackedTopKSampleLaunch", "draw must be finite", nil)
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.PackedTopKSampleLaunch", "input bytes", args.InputBytes); err != nil {
+		return nil, err
+	}
+	if cap(payload) < hipPackedTopKSampleLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipPackedTopKSampleLaunchArgsBytes)
+	} else {
+		payload = payload[:hipPackedTopKSampleLaunchArgsBytes]
+		clear(payload)
+	}
+	binary.LittleEndian.PutUint32(payload[0:], hipPackedTopKSampleLaunchArgsVersion)
+	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
+	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
+	binary.LittleEndian.PutUint64(payload[16:], uint64(args.OutputPointer))
+	binary.LittleEndian.PutUint32(payload[24:], inputCount)
+	binary.LittleEndian.PutUint32(payload[28:], topK)
+	binary.LittleEndian.PutUint32(payload[32:], uint32(args.InputBytes))
+	binary.LittleEndian.PutUint32(payload[36:], uint32(args.OutputBytes))
+	binary.LittleEndian.PutUint32(payload[40:], math.Float32bits(args.Temperature))
+	binary.LittleEndian.PutUint32(payload[44:], math.Float32bits(args.TopP))
+	binary.LittleEndian.PutUint64(payload[48:], math.Float64bits(args.Draw))
+	return payload, nil
+}
+
 const (
 	hipMLXQ4ProjectionOutputFull = iota
 	hipMLXQ4ProjectionOutputBest
 	hipMLXQ4ProjectionOutputScores
 )
 
-func (args hipMLXQ4ProjectionLaunchArgs) binary(outputKind int) ([]byte, error) {
+func hipMLXAffineLaunchPackedGroups(operation string, cols, groupSize, bits uint32) (uint64, uint64, error) {
+	if !hipMLXAffineSupportedBits(int(bits)) {
+		return 0, 0, core.E(operation, "only 4-, 6-, and 8-bit MLX affine projection is supported", nil)
+	}
+	if groupSize == 0 || cols%groupSize != 0 {
+		return 0, 0, core.E(operation, "cols must be divisible by group size", nil)
+	}
+	totalBits := uint64(cols) * uint64(bits)
+	if totalBits%32 != 0 {
+		return 0, 0, core.E(operation, "cols*bits must be divisible by 32 for MLX affine packing", nil)
+	}
+	return totalBits / 32, uint64(cols / groupSize), nil
+}
+
+func (args hipMLXQ4ProjectionLaunchArgs) binaryInto(outputKind int, payload []byte) ([]byte, error) {
 	if args.InputPointer == 0 || args.WeightPointer == 0 || args.ScalePointer == 0 || args.BiasPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.MLXQ4ProjectionLaunch", "input, weight, scale, bias, and output pointers are required", nil)
 	}
@@ -856,17 +1148,10 @@ func (args hipMLXQ4ProjectionLaunchArgs) binary(outputKind int) ([]byte, error) 
 	if err != nil {
 		return nil, err
 	}
-	if bits != hipMLXQ4ProjectionBits {
-		return nil, core.E("rocm.hip.MLXQ4ProjectionLaunch", "only 4-bit MLX affine projection is supported", nil)
+	packedPerRow, groupsPerRow, err := hipMLXAffineLaunchPackedGroups("rocm.hip.MLXQ4ProjectionLaunch", cols, groupSize, bits)
+	if err != nil {
+		return nil, err
 	}
-	if cols%8 != 0 {
-		return nil, core.E("rocm.hip.MLXQ4ProjectionLaunch", "cols must be divisible by 8 for q4 packing", nil)
-	}
-	if cols%groupSize != 0 {
-		return nil, core.E("rocm.hip.MLXQ4ProjectionLaunch", "cols must be divisible by group size", nil)
-	}
-	packedPerRow := uint64(cols / 8)
-	groupsPerRow := uint64(cols / groupSize)
 	if args.InputBytes != uint64(cols)*4 {
 		return nil, core.E("rocm.hip.MLXQ4ProjectionLaunch", "input byte count mismatch", nil)
 	}
@@ -918,7 +1203,12 @@ func (args hipMLXQ4ProjectionLaunchArgs) binary(outputKind int) ([]byte, error) 
 	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4ProjectionLaunch", "output bytes", args.OutputBytes); err != nil {
 		return nil, err
 	}
-	payload := hipBorrowLaunchPacket(hipMLXQ4ProjectionLaunchArgsBytes)
+	if cap(payload) < hipMLXQ4ProjectionLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipMLXQ4ProjectionLaunchArgsBytes)
+	} else {
+		payload = payload[:hipMLXQ4ProjectionLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipMLXQ4ProjectionLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
@@ -941,6 +1231,10 @@ func (args hipMLXQ4ProjectionLaunchArgs) binary(outputKind int) ([]byte, error) 
 }
 
 func (args hipMLXQ4ProjectionBatchLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipMLXQ4ProjectionBatchLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.InputPointer == 0 || args.WeightPointer == 0 || args.ScalePointer == 0 || args.BiasPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.MLXQ4ProjectionBatchLaunch", "input, weight, scale, bias, and output pointers are required", nil)
 	}
@@ -964,17 +1258,10 @@ func (args hipMLXQ4ProjectionBatchLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if bits != hipMLXQ4ProjectionBits {
-		return nil, core.E("rocm.hip.MLXQ4ProjectionBatchLaunch", "only 4-bit MLX affine projection is supported", nil)
+	packedPerRow, groupsPerRow, err := hipMLXAffineLaunchPackedGroups("rocm.hip.MLXQ4ProjectionBatchLaunch", cols, groupSize, bits)
+	if err != nil {
+		return nil, err
 	}
-	if cols%8 != 0 {
-		return nil, core.E("rocm.hip.MLXQ4ProjectionBatchLaunch", "cols must be divisible by 8 for q4 packing", nil)
-	}
-	if cols%groupSize != 0 {
-		return nil, core.E("rocm.hip.MLXQ4ProjectionBatchLaunch", "cols must be divisible by group size", nil)
-	}
-	packedPerRow := uint64(cols / 8)
-	groupsPerRow := uint64(cols / groupSize)
 	if args.InputBytes != uint64(batch)*uint64(cols)*4 {
 		return nil, core.E("rocm.hip.MLXQ4ProjectionBatchLaunch", "input byte count mismatch", nil)
 	}
@@ -1002,7 +1289,12 @@ func (args hipMLXQ4ProjectionBatchLaunchArgs) Binary() ([]byte, error) {
 	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4ProjectionBatchLaunch", "output bytes", args.OutputBytes); err != nil {
 		return nil, err
 	}
-	payload := hipBorrowLaunchPacket(hipMLXQ4ProjectionBatchLaunchArgsBytes)
+	if cap(payload) < hipMLXQ4ProjectionBatchLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipMLXQ4ProjectionBatchLaunchArgsBytes)
+	} else {
+		payload = payload[:hipMLXQ4ProjectionBatchLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipMLXQ4ProjectionBatchLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
@@ -1023,7 +1315,109 @@ func (args hipMLXQ4ProjectionBatchLaunchArgs) Binary() ([]byte, error) {
 	return payload, nil
 }
 
+func (args hipMLXQ4ProjectionGreedyBatchLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipMLXQ4ProjectionGreedyBatchLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
+	if args.InputPointer == 0 || args.WeightPointer == 0 || args.ScalePointer == 0 || args.BiasPointer == 0 || args.OutputPointer == 0 {
+		return nil, core.E("rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", "input, weight, scale, bias, and output pointers are required", nil)
+	}
+	rows, err := rocmDeviceKVPositiveUint32("rows", args.Rows)
+	if err != nil {
+		return nil, err
+	}
+	cols, err := rocmDeviceKVPositiveUint32("cols", args.Cols)
+	if err != nil {
+		return nil, err
+	}
+	batch, err := rocmDeviceKVPositiveUint32("batch", args.Batch)
+	if err != nil {
+		return nil, err
+	}
+	groupSize, err := rocmDeviceKVPositiveUint32("group size", args.GroupSize)
+	if err != nil {
+		return nil, err
+	}
+	bits, err := rocmDeviceKVPositiveUint32("bits", args.Bits)
+	if err != nil {
+		return nil, err
+	}
+	packedPerRow, groupsPerRow, err := hipMLXAffineLaunchPackedGroups("rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", cols, groupSize, bits)
+	if err != nil {
+		return nil, err
+	}
+	if args.InputBytes != uint64(batch)*uint64(cols)*4 {
+		return nil, core.E("rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", "input byte count mismatch", nil)
+	}
+	if args.WeightBytes != uint64(rows)*packedPerRow*4 {
+		return nil, core.E("rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", "packed weight byte count mismatch", nil)
+	}
+	if args.ScaleBytes != uint64(rows)*groupsPerRow*2 || args.BiasBytes != uint64(rows)*groupsPerRow*2 {
+		return nil, core.E("rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", "scale/bias byte count mismatch", nil)
+	}
+	if args.OutputBytes != uint64(batch)*hipMLXQ4ProjectionBestBytes {
+		return nil, core.E("rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", "output byte count mismatch", nil)
+	}
+	suppressCount := uint32(0)
+	if args.SuppressCount > 0 {
+		if args.SuppressPointer == 0 {
+			return nil, core.E("rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", "suppress token pointer is required", nil)
+		}
+		value, err := rocmDeviceKVPositiveUint32("suppress token count", args.SuppressCount)
+		if err != nil {
+			return nil, err
+		}
+		suppressCount = value
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", "input bytes", args.InputBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", "weight bytes", args.WeightBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", "scale bytes", args.ScaleBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", "bias bytes", args.BiasBytes); err != nil {
+		return nil, err
+	}
+	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", "output bytes", args.OutputBytes); err != nil {
+		return nil, err
+	}
+	if cap(payload) < hipMLXQ4ProjectionGreedyBatchLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipMLXQ4ProjectionGreedyBatchLaunchArgsBytes)
+	} else {
+		payload = payload[:hipMLXQ4ProjectionGreedyBatchLaunchArgsBytes]
+		clear(payload)
+	}
+	binary.LittleEndian.PutUint32(payload[0:], hipMLXQ4ProjectionGreedyBatchLaunchArgsVersion)
+	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
+	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
+	binary.LittleEndian.PutUint64(payload[16:], uint64(args.WeightPointer))
+	binary.LittleEndian.PutUint64(payload[24:], uint64(args.ScalePointer))
+	binary.LittleEndian.PutUint64(payload[32:], uint64(args.BiasPointer))
+	binary.LittleEndian.PutUint64(payload[40:], uint64(args.OutputPointer))
+	binary.LittleEndian.PutUint64(payload[48:], uint64(args.SuppressPointer))
+	binary.LittleEndian.PutUint32(payload[56:], rows)
+	binary.LittleEndian.PutUint32(payload[60:], cols)
+	binary.LittleEndian.PutUint32(payload[64:], batch)
+	binary.LittleEndian.PutUint32(payload[68:], groupSize)
+	binary.LittleEndian.PutUint32(payload[72:], bits)
+	binary.LittleEndian.PutUint32(payload[76:], uint32(args.InputBytes))
+	binary.LittleEndian.PutUint32(payload[80:], uint32(args.WeightBytes))
+	binary.LittleEndian.PutUint32(payload[84:], uint32(args.ScaleBytes))
+	binary.LittleEndian.PutUint32(payload[88:], uint32(args.BiasBytes))
+	binary.LittleEndian.PutUint32(payload[92:], uint32(args.OutputBytes))
+	binary.LittleEndian.PutUint32(payload[96:], suppressCount)
+	return payload, nil
+}
+
 func (args hipMLXQ4TripleProjLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipMLXQ4TripleProjLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.InputPointer == 0 || args.OutputPointer == 0 ||
 		args.FirstWeightPointer == 0 || args.FirstScalePointer == 0 || args.FirstBiasPointer == 0 ||
 		args.SecondWeightPointer == 0 || args.SecondScalePointer == 0 || args.SecondBiasPointer == 0 {
@@ -1059,17 +1453,10 @@ func (args hipMLXQ4TripleProjLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if bits != hipMLXQ4ProjectionBits {
-		return nil, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "only 4-bit MLX affine projection is supported", nil)
+	packedPerRow, groupsPerRow, err := hipMLXAffineLaunchPackedGroups("rocm.hip.MLXQ4TripleProjectionLaunch", cols, groupSize, bits)
+	if err != nil {
+		return nil, err
 	}
-	if cols%8 != 0 {
-		return nil, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "cols must be divisible by 8 for q4 packing", nil)
-	}
-	if cols%groupSize != 0 {
-		return nil, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "cols must be divisible by group size", nil)
-	}
-	packedPerRow := uint64(cols / 8)
-	groupsPerRow := uint64(cols / groupSize)
 	totalRows := uint64(firstRows) + uint64(secondRows) + uint64(thirdRows)
 	if args.InputBytes != uint64(cols)*4 {
 		return nil, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "input byte count mismatch", nil)
@@ -1131,7 +1518,12 @@ func (args hipMLXQ4TripleProjLaunchArgs) Binary() ([]byte, error) {
 	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4TripleProjectionLaunch", "third bias bytes", args.ThirdBiasBytes); err != nil {
 		return nil, err
 	}
-	payload := hipBorrowLaunchPacket(hipMLXQ4TripleProjLaunchArgsBytes)
+	if cap(payload) < hipMLXQ4TripleProjLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipMLXQ4TripleProjLaunchArgsBytes)
+	} else {
+		payload = payload[:hipMLXQ4TripleProjLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipMLXQ4TripleProjLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
@@ -1166,6 +1558,10 @@ func (args hipMLXQ4TripleProjLaunchArgs) Binary() ([]byte, error) {
 }
 
 func (args hipMLXQ4GELUTanhMulLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipMLXQ4GELUTanhMulLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.InputPointer == 0 || args.GateWeightPointer == 0 || args.GateScalePointer == 0 ||
 		args.GateBiasPointer == 0 || args.UpWeightPointer == 0 || args.UpScalePointer == 0 ||
 		args.UpBiasPointer == 0 || args.OutputPointer == 0 {
@@ -1187,17 +1583,10 @@ func (args hipMLXQ4GELUTanhMulLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if bits != hipMLXQ4ProjectionBits {
-		return nil, core.E("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "only 4-bit MLX affine projection is supported", nil)
+	packedPerRow, groupsPerRow, err := hipMLXAffineLaunchPackedGroups("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", cols, groupSize, bits)
+	if err != nil {
+		return nil, err
 	}
-	if cols%8 != 0 {
-		return nil, core.E("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "cols must be divisible by 8 for q4 packing", nil)
-	}
-	if cols%groupSize != 0 {
-		return nil, core.E("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "cols must be divisible by group size", nil)
-	}
-	packedPerRow := uint64(cols / 8)
-	groupsPerRow := uint64(cols / groupSize)
 	if args.InputBytes != uint64(cols)*4 {
 		return nil, core.E("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "input byte count mismatch", nil)
 	}
@@ -1237,7 +1626,12 @@ func (args hipMLXQ4GELUTanhMulLaunchArgs) Binary() ([]byte, error) {
 	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "output bytes", args.OutputBytes); err != nil {
 		return nil, err
 	}
-	payload := hipBorrowLaunchPacket(hipMLXQ4GELUTanhMulLaunchArgsBytes)
+	if cap(payload) < hipMLXQ4GELUTanhMulLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipMLXQ4GELUTanhMulLaunchArgsBytes)
+	} else {
+		payload = payload[:hipMLXQ4GELUTanhMulLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipMLXQ4GELUTanhMulLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
@@ -1264,6 +1658,10 @@ func (args hipMLXQ4GELUTanhMulLaunchArgs) Binary() ([]byte, error) {
 }
 
 func (args hipMLXQ4GELUTanhMulBatchLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipMLXQ4GELUTanhMulBatchLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.InputPointer == 0 || args.GateWeightPointer == 0 || args.GateScalePointer == 0 ||
 		args.GateBiasPointer == 0 || args.UpWeightPointer == 0 || args.UpScalePointer == 0 ||
 		args.UpBiasPointer == 0 || args.OutputPointer == 0 {
@@ -1289,17 +1687,10 @@ func (args hipMLXQ4GELUTanhMulBatchLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if bits != hipMLXQ4ProjectionBits {
-		return nil, core.E("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "only 4-bit MLX affine projection is supported", nil)
+	packedPerRow, groupsPerRow, err := hipMLXAffineLaunchPackedGroups("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", cols, groupSize, bits)
+	if err != nil {
+		return nil, err
 	}
-	if cols%8 != 0 {
-		return nil, core.E("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "cols must be divisible by 8 for q4 packing", nil)
-	}
-	if cols%groupSize != 0 {
-		return nil, core.E("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "cols must be divisible by group size", nil)
-	}
-	packedPerRow := uint64(cols / 8)
-	groupsPerRow := uint64(cols / groupSize)
 	if args.InputBytes != uint64(batch)*uint64(cols)*4 {
 		return nil, core.E("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "input byte count mismatch", nil)
 	}
@@ -1339,7 +1730,12 @@ func (args hipMLXQ4GELUTanhMulBatchLaunchArgs) Binary() ([]byte, error) {
 	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "output bytes", args.OutputBytes); err != nil {
 		return nil, err
 	}
-	payload := hipBorrowLaunchPacket(hipMLXQ4GELUTanhMulBatchLaunchArgsBytes)
+	if cap(payload) < hipMLXQ4GELUTanhMulBatchLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipMLXQ4GELUTanhMulBatchLaunchArgsBytes)
+	} else {
+		payload = payload[:hipMLXQ4GELUTanhMulBatchLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipMLXQ4GELUTanhMulBatchLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
@@ -1367,6 +1763,10 @@ func (args hipMLXQ4GELUTanhMulBatchLaunchArgs) Binary() ([]byte, error) {
 }
 
 func (args hipMLXQ4GELUTanhProjLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipMLXQ4GELUTanhProjLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.InputPointer == 0 || args.WeightPointer == 0 || args.ScalePointer == 0 ||
 		args.BiasPointer == 0 || args.MultiplierPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.MLXQ4GELUTanhProjectionLaunch", "input, weight, scale, bias, multiplier, and output pointers are required", nil)
@@ -1387,17 +1787,10 @@ func (args hipMLXQ4GELUTanhProjLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if bits != hipMLXQ4ProjectionBits {
-		return nil, core.E("rocm.hip.MLXQ4GELUTanhProjectionLaunch", "only 4-bit MLX affine projection is supported", nil)
+	packedPerRow, groupsPerRow, err := hipMLXAffineLaunchPackedGroups("rocm.hip.MLXQ4GELUTanhProjectionLaunch", cols, groupSize, bits)
+	if err != nil {
+		return nil, err
 	}
-	if cols%8 != 0 {
-		return nil, core.E("rocm.hip.MLXQ4GELUTanhProjectionLaunch", "cols must be divisible by 8 for q4 packing", nil)
-	}
-	if cols%groupSize != 0 {
-		return nil, core.E("rocm.hip.MLXQ4GELUTanhProjectionLaunch", "cols must be divisible by group size", nil)
-	}
-	packedPerRow := uint64(cols / 8)
-	groupsPerRow := uint64(cols / groupSize)
 	if args.InputBytes != uint64(cols)*4 {
 		return nil, core.E("rocm.hip.MLXQ4GELUTanhProjectionLaunch", "input byte count mismatch", nil)
 	}
@@ -1428,7 +1821,12 @@ func (args hipMLXQ4GELUTanhProjLaunchArgs) Binary() ([]byte, error) {
 	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhProjectionLaunch", "output bytes", args.OutputBytes); err != nil {
 		return nil, err
 	}
-	payload := hipBorrowLaunchPacket(hipMLXQ4GELUTanhProjLaunchArgsBytes)
+	if cap(payload) < hipMLXQ4GELUTanhProjLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipMLXQ4GELUTanhProjLaunchArgsBytes)
+	} else {
+		payload = payload[:hipMLXQ4GELUTanhProjLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipMLXQ4GELUTanhProjLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
@@ -1451,6 +1849,10 @@ func (args hipMLXQ4GELUTanhProjLaunchArgs) Binary() ([]byte, error) {
 }
 
 func (args hipMLXQ4GELUTanhProjBatchLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipMLXQ4GELUTanhProjBatchLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.InputPointer == 0 || args.WeightPointer == 0 || args.ScalePointer == 0 ||
 		args.BiasPointer == 0 || args.MultiplierPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "input, weight, scale, bias, multiplier, and output pointers are required", nil)
@@ -1475,17 +1877,10 @@ func (args hipMLXQ4GELUTanhProjBatchLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if bits != hipMLXQ4ProjectionBits {
-		return nil, core.E("rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "only 4-bit MLX affine projection is supported", nil)
+	packedPerRow, groupsPerRow, err := hipMLXAffineLaunchPackedGroups("rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", cols, groupSize, bits)
+	if err != nil {
+		return nil, err
 	}
-	if cols%8 != 0 {
-		return nil, core.E("rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "cols must be divisible by 8 for q4 packing", nil)
-	}
-	if cols%groupSize != 0 {
-		return nil, core.E("rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "cols must be divisible by group size", nil)
-	}
-	packedPerRow := uint64(cols / 8)
-	groupsPerRow := uint64(cols / groupSize)
 	if args.InputBytes != uint64(batch)*uint64(cols)*4 {
 		return nil, core.E("rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "input byte count mismatch", nil)
 	}
@@ -1516,7 +1911,12 @@ func (args hipMLXQ4GELUTanhProjBatchLaunchArgs) Binary() ([]byte, error) {
 	if err := hipProjectionUint32Bytes("rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "output bytes", args.OutputBytes); err != nil {
 		return nil, err
 	}
-	payload := hipBorrowLaunchPacket(hipMLXQ4GELUTanhProjBatchLaunchArgsBytes)
+	if cap(payload) < hipMLXQ4GELUTanhProjBatchLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipMLXQ4GELUTanhProjBatchLaunchArgsBytes)
+	} else {
+		payload = payload[:hipMLXQ4GELUTanhProjBatchLaunchArgsBytes]
+		clear(payload)
+	}
 	binary.LittleEndian.PutUint32(payload[0:], hipMLXQ4GELUTanhProjBatchLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
@@ -1579,6 +1979,17 @@ func hipUnpackGreedyBest(packed uint64, softcap float32, vocabSize int) (hipGree
 	return hipGreedySampleResult{TokenID: tokenID, Score: score}, nil
 }
 
+func hipUnpackGreedyBestTokenID(packedLow uint32, vocabSize int) (int, error) {
+	if vocabSize <= 0 {
+		return 0, core.E("rocm.hip.MLXQ4ProjectionGreedyLaunch", "vocab size must be positive", nil)
+	}
+	tokenID := int(^packedLow)
+	if tokenID < 0 || tokenID >= vocabSize {
+		return 0, core.E("rocm.hip.MLXQ4ProjectionGreedyLaunch", "greedy projection token is out of range", nil)
+	}
+	return tokenID, nil
+}
+
 func hipProjectionWeightEncodingCode(req hipProjectionRequest) (uint32, error) {
 	switch {
 	case len(req.F32) > 0 && len(req.FP16) == 0 && len(req.BF16) == 0 && len(req.Q8) == 0:
@@ -1616,7 +2027,7 @@ func hipRunMLXQ4ProjectionKernel(ctx context.Context, driver nativeHIPDriver, re
 	if err != nil {
 		return nil, err
 	}
-	config, err := hipMLXQ4ProjectionLaunchConfigForShape(launchBytes, req.Rows, req.Cols, req.GroupSize)
+	config, err := hipMLXQ4ProjectionLaunchConfigForShape(launchBytes, req.Rows, req.Cols, req.GroupSize, hipMLXQ4ProjectionBitsOrDefault(req.Bits))
 	if err != nil {
 		return nil, err
 	}
@@ -1703,6 +2114,10 @@ func hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx context.Context, driver nati
 }
 
 func hipRunMLXQ4ProjectionKernelWithDeviceInputOutput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, output *hipDeviceByteBuffer) error {
+	return hipRunMLXQ4ProjectionKernelWithDeviceInputOutputWithWorkspace(ctx, driver, input, cfg, output, nil)
+}
+
+func hipRunMLXQ4ProjectionKernelWithDeviceInputOutputWithWorkspace(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, output *hipDeviceByteBuffer, workspace *hipAttentionHeadsChunkedWorkspace) error {
 	if err := hipContextErr(ctx); err != nil {
 		return err
 	}
@@ -1721,7 +2136,7 @@ func hipRunMLXQ4ProjectionKernelWithDeviceInputOutput(ctx context.Context, drive
 	if output == nil || output.Pointer() == 0 || output.Count() != cfg.Rows || output.SizeBytes() != uint64(cfg.Rows*4) {
 		return core.E("rocm.hip.MLXQ4ProjectionLaunch", "MLX q4 projection output shape mismatch", nil)
 	}
-	launchBytes, err := (hipMLXQ4ProjectionLaunchArgs{
+	launchArgs := hipMLXQ4ProjectionLaunchArgs{
 		InputPointer:  input.Pointer(),
 		WeightPointer: cfg.WeightPointer,
 		ScalePointer:  cfg.ScalePointer,
@@ -1730,17 +2145,24 @@ func hipRunMLXQ4ProjectionKernelWithDeviceInputOutput(ctx context.Context, drive
 		Rows:          cfg.Rows,
 		Cols:          cfg.Cols,
 		GroupSize:     cfg.GroupSize,
-		Bits:          hipMLXQ4ProjectionBits,
+		Bits:          cfg.quantBits(),
 		InputBytes:    input.SizeBytes(),
 		WeightBytes:   cfg.WeightBytes,
 		ScaleBytes:    cfg.ScaleBytes,
 		BiasBytes:     cfg.BiasBytes,
 		OutputBytes:   output.SizeBytes(),
-	}).Binary()
+	}
+	var launchBytes []byte
+	var err error
+	if workspace != nil {
+		launchBytes, err = launchArgs.BinaryInto(workspace.ProjectionArgs[:])
+	} else {
+		launchBytes, err = launchArgs.Binary()
+	}
 	if err != nil {
 		return err
 	}
-	config, err := hipMLXQ4ProjectionLaunchConfigForShape(launchBytes, cfg.Rows, cfg.Cols, cfg.GroupSize)
+	config, err := hipMLXQ4ProjectionLaunchConfigForShape(launchBytes, cfg.Rows, cfg.Cols, cfg.GroupSize, cfg.quantBits())
 	if err != nil {
 		return err
 	}
@@ -1774,6 +2196,30 @@ func hipRunMLXQ4ProjectionBatchKernelWithDeviceInput(ctx context.Context, driver
 			_ = output.Close()
 		}
 	}()
+	if err := hipRunMLXQ4ProjectionBatchKernelWithDeviceInputOutput(ctx, driver, input, cfg, batch, output); err != nil {
+		return nil, err
+	}
+	success = true
+	return output, nil
+}
+
+func hipRunMLXQ4ProjectionBatchKernelWithDeviceInputOutput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, batch int, output *hipDeviceByteBuffer) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	if input == nil || input.Pointer() == 0 {
+		return core.E("rocm.hip.MLXQ4ProjectionBatchLaunch", "MLX q4 projection batch device input is required", nil)
+	}
+	if err := cfg.validateBatchInputCount(input.Count(), batch); err != nil {
+		return err
+	}
+	if input.SizeBytes() != uint64(batch*cfg.Cols*4) {
+		return core.E("rocm.hip.MLXQ4ProjectionBatchLaunch", "MLX q4 projection batch device input byte count mismatch", nil)
+	}
+	outputCount := batch * cfg.Rows
+	if output == nil || output.Pointer() == 0 || output.Count() != outputCount || output.SizeBytes() != uint64(outputCount*4) {
+		return core.E("rocm.hip.MLXQ4ProjectionBatchLaunch", "MLX q4 projection batch output shape mismatch", nil)
+	}
 	launchBytes, err := (hipMLXQ4ProjectionBatchLaunchArgs{
 		InputPointer:  input.Pointer(),
 		WeightPointer: cfg.WeightPointer,
@@ -1784,7 +2230,7 @@ func hipRunMLXQ4ProjectionBatchKernelWithDeviceInput(ctx context.Context, driver
 		Cols:          cfg.Cols,
 		Batch:         batch,
 		GroupSize:     cfg.GroupSize,
-		Bits:          hipMLXQ4ProjectionBits,
+		Bits:          cfg.quantBits(),
 		InputBytes:    input.SizeBytes(),
 		WeightBytes:   cfg.WeightBytes,
 		ScaleBytes:    cfg.ScaleBytes,
@@ -1792,17 +2238,16 @@ func hipRunMLXQ4ProjectionBatchKernelWithDeviceInput(ctx context.Context, driver
 		OutputBytes:   output.SizeBytes(),
 	}).Binary()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	config, err := hipMLXQ4ProjectionBatchLaunchConfig(launchBytes, cfg.Rows, batch)
+	config, err := hipMLXQ4ProjectionBatchLaunchConfigForShape(launchBytes, cfg.Rows, cfg.Cols, cfg.GroupSize, cfg.quantBits(), batch)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if err := hipLaunchKernel(driver, config); err != nil {
-		return nil, err
+		return err
 	}
-	success = true
-	return output, nil
+	return nil
 }
 
 func hipRunMLXQ4TripleProjectionKernelWithDeviceInput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, firstCfg, secondCfg, thirdCfg hipMLXQ4DeviceWeightConfig) (*hipDeviceByteBuffer, *hipDeviceByteBuffer, *hipDeviceByteBuffer, *hipDeviceByteBuffer, error) {
@@ -1824,7 +2269,8 @@ func hipRunMLXQ4TripleProjectionKernelWithDeviceInputViews(ctx context.Context, 
 		return nil, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "MLX q4 triple projection device input is required", nil)
 	}
 	if firstCfg.Cols != secondCfg.Cols || firstCfg.Cols != thirdCfg.Cols ||
-		firstCfg.GroupSize != secondCfg.GroupSize || firstCfg.GroupSize != thirdCfg.GroupSize {
+		firstCfg.GroupSize != secondCfg.GroupSize || firstCfg.GroupSize != thirdCfg.GroupSize ||
+		firstCfg.quantBits() != secondCfg.quantBits() || firstCfg.quantBits() != thirdCfg.quantBits() {
 		return nil, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "triple projection input shapes must match", nil)
 	}
 	if err := firstCfg.validateInputCount(input.Count()); err != nil {
@@ -1865,6 +2311,10 @@ func hipRunMLXQ4TripleProjectionKernelWithDeviceInputViews(ctx context.Context, 
 }
 
 func hipRunMLXQ4TripleProjectionKernelWithDeviceInputViewsOutput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, firstCfg, secondCfg, thirdCfg hipMLXQ4DeviceWeightConfig, output *hipDeviceByteBuffer) (hipDeviceByteBuffer, hipDeviceByteBuffer, hipDeviceByteBuffer, error) {
+	return hipRunMLXQ4TripleProjectionKernelWithDeviceInputViewsOutputWithWorkspace(ctx, driver, input, firstCfg, secondCfg, thirdCfg, output, nil)
+}
+
+func hipRunMLXQ4TripleProjectionKernelWithDeviceInputViewsOutputWithWorkspace(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, firstCfg, secondCfg, thirdCfg hipMLXQ4DeviceWeightConfig, output *hipDeviceByteBuffer, workspace *hipAttentionHeadsChunkedWorkspace) (hipDeviceByteBuffer, hipDeviceByteBuffer, hipDeviceByteBuffer, error) {
 	if err := hipContextErr(ctx); err != nil {
 		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, err
 	}
@@ -1872,7 +2322,8 @@ func hipRunMLXQ4TripleProjectionKernelWithDeviceInputViewsOutput(ctx context.Con
 		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "MLX q4 triple projection device input is required", nil)
 	}
 	if firstCfg.Cols != secondCfg.Cols || firstCfg.Cols != thirdCfg.Cols ||
-		firstCfg.GroupSize != secondCfg.GroupSize || firstCfg.GroupSize != thirdCfg.GroupSize {
+		firstCfg.GroupSize != secondCfg.GroupSize || firstCfg.GroupSize != thirdCfg.GroupSize ||
+		firstCfg.quantBits() != secondCfg.quantBits() || firstCfg.quantBits() != thirdCfg.quantBits() {
 		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "triple projection input shapes must match", nil)
 	}
 	if err := firstCfg.validateInputCount(input.Count()); err != nil {
@@ -1897,7 +2348,7 @@ func hipRunMLXQ4TripleProjectionKernelWithDeviceInputViewsOutput(ctx context.Con
 	if output == nil || output.Pointer() == 0 || output.Count() != totalRows || output.SizeBytes() != uint64(totalRows*4) {
 		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4TripleProjectionLaunch", "MLX q4 triple projection output shape mismatch", nil)
 	}
-	launchBytes, err := (hipMLXQ4TripleProjLaunchArgs{
+	launchArgs := hipMLXQ4TripleProjLaunchArgs{
 		InputPointer:        input.Pointer(),
 		OutputPointer:       output.Pointer(),
 		FirstWeightPointer:  firstCfg.WeightPointer,
@@ -1914,7 +2365,7 @@ func hipRunMLXQ4TripleProjectionKernelWithDeviceInputViewsOutput(ctx context.Con
 		ThirdRows:           thirdCfg.Rows,
 		Cols:                firstCfg.Cols,
 		GroupSize:           firstCfg.GroupSize,
-		Bits:                hipMLXQ4ProjectionBits,
+		Bits:                firstCfg.quantBits(),
 		InputBytes:          input.SizeBytes(),
 		OutputBytes:         output.SizeBytes(),
 		FirstWeightBytes:    firstCfg.WeightBytes,
@@ -1926,11 +2377,18 @@ func hipRunMLXQ4TripleProjectionKernelWithDeviceInputViewsOutput(ctx context.Con
 		ThirdWeightBytes:    thirdCfg.WeightBytes,
 		ThirdScaleBytes:     thirdCfg.ScaleBytes,
 		ThirdBiasBytes:      thirdCfg.BiasBytes,
-	}).Binary()
+	}
+	var launchBytes []byte
+	var err error
+	if workspace != nil {
+		launchBytes, err = launchArgs.BinaryInto(workspace.TripleProjectionArgs[:])
+	} else {
+		launchBytes, err = launchArgs.Binary()
+	}
 	if err != nil {
 		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, err
 	}
-	config, err := hipMLXQ4TripleProjectionLaunchConfig(launchBytes, totalRows)
+	config, err := hipMLXQ4TripleProjectionLaunchConfigForShape(launchBytes, totalRows, firstCfg.Cols, firstCfg.GroupSize, firstCfg.quantBits())
 	if err != nil {
 		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, err
 	}
@@ -1973,7 +2431,7 @@ func hipRunMLXQ4PairProjectionKernelWithDeviceInputViews(ctx context.Context, dr
 	if input == nil || input.Pointer() == 0 {
 		return nil, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4PairProjectionLaunch", "MLX q4 pair projection device input is required", nil)
 	}
-	if firstCfg.Cols != secondCfg.Cols || firstCfg.GroupSize != secondCfg.GroupSize {
+	if firstCfg.Cols != secondCfg.Cols || firstCfg.GroupSize != secondCfg.GroupSize || firstCfg.quantBits() != secondCfg.quantBits() {
 		return nil, hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4PairProjectionLaunch", "pair projection input shapes must match", nil)
 	}
 	if err := firstCfg.validateInputCount(input.Count()); err != nil {
@@ -2008,13 +2466,17 @@ func hipRunMLXQ4PairProjectionKernelWithDeviceInputViews(ctx context.Context, dr
 }
 
 func hipRunMLXQ4PairProjectionKernelWithDeviceInputViewsOutput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, firstCfg, secondCfg hipMLXQ4DeviceWeightConfig, output *hipDeviceByteBuffer) (hipDeviceByteBuffer, hipDeviceByteBuffer, error) {
+	return hipRunMLXQ4PairProjectionKernelWithDeviceInputViewsOutputWithWorkspace(ctx, driver, input, firstCfg, secondCfg, output, nil)
+}
+
+func hipRunMLXQ4PairProjectionKernelWithDeviceInputViewsOutputWithWorkspace(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, firstCfg, secondCfg hipMLXQ4DeviceWeightConfig, output *hipDeviceByteBuffer, workspace *hipAttentionHeadsChunkedWorkspace) (hipDeviceByteBuffer, hipDeviceByteBuffer, error) {
 	if err := hipContextErr(ctx); err != nil {
 		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, err
 	}
 	if input == nil || input.Pointer() == 0 {
 		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4PairProjectionLaunch", "MLX q4 pair projection device input is required", nil)
 	}
-	if firstCfg.Cols != secondCfg.Cols || firstCfg.GroupSize != secondCfg.GroupSize {
+	if firstCfg.Cols != secondCfg.Cols || firstCfg.GroupSize != secondCfg.GroupSize || firstCfg.quantBits() != secondCfg.quantBits() {
 		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4PairProjectionLaunch", "pair projection input shapes must match", nil)
 	}
 	if err := firstCfg.validateInputCount(input.Count()); err != nil {
@@ -2033,7 +2495,7 @@ func hipRunMLXQ4PairProjectionKernelWithDeviceInputViewsOutput(ctx context.Conte
 	if output == nil || output.Pointer() == 0 || output.Count() != totalRows || output.SizeBytes() != uint64(totalRows*4) {
 		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, core.E("rocm.hip.MLXQ4PairProjectionLaunch", "MLX q4 pair projection output shape mismatch", nil)
 	}
-	launchBytes, err := (hipMLXQ4TripleProjLaunchArgs{
+	launchArgs := hipMLXQ4TripleProjLaunchArgs{
 		InputPointer:        input.Pointer(),
 		OutputPointer:       output.Pointer(),
 		FirstWeightPointer:  firstCfg.WeightPointer,
@@ -2046,7 +2508,7 @@ func hipRunMLXQ4PairProjectionKernelWithDeviceInputViewsOutput(ctx context.Conte
 		SecondRows:          secondCfg.Rows,
 		Cols:                firstCfg.Cols,
 		GroupSize:           firstCfg.GroupSize,
-		Bits:                hipMLXQ4ProjectionBits,
+		Bits:                firstCfg.quantBits(),
 		InputBytes:          input.SizeBytes(),
 		OutputBytes:         output.SizeBytes(),
 		FirstWeightBytes:    firstCfg.WeightBytes,
@@ -2055,7 +2517,14 @@ func hipRunMLXQ4PairProjectionKernelWithDeviceInputViewsOutput(ctx context.Conte
 		SecondWeightBytes:   secondCfg.WeightBytes,
 		SecondScaleBytes:    secondCfg.ScaleBytes,
 		SecondBiasBytes:     secondCfg.BiasBytes,
-	}).Binary()
+	}
+	var launchBytes []byte
+	var err error
+	if workspace != nil {
+		launchBytes, err = launchArgs.BinaryInto(workspace.TripleProjectionArgs[:])
+	} else {
+		launchBytes, err = launchArgs.Binary()
+	}
 	if err != nil {
 		return hipDeviceByteBuffer{}, hipDeviceByteBuffer{}, err
 	}
@@ -2096,7 +2565,7 @@ func hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInput(ctx context.Context, drive
 	if input == nil || input.Pointer() == 0 {
 		return nil, core.E("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "MLX q4 GELU tanh multiply device input is required", nil)
 	}
-	if gateCfg.Rows != upCfg.Rows || gateCfg.Cols != upCfg.Cols || gateCfg.GroupSize != upCfg.GroupSize {
+	if gateCfg.Rows != upCfg.Rows || gateCfg.Cols != upCfg.Cols || gateCfg.GroupSize != upCfg.GroupSize || gateCfg.quantBits() != upCfg.quantBits() {
 		return nil, core.E("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "gate and up q4 projection shapes must match", nil)
 	}
 	if err := gateCfg.validateInputCount(input.Count()); err != nil {
@@ -2126,6 +2595,10 @@ func hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInput(ctx context.Context, drive
 }
 
 func hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInputOutput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, gateCfg, upCfg hipMLXQ4DeviceWeightConfig, output *hipDeviceByteBuffer) error {
+	return hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInputOutputWithWorkspace(ctx, driver, input, gateCfg, upCfg, output, nil)
+}
+
+func hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInputOutputWithWorkspace(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, gateCfg, upCfg hipMLXQ4DeviceWeightConfig, output *hipDeviceByteBuffer, workspace *hipAttentionHeadsChunkedWorkspace) error {
 	if err := hipContextErr(ctx); err != nil {
 		return err
 	}
@@ -2135,7 +2608,7 @@ func hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInputOutput(ctx context.Context,
 	if input == nil || input.Pointer() == 0 {
 		return core.E("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "MLX q4 GELU tanh multiply device input is required", nil)
 	}
-	if gateCfg.Rows != upCfg.Rows || gateCfg.Cols != upCfg.Cols || gateCfg.GroupSize != upCfg.GroupSize {
+	if gateCfg.Rows != upCfg.Rows || gateCfg.Cols != upCfg.Cols || gateCfg.GroupSize != upCfg.GroupSize || gateCfg.quantBits() != upCfg.quantBits() {
 		return core.E("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "gate and up q4 projection shapes must match", nil)
 	}
 	if err := gateCfg.validateInputCount(input.Count()); err != nil {
@@ -2150,7 +2623,7 @@ func hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInputOutput(ctx context.Context,
 	if output == nil || output.Pointer() == 0 || output.Count() != gateCfg.Rows || output.SizeBytes() != uint64(gateCfg.Rows*4) {
 		return core.E("rocm.hip.MLXQ4GELUTanhMultiplyLaunch", "MLX q4 GELU tanh multiply output shape mismatch", nil)
 	}
-	launchBytes, err := (hipMLXQ4GELUTanhMulLaunchArgs{
+	launchArgs := hipMLXQ4GELUTanhMulLaunchArgs{
 		InputPointer:      input.Pointer(),
 		GateWeightPointer: gateCfg.WeightPointer,
 		GateScalePointer:  gateCfg.ScalePointer,
@@ -2162,7 +2635,7 @@ func hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInputOutput(ctx context.Context,
 		Rows:              gateCfg.Rows,
 		Cols:              gateCfg.Cols,
 		GroupSize:         gateCfg.GroupSize,
-		Bits:              hipMLXQ4ProjectionBits,
+		Bits:              gateCfg.quantBits(),
 		InputBytes:        input.SizeBytes(),
 		GateWeightBytes:   gateCfg.WeightBytes,
 		GateScaleBytes:    gateCfg.ScaleBytes,
@@ -2171,11 +2644,18 @@ func hipRunMLXQ4GELUTanhMultiplyKernelWithDeviceInputOutput(ctx context.Context,
 		UpScaleBytes:      upCfg.ScaleBytes,
 		UpBiasBytes:       upCfg.BiasBytes,
 		OutputBytes:       output.SizeBytes(),
-	}).Binary()
+	}
+	var launchBytes []byte
+	var err error
+	if workspace != nil {
+		launchBytes, err = launchArgs.BinaryInto(workspace.GELUTanhMulArgs[:])
+	} else {
+		launchBytes, err = launchArgs.Binary()
+	}
 	if err != nil {
 		return err
 	}
-	config, err := hipMLXQ4GELUTanhMultiplyLaunchConfig(launchBytes, gateCfg.Rows)
+	config, err := hipMLXQ4GELUTanhMultiplyLaunchConfigForShape(launchBytes, gateCfg.Rows, gateCfg.Cols, gateCfg.GroupSize, gateCfg.quantBits())
 	if err != nil {
 		return err
 	}
@@ -2195,7 +2675,7 @@ func hipRunMLXQ4GELUTanhMultiplyBatchKernelWithDeviceInput(ctx context.Context, 
 	if input == nil || input.Pointer() == 0 {
 		return nil, core.E("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "MLX q4 GELU tanh multiply batch device input is required", nil)
 	}
-	if gateCfg.Rows != upCfg.Rows || gateCfg.Cols != upCfg.Cols || gateCfg.GroupSize != upCfg.GroupSize {
+	if gateCfg.Rows != upCfg.Rows || gateCfg.Cols != upCfg.Cols || gateCfg.GroupSize != upCfg.GroupSize || gateCfg.quantBits() != upCfg.quantBits() {
 		return nil, core.E("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "gate and up q4 projection shapes must match", nil)
 	}
 	if err := gateCfg.validateBatchInputCount(input.Count(), batch); err != nil {
@@ -2230,7 +2710,7 @@ func hipRunMLXQ4GELUTanhMultiplyBatchKernelWithDeviceInput(ctx context.Context, 
 		Rows:              gateCfg.Rows,
 		Cols:              gateCfg.Cols,
 		GroupSize:         gateCfg.GroupSize,
-		Bits:              hipMLXQ4ProjectionBits,
+		Bits:              gateCfg.quantBits(),
 		InputBytes:        input.SizeBytes(),
 		GateWeightBytes:   gateCfg.WeightBytes,
 		GateScaleBytes:    gateCfg.ScaleBytes,
@@ -2253,6 +2733,65 @@ func hipRunMLXQ4GELUTanhMultiplyBatchKernelWithDeviceInput(ctx context.Context, 
 	}
 	success = true
 	return output, nil
+}
+
+func hipRunMLXQ4GELUTanhMultiplyBatchKernelWithDeviceInputOutput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, gateCfg, upCfg hipMLXQ4DeviceWeightConfig, batch int, output *hipDeviceByteBuffer) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	if driver == nil || !driver.Available() {
+		return core.E("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "HIP driver is not available", nil)
+	}
+	if input == nil || input.Pointer() == 0 {
+		return core.E("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "MLX q4 GELU tanh multiply batch device input is required", nil)
+	}
+	if gateCfg.Rows != upCfg.Rows || gateCfg.Cols != upCfg.Cols || gateCfg.GroupSize != upCfg.GroupSize || gateCfg.quantBits() != upCfg.quantBits() {
+		return core.E("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "gate and up q4 projection shapes must match", nil)
+	}
+	if err := gateCfg.validateBatchInputCount(input.Count(), batch); err != nil {
+		return err
+	}
+	if err := upCfg.validateBatchInputCount(input.Count(), batch); err != nil {
+		return err
+	}
+	if input.SizeBytes() != uint64(batch*gateCfg.Cols*4) {
+		return core.E("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "MLX q4 GELU tanh multiply batch device input byte count mismatch", nil)
+	}
+	outputCount := batch * gateCfg.Rows
+	if output == nil || output.Pointer() == 0 || output.Count() != outputCount || output.SizeBytes() != uint64(outputCount*4) {
+		return core.E("rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "MLX q4 GELU tanh multiply batch output shape mismatch", nil)
+	}
+	launchBytes, err := (hipMLXQ4GELUTanhMulBatchLaunchArgs{
+		InputPointer:      input.Pointer(),
+		GateWeightPointer: gateCfg.WeightPointer,
+		GateScalePointer:  gateCfg.ScalePointer,
+		GateBiasPointer:   gateCfg.BiasPointer,
+		UpWeightPointer:   upCfg.WeightPointer,
+		UpScalePointer:    upCfg.ScalePointer,
+		UpBiasPointer:     upCfg.BiasPointer,
+		OutputPointer:     output.Pointer(),
+		Rows:              gateCfg.Rows,
+		Cols:              gateCfg.Cols,
+		GroupSize:         gateCfg.GroupSize,
+		Bits:              gateCfg.quantBits(),
+		InputBytes:        input.SizeBytes(),
+		GateWeightBytes:   gateCfg.WeightBytes,
+		GateScaleBytes:    gateCfg.ScaleBytes,
+		GateBiasBytes:     gateCfg.BiasBytes,
+		UpWeightBytes:     upCfg.WeightBytes,
+		UpScaleBytes:      upCfg.ScaleBytes,
+		UpBiasBytes:       upCfg.BiasBytes,
+		OutputBytes:       output.SizeBytes(),
+		Batch:             batch,
+	}).Binary()
+	if err != nil {
+		return err
+	}
+	config, err := hipMLXQ4GELUTanhMultiplyBatchLaunchConfig(launchBytes, gateCfg.Rows, batch)
+	if err != nil {
+		return err
+	}
+	return hipLaunchKernel(driver, config)
 }
 
 func hipRunMLXQ4GELUTanhProjectionKernelWithDeviceMultiplier(ctx context.Context, driver nativeHIPDriver, input, multiplier *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig) (*hipDeviceByteBuffer, error) {
@@ -2292,6 +2831,10 @@ func hipRunMLXQ4GELUTanhProjectionKernelWithDeviceMultiplier(ctx context.Context
 }
 
 func hipRunMLXQ4GELUTanhProjectionKernelWithDeviceMultiplierOutput(ctx context.Context, driver nativeHIPDriver, input, multiplier *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, output *hipDeviceByteBuffer) error {
+	return hipRunMLXQ4GELUTanhProjectionKernelWithDeviceMultiplierOutputWithWorkspace(ctx, driver, input, multiplier, cfg, output, nil)
+}
+
+func hipRunMLXQ4GELUTanhProjectionKernelWithDeviceMultiplierOutputWithWorkspace(ctx context.Context, driver nativeHIPDriver, input, multiplier *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, output *hipDeviceByteBuffer, workspace *hipAttentionHeadsChunkedWorkspace) error {
 	if err := hipContextErr(ctx); err != nil {
 		return err
 	}
@@ -2313,7 +2856,7 @@ func hipRunMLXQ4GELUTanhProjectionKernelWithDeviceMultiplierOutput(ctx context.C
 	if output == nil || output.Pointer() == 0 || output.Count() != cfg.Rows || output.SizeBytes() != uint64(cfg.Rows*4) {
 		return core.E("rocm.hip.MLXQ4GELUTanhProjectionLaunch", "MLX q4 GELU tanh projection output shape mismatch", nil)
 	}
-	launchBytes, err := (hipMLXQ4GELUTanhProjLaunchArgs{
+	launchArgs := hipMLXQ4GELUTanhProjLaunchArgs{
 		InputPointer:      input.Pointer(),
 		WeightPointer:     cfg.WeightPointer,
 		ScalePointer:      cfg.ScalePointer,
@@ -2323,18 +2866,25 @@ func hipRunMLXQ4GELUTanhProjectionKernelWithDeviceMultiplierOutput(ctx context.C
 		Rows:              cfg.Rows,
 		Cols:              cfg.Cols,
 		GroupSize:         cfg.GroupSize,
-		Bits:              hipMLXQ4ProjectionBits,
+		Bits:              cfg.quantBits(),
 		InputBytes:        input.SizeBytes(),
 		WeightBytes:       cfg.WeightBytes,
 		ScaleBytes:        cfg.ScaleBytes,
 		BiasBytes:         cfg.BiasBytes,
 		MultiplierBytes:   multiplier.SizeBytes(),
 		OutputBytes:       output.SizeBytes(),
-	}).Binary()
+	}
+	var launchBytes []byte
+	var err error
+	if workspace != nil {
+		launchBytes, err = launchArgs.BinaryInto(workspace.GELUTanhProjArgs[:])
+	} else {
+		launchBytes, err = launchArgs.Binary()
+	}
 	if err != nil {
 		return err
 	}
-	config, err := hipMLXQ4GELUTanhProjectionLaunchConfig(launchBytes, cfg.Rows)
+	config, err := hipMLXQ4GELUTanhProjectionLaunchConfigForShape(launchBytes, cfg.Rows, cfg.Cols, cfg.GroupSize, cfg.quantBits())
 	if err != nil {
 		return err
 	}
@@ -2377,6 +2927,39 @@ func hipRunMLXQ4GELUTanhProjectionBatchKernelWithDeviceMultiplier(ctx context.Co
 			_ = output.Close()
 		}
 	}()
+	if err := hipRunMLXQ4GELUTanhProjectionBatchKernelWithDeviceMultiplierOutput(ctx, driver, input, multiplier, cfg, batch, output); err != nil {
+		return nil, err
+	}
+	success = true
+	return output, nil
+}
+
+func hipRunMLXQ4GELUTanhProjectionBatchKernelWithDeviceMultiplierOutput(ctx context.Context, driver nativeHIPDriver, input, multiplier *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, batch int, output *hipDeviceByteBuffer) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	if driver == nil || !driver.Available() {
+		return core.E("rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "HIP driver is not available", nil)
+	}
+	if batch <= 0 {
+		return core.E("rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "MLX q4 GELU tanh projection batch size must be positive", nil)
+	}
+	if input == nil || input.Pointer() == 0 {
+		return core.E("rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "MLX q4 GELU tanh projection batch device input is required", nil)
+	}
+	if multiplier == nil || multiplier.Pointer() == 0 || multiplier.Count() != batch*cfg.Rows || multiplier.SizeBytes() != uint64(batch*cfg.Rows*4) {
+		return core.E("rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "MLX q4 GELU tanh projection batch multiplier device buffer shape mismatch", nil)
+	}
+	if err := cfg.validateInputCount(input.Count() / batch); err != nil {
+		return err
+	}
+	if input.Count() != batch*cfg.Cols || input.SizeBytes() != uint64(batch*cfg.Cols*4) {
+		return core.E("rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "MLX q4 GELU tanh projection batch device input byte count mismatch", nil)
+	}
+	outputCount := batch * cfg.Rows
+	if output == nil || output.Pointer() == 0 || output.Count() != outputCount || output.SizeBytes() != uint64(outputCount*4) {
+		return core.E("rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "MLX q4 GELU tanh projection batch output shape mismatch", nil)
+	}
 	launchBytes, err := (hipMLXQ4GELUTanhProjBatchLaunchArgs{
 		InputPointer:      input.Pointer(),
 		WeightPointer:     cfg.WeightPointer,
@@ -2388,7 +2971,7 @@ func hipRunMLXQ4GELUTanhProjectionBatchKernelWithDeviceMultiplier(ctx context.Co
 		Cols:              cfg.Cols,
 		Batch:             batch,
 		GroupSize:         cfg.GroupSize,
-		Bits:              hipMLXQ4ProjectionBits,
+		Bits:              cfg.quantBits(),
 		InputBytes:        input.SizeBytes(),
 		WeightBytes:       cfg.WeightBytes,
 		ScaleBytes:        cfg.ScaleBytes,
@@ -2397,17 +2980,16 @@ func hipRunMLXQ4GELUTanhProjectionBatchKernelWithDeviceMultiplier(ctx context.Co
 		OutputBytes:       output.SizeBytes(),
 	}).Binary()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	config, err := hipMLXQ4GELUTanhProjectionBatchLaunchConfig(launchBytes, cfg.Rows, batch)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if err := hipLaunchKernel(driver, config); err != nil {
-		return nil, err
+		return err
 	}
-	success = true
-	return output, nil
+	return nil
 }
 
 func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32) (hipGreedySampleResult, error) {
@@ -2419,6 +3001,10 @@ func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBuffer(ctx context.C
 }
 
 func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressBuffer(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, best *hipDeviceByteBuffer, suppress *hipDeviceTokenBuffer) (hipGreedySampleResult, error) {
+	return hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressBufferInitialized(ctx, driver, input, cfg, softcap, best, suppress, true)
+}
+
+func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressBufferInitialized(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, best *hipDeviceByteBuffer, suppress *hipDeviceTokenBuffer, initializeBest bool) (hipGreedySampleResult, error) {
 	if err := hipContextErr(ctx); err != nil {
 		return hipGreedySampleResult{}, err
 	}
@@ -2445,6 +3031,7 @@ func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressBuffer
 			return hipGreedySampleResult{}, err
 		}
 		ownsBest = true
+		initializeBest = true
 	} else if best.Pointer() == 0 || best.Count() != 1 || best.SizeBytes() != hipMLXQ4ProjectionBestBytes {
 		return hipGreedySampleResult{}, core.E("rocm.hip.MLXQ4ProjectionGreedyLaunch", "MLX q4 projection greedy best buffer shape mismatch", nil)
 	}
@@ -2454,8 +3041,10 @@ func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressBuffer
 	if ownsBest {
 		defer best.Close()
 	}
-	if err := hipMemsetDevice(driver, best.Pointer(), 0, best.SizeBytes()); err != nil {
-		return hipGreedySampleResult{}, core.E("rocm.hip.MLXQ4ProjectionGreedyLaunch", "initialize greedy best", err)
+	if initializeBest {
+		if err := hipMemsetDevice(driver, best.Pointer(), 0, best.SizeBytes()); err != nil {
+			return hipGreedySampleResult{}, core.E("rocm.hip.MLXQ4ProjectionGreedyLaunch", "initialize greedy best", err)
+		}
 	}
 	launchBytes, err := (hipMLXQ4ProjectionLaunchArgs{
 		InputPointer:  input.Pointer(),
@@ -2466,7 +3055,7 @@ func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressBuffer
 		Rows:          cfg.Rows,
 		Cols:          cfg.Cols,
 		GroupSize:     cfg.GroupSize,
-		Bits:          hipMLXQ4ProjectionBits,
+		Bits:          cfg.quantBits(),
 		InputBytes:    input.SizeBytes(),
 		WeightBytes:   cfg.WeightBytes,
 		ScaleBytes:    cfg.ScaleBytes,
@@ -2484,7 +3073,7 @@ func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressBuffer
 			Rows:            cfg.Rows,
 			Cols:            cfg.Cols,
 			GroupSize:       cfg.GroupSize,
-			Bits:            hipMLXQ4ProjectionBits,
+			Bits:            cfg.quantBits(),
 			SuppressCount:   suppress.Count(),
 			InputBytes:      input.SizeBytes(),
 			WeightBytes:     cfg.WeightBytes,
@@ -2496,7 +3085,7 @@ func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressBuffer
 	if err != nil {
 		return hipGreedySampleResult{}, err
 	}
-	config, err := hipMLXQ4ProjectionGreedyLaunchConfig(launchBytes, cfg.Rows)
+	config, err := hipMLXQ4ProjectionGreedyLaunchConfigForShape(launchBytes, cfg.Rows, cfg.Cols, cfg.GroupSize, cfg.quantBits())
 	if err != nil {
 		return hipGreedySampleResult{}, err
 	}
@@ -2510,8 +3099,127 @@ func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressBuffer
 	return hipUnpackGreedyBest(packed, softcap, cfg.Rows)
 }
 
+func hipRunMLXQ4ProjectionSoftcapGreedyBatchKernelWithDeviceInput(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, batch int) ([]hipGreedySampleResult, error) {
+	return hipRunMLXQ4ProjectionSoftcapGreedyBatchKernelWithDeviceInputBufferSuppressBufferInitialized(ctx, driver, input, cfg, softcap, batch, nil, nil, true)
+}
+
+func hipRunMLXQ4ProjectionSoftcapGreedyBatchKernelWithDeviceInputBufferSuppress(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, batch int, best *hipDeviceByteBuffer, suppressTokens []int32, workspace *hipAttentionHeadsChunkedWorkspace) ([]hipGreedySampleResult, error) {
+	var suppress *hipDeviceTokenBuffer
+	if len(suppressTokens) > 0 {
+		var err error
+		if workspace != nil {
+			suppress, err = workspace.EnsureSuppressTokenBuffer(driver, suppressTokens)
+		} else {
+			suppress, err = hipUploadTokenIDs(driver, suppressTokens)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if workspace == nil {
+			defer suppress.Close()
+		}
+	}
+	return hipRunMLXQ4ProjectionSoftcapGreedyBatchKernelWithDeviceInputBufferSuppressBufferInitialized(ctx, driver, input, cfg, softcap, batch, best, suppress, true)
+}
+
+func hipRunMLXQ4ProjectionSoftcapGreedyBatchKernelWithDeviceInputBufferSuppressBufferInitialized(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, batch int, best *hipDeviceByteBuffer, suppress *hipDeviceTokenBuffer, initializeBest bool) ([]hipGreedySampleResult, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return nil, err
+	}
+	if driver == nil || !driver.Available() {
+		return nil, core.E("rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", "HIP driver is not available", nil)
+	}
+	if batch <= 0 {
+		return nil, core.E("rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", "MLX q4 projection greedy batch size must be positive", nil)
+	}
+	if input == nil || input.Pointer() == 0 {
+		return nil, core.E("rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", "MLX q4 projection batch device input is required", nil)
+	}
+	if err := cfg.validateInputCount(cfg.Cols); err != nil {
+		return nil, err
+	}
+	if input.Count() != batch*cfg.Cols || input.SizeBytes() != uint64(batch*cfg.Cols*4) {
+		return nil, core.E("rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", "MLX q4 projection batch device input byte count mismatch", nil)
+	}
+	if softcap < 0 || math.IsNaN(float64(softcap)) || math.IsInf(float64(softcap), 0) {
+		return nil, core.E("rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", "softcap must be non-negative and finite", nil)
+	}
+	ownsBest := false
+	bestBytes := uint64(batch * hipMLXQ4ProjectionBestBytes)
+	if best == nil {
+		var err error
+		best, err = hipAllocateByteBuffer(driver, "rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", "MLX q4 projection greedy batch best", bestBytes, batch)
+		if err != nil {
+			return nil, err
+		}
+		ownsBest = true
+		initializeBest = true
+	} else if best.Pointer() == 0 || best.Count() != batch || best.SizeBytes() != bestBytes {
+		return nil, core.E("rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", "MLX q4 projection greedy batch best buffer shape mismatch", nil)
+	}
+	if suppress != nil && (suppress.Pointer() == 0 || suppress.Count() <= 0 || suppress.SizeBytes() != uint64(suppress.Count()*4)) {
+		return nil, core.E("rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", "MLX q4 suppress token buffer shape mismatch", nil)
+	}
+	if ownsBest {
+		defer best.Close()
+	}
+	if initializeBest {
+		if err := hipMemsetDevice(driver, best.Pointer(), 0, best.SizeBytes()); err != nil {
+			return nil, core.E("rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", "initialize greedy batch best", err)
+		}
+	}
+	launchArgs := hipMLXQ4ProjectionGreedyBatchLaunchArgs{
+		InputPointer:  input.Pointer(),
+		WeightPointer: cfg.WeightPointer,
+		ScalePointer:  cfg.ScalePointer,
+		BiasPointer:   cfg.BiasPointer,
+		OutputPointer: best.Pointer(),
+		Rows:          cfg.Rows,
+		Cols:          cfg.Cols,
+		Batch:         batch,
+		GroupSize:     cfg.GroupSize,
+		Bits:          cfg.quantBits(),
+		InputBytes:    input.SizeBytes(),
+		WeightBytes:   cfg.WeightBytes,
+		ScaleBytes:    cfg.ScaleBytes,
+		BiasBytes:     cfg.BiasBytes,
+		OutputBytes:   best.SizeBytes(),
+	}
+	if suppress != nil {
+		launchArgs.SuppressPointer = suppress.Pointer()
+		launchArgs.SuppressCount = suppress.Count()
+	}
+	launchBytes, err := launchArgs.Binary()
+	if err != nil {
+		return nil, err
+	}
+	config, err := hipMLXQ4ProjectionGreedyBatchLaunchConfigForShape(launchBytes, cfg.Rows, cfg.Cols, cfg.GroupSize, cfg.quantBits(), batch)
+	if err != nil {
+		return nil, err
+	}
+	if err := hipLaunchKernel(driver, config); err != nil {
+		return nil, err
+	}
+	packed, err := hipReadUint64DeviceOutput(best, "rocm.hip.MLXQ4ProjectionGreedyBatchLaunch", "MLX q4 projection greedy batch best", batch)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]hipGreedySampleResult, batch)
+	for index, value := range packed {
+		results[index], err = hipUnpackGreedyBest(value, softcap, cfg.Rows)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return results, nil
+}
+
 type nativeHIPDeviceUint64Reader interface {
 	CopyDeviceToHostUint64(pointer nativeDevicePointer) (uint64, error)
+}
+
+type nativeHIPDeviceUint32Reader interface {
+	CopyDeviceToHostUint32(pointer nativeDevicePointer) (uint32, error)
 }
 
 func hipReadDeviceUint64(driver nativeHIPDriver, pointer nativeDevicePointer) (uint64, error) {
@@ -2523,6 +3231,17 @@ func hipReadDeviceUint64(driver nativeHIPDriver, pointer nativeDevicePointer) (u
 		return 0, err
 	}
 	return binary.LittleEndian.Uint64(payload[:]), nil
+}
+
+func hipReadDeviceUint32(driver nativeHIPDriver, pointer nativeDevicePointer) (uint32, error) {
+	if reader, ok := driver.(nativeHIPDeviceUint32Reader); ok {
+		return reader.CopyDeviceToHostUint32(pointer)
+	}
+	var payload [4]byte
+	if err := driver.CopyDeviceToHost(pointer, payload[:]); err != nil {
+		return 0, err
+	}
+	return binary.LittleEndian.Uint32(payload[:]), nil
 }
 
 func hipReadUint64DeviceOutput(buffer *hipDeviceByteBuffer, operation, label string, count int) ([]uint64, error) {
@@ -2547,7 +3266,8 @@ func hipReadUint64DeviceOutput(buffer *hipDeviceByteBuffer, operation, label str
 }
 
 func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppress(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, best *hipDeviceByteBuffer, suppressTokens []int32, workspace *hipAttentionHeadsChunkedWorkspace) (hipGreedySampleResult, error) {
-	greedy, err := hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBuffer(ctx, driver, input, cfg, softcap, best)
+	usesBorrowedBest := workspace != nil && best != nil && best.borrowed
+	greedy, err := hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressBufferInitialized(ctx, driver, input, cfg, softcap, best, nil, true)
 	if err != nil || !hipTokenIsSuppressed(int32(greedy.TokenID), suppressTokens) {
 		return greedy, err
 	}
@@ -2556,7 +3276,15 @@ func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppress(ctx c
 		if err != nil {
 			return hipGreedySampleResult{}, err
 		}
-		return hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressBuffer(ctx, driver, input, cfg, softcap, best, suppress)
+		suppressBest := best
+		initializeBest := true
+		if usesBorrowedBest {
+			suppressBest, err = workspace.BorrowProjectionGreedyBest(driver)
+			if err != nil {
+				return hipGreedySampleResult{}, err
+			}
+		}
+		return hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressBufferInitialized(ctx, driver, input, cfg, softcap, suppressBest, suppress, initializeBest)
 	}
 	logitsBuffer, err := hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx, driver, input, cfg)
 	if err != nil {
@@ -2576,6 +3304,371 @@ func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppress(ctx c
 		return hipGreedySampleResult{}, err
 	}
 	return hipGreedySampleResult{TokenID: tokenID, Score: score}, nil
+}
+
+func hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressResult(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, best *hipDeviceByteBuffer, suppressTokens []int32, workspace *hipAttentionHeadsChunkedWorkspace) (hipGreedySampleResult, *hipDeviceByteBuffer, error) {
+	resultBuffer := best
+	initializeBest := true
+	if workspace != nil {
+		var err error
+		resultBuffer, err = workspace.BorrowProjectionGreedyBest(driver)
+		if err != nil {
+			return hipGreedySampleResult{}, nil, err
+		}
+	}
+	greedy, err := hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressBufferInitialized(ctx, driver, input, cfg, softcap, resultBuffer, nil, initializeBest)
+	if err != nil {
+		return hipGreedySampleResult{}, nil, err
+	}
+	if !hipTokenIsSuppressed(int32(greedy.TokenID), suppressTokens) {
+		if resultBuffer == nil {
+			return greedy, nil, nil
+		}
+		return greedy, resultBuffer, nil
+	}
+	if workspace != nil {
+		suppress, err := workspace.EnsureSuppressTokenBuffer(driver, suppressTokens)
+		if err != nil {
+			return hipGreedySampleResult{}, nil, err
+		}
+		resultBuffer, err = workspace.BorrowProjectionGreedyBest(driver)
+		if err != nil {
+			return hipGreedySampleResult{}, nil, err
+		}
+		greedy, err = hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressBufferInitialized(ctx, driver, input, cfg, softcap, resultBuffer, suppress, true)
+		return greedy, resultBuffer, err
+	}
+	logitsBuffer, err := hipRunMLXQ4ProjectionKernelWithDeviceInput(ctx, driver, input, cfg)
+	if err != nil {
+		return hipGreedySampleResult{}, nil, err
+	}
+	defer logitsBuffer.Close()
+	logits, err := hipReadFloat32DeviceOutput(logitsBuffer, "rocm.hip.MLXQ4ProjectionGreedyLaunch", "MLX q4 suppressed projection logits", cfg.Rows)
+	if err != nil {
+		return hipGreedySampleResult{}, nil, err
+	}
+	logits, err = hipGemma4Q4SoftcapLogits(logits, softcap)
+	if err != nil {
+		return hipGreedySampleResult{}, nil, err
+	}
+	tokenID, score, err := hipReferenceGreedySampleSuppress(logits, suppressTokens)
+	if err != nil {
+		return hipGreedySampleResult{}, nil, err
+	}
+	return hipGreedySampleResult{TokenID: tokenID, Score: score}, nil, nil
+}
+
+func hipRunMLXQ4ProjectionSoftcapGreedyTokenKernelWithDeviceInputBufferSuppressResult(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, best *hipDeviceByteBuffer, suppressTokens []int32, workspace *hipAttentionHeadsChunkedWorkspace) (hipGreedySampleResult, *hipDeviceByteBuffer, error) {
+	resultBuffer := best
+	initializeBest := true
+	if workspace != nil {
+		var err error
+		resultBuffer, err = workspace.BorrowProjectionGreedyBest(driver)
+		if err != nil {
+			return hipGreedySampleResult{}, nil, err
+		}
+	}
+	if resultBuffer == nil {
+		greedy, device, err := hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressResult(ctx, driver, input, cfg, softcap, best, suppressTokens, workspace)
+		return greedy, device, err
+	}
+	tokenID, err := hipRunMLXQ4ProjectionSoftcapGreedyTokenKernelWithDeviceInputBufferSuppressBufferInitialized(ctx, driver, input, cfg, softcap, resultBuffer, nil, initializeBest)
+	if err != nil {
+		return hipGreedySampleResult{}, nil, err
+	}
+	if !hipTokenIsSuppressed(int32(tokenID), suppressTokens) {
+		return hipGreedySampleResult{TokenID: tokenID}, resultBuffer, nil
+	}
+	if workspace != nil {
+		suppress, err := workspace.EnsureSuppressTokenBuffer(driver, suppressTokens)
+		if err != nil {
+			return hipGreedySampleResult{}, nil, err
+		}
+		resultBuffer, err = workspace.BorrowProjectionGreedyBest(driver)
+		if err != nil {
+			return hipGreedySampleResult{}, nil, err
+		}
+		tokenID, err = hipRunMLXQ4ProjectionSoftcapGreedyTokenKernelWithDeviceInputBufferSuppressBufferInitialized(ctx, driver, input, cfg, softcap, resultBuffer, suppress, true)
+		return hipGreedySampleResult{TokenID: tokenID}, resultBuffer, err
+	}
+	greedy, _, err := hipRunMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressResult(ctx, driver, input, cfg, softcap, best, suppressTokens, workspace)
+	return greedy, resultBuffer, err
+}
+
+func hipRunMLXQ4ProjectionSoftcapGreedyTokenKernelWithDeviceInputBufferSuppressDevice(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, best *hipDeviceByteBuffer, suppressTokens []int32, workspace *hipAttentionHeadsChunkedWorkspace) (*hipDeviceByteBuffer, error) {
+	resultBuffer := best
+	initializeBest := true
+	var err error
+	if workspace != nil {
+		resultBuffer, err = workspace.BorrowProjectionGreedyBest(driver)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if resultBuffer == nil {
+		return nil, core.E("rocm.hip.MLXQ4ProjectionGreedyLaunch", "MLX q4 projection greedy best buffer is required for deferred token read", nil)
+	}
+	var suppress *hipDeviceTokenBuffer
+	if len(suppressTokens) > 0 {
+		if workspace != nil {
+			suppress, err = workspace.EnsureSuppressTokenBuffer(driver, suppressTokens)
+		} else {
+			suppress, err = hipUploadTokenIDs(driver, suppressTokens)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if workspace == nil {
+			defer suppress.Close()
+		}
+	}
+	if err := hipLaunchMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressBufferInitialized(ctx, driver, input, cfg, softcap, resultBuffer, suppress, initializeBest); err != nil {
+		return nil, err
+	}
+	return resultBuffer, nil
+}
+
+func hipRunMLXQ4ProjectionSoftcapGreedyTokenKernelWithDeviceInputBufferSuppressBufferInitialized(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, best *hipDeviceByteBuffer, suppress *hipDeviceTokenBuffer, initializeBest bool) (int, error) {
+	if err := hipLaunchMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressBufferInitialized(ctx, driver, input, cfg, softcap, best, suppress, initializeBest); err != nil {
+		return 0, err
+	}
+	packedLow, err := hipReadDeviceUint32(driver, best.Pointer())
+	if err != nil {
+		return 0, core.E("rocm.hip.MLXQ4ProjectionGreedyLaunch", "copy greedy token", err)
+	}
+	return hipUnpackGreedyBestTokenID(packedLow, cfg.Rows)
+}
+
+func hipLaunchMLXQ4ProjectionSoftcapGreedyKernelWithDeviceInputBufferSuppressBufferInitialized(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, best *hipDeviceByteBuffer, suppress *hipDeviceTokenBuffer, initializeBest bool) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	if driver == nil || !driver.Available() {
+		return core.E("rocm.hip.MLXQ4ProjectionGreedyLaunch", "HIP driver is not available", nil)
+	}
+	if input == nil || input.Pointer() == 0 {
+		return core.E("rocm.hip.MLXQ4ProjectionGreedyLaunch", "MLX q4 projection device input is required", nil)
+	}
+	if err := cfg.validateInputCount(input.Count()); err != nil {
+		return err
+	}
+	if input.SizeBytes() != uint64(cfg.Cols*4) {
+		return core.E("rocm.hip.MLXQ4ProjectionGreedyLaunch", "MLX q4 projection device input byte count mismatch", nil)
+	}
+	if softcap < 0 || math.IsNaN(float64(softcap)) || math.IsInf(float64(softcap), 0) {
+		return core.E("rocm.hip.MLXQ4ProjectionGreedyLaunch", "softcap must be non-negative and finite", nil)
+	}
+	if best == nil || best.Pointer() == 0 || best.Count() != 1 || best.SizeBytes() != hipMLXQ4ProjectionBestBytes {
+		return core.E("rocm.hip.MLXQ4ProjectionGreedyLaunch", "MLX q4 projection greedy best buffer shape mismatch", nil)
+	}
+	if suppress != nil && (suppress.Pointer() == 0 || suppress.Count() <= 0 || suppress.SizeBytes() != uint64(suppress.Count()*4)) {
+		return core.E("rocm.hip.MLXQ4ProjectionGreedyLaunch", "MLX q4 suppress token buffer shape mismatch", nil)
+	}
+	if initializeBest {
+		if err := hipMemsetDevice(driver, best.Pointer(), 0, best.SizeBytes()); err != nil {
+			return core.E("rocm.hip.MLXQ4ProjectionGreedyLaunch", "initialize greedy best", err)
+		}
+	}
+	launchArgs := hipMLXQ4ProjectionLaunchArgs{
+		InputPointer:  input.Pointer(),
+		WeightPointer: cfg.WeightPointer,
+		ScalePointer:  cfg.ScalePointer,
+		BiasPointer:   cfg.BiasPointer,
+		OutputPointer: best.Pointer(),
+		Rows:          cfg.Rows,
+		Cols:          cfg.Cols,
+		GroupSize:     cfg.GroupSize,
+		Bits:          cfg.quantBits(),
+		InputBytes:    input.SizeBytes(),
+		WeightBytes:   cfg.WeightBytes,
+		ScaleBytes:    cfg.ScaleBytes,
+		BiasBytes:     cfg.BiasBytes,
+		OutputBytes:   best.SizeBytes(),
+	}
+	if suppress != nil {
+		launchArgs.SuppressPointer = suppress.Pointer()
+		launchArgs.SuppressCount = suppress.Count()
+	}
+	launchBytes, err := launchArgs.GreedyBinary()
+	if err != nil {
+		return err
+	}
+	config, err := hipMLXQ4ProjectionGreedyLaunchConfigForShape(launchBytes, cfg.Rows, cfg.Cols, cfg.GroupSize, cfg.quantBits())
+	if err != nil {
+		return err
+	}
+	return hipLaunchKernel(driver, config)
+}
+
+func hipRunMLXQ4ProjectionSoftcapSelectedGreedyTokenKernelWithDeviceInputBufferResult(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, selected *hipDeviceTokenBuffer, best *hipDeviceByteBuffer, workspace *hipAttentionHeadsChunkedWorkspace) (hipGreedySampleResult, *hipDeviceByteBuffer, error) {
+	resultBuffer := best
+	initializeBest := true
+	if workspace != nil {
+		var err error
+		resultBuffer, err = workspace.BorrowProjectionGreedyBest(driver)
+		if err != nil {
+			return hipGreedySampleResult{}, nil, err
+		}
+	}
+	tokenID, err := hipRunMLXQ4ProjectionSoftcapSelectedGreedyTokenKernelWithDeviceInputBufferInitialized(ctx, driver, input, cfg, softcap, selected, resultBuffer, initializeBest)
+	if err != nil {
+		return hipGreedySampleResult{}, nil, err
+	}
+	return hipGreedySampleResult{TokenID: tokenID}, resultBuffer, nil
+}
+
+func hipRunMLXQ4ProjectionSoftcapSelectedGreedyTokenKernelWithDeviceInputBufferDevice(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, selected *hipDeviceTokenBuffer, best *hipDeviceByteBuffer, workspace *hipAttentionHeadsChunkedWorkspace) (*hipDeviceByteBuffer, error) {
+	resultBuffer := best
+	initializeBest := true
+	var err error
+	if workspace != nil {
+		resultBuffer, err = workspace.BorrowProjectionGreedyBest(driver)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if resultBuffer == nil {
+		return nil, core.E("rocm.hip.MLXQ4ProjectionSelectedGreedyLaunch", "MLX q4 selected projection greedy best buffer is required for deferred token read", nil)
+	}
+	if _, err := hipRunMLXQ4ProjectionSoftcapSelectedGreedyTokenKernelWithDeviceInputBufferInitialized(ctx, driver, input, cfg, softcap, selected, resultBuffer, initializeBest); err != nil {
+		return nil, err
+	}
+	return resultBuffer, nil
+}
+
+func hipRunMLXQ4ProjectionSoftcapSelectedGreedyTokenKernelWithDeviceInputBufferInitialized(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, selected *hipDeviceTokenBuffer, best *hipDeviceByteBuffer, initializeBest bool) (int, error) {
+	if err := hipLaunchMLXQ4ProjectionSoftcapSelectedGreedyKernelWithDeviceInputBufferInitialized(ctx, driver, input, cfg, softcap, selected, best, initializeBest); err != nil {
+		return 0, err
+	}
+	packedLow, err := hipReadDeviceUint32(driver, best.Pointer())
+	if err != nil {
+		return 0, core.E("rocm.hip.MLXQ4ProjectionSelectedGreedyLaunch", "copy selected greedy token", err)
+	}
+	return hipUnpackGreedyBestTokenID(packedLow, cfg.Rows)
+}
+
+func hipLaunchMLXQ4ProjectionSoftcapSelectedGreedyKernelWithDeviceInputBufferInitialized(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, selected *hipDeviceTokenBuffer, best *hipDeviceByteBuffer, initializeBest bool) error {
+	if err := hipContextErr(ctx); err != nil {
+		return err
+	}
+	if driver == nil || !driver.Available() {
+		return core.E("rocm.hip.MLXQ4ProjectionSelectedGreedyLaunch", "HIP driver is not available", nil)
+	}
+	if input == nil || input.Pointer() == 0 {
+		return core.E("rocm.hip.MLXQ4ProjectionSelectedGreedyLaunch", "MLX q4 projection device input is required", nil)
+	}
+	if err := cfg.validateInputCount(input.Count()); err != nil {
+		return err
+	}
+	if input.SizeBytes() != uint64(cfg.Cols*4) {
+		return core.E("rocm.hip.MLXQ4ProjectionSelectedGreedyLaunch", "MLX q4 projection device input byte count mismatch", nil)
+	}
+	if softcap < 0 || math.IsNaN(float64(softcap)) || math.IsInf(float64(softcap), 0) {
+		return core.E("rocm.hip.MLXQ4ProjectionSelectedGreedyLaunch", "softcap must be non-negative and finite", nil)
+	}
+	if selected == nil || selected.Pointer() == 0 || selected.Count() <= 0 || selected.SizeBytes() != uint64(selected.Count()*4) {
+		return core.E("rocm.hip.MLXQ4ProjectionSelectedGreedyLaunch", "selected token buffer shape mismatch", nil)
+	}
+	if best == nil || best.Pointer() == 0 || best.Count() != 1 || best.SizeBytes() != hipMLXQ4ProjectionBestBytes {
+		return core.E("rocm.hip.MLXQ4ProjectionSelectedGreedyLaunch", "MLX q4 projection greedy best buffer shape mismatch", nil)
+	}
+	if initializeBest {
+		if err := hipMemsetDevice(driver, best.Pointer(), 0, best.SizeBytes()); err != nil {
+			return core.E("rocm.hip.MLXQ4ProjectionSelectedGreedyLaunch", "initialize selected greedy best", err)
+		}
+	}
+	launchBytes, err := (hipMLXQ4ProjectionLaunchArgs{
+		InputPointer:    input.Pointer(),
+		WeightPointer:   cfg.WeightPointer,
+		ScalePointer:    cfg.ScalePointer,
+		BiasPointer:     cfg.BiasPointer,
+		OutputPointer:   best.Pointer(),
+		SuppressPointer: selected.Pointer(),
+		Rows:            cfg.Rows,
+		Cols:            cfg.Cols,
+		GroupSize:       cfg.GroupSize,
+		Bits:            cfg.quantBits(),
+		SuppressCount:   selected.Count(),
+		InputBytes:      input.SizeBytes(),
+		WeightBytes:     cfg.WeightBytes,
+		ScaleBytes:      cfg.ScaleBytes,
+		BiasBytes:       cfg.BiasBytes,
+		OutputBytes:     best.SizeBytes(),
+	}).GreedyBinary()
+	if err != nil {
+		return err
+	}
+	config, err := hipMLXQ4ProjectionSelectedGreedyLaunchConfigForShape(launchBytes, selected.Count(), cfg.Cols, cfg.GroupSize, cfg.quantBits())
+	if err != nil {
+		return err
+	}
+	return hipLaunchKernel(driver, config)
+}
+
+func hipRunOrderedEmbeddingCandidatesKernel(ctx context.Context, driver nativeHIPDriver, topK *hipDeviceByteBuffer, topKCount int, tokenOrderingPointer nativeDevicePointer, tokenOrderingBytes uint64, tokenOrderingElementBytes, numCentroids, tokensPerCentroid int, suppress *hipDeviceTokenBuffer, workspace *hipAttentionHeadsChunkedWorkspace) (*hipDeviceTokenBuffer, error) {
+	if err := hipContextErr(ctx); err != nil {
+		return nil, err
+	}
+	if driver == nil || !driver.Available() {
+		return nil, core.E("rocm.hip.OrderedEmbeddingCandidatesLaunch", "HIP driver is not available", nil)
+	}
+	if topK == nil || topK.Pointer() == 0 || topKCount <= 0 || topK.Count() != topKCount || topK.SizeBytes() != uint64(topKCount*hipMLXQ4ProjectionBestBytes) {
+		return nil, core.E("rocm.hip.OrderedEmbeddingCandidatesLaunch", "top-k device buffer shape mismatch", nil)
+	}
+	if tokenOrderingPointer == 0 || tokenOrderingBytes == 0 {
+		return nil, core.E("rocm.hip.OrderedEmbeddingCandidatesLaunch", "token-ordering device tensor is required", nil)
+	}
+	if tokenOrderingElementBytes != 4 && tokenOrderingElementBytes != 8 {
+		return nil, core.E("rocm.hip.OrderedEmbeddingCandidatesLaunch", "token-ordering element bytes must be 4 or 8", nil)
+	}
+	if numCentroids <= 0 || tokensPerCentroid <= 0 {
+		return nil, core.E("rocm.hip.OrderedEmbeddingCandidatesLaunch", "ordered embedding shape must be positive", nil)
+	}
+	tokenOrderingCount := numCentroids * tokensPerCentroid
+	if tokenOrderingBytes != uint64(tokenOrderingCount*tokenOrderingElementBytes) {
+		return nil, core.E("rocm.hip.OrderedEmbeddingCandidatesLaunch", "token-ordering byte count mismatch", nil)
+	}
+	if suppress != nil && (suppress.Pointer() == 0 || suppress.Count() <= 0 || suppress.SizeBytes() != uint64(suppress.Count()*4)) {
+		return nil, core.E("rocm.hip.OrderedEmbeddingCandidatesLaunch", "suppress token buffer shape mismatch", nil)
+	}
+	if workspace == nil {
+		return nil, core.E("rocm.hip.OrderedEmbeddingCandidatesLaunch", "attention workspace is required", nil)
+	}
+	outputCount := topKCount * tokensPerCentroid
+	output, err := workspace.EnsureProjectionCandidateTokenOutput(driver, outputCount)
+	if err != nil {
+		return nil, err
+	}
+	launchArgs := hipOrderedEmbeddingCandidatesLaunchArgs{
+		TopKPointer:               topK.Pointer(),
+		TokenOrderingPointer:      tokenOrderingPointer,
+		OutputPointer:             output.Pointer(),
+		TopKCount:                 topKCount,
+		NumCentroids:              numCentroids,
+		TokensPerCentroid:         tokensPerCentroid,
+		TokenOrderingElementBytes: tokenOrderingElementBytes,
+		TokenOrderingCount:        tokenOrderingCount,
+		OutputCount:               outputCount,
+		TopKBytes:                 topK.SizeBytes(),
+		TokenOrderingBytes:        tokenOrderingBytes,
+		OutputBytes:               output.SizeBytes(),
+	}
+	if suppress != nil {
+		launchArgs.SuppressPointer = suppress.Pointer()
+		launchArgs.SuppressCount = suppress.Count()
+	}
+	launchBytes, err := launchArgs.BinaryInto(workspace.OrderedEmbeddingCandidatesArgs[:])
+	if err != nil {
+		return nil, err
+	}
+	config, err := hipOrderedEmbeddingCandidatesLaunchConfig(launchBytes, outputCount)
+	if err != nil {
+		return nil, err
+	}
+	if err := hipLaunchKernel(driver, config); err != nil {
+		return nil, err
+	}
+	return output, nil
 }
 
 func hipRunPackedTopKKernelWithWorkspace(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, inputCount, topK int, workspace *hipAttentionHeadsChunkedWorkspace) (*hipDeviceByteBuffer, int, error) {
@@ -2616,7 +3709,7 @@ func hipRunPackedTopKKernelWithWorkspaceOutput(ctx context.Context, driver nativ
 		ChunkSize:     hipPackedTopKChunkSize,
 		InputBytes:    input.SizeBytes(),
 		OutputBytes:   output.SizeBytes(),
-	}).Binary()
+	}).BinaryInto(workspace.ProjectionTopKArgs[:])
 	if err != nil {
 		return nil, 0, err
 	}
@@ -2639,13 +3732,139 @@ func hipRunPackedTopKReduceKernelWithWorkspace(ctx context.Context, driver nativ
 		if err != nil {
 			return nil, 0, err
 		}
-		if outputCount <= hipPackedTopKChunkSize {
+		if outputCount <= topK {
 			return output, outputCount, nil
 		}
 		current = output
 		currentCount = outputCount
 		workOutput = !workOutput
 	}
+}
+
+func hipRunMLXQ4ProjectionSoftcapScoreTopKDeviceWithDeviceInputBufferSuppress(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, topK int, suppressTokens []int32, workspace *hipAttentionHeadsChunkedWorkspace) (*hipDeviceByteBuffer, int, error) {
+	if input == nil || input.Pointer() == 0 {
+		return nil, 0, core.E("rocm.hip.MLXQ4ProjectionScoresLaunch", "MLX q4 projection device input is required", nil)
+	}
+	if err := cfg.validateInputCount(input.Count()); err != nil {
+		return nil, 0, err
+	}
+	if input.SizeBytes() != uint64(cfg.Cols*4) {
+		return nil, 0, core.E("rocm.hip.MLXQ4ProjectionScoresLaunch", "MLX q4 projection device input byte count mismatch", nil)
+	}
+	if topK <= 0 || topK > cfg.Rows {
+		return nil, 0, core.E("rocm.hip.MLXQ4ProjectionScoresLaunch", "top-k must be within vocabulary size", nil)
+	}
+	if softcap < 0 || math.IsNaN(float64(softcap)) || math.IsInf(float64(softcap), 0) {
+		return nil, 0, core.E("rocm.hip.MLXQ4ProjectionScoresLaunch", "softcap must be non-negative and finite", nil)
+	}
+	if workspace == nil {
+		return nil, 0, core.E("rocm.hip.PackedTopKLaunch", "attention workspace is required", nil)
+	}
+	var suppress *hipDeviceTokenBuffer
+	var err error
+	if len(suppressTokens) > 0 {
+		suppress, err = workspace.EnsureSuppressTokenBuffer(driver, suppressTokens)
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	scores, err := workspace.EnsureProjectionScoreOutput(driver, cfg.Rows)
+	if err != nil {
+		return nil, 0, err
+	}
+	launchArgs := hipMLXQ4ProjectionLaunchArgs{
+		InputPointer:  input.Pointer(),
+		WeightPointer: cfg.WeightPointer,
+		ScalePointer:  cfg.ScalePointer,
+		BiasPointer:   cfg.BiasPointer,
+		OutputPointer: scores.Pointer(),
+		Rows:          cfg.Rows,
+		Cols:          cfg.Cols,
+		GroupSize:     cfg.GroupSize,
+		Bits:          cfg.quantBits(),
+		InputBytes:    input.SizeBytes(),
+		WeightBytes:   cfg.WeightBytes,
+		ScaleBytes:    cfg.ScaleBytes,
+		BiasBytes:     cfg.BiasBytes,
+		OutputBytes:   scores.SizeBytes(),
+	}
+	if suppress != nil {
+		launchArgs.SuppressPointer = suppress.Pointer()
+		launchArgs.SuppressCount = suppress.Count()
+	}
+	launchBytes, err := launchArgs.ScoresBinaryInto(workspace.ProjectionScoresArgs[:])
+	if err != nil {
+		return nil, 0, err
+	}
+	config, err := hipMLXQ4ProjectionScoresLaunchConfigForShape(launchBytes, cfg.Rows, cfg.Cols, cfg.GroupSize, cfg.quantBits())
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := hipLaunchKernel(driver, config); err != nil {
+		return nil, 0, err
+	}
+	return hipRunPackedTopKReduceKernelWithWorkspace(ctx, driver, scores, cfg.Rows, topK, workspace)
+}
+
+func hipRunPackedTopKSampleKernel(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, inputCount, topK int, generateTemperature, generateTopP float32, draw float64, output *hipDeviceByteBuffer, workspace *hipAttentionHeadsChunkedWorkspace) (hipGreedySampleResult, *hipDeviceByteBuffer, error) {
+	if input == nil || input.Pointer() == 0 {
+		return hipGreedySampleResult{}, nil, core.E("rocm.hip.PackedTopKSampleLaunch", "packed candidate input is required", nil)
+	}
+	if inputCount <= 0 || input.Count() != inputCount || input.SizeBytes() != uint64(inputCount*hipMLXQ4ProjectionBestBytes) {
+		return hipGreedySampleResult{}, nil, core.E("rocm.hip.PackedTopKSampleLaunch", "packed candidate input shape mismatch", nil)
+	}
+	if topK <= 0 || topK > inputCount || topK > hipPackedTopKMaxK {
+		return hipGreedySampleResult{}, nil, core.E("rocm.hip.PackedTopKSampleLaunch", "top-k must be within input and kernel maximum", nil)
+	}
+	if workspace == nil {
+		return hipGreedySampleResult{}, nil, core.E("rocm.hip.PackedTopKSampleLaunch", "attention workspace is required", nil)
+	}
+	if output == nil || output.Pointer() == 0 {
+		var err error
+		output, err = hipAllocateByteBuffer(driver, "rocm.hip.PackedTopKSampleLaunch", "sampled packed top-k", hipMLXQ4ProjectionBestBytes, 1)
+		if err != nil {
+			return hipGreedySampleResult{}, nil, err
+		}
+	}
+	if output.Count() != 1 || output.SizeBytes() != hipMLXQ4ProjectionBestBytes {
+		return hipGreedySampleResult{}, nil, core.E("rocm.hip.PackedTopKSampleLaunch", "sample output shape mismatch", nil)
+	}
+	launchBytes, err := (hipPackedTopKSampleLaunchArgs{
+		InputPointer:  input.Pointer(),
+		OutputPointer: output.Pointer(),
+		InputCount:    inputCount,
+		TopK:          topK,
+		InputBytes:    input.SizeBytes(),
+		OutputBytes:   output.SizeBytes(),
+		Temperature:   generateTemperature,
+		TopP:          generateTopP,
+		Draw:          draw,
+	}).BinaryInto(workspace.ProjectionTopKSampleArgs[:])
+	if err != nil {
+		return hipGreedySampleResult{}, nil, err
+	}
+	config := hipKernelLaunchConfig{
+		Name:   hipKernelNamePackedTopKSample,
+		Args:   launchBytes,
+		GridX:  1,
+		GridY:  1,
+		GridZ:  1,
+		BlockX: 1,
+		BlockY: 1,
+		BlockZ: 1,
+	}
+	if err := hipLaunchKernel(driver, config); err != nil {
+		return hipGreedySampleResult{}, nil, err
+	}
+	packed, err := hipReadDeviceUint64(driver, output.Pointer())
+	if err != nil {
+		return hipGreedySampleResult{}, nil, core.E("rocm.hip.PackedTopKSampleLaunch", "copy sampled packed top-k", err)
+	}
+	result, err := hipUnpackGreedyBest(packed, 0, math.MaxInt32)
+	if err != nil {
+		return hipGreedySampleResult{}, nil, err
+	}
+	return result, output, nil
 }
 
 func hipRunMLXQ4ProjectionSoftcapScoreKernelWithDeviceInputBufferSuppress(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, topK int, suppressTokens []int32, workspace *hipAttentionHeadsChunkedWorkspace) ([]hipGreedySampleResult, error) {
@@ -2701,7 +3920,7 @@ func hipRunMLXQ4ProjectionSoftcapScoreKernelWithDeviceInputBufferSuppress(ctx co
 		Rows:          cfg.Rows,
 		Cols:          cfg.Cols,
 		GroupSize:     cfg.GroupSize,
-		Bits:          hipMLXQ4ProjectionBits,
+		Bits:          cfg.quantBits(),
 		InputBytes:    input.SizeBytes(),
 		WeightBytes:   cfg.WeightBytes,
 		ScaleBytes:    cfg.ScaleBytes,
@@ -2712,11 +3931,16 @@ func hipRunMLXQ4ProjectionSoftcapScoreKernelWithDeviceInputBufferSuppress(ctx co
 		launchArgs.SuppressPointer = suppress.Pointer()
 		launchArgs.SuppressCount = suppress.Count()
 	}
-	launchBytes, err := launchArgs.ScoresBinary()
+	var launchBytes []byte
+	if workspace != nil {
+		launchBytes, err = launchArgs.ScoresBinaryInto(workspace.ProjectionScoresArgs[:])
+	} else {
+		launchBytes, err = launchArgs.ScoresBinary()
+	}
 	if err != nil {
 		return nil, err
 	}
-	config, err := hipMLXQ4ProjectionScoresLaunchConfig(launchBytes, cfg.Rows)
+	config, err := hipMLXQ4ProjectionScoresLaunchConfigForShape(launchBytes, cfg.Rows, cfg.Cols, cfg.GroupSize, cfg.quantBits())
 	if err != nil {
 		return nil, err
 	}
@@ -2736,7 +3960,7 @@ func hipRunMLXQ4ProjectionSoftcapScoreKernelWithDeviceInputBufferSuppress(ctx co
 		if err := driver.CopyDeviceToHost(partial.Pointer(), payload); err != nil {
 			return nil, core.E("rocm.hip.PackedTopKLaunch", "copy packed top-k partial scores", err)
 		}
-		top = hipTopPackedScoresBytesInto(payload, topK, workspace.ProjectionTopPacked)
+		top = hipSortedPackedScoresBytesInto(payload, topK, workspace.ProjectionTopPacked)
 		workspace.ProjectionTopPacked = top
 	} else {
 		packed, err := hipReadUint64DeviceOutput(scores, "rocm.hip.MLXQ4ProjectionScoresLaunch", "MLX q4 projection packed scores", cfg.Rows)
@@ -2768,6 +3992,82 @@ func hipRunMLXQ4ProjectionSoftcapScoreKernelWithDeviceInputBufferSuppress(ctx co
 		workspace.ProjectionCandidates = candidates
 	}
 	return candidates, nil
+}
+
+func hipRunMLXQ4ProjectionSoftcapSampleKernelWithDeviceInputBufferSuppress(ctx context.Context, driver nativeHIPDriver, input *hipDeviceByteBuffer, cfg hipMLXQ4DeviceWeightConfig, softcap float32, topK int, temperature, topP float32, draw float64, best *hipDeviceByteBuffer, suppressTokens []int32, workspace *hipAttentionHeadsChunkedWorkspace) (hipGreedySampleResult, *hipDeviceByteBuffer, error) {
+	if input == nil || input.Pointer() == 0 {
+		return hipGreedySampleResult{}, nil, core.E("rocm.hip.MLXQ4ProjectionScoresLaunch", "MLX q4 projection device input is required", nil)
+	}
+	if err := cfg.validateInputCount(input.Count()); err != nil {
+		return hipGreedySampleResult{}, nil, err
+	}
+	if input.SizeBytes() != uint64(cfg.Cols*4) {
+		return hipGreedySampleResult{}, nil, core.E("rocm.hip.MLXQ4ProjectionScoresLaunch", "MLX q4 projection device input byte count mismatch", nil)
+	}
+	if topK <= 0 || topK > cfg.Rows {
+		return hipGreedySampleResult{}, nil, core.E("rocm.hip.MLXQ4ProjectionScoresLaunch", "top-k must be within vocabulary size", nil)
+	}
+	if softcap < 0 || math.IsNaN(float64(softcap)) || math.IsInf(float64(softcap), 0) {
+		return hipGreedySampleResult{}, nil, core.E("rocm.hip.MLXQ4ProjectionScoresLaunch", "softcap must be non-negative and finite", nil)
+	}
+	if workspace == nil {
+		return hipGreedySampleResult{}, nil, core.E("rocm.hip.PackedTopKSampleLaunch", "attention workspace is required", nil)
+	}
+	var suppress *hipDeviceTokenBuffer
+	var err error
+	if len(suppressTokens) > 0 {
+		suppress, err = workspace.EnsureSuppressTokenBuffer(driver, suppressTokens)
+		if err != nil {
+			return hipGreedySampleResult{}, nil, err
+		}
+	}
+	scores, err := workspace.EnsureProjectionScoreOutput(driver, cfg.Rows)
+	if err != nil {
+		return hipGreedySampleResult{}, nil, err
+	}
+	launchArgs := hipMLXQ4ProjectionLaunchArgs{
+		InputPointer:  input.Pointer(),
+		WeightPointer: cfg.WeightPointer,
+		ScalePointer:  cfg.ScalePointer,
+		BiasPointer:   cfg.BiasPointer,
+		OutputPointer: scores.Pointer(),
+		Rows:          cfg.Rows,
+		Cols:          cfg.Cols,
+		GroupSize:     cfg.GroupSize,
+		Bits:          cfg.quantBits(),
+		InputBytes:    input.SizeBytes(),
+		WeightBytes:   cfg.WeightBytes,
+		ScaleBytes:    cfg.ScaleBytes,
+		BiasBytes:     cfg.BiasBytes,
+		OutputBytes:   scores.SizeBytes(),
+	}
+	if suppress != nil {
+		launchArgs.SuppressPointer = suppress.Pointer()
+		launchArgs.SuppressCount = suppress.Count()
+	}
+	launchBytes, err := launchArgs.ScoresBinaryInto(workspace.ProjectionScoresArgs[:])
+	if err != nil {
+		return hipGreedySampleResult{}, nil, err
+	}
+	config, err := hipMLXQ4ProjectionScoresLaunchConfigForShape(launchBytes, cfg.Rows, cfg.Cols, cfg.GroupSize, cfg.quantBits())
+	if err != nil {
+		return hipGreedySampleResult{}, nil, err
+	}
+	if err := hipLaunchKernel(driver, config); err != nil {
+		return hipGreedySampleResult{}, nil, err
+	}
+	partial, partialCount, err := hipRunPackedTopKReduceKernelWithWorkspace(ctx, driver, scores, cfg.Rows, topK, workspace)
+	if err != nil {
+		return hipGreedySampleResult{}, nil, err
+	}
+	result, best, err := hipRunPackedTopKSampleKernel(ctx, driver, partial, partialCount, topK, temperature, topP, draw, best, workspace)
+	if err != nil {
+		return hipGreedySampleResult{}, nil, err
+	}
+	if result.TokenID < 0 || result.TokenID >= cfg.Rows {
+		return hipGreedySampleResult{}, nil, core.E("rocm.hip.PackedTopKSampleLaunch", "sampled token is out of range", nil)
+	}
+	return result, best, nil
 }
 
 func hipTopPackedScores(values []uint64, topK int) []uint64 {
@@ -2832,6 +4132,25 @@ func hipTopPackedScoresBytesInto(payload []byte, topK int, top []uint64) []uint6
 	return top
 }
 
+func hipSortedPackedScoresBytesInto(payload []byte, topK int, top []uint64) []uint64 {
+	if topK <= 0 || len(payload) == 0 {
+		return nil
+	}
+	limit := min(topK, len(payload)/hipMLXQ4ProjectionBestBytes)
+	top = top[:0]
+	if cap(top) < limit {
+		top = make([]uint64, 0, limit)
+	}
+	for offset := 0; offset+hipMLXQ4ProjectionBestBytes <= len(payload) && len(top) < limit; offset += hipMLXQ4ProjectionBestBytes {
+		value := binary.LittleEndian.Uint64(payload[offset:])
+		if value == 0 {
+			continue
+		}
+		top = append(top, value)
+	}
+	return top
+}
+
 func hipMLXQ4ProjectionLaunchConfig(args []byte, rows int) (hipKernelLaunchConfig, error) {
 	gridX, err := rocmDeviceKVPositiveUint32("MLX q4 projection row blocks", (rows+hipMLXQ4ProjectionRowsPerBlock-1)/hipMLXQ4ProjectionRowsPerBlock)
 	if err != nil {
@@ -2850,8 +4169,8 @@ func hipMLXQ4ProjectionLaunchConfig(args []byte, rows int) (hipKernelLaunchConfi
 	return config, config.Validate()
 }
 
-func hipMLXQ4ProjectionLaunchConfigForShape(args []byte, rows, cols, groupSize int) (hipKernelLaunchConfig, error) {
-	if cols == 256 && groupSize == 64 {
+func hipMLXQ4ProjectionLaunchConfigForShape(args []byte, rows, cols, groupSize, bits int) (hipKernelLaunchConfig, error) {
+	if cols == 256 && groupSize == 64 && hipMLXQ4ProjectionCols256Bits(hipMLXQ4ProjectionBitsOrDefault(bits)) {
 		gridX, err := rocmDeviceKVPositiveUint32("MLX q4 cols256 projection row blocks", (rows+hipMLXQ4ProjectionCols256RowsPerBlock-1)/hipMLXQ4ProjectionCols256RowsPerBlock)
 		if err != nil {
 			return hipKernelLaunchConfig{}, err
@@ -2868,7 +4187,45 @@ func hipMLXQ4ProjectionLaunchConfigForShape(args []byte, rows, cols, groupSize i
 		}
 		return config, config.Validate()
 	}
+	if cols >= 1536 && cols <= 2048 && groupSize == 64 && hipMLXQ4ProjectionBitsOrDefault(bits) == 6 {
+		gridX, err := rocmDeviceKVPositiveUint32("MLX q4 q6 row64 projection row blocks", (rows+hipMLXQ4ProjectionQ6Row64RowsPerBlock-1)/hipMLXQ4ProjectionQ6Row64RowsPerBlock)
+		if err != nil {
+			return hipKernelLaunchConfig{}, err
+		}
+		config := hipKernelLaunchConfig{
+			Name:   hipKernelNameMLXQ4ProjQ6Row64,
+			Args:   args,
+			GridX:  gridX,
+			GridY:  1,
+			GridZ:  1,
+			BlockX: hipMLXQ4ProjectionBlockSize,
+			BlockY: 1,
+			BlockZ: 1,
+		}
+		return config, config.Validate()
+	}
+	if cols > 2048 && groupSize == 64 && hipMLXQ4ProjectionBitsOrDefault(bits) == 6 {
+		gridX, err := rocmDeviceKVPositiveUint32("MLX q4 q6 row16 projection row blocks", (rows+hipMLXQ4ProjectionQ6Row16RowsPerBlock-1)/hipMLXQ4ProjectionQ6Row16RowsPerBlock)
+		if err != nil {
+			return hipKernelLaunchConfig{}, err
+		}
+		config := hipKernelLaunchConfig{
+			Name:   hipKernelNameMLXQ4ProjQ6Row16,
+			Args:   args,
+			GridX:  gridX,
+			GridY:  1,
+			GridZ:  1,
+			BlockX: hipMLXQ4ProjectionBlockSize,
+			BlockY: 1,
+			BlockZ: 1,
+		}
+		return config, config.Validate()
+	}
 	return hipMLXQ4ProjectionLaunchConfig(args, rows)
+}
+
+func hipMLXQ4ProjectionCols256Bits(bits int) bool {
+	return bits == 4 || bits == 6
 }
 
 func hipMLXQ4ProjectionScoresLaunchConfig(args []byte, rows int) (hipKernelLaunchConfig, error) {
@@ -2887,6 +4244,27 @@ func hipMLXQ4ProjectionScoresLaunchConfig(args []byte, rows int) (hipKernelLaunc
 		BlockZ: 1,
 	}
 	return config, config.Validate()
+}
+
+func hipMLXQ4ProjectionScoresLaunchConfigForShape(args []byte, rows, cols, groupSize, bits int) (hipKernelLaunchConfig, error) {
+	if cols >= 1536 && groupSize == 64 && hipMLXQ4ProjectionBitsOrDefault(bits) == 6 {
+		gridX, err := rocmDeviceKVPositiveUint32("MLX q4 q6 row64 projection score row blocks", (rows+hipMLXQ4ProjectionGreedyQ6RowsPerBlock-1)/hipMLXQ4ProjectionGreedyQ6RowsPerBlock)
+		if err != nil {
+			return hipKernelLaunchConfig{}, err
+		}
+		config := hipKernelLaunchConfig{
+			Name:   hipKernelNameMLXQ4ProjScoresQ6Row64,
+			Args:   args,
+			GridX:  gridX,
+			GridY:  1,
+			GridZ:  1,
+			BlockX: hipMLXQ4ProjectionBlockSize,
+			BlockY: 1,
+			BlockZ: 1,
+		}
+		return config, config.Validate()
+	}
+	return hipMLXQ4ProjectionScoresLaunchConfig(args, rows)
 }
 
 func hipPackedTopKLaunchConfig(args []byte, chunkCount int) (hipKernelLaunchConfig, error) {
@@ -2951,6 +4329,31 @@ func hipMLXQ4ProjectionBatchLaunchConfig(args []byte, rows, batch int) (hipKerne
 	return config, config.Validate()
 }
 
+func hipMLXQ4ProjectionBatchLaunchConfigForShape(args []byte, rows, cols, groupSize, bits, batch int) (hipKernelLaunchConfig, error) {
+	if cols >= 1536 && groupSize == 64 && hipMLXQ4ProjectionBitsOrDefault(bits) == 6 {
+		gridX, err := rocmDeviceKVPositiveUint32("MLX q4 q6 row16 projection batch row blocks", (rows+hipMLXQ4ProjectionQ6Row16RowsPerBlock-1)/hipMLXQ4ProjectionQ6Row16RowsPerBlock)
+		if err != nil {
+			return hipKernelLaunchConfig{}, err
+		}
+		gridY, err := rocmDeviceKVPositiveUint32("MLX q4 q6 projection batch token blocks", (batch+hipMLXQ4ProjectionBatchTokensPerBlock-1)/hipMLXQ4ProjectionBatchTokensPerBlock)
+		if err != nil {
+			return hipKernelLaunchConfig{}, err
+		}
+		config := hipKernelLaunchConfig{
+			Name:   hipKernelNameMLXQ4ProjBatchQ6Row16,
+			Args:   args,
+			GridX:  gridX,
+			GridY:  gridY,
+			GridZ:  1,
+			BlockX: hipMLXQ4ProjectionBlockSize,
+			BlockY: 1,
+			BlockZ: 1,
+		}
+		return config, config.Validate()
+	}
+	return hipMLXQ4ProjectionBatchLaunchConfig(args, rows, batch)
+}
+
 func hipMLXQ4ProjectionGreedyLaunchConfig(args []byte, rows int) (hipKernelLaunchConfig, error) {
 	gridX, err := rocmDeviceKVPositiveUint32("MLX q4 projection row blocks", (rows+hipMLXQ4ProjectionGreedyRowsPerBlock-1)/hipMLXQ4ProjectionGreedyRowsPerBlock)
 	if err != nil {
@@ -2967,6 +4370,131 @@ func hipMLXQ4ProjectionGreedyLaunchConfig(args []byte, rows int) (hipKernelLaunc
 		BlockZ: 1,
 	}
 	return config, config.Validate()
+}
+
+func hipMLXQ4ProjectionGreedyLaunchConfigForShape(args []byte, rows, cols, groupSize, bits int) (hipKernelLaunchConfig, error) {
+	if cols >= 1536 && groupSize == 64 && hipMLXQ4ProjectionBitsOrDefault(bits) == 6 {
+		gridX, err := rocmDeviceKVPositiveUint32("MLX q4 q6 row64 projection greedy row blocks", (rows+hipMLXQ4ProjectionGreedyQ6RowsPerBlock-1)/hipMLXQ4ProjectionGreedyQ6RowsPerBlock)
+		if err != nil {
+			return hipKernelLaunchConfig{}, err
+		}
+		config := hipKernelLaunchConfig{
+			Name:   hipKernelNameMLXQ4ProjGreedyQ6Row64,
+			Args:   args,
+			GridX:  gridX,
+			GridY:  1,
+			GridZ:  1,
+			BlockX: hipMLXQ4ProjectionBlockSize,
+			BlockY: 1,
+			BlockZ: 1,
+		}
+		return config, config.Validate()
+	}
+	return hipMLXQ4ProjectionGreedyLaunchConfig(args, rows)
+}
+
+func hipMLXQ4ProjectionSelectedGreedyLaunchConfig(args []byte, selectedCount int) (hipKernelLaunchConfig, error) {
+	gridX, err := rocmDeviceKVPositiveUint32("MLX q4 selected projection row blocks", (selectedCount+hipMLXQ4ProjectionGreedyRowsPerBlock-1)/hipMLXQ4ProjectionGreedyRowsPerBlock)
+	if err != nil {
+		return hipKernelLaunchConfig{}, err
+	}
+	config := hipKernelLaunchConfig{
+		Name:   hipKernelNameMLXQ4ProjSelectedGreedy,
+		Args:   args,
+		GridX:  gridX,
+		GridY:  1,
+		GridZ:  1,
+		BlockX: hipMLXQ4ProjectionBlockSize,
+		BlockY: 1,
+		BlockZ: 1,
+	}
+	return config, config.Validate()
+}
+
+func hipMLXQ4ProjectionSelectedGreedyLaunchConfigForShape(args []byte, selectedCount, cols, groupSize, bits int) (hipKernelLaunchConfig, error) {
+	if cols >= 1536 && groupSize == 64 && hipMLXQ4ProjectionBitsOrDefault(bits) == 6 {
+		gridX, err := rocmDeviceKVPositiveUint32("MLX q4 q6 row64 selected projection row blocks", (selectedCount+hipMLXQ4ProjectionGreedyQ6RowsPerBlock-1)/hipMLXQ4ProjectionGreedyQ6RowsPerBlock)
+		if err != nil {
+			return hipKernelLaunchConfig{}, err
+		}
+		config := hipKernelLaunchConfig{
+			Name:   hipKernelNameMLXQ4ProjSelectedGreedyQ6Row64,
+			Args:   args,
+			GridX:  gridX,
+			GridY:  1,
+			GridZ:  1,
+			BlockX: hipMLXQ4ProjectionBlockSize,
+			BlockY: 1,
+			BlockZ: 1,
+		}
+		return config, config.Validate()
+	}
+	return hipMLXQ4ProjectionSelectedGreedyLaunchConfig(args, selectedCount)
+}
+
+func hipOrderedEmbeddingCandidatesLaunchConfig(args []byte, outputCount int) (hipKernelLaunchConfig, error) {
+	gridX, err := rocmDeviceKVPositiveUint32("ordered embedding candidate blocks", (outputCount+int(hipOrderedEmbeddingCandidatesBlockSize)-1)/int(hipOrderedEmbeddingCandidatesBlockSize))
+	if err != nil {
+		return hipKernelLaunchConfig{}, err
+	}
+	config := hipKernelLaunchConfig{
+		Name:   hipKernelNameOrderedEmbeddingCandidates,
+		Args:   args,
+		GridX:  gridX,
+		GridY:  1,
+		GridZ:  1,
+		BlockX: hipOrderedEmbeddingCandidatesBlockSize,
+		BlockY: 1,
+		BlockZ: 1,
+	}
+	return config, config.Validate()
+}
+
+func hipMLXQ4ProjectionGreedyBatchLaunchConfig(args []byte, rows, batch int) (hipKernelLaunchConfig, error) {
+	gridX, err := rocmDeviceKVPositiveUint32("MLX q4 projection greedy batch row blocks", (rows+hipMLXQ4ProjectionGreedyRowsPerBlock-1)/hipMLXQ4ProjectionGreedyRowsPerBlock)
+	if err != nil {
+		return hipKernelLaunchConfig{}, err
+	}
+	gridY, err := rocmDeviceKVPositiveUint32("MLX q4 projection greedy batch rows", batch)
+	if err != nil {
+		return hipKernelLaunchConfig{}, err
+	}
+	config := hipKernelLaunchConfig{
+		Name:   hipKernelNameMLXQ4ProjGreedyBatch,
+		Args:   args,
+		GridX:  gridX,
+		GridY:  gridY,
+		GridZ:  1,
+		BlockX: hipMLXQ4ProjectionBlockSize,
+		BlockY: 1,
+		BlockZ: 1,
+	}
+	return config, config.Validate()
+}
+
+func hipMLXQ4ProjectionGreedyBatchLaunchConfigForShape(args []byte, rows, cols, groupSize, bits, batch int) (hipKernelLaunchConfig, error) {
+	if cols >= 1536 && groupSize == 64 && hipMLXQ4ProjectionBitsOrDefault(bits) == 6 {
+		gridX, err := rocmDeviceKVPositiveUint32("MLX q4 q6 row64 projection greedy batch row blocks", (rows+hipMLXQ4ProjectionGreedyQ6RowsPerBlock-1)/hipMLXQ4ProjectionGreedyQ6RowsPerBlock)
+		if err != nil {
+			return hipKernelLaunchConfig{}, err
+		}
+		gridY, err := rocmDeviceKVPositiveUint32("MLX q4 q6 projection greedy batch rows", batch)
+		if err != nil {
+			return hipKernelLaunchConfig{}, err
+		}
+		config := hipKernelLaunchConfig{
+			Name:   hipKernelNameMLXQ4ProjGreedyBatchQ6Row64,
+			Args:   args,
+			GridX:  gridX,
+			GridY:  gridY,
+			GridZ:  1,
+			BlockX: hipMLXQ4ProjectionBlockSize,
+			BlockY: 1,
+			BlockZ: 1,
+		}
+		return config, config.Validate()
+	}
+	return hipMLXQ4ProjectionGreedyBatchLaunchConfig(args, rows, batch)
 }
 
 func hipMLXQ4TripleProjectionLaunchConfig(args []byte, rows int) (hipKernelLaunchConfig, error) {
@@ -3005,6 +4533,44 @@ func hipMLXQ4PairProjectionLaunchConfig(args []byte, rows int) (hipKernelLaunchC
 	return config, config.Validate()
 }
 
+func hipMLXQ4TripleProjectionLaunchConfigForShape(args []byte, rows, cols, groupSize, bits int) (hipKernelLaunchConfig, error) {
+	if cols == 1536 && groupSize == 64 && hipMLXQ4ProjectionBitsOrDefault(bits) == 6 {
+		gridX, err := rocmDeviceKVPositiveUint32("MLX q4 q6 row64 triple projection row blocks", (rows+hipMLXQ4ProjectionQ6Row64RowsPerBlock-1)/hipMLXQ4ProjectionQ6Row64RowsPerBlock)
+		if err != nil {
+			return hipKernelLaunchConfig{}, err
+		}
+		config := hipKernelLaunchConfig{
+			Name:   hipKernelNameMLXQ4TripleProjQ6Row64,
+			Args:   args,
+			GridX:  gridX,
+			GridY:  1,
+			GridZ:  1,
+			BlockX: hipMLXQ4ProjectionBlockSize,
+			BlockY: 1,
+			BlockZ: 1,
+		}
+		return config, config.Validate()
+	}
+	if cols > 1536 && groupSize == 64 && hipMLXQ4ProjectionBitsOrDefault(bits) == 6 {
+		gridX, err := rocmDeviceKVPositiveUint32("MLX q4 q6 row16 triple projection row blocks", (rows+hipMLXQ4ProjectionQ6Row16RowsPerBlock-1)/hipMLXQ4ProjectionQ6Row16RowsPerBlock)
+		if err != nil {
+			return hipKernelLaunchConfig{}, err
+		}
+		config := hipKernelLaunchConfig{
+			Name:   hipKernelNameMLXQ4TripleProjQ6Row16,
+			Args:   args,
+			GridX:  gridX,
+			GridY:  1,
+			GridZ:  1,
+			BlockX: hipMLXQ4ProjectionBlockSize,
+			BlockY: 1,
+			BlockZ: 1,
+		}
+		return config, config.Validate()
+	}
+	return hipMLXQ4TripleProjectionLaunchConfig(args, rows)
+}
+
 func hipMLXQ4GELUTanhMultiplyLaunchConfig(args []byte, rows int) (hipKernelLaunchConfig, error) {
 	gridX, err := rocmDeviceKVPositiveUint32("MLX q4 GELU tanh multiply row blocks", (rows+hipMLXQ4ProjectionRowsPerBlock-1)/hipMLXQ4ProjectionRowsPerBlock)
 	if err != nil {
@@ -3021,6 +4587,44 @@ func hipMLXQ4GELUTanhMultiplyLaunchConfig(args []byte, rows int) (hipKernelLaunc
 		BlockZ: 1,
 	}
 	return config, config.Validate()
+}
+
+func hipMLXQ4GELUTanhMultiplyLaunchConfigForShape(args []byte, rows, cols, groupSize, bits int) (hipKernelLaunchConfig, error) {
+	if cols == 1536 && groupSize == 64 && hipMLXQ4ProjectionBitsOrDefault(bits) == 6 {
+		if rows <= 6144 {
+			gridX, err := rocmDeviceKVPositiveUint32("MLX q4 GELU tanh multiply q6 cols1536 row64 row blocks", (rows+hipMLXQ4GELUTanhQ6Cols1536Row64RowsPerBlock-1)/hipMLXQ4GELUTanhQ6Cols1536Row64RowsPerBlock)
+			if err != nil {
+				return hipKernelLaunchConfig{}, err
+			}
+			config := hipKernelLaunchConfig{
+				Name:   hipKernelNameMLXQ4GELUTanhMulQ6Cols1536Row64,
+				Args:   args,
+				GridX:  gridX,
+				GridY:  1,
+				GridZ:  1,
+				BlockX: hipMLXQ4ProjectionBlockSize,
+				BlockY: 1,
+				BlockZ: 1,
+			}
+			return config, config.Validate()
+		}
+		gridX, err := rocmDeviceKVPositiveUint32("MLX q4 GELU tanh multiply q6 cols1536 row blocks", (rows+hipMLXQ4GELUTanhQ6Cols1536RowsPerBlock-1)/hipMLXQ4GELUTanhQ6Cols1536RowsPerBlock)
+		if err != nil {
+			return hipKernelLaunchConfig{}, err
+		}
+		config := hipKernelLaunchConfig{
+			Name:   hipKernelNameMLXQ4GELUTanhMulQ6Cols1536,
+			Args:   args,
+			GridX:  gridX,
+			GridY:  1,
+			GridZ:  1,
+			BlockX: hipMLXQ4ProjectionBlockSize,
+			BlockY: 1,
+			BlockZ: 1,
+		}
+		return config, config.Validate()
+	}
+	return hipMLXQ4GELUTanhMultiplyLaunchConfig(args, rows)
 }
 
 func hipMLXQ4GELUTanhMultiplyBatchLaunchConfig(args []byte, rows, batch int) (hipKernelLaunchConfig, error) {
@@ -3063,6 +4667,27 @@ func hipMLXQ4GELUTanhProjectionLaunchConfig(args []byte, rows int) (hipKernelLau
 	return config, config.Validate()
 }
 
+func hipMLXQ4GELUTanhProjectionLaunchConfigForShape(args []byte, rows, cols, groupSize, bits int) (hipKernelLaunchConfig, error) {
+	if cols >= 1536 && groupSize == 64 && hipMLXQ4ProjectionBitsOrDefault(bits) == 6 {
+		gridX, err := rocmDeviceKVPositiveUint32("MLX q4 q6 row16 GELU tanh projection row blocks", (rows+hipMLXQ4ProjectionQ6Row16RowsPerBlock-1)/hipMLXQ4ProjectionQ6Row16RowsPerBlock)
+		if err != nil {
+			return hipKernelLaunchConfig{}, err
+		}
+		config := hipKernelLaunchConfig{
+			Name:   hipKernelNameMLXQ4GELUTanhProjQ6Row16,
+			Args:   args,
+			GridX:  gridX,
+			GridY:  1,
+			GridZ:  1,
+			BlockX: hipMLXQ4ProjectionBlockSize,
+			BlockY: 1,
+			BlockZ: 1,
+		}
+		return config, config.Validate()
+	}
+	return hipMLXQ4GELUTanhProjectionLaunchConfig(args, rows)
+}
+
 func hipMLXQ4GELUTanhProjectionBatchLaunchConfig(args []byte, rows, batch int) (hipKernelLaunchConfig, error) {
 	gridX, err := rocmDeviceKVPositiveUint32("MLX q4 GELU tanh projection batch row blocks", (rows+hipMLXQ4ProjectionRowsPerBlock-1)/hipMLXQ4ProjectionRowsPerBlock)
 	if err != nil {
@@ -3093,7 +4718,7 @@ func hipUploadByteBuffer(driver nativeHIPDriver, operation, label string, payloa
 	if err != nil {
 		return nil, err
 	}
-	if err := hipCopyHostToDevice(driver, buffer.pointer, payload); err != nil {
+	if err := hipCopyHostToDeviceLabeled(driver, buffer.pointer, payload, operation, label); err != nil {
 		_ = buffer.Close()
 		return nil, core.E(operation, "copy "+label, err)
 	}
@@ -3101,17 +4726,25 @@ func hipUploadByteBuffer(driver nativeHIPDriver, operation, label string, payloa
 }
 
 func hipAllocateByteBuffer(driver nativeHIPDriver, operation, label string, sizeBytes uint64, count int) (*hipDeviceByteBuffer, error) {
+	buffer, err := hipAllocateByteBufferValue(driver, operation, label, sizeBytes, count)
+	if err != nil {
+		return nil, err
+	}
+	return &buffer, nil
+}
+
+func hipAllocateByteBufferValue(driver nativeHIPDriver, operation, label string, sizeBytes uint64, count int) (hipDeviceByteBuffer, error) {
 	if driver == nil {
-		return nil, core.E(operation, "HIP driver is nil", nil)
+		return hipDeviceByteBuffer{}, core.E(operation, "HIP driver is nil", nil)
 	}
 	if !driver.Available() {
-		return nil, core.E(operation, "HIP driver is not available", nil)
+		return hipDeviceByteBuffer{}, core.E(operation, "HIP driver is not available", nil)
 	}
 	if sizeBytes == 0 || count <= 0 {
-		return nil, core.E(operation, label+" size must be positive", nil)
+		return hipDeviceByteBuffer{}, core.E(operation, label+" size must be positive", nil)
 	}
 	if pointer, ok := hipDeviceByteBufferPoolTake(driver, sizeBytes); ok {
-		return &hipDeviceByteBuffer{
+		return hipDeviceByteBuffer{
 			driver:    driver,
 			pointer:   pointer,
 			count:     count,
@@ -3120,11 +4753,11 @@ func hipAllocateByteBuffer(driver nativeHIPDriver, operation, label string, size
 			label:     label,
 		}, nil
 	}
-	pointer, err := driver.Malloc(sizeBytes)
+	pointer, err := hipMallocLabeled(driver, operation, label, sizeBytes)
 	if err != nil {
-		return nil, core.E(operation, "allocate "+label, err)
+		return hipDeviceByteBuffer{}, core.E(operation, "allocate "+label, err)
 	}
-	return &hipDeviceByteBuffer{
+	return hipDeviceByteBuffer{
 		driver:    driver,
 		pointer:   pointer,
 		count:     count,
@@ -3134,8 +4767,44 @@ func hipAllocateByteBuffer(driver nativeHIPDriver, operation, label string, size
 	}, nil
 }
 
+func hipMallocLabeled(driver nativeHIPDriver, operation, label string, sizeBytes uint64) (nativeDevicePointer, error) {
+	pointer, err := driver.Malloc(sizeBytes)
+	if err != nil {
+		return 0, err
+	}
+	hipRecordDeviceAllocationLabel(driver, sizeBytes, operation, label)
+	return pointer, nil
+}
+
+func hipRecordDeviceAllocationLabel(driver nativeHIPDriver, sizeBytes uint64, operation, label string) {
+	if driver == nil || sizeBytes == 0 {
+		return
+	}
+	recorder, ok := driver.(hipDeviceAllocationLabelRecorder)
+	if !ok {
+		return
+	}
+	recorder.RecordDeviceAllocationLabel(sizeBytes, operation, label)
+}
+
 func hipDeviceByteBufferPoolEnabled() bool {
 	return os.Getenv("GO_ROCM_DISABLE_DEVICE_BUFFER_POOL") != "1"
+}
+
+func hipPrewarmDeviceByteBufferPool(driver nativeHIPDriver, sizeBytes uint64, count int) {
+	if driver == nil || !driver.Available() || sizeBytes == 0 || count <= 0 || !hipDeviceByteBufferPoolEnabled() {
+		return
+	}
+	for i := 0; i < count; i++ {
+		pointer, err := hipMallocLabeled(driver, "rocm.hip.DeviceByteBufferPool", "prewarm device byte buffer", sizeBytes)
+		if err != nil {
+			return
+		}
+		if !hipDeviceByteBufferPoolPut(driver, pointer, sizeBytes) {
+			_ = driver.Free(pointer)
+			return
+		}
+	}
 }
 
 func hipDeviceByteBufferPoolTake(driver nativeHIPDriver, sizeBytes uint64) (nativeDevicePointer, bool) {
@@ -3144,6 +4813,32 @@ func hipDeviceByteBufferPoolTake(driver nativeHIPDriver, sizeBytes uint64) (nati
 	}
 	hipDeviceByteBufferPool.Lock()
 	defer hipDeviceByteBufferPool.Unlock()
+	for index := range hipDeviceByteBufferPool.single {
+		slot := &hipDeviceByteBufferPool.single[index]
+		if slot.sizeBytes != sizeBytes || slot.count == 0 {
+			continue
+		}
+		for entryIndex := int(slot.count) - 1; entryIndex >= 0; entryIndex-- {
+			entry := slot.entries[entryIndex]
+			if entry.pointer == 0 || entry.driver != driver {
+				continue
+			}
+			pointer := entry.pointer
+			lastIndex := int(slot.count) - 1
+			slot.entries[entryIndex] = slot.entries[lastIndex]
+			slot.entries[lastIndex] = hipDeviceByteBufferPoolEntry{}
+			slot.count--
+			if slot.count == 0 {
+				*slot = hipDeviceByteBufferPoolSingleSlot{}
+			}
+			if hipDeviceByteBufferPool.bytes >= sizeBytes {
+				hipDeviceByteBufferPool.bytes -= sizeBytes
+			} else {
+				hipDeviceByteBufferPool.bytes = 0
+			}
+			return pointer, true
+		}
+	}
 	entries := hipDeviceByteBufferPool.entries[sizeBytes]
 	for index := len(entries) - 1; index >= 0; index-- {
 		entry := entries[index]
@@ -3171,8 +4866,40 @@ func hipDeviceByteBufferPoolPut(driver nativeHIPDriver, pointer nativeDevicePoin
 	}
 	hipDeviceByteBufferPool.Lock()
 	defer hipDeviceByteBufferPool.Unlock()
+	if hipDeviceByteBufferPool.bytes+sizeBytes > hipDeviceByteBufferPoolMaxBytes {
+		return false
+	}
+	emptySingle := -1
+	for index := range hipDeviceByteBufferPool.single {
+		slot := &hipDeviceByteBufferPool.single[index]
+		if slot.count == 0 {
+			if emptySingle < 0 {
+				emptySingle = index
+			}
+			continue
+		}
+		if slot.sizeBytes == sizeBytes {
+			if int(slot.count) < len(slot.entries) {
+				slot.entries[slot.count] = hipDeviceByteBufferPoolEntry{driver: driver, pointer: pointer}
+				slot.count++
+				hipDeviceByteBufferPool.bytes += sizeBytes
+				return true
+			}
+			emptySingle = -1
+			break
+		}
+	}
+	if emptySingle >= 0 {
+		hipDeviceByteBufferPool.single[emptySingle] = hipDeviceByteBufferPoolSingleSlot{
+			sizeBytes: sizeBytes,
+			entries:   [hipDeviceByteBufferPoolSingleSlotCapacity]hipDeviceByteBufferPoolEntry{{driver: driver, pointer: pointer}},
+			count:     1,
+		}
+		hipDeviceByteBufferPool.bytes += sizeBytes
+		return true
+	}
 	entries := hipDeviceByteBufferPool.entries[sizeBytes]
-	if len(entries) >= hipDeviceByteBufferPoolMaxPerSize || hipDeviceByteBufferPool.bytes+sizeBytes > hipDeviceByteBufferPoolMaxBytes {
+	if len(entries) >= hipDeviceByteBufferPoolMaxPerSize {
 		return false
 	}
 	hipDeviceByteBufferPool.entries[sizeBytes] = append(entries, hipDeviceByteBufferPoolEntry{driver: driver, pointer: pointer})
@@ -3181,7 +4908,12 @@ func hipDeviceByteBufferPoolPut(driver nativeHIPDriver, pointer nativeDevicePoin
 }
 
 func hipBorrowDeviceByteBuffer(driver nativeHIPDriver, label string, pointer nativeDevicePointer, sizeBytes uint64, count int) *hipDeviceByteBuffer {
-	return &hipDeviceByteBuffer{
+	buffer := hipBorrowDeviceByteBufferValue(driver, label, pointer, sizeBytes, count)
+	return &buffer
+}
+
+func hipBorrowDeviceByteBufferValue(driver nativeHIPDriver, label string, pointer nativeDevicePointer, sizeBytes uint64, count int) hipDeviceByteBuffer {
+	return hipDeviceByteBuffer{
 		driver:    driver,
 		pointer:   pointer,
 		count:     count,
@@ -3273,6 +5005,17 @@ func hipFloat32Payload(values []float32) ([]byte, error) {
 		return nil, core.E("rocm.hip.ProjectionLaunch", "float32 payload is empty", nil)
 	}
 	payload := make([]byte, len(values)*4)
+	return hipFloat32PayloadInto(payload, values)
+}
+
+func hipFloat32PayloadInto(payload []byte, values []float32) ([]byte, error) {
+	if len(values) == 0 {
+		return nil, core.E("rocm.hip.ProjectionLaunch", "float32 payload is empty", nil)
+	}
+	if len(payload) < len(values)*4 {
+		return nil, core.E("rocm.hip.ProjectionLaunch", "float32 payload buffer is too small", nil)
+	}
+	payload = payload[:len(values)*4]
 	for index, value := range values {
 		binary.LittleEndian.PutUint32(payload[index*4:], math.Float32bits(value))
 	}
@@ -3348,6 +5091,18 @@ func hipFloat32PayloadValues(payload []byte) ([]float32, error) {
 		return nil, core.E("rocm.hip.ProjectionLaunch", "float32 payload byte length must be positive and aligned", nil)
 	}
 	values := make([]float32, len(payload)/4)
+	return hipFloat32PayloadValuesInto(values, payload)
+}
+
+func hipFloat32PayloadValuesInto(values []float32, payload []byte) ([]float32, error) {
+	if len(payload) == 0 || len(payload)%4 != 0 {
+		return nil, core.E("rocm.hip.ProjectionLaunch", "float32 payload byte length must be positive and aligned", nil)
+	}
+	count := len(payload) / 4
+	if len(values) < count {
+		return nil, core.E("rocm.hip.ProjectionLaunch", "float32 output buffer is too small", nil)
+	}
+	values = values[:count]
 	for index := range values {
 		values[index] = math.Float32frombits(binary.LittleEndian.Uint32(payload[index*4:]))
 	}

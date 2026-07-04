@@ -1,4 +1,17 @@
 dappco.re/go v0.9.0 h1:4ruZRNqKDDva8o6g65tYggjGVe42E6/lMZfVKXtr3p0=
 dappco.re/go v0.9.0/go.mod h1:xapr7fLK4/9Pu2iSCr4qZuIuatmtx1j56zS/oPDbGyQ=
+dappco.re/go v0.10.3 h1:aViRNxdg2jG84P6RsiD+aSta+GcFJwGXMNQPjFPbJ9g=
+dappco.re/go v0.10.3/go.mod h1:xapr7fLK4/9Pu2iSCr4qZuIuatmtx1j56zS/oPDbGyQ=
+dappco.re/go/cgo v0.11.1/go.mod h1:tpuR2ga7cM4tEt3y+JwFYE0Psl/3FwroBHqDntftWdw=
+dappco.re/go/core v0.8.0-alpha.1 h1:gj7+Scv+L63Z7wMxbJYHhaRFkHJo2u4MMPuUSv/Dhtk=
+dappco.re/go/core v0.8.0-alpha.1/go.mod h1:f2/tBZ3+3IqDrg2F5F598llv0nmb/4gJVCFzM5geE4A=
+dappco.re/go/i18n v0.8.0-alpha.1 h1:9LI/PrF41XeQu69eOaBTz3LMrXTJ08O2f1EEATq9k5A=
+dappco.re/go/i18n v0.8.0-alpha.1/go.mod h1:aSfWSAW2EVh/aMbMplc27URnjl6DvRVvWfvRC2my7AY=
 dappco.re/go/inference v0.9.0 h1:6eD49KTjj4xrowWdltobEWZYLPY+zbiyDiq+Hv2nkmc=
 dappco.re/go/inference v0.9.0/go.mod h1:eu0je5UqOQyoG6eaJ1IqY5eORev+PfmsRXSNCanqBkk=
+dappco.re/go/inference v0.10.0 h1:4V4H9ZsetAhWavGBX+rqsDgjqbvr/KgpwKeNVo1pCjU=
+dappco.re/go/inference v0.10.0/go.mod h1:iYCfbhQ98dAITst7tHe9yVzdwu/a1v4Ysj5T4xkPhWE=
+dappco.re/go/log v0.8.0-alpha.1 h1:eXTdrt88Ovbdm0KJkJDaEpgLUHUZgJ2xYEu2uN3eV4I=
+dappco.re/go/log v0.8.0-alpha.1/go.mod h1:IC04Em9SfVTcXiWc1BqZDQfa1MtOuMDEermZkQcTz9c=
+golang.org/x/text v0.36.0 h1:JfKh3XmcRPqZPKevfXVpI1wXPTqbkE5f7JA92a55Yxg=
+golang.org/x/text v0.36.0/go.mod h1:NIdBknypM8iqVmPiuco0Dh6P5Jcdk8lJL0CUebqK164=

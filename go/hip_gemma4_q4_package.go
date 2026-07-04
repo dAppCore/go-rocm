@@ -15,11 +15,11 @@ func (model *hipLoadedModel) loadedGemma4Q4PackageForwardConfig() (hipGemma4Q4Fo
 	if model == nil {
 		return hipGemma4Q4ForwardConfig{}, false, nil
 	}
-	if !isROCmGemma4Architecture(model.modelInfo.Architecture) || model.modelInfo.QuantBits != 4 {
+	if !hipLoadedGemma4Q4GenerateLinked(model) {
 		return hipGemma4Q4ForwardConfig{}, false, nil
 	}
 	if model.modelInfo.NumLayers <= 0 {
-		return hipGemma4Q4ForwardConfig{}, true, core.E(hipGemma4Q4Layer0Operation, "loaded Gemma4 q4 layer count is required", nil)
+		return hipGemma4Q4ForwardConfig{}, true, core.E(hipGemma4Q4Layer0Operation, "loaded Gemma4 MLX affine layer count is required", nil)
 	}
 	cfg, err := model.cachedGemma4Q4ForwardConfig(model.modelInfo.NumLayers)
 	return cfg, true, err
@@ -33,7 +33,7 @@ func hipRunGemma4Q4PackagePrefill(ctx context.Context, model *hipLoadedModel, cf
 	if err != nil {
 		return hipPrefillResult{}, err
 	}
-	mode, err := hipGemma4Q4PackagePrefillKVMode(cfg, req)
+	mode, err := hipGemma4Q4PackagePrefillKVMode(model, cfg, req)
 	if err != nil {
 		return hipPrefillResult{}, err
 	}
@@ -94,7 +94,7 @@ func hipRunGemma4Q4PackageDecode(ctx context.Context, model *hipLoadedModel, cfg
 	if err := req.Gemma4Q4State.validate(cfg); err != nil {
 		return hipDecodeResult{}, err
 	}
-	mode, err := hipGemma4Q4PackageDecodeKVMode(req)
+	mode, err := hipGemma4Q4PackageDecodeKVMode(model, req)
 	if err != nil {
 		return hipDecodeResult{}, err
 	}
@@ -133,8 +133,8 @@ func hipRunGemma4Q4PackageDecode(ctx context.Context, model *hipLoadedModel, cfg
 	}, nil
 }
 
-func hipGemma4Q4PackagePrefillKVMode(cfg hipGemma4Q4ForwardConfig, req hipPrefillRequest) (string, error) {
-	mode := firstNonEmptyString(req.CacheMode, rocmKVCacheModeKQ8VQ4)
+func hipGemma4Q4PackagePrefillKVMode(model *hipLoadedModel, cfg hipGemma4Q4ForwardConfig, req hipPrefillRequest) (string, error) {
+	mode := firstNonEmptyString(req.CacheMode, model.gemma4Q4EngineConfig().DeviceKVMode, rocmKVCacheModeKQ8VQ4)
 	if !isROCmKVCacheMode(mode) {
 		return "", core.E("rocm.hip.Prefill", core.Sprintf("unsupported cache mode %q", mode), nil)
 	}
@@ -152,12 +152,12 @@ func hipGemma4Q4PackagePrefillKVMode(cfg hipGemma4Q4ForwardConfig, req hipPrefil
 	return mode, nil
 }
 
-func hipGemma4Q4PackageDecodeKVMode(req hipDecodeRequest) (string, error) {
+func hipGemma4Q4PackageDecodeKVMode(model *hipLoadedModel, req hipDecodeRequest) (string, error) {
 	mode := req.DeviceKVMode
 	if mode == "" && req.Gemma4Q4DeviceState != nil {
 		mode = req.Gemma4Q4DeviceState.mode
 	}
-	mode = firstNonEmptyString(mode, rocmKVCacheModeKQ8VQ4)
+	mode = firstNonEmptyString(mode, model.gemma4Q4EngineConfig().DeviceKVMode, rocmKVCacheModeKQ8VQ4)
 	if !isROCmKVCacheMode(mode) {
 		return "", core.E("rocm.hip.Decode", core.Sprintf("unsupported device KV cache mode %q", mode), nil)
 	}

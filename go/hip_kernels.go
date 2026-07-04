@@ -49,6 +49,7 @@ type hipKernelStatus struct {
 	Embedding    string
 	GRPO         string
 	LoRA         string
+	Optimizer    string
 	Prefill      string
 	Projection   string
 	Rerank       string
@@ -139,6 +140,7 @@ func defaultHIPKernelStatus() hipKernelStatus {
 		Embedding:    hipKernelStatusNotLinked,
 		GRPO:         hipKernelStatusNotLinked,
 		LoRA:         hipKernelStatusNotLinked,
+		Optimizer:    hipKernelStatusNotLinked,
 		Prefill:      hipKernelStatusNotLinked,
 		Projection:   hipKernelStatusNotLinked,
 		Rerank:       hipKernelStatusNotLinked,
@@ -167,6 +169,9 @@ func normalizeHIPKernelStatus(status hipKernelStatus) hipKernelStatus {
 	if status.LoRA == "" {
 		status.LoRA = defaultStatus.LoRA
 	}
+	if status.Optimizer == "" {
+		status.Optimizer = defaultStatus.Optimizer
+	}
 	if status.Prefill == "" {
 		status.Prefill = defaultStatus.Prefill
 	}
@@ -187,10 +192,10 @@ func normalizeHIPKernelStatus(status hipKernelStatus) hipKernelStatus {
 
 func (status hipKernelStatus) Overall() string {
 	status = normalizeHIPKernelStatusFields(status)
-	if status.CrossEntropy == hipKernelStatusLinked || status.Decode == hipKernelStatusLinked || status.Distillation == hipKernelStatusLinked || status.Embedding == hipKernelStatusLinked || status.GRPO == hipKernelStatusLinked || status.LoRA == hipKernelStatusLinked || status.Prefill == hipKernelStatusLinked || status.Projection == hipKernelStatusLinked || status.Rerank == hipKernelStatusLinked {
+	if status.CrossEntropy == hipKernelStatusLinked || status.Decode == hipKernelStatusLinked || status.Distillation == hipKernelStatusLinked || status.Embedding == hipKernelStatusLinked || status.GRPO == hipKernelStatusLinked || status.LoRA == hipKernelStatusLinked || status.Optimizer == hipKernelStatusLinked || status.Prefill == hipKernelStatusLinked || status.Projection == hipKernelStatusLinked || status.Rerank == hipKernelStatusLinked {
 		return hipKernelStatusLinked
 	}
-	if status.CrossEntropy == hipKernelStatusNotLinked || status.Decode == hipKernelStatusNotLinked || status.Distillation == hipKernelStatusNotLinked || status.Embedding == hipKernelStatusNotLinked || status.GRPO == hipKernelStatusNotLinked || status.LoRA == hipKernelStatusNotLinked || status.Prefill == hipKernelStatusNotLinked || status.Projection == hipKernelStatusNotLinked || status.Rerank == hipKernelStatusNotLinked {
+	if status.CrossEntropy == hipKernelStatusNotLinked || status.Decode == hipKernelStatusNotLinked || status.Distillation == hipKernelStatusNotLinked || status.Embedding == hipKernelStatusNotLinked || status.GRPO == hipKernelStatusNotLinked || status.LoRA == hipKernelStatusNotLinked || status.Optimizer == hipKernelStatusNotLinked || status.Prefill == hipKernelStatusNotLinked || status.Projection == hipKernelStatusNotLinked || status.Rerank == hipKernelStatusNotLinked {
 		return hipKernelStatusNotLinked
 	}
 	return hipKernelStatusPlanned
@@ -207,6 +212,7 @@ func (status hipKernelStatus) Labels() map[string]string {
 		"kernel_status":        status.Overall(),
 		"kv_cache_kernel":      firstNonEmptyString(status.KVCache, hipKernelStatusPlanned),
 		"lora_kernel":          firstNonEmptyString(status.LoRA, hipKernelStatusPlanned),
+		"optimizer_kernel":     firstNonEmptyString(status.Optimizer, hipKernelStatusPlanned),
 		"prefill_kernel":       firstNonEmptyString(status.Prefill, hipKernelStatusPlanned),
 		"projection_kernel":    firstNonEmptyString(status.Projection, hipKernelStatusPlanned),
 		"rerank_kernel":        firstNonEmptyString(status.Rerank, hipKernelStatusPlanned),
@@ -235,6 +241,9 @@ func normalizeHIPKernelStatusFields(status hipKernelStatus) hipKernelStatus {
 	}
 	if status.LoRA == "" {
 		status.LoRA = hipKernelStatusPlanned
+	}
+	if status.Optimizer == "" {
+		status.Optimizer = hipKernelStatusPlanned
 	}
 	if status.Prefill == "" {
 		status.Prefill = hipKernelStatusPlanned
@@ -501,7 +510,7 @@ func (args hipPrefillLaunchArgs) Binary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	payload := make([]byte, hipPrefillLaunchArgsBytes)
+	payload := hipBorrowLaunchPacket(hipPrefillLaunchArgsBytes)
 	statusValue := args.StatusValue
 	if args.StatusPointer != 0 && statusValue == 0 {
 		statusValue = hipPrefillLaunchStatusOK
@@ -541,6 +550,10 @@ func (req hipDecodeRequest) decodeLaunchArgsBytes() ([]byte, error) {
 }
 
 func (args hipDecodeLaunchArgs) Binary() ([]byte, error) {
+	return args.BinaryInto(nil)
+}
+
+func (args hipDecodeLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.TokenID < 0 {
 		return nil, core.E("rocm.hip.DecodeLaunch", "token ID must be non-negative", nil)
 	}
@@ -550,11 +563,16 @@ func (args hipDecodeLaunchArgs) Binary() ([]byte, error) {
 	if args.Position != args.KV.TokenCount {
 		return nil, core.E("rocm.hip.DecodeLaunch", "decode position must match KV token count", nil)
 	}
-	kvPayload, err := args.KV.Binary()
+	if cap(payload) < hipDecodeLaunchArgsBytes {
+		payload = hipBorrowLaunchPacket(hipDecodeLaunchArgsBytes)
+	} else {
+		payload = payload[:hipDecodeLaunchArgsBytes]
+		clear(payload)
+	}
+	kvPayload, err := args.KV.BinaryInto(payload[hipDecodeLaunchArgsHeaderBytes:])
 	if err != nil {
 		return nil, core.E("rocm.hip.DecodeLaunch", "KV launch descriptor", err)
 	}
-	payload := make([]byte, hipDecodeLaunchArgsBytes)
 	binary.LittleEndian.PutUint32(payload[0:], hipDecodeLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(hipDecodeLaunchArgsHeaderBytes))
 	binary.LittleEndian.PutUint32(payload[8:], uint32(len(payload)))

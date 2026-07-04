@@ -58,7 +58,13 @@ func TestNativeDecodeSmokeKernelStatus_Good(t *testing.T) {
 	}
 	defer model.Close()
 
-	if !gemma4Q4ExperimentalTextGenerateEnv() {
+	linkedGemma4Generate := false
+	if rocmLoaded, ok := model.(*rocmModel); ok {
+		if hipLoaded, ok := rocmLoaded.native.(*hipLoadedModel); ok {
+			linkedGemma4Generate = hipLoadedGemma4Q4GenerateLinked(hipLoaded)
+		}
+	}
+	if !linkedGemma4Generate {
 		for range model.Generate(context.Background(), "hello", inference.WithMaxTokens(1)) {
 		}
 		err = model.Err()
@@ -99,6 +105,164 @@ func TestNativeDecodeSmokeKernelStatus_Good(t *testing.T) {
 	}
 }
 
+func TestNativeAttachedDrafterGenerateSmoke_Good(t *testing.T) {
+	if os.Getenv("GO_ROCM_RUN_MODEL_TESTS") != "1" {
+		t.Skip("set GO_ROCM_RUN_MODEL_TESTS=1 to run ROCm model smoke tests")
+	}
+	targetPath := strings.TrimSpace(os.Getenv("GO_ROCM_ATTACHED_DRAFTER_TARGET_PATH"))
+	if targetPath == "" {
+		targetPath = strings.TrimSpace(os.Getenv("GO_ROCM_PRODUCTION_MODEL_PATH"))
+	}
+	if targetPath == "" {
+		targetPath = strings.TrimSpace(os.Getenv("GO_ROCM_MODEL_PATH"))
+	}
+	if targetPath == "" {
+		t.Skip("set GO_ROCM_ATTACHED_DRAFTER_TARGET_PATH, GO_ROCM_PRODUCTION_MODEL_PATH, or GO_ROCM_MODEL_PATH to a local Gemma4 QAT target pack")
+	}
+	draftPath := strings.TrimSpace(os.Getenv("GO_ROCM_ATTACHED_DRAFTER_DRAFT_PATH"))
+	if draftPath == "" {
+		draftPath = strings.TrimSpace(os.Getenv("GO_ROCM_DRAFT_MODEL_PATH"))
+	}
+	if draftPath == "" {
+		t.Skip("set GO_ROCM_ATTACHED_DRAFTER_DRAFT_PATH or GO_ROCM_DRAFT_MODEL_PATH to a local Gemma4 MTP-QAT assistant pack")
+	}
+	prompt := strings.TrimSpace(os.Getenv("GO_ROCM_ATTACHED_DRAFTER_GENERATE_PROMPT"))
+	if prompt == "" {
+		prompt = "text:Write one concise sentence about ROCm inference."
+	}
+	maxTokens := 16
+	if raw := strings.TrimSpace(os.Getenv("GO_ROCM_ATTACHED_DRAFTER_GENERATE_TOKENS")); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value <= 0 {
+			t.Fatalf("GO_ROCM_ATTACHED_DRAFTER_GENERATE_TOKENS=%q, want positive integer", raw)
+		}
+		maxTokens = value
+	}
+
+	backend := newROCmBackendWithRuntime(newSystemNativeRuntime())
+	pair, err := backend.LoadAttachedDrafterPair(targetPath, draftPath, AttachedDrafterPairConfig{
+		TargetOptions: []inference.LoadOption{inference.WithContextLen(defaultContextLengthCap)},
+		DraftOptions:  []inference.LoadOption{inference.WithContextLen(defaultContextLengthCap)},
+	})
+	if err != nil {
+		t.Fatalf("LoadAttachedDrafterPair(%q, %q): %v", targetPath, draftPath, err)
+	}
+	pairClosed := false
+	defer func() {
+		if !pairClosed {
+			_ = pair.Close()
+		}
+	}()
+	if !pair.NativeReady() {
+		t.Fatalf("attached drafter native ready = false labels=%+v error=%q", pair.Attachment.Labels, pair.NativeError)
+	}
+	target, ok := pair.Target.(*rocmModel)
+	if !ok || target == nil {
+		t.Fatalf("pair target = %T, want *rocmModel", pair.Target)
+	}
+
+	draftTokens := pair.Plan.DraftTokens
+	result, err := pair.GenerateNative(context.Background(), prompt, AttachedDrafterGenerateConfig{
+		MaxTokens:   maxTokens,
+		DraftTokens: draftTokens,
+		Temperature: 0,
+	})
+	if err != nil {
+		t.Fatalf("GenerateNative(%q): %v", prompt, err)
+	}
+	if result.Text == "" {
+		t.Fatalf("GenerateNative(%q) returned empty text; metrics=%+v", prompt, result.Metrics)
+	}
+	if result.Metrics.DraftCalls == 0 {
+		t.Fatalf("GenerateNative metrics = %+v, want assistant draft calls", result.Metrics)
+	}
+	if result.Metrics.TargetCalls == 0 {
+		t.Fatalf("GenerateNative metrics = %+v, want target verification calls", result.Metrics)
+	}
+	if result.Metrics.AcceptedTokens+result.Metrics.RejectedTokens != result.Metrics.DraftTokens {
+		t.Fatalf("GenerateNative metrics = %+v, want accepted+rejected to match draft tokens", result.Metrics)
+	}
+	if err := pair.Close(); err != nil {
+		t.Fatalf("close attached drafter pair before reference target load: %v", err)
+	}
+	pairClosed = true
+
+	referenceModel, err := newROCmBackendWithRuntime(newSystemNativeRuntime()).LoadModel(targetPath, inference.WithContextLen(defaultContextLengthCap))
+	if err != nil {
+		t.Fatalf("LoadModel reference target %q: %v", targetPath, err)
+	}
+	defer referenceModel.Close()
+	targetText := strings.Join(collectTokenText(referenceModel.Generate(context.Background(), prompt, inference.WithMaxTokens(maxTokens), inference.WithTemperature(0))), "")
+	if err := referenceModel.Err(); err != nil {
+		t.Fatalf("reference target Generate(%q): %v", prompt, err)
+	}
+	if targetText == "" {
+		t.Fatalf("reference target Generate(%q) returned empty text", prompt)
+	}
+	if result.Text == targetText {
+		t.Logf("native attached smoke exact-match: text=%q metrics=%+v", result.Text, result.Metrics)
+	} else {
+		assertNativeAttachedDrafterTargetARMatchStable(t, targetPath, draftPath, prompt, maxTokens, draftTokens, result.Text, targetText)
+	}
+}
+
+func assertNativeAttachedDrafterTargetARMatchStable(t *testing.T, targetPath, draftPath, prompt string, maxTokens, draftTokens int, nativeText, targetText string) {
+	t.Helper()
+	targetAgain := loadNativeAttachedDrafterReferenceText(t, targetPath, prompt, maxTokens)
+	if targetAgain != targetText {
+		t.Skipf("reference target Generate(%q) shifted between runs (%q -> %q); attached-drafter equivalence comparison is not stable", prompt, targetText, targetAgain)
+	}
+	nativeAgain := loadNativeAttachedDrafterText(t, targetPath, draftPath, prompt, maxTokens, draftTokens)
+	if nativeAgain != nativeText {
+		t.Skipf("native attached Generate(%q) shifted between runs (%q -> %q); attached-drafter equivalence comparison is not stable", prompt, nativeText, nativeAgain)
+	}
+	t.Fatalf("native attached drafter text differs from stable target AR route: native=%q target=%q", nativeText, targetText)
+}
+
+func loadNativeAttachedDrafterReferenceText(t *testing.T, targetPath, prompt string, maxTokens int) string {
+	t.Helper()
+	referenceModel, err := newROCmBackendWithRuntime(newSystemNativeRuntime()).LoadModel(targetPath, inference.WithContextLen(defaultContextLengthCap))
+	if err != nil {
+		t.Fatalf("LoadModel reference target %q: %v", targetPath, err)
+	}
+	defer referenceModel.Close()
+	targetText := strings.Join(collectTokenText(referenceModel.Generate(context.Background(), prompt, inference.WithMaxTokens(maxTokens), inference.WithTemperature(0))), "")
+	if err := referenceModel.Err(); err != nil {
+		t.Fatalf("reference target Generate(%q): %v", prompt, err)
+	}
+	if targetText == "" {
+		t.Fatalf("reference target Generate(%q) returned empty text", prompt)
+	}
+	return targetText
+}
+
+func loadNativeAttachedDrafterText(t *testing.T, targetPath, draftPath, prompt string, maxTokens, draftTokens int) string {
+	t.Helper()
+	pair, err := newROCmBackendWithRuntime(newSystemNativeRuntime()).LoadAttachedDrafterPair(targetPath, draftPath, AttachedDrafterPairConfig{
+		TargetOptions: []inference.LoadOption{inference.WithContextLen(defaultContextLengthCap)},
+		DraftOptions:  []inference.LoadOption{inference.WithContextLen(defaultContextLengthCap)},
+	})
+	if err != nil {
+		t.Fatalf("LoadAttachedDrafterPair(%q, %q): %v", targetPath, draftPath, err)
+	}
+	defer pair.Close()
+	if !pair.NativeReady() {
+		t.Fatalf("attached drafter native ready = false labels=%+v error=%q", pair.Attachment.Labels, pair.NativeError)
+	}
+	result, err := pair.GenerateNative(context.Background(), prompt, AttachedDrafterGenerateConfig{
+		MaxTokens:   maxTokens,
+		DraftTokens: draftTokens,
+		Temperature: 0,
+	})
+	if err != nil {
+		t.Fatalf("GenerateNative(%q): %v", prompt, err)
+	}
+	if result.Text == "" {
+		t.Fatalf("GenerateNative(%q) returned empty text; metrics=%+v", prompt, result.Metrics)
+	}
+	return result.Text
+}
+
 func assertLoadedGemma4BF16EmbeddingLookupSmoke(t *testing.T, model *hipLoadedModel) []float32 {
 	t.Helper()
 	if model == nil ||
@@ -137,20 +301,21 @@ func assertLoadedGemma4MLXQ4EmbeddingLookupSmoke(t *testing.T, model *hipLoadedM
 	t.Helper()
 	if model == nil ||
 		!isROCmGemma4Architecture(model.modelInfo.Architecture) ||
-		model.modelInfo.QuantBits != 4 {
+		!hipMLXAffineSupportedBits(model.modelInfo.QuantBits) {
 		return nil
 	}
+	bits := hipMLXQ4ProjectionBitsOrDefault(model.modelInfo.QuantBits)
 	weight, ok := model.tensors["language_model.model.embed_tokens.weight"]
 	if !ok {
-		t.Fatalf("loaded Gemma4 q4 model is missing embed_tokens packed weight tensor")
+		t.Fatalf("loaded Gemma4 q%d model is missing embed_tokens packed weight tensor", bits)
 	}
 	scales, ok := model.tensors["language_model.model.embed_tokens.scales"]
 	if !ok {
-		t.Fatalf("loaded Gemma4 q4 model is missing embed_tokens scales tensor")
+		t.Fatalf("loaded Gemma4 q%d model is missing embed_tokens scales tensor", bits)
 	}
 	biases, ok := model.tensors["language_model.model.embed_tokens.biases"]
 	if !ok {
-		t.Fatalf("loaded Gemma4 q4 model is missing embed_tokens biases tensor")
+		t.Fatalf("loaded Gemma4 q%d model is missing embed_tokens biases tensor", bits)
 	}
 	vocab := model.modelInfo.VocabSize
 	hidden := model.modelInfo.HiddenSize
@@ -158,16 +323,18 @@ func assertLoadedGemma4MLXQ4EmbeddingLookupSmoke(t *testing.T, model *hipLoadedM
 	if groupSize == 0 {
 		groupSize = 64
 	}
+	packedPerRow, err := hipMLXAffinePackedCols(hidden, bits)
+	core.RequireNoError(t, err)
 	groups := hidden / groupSize
 	if vocab != 262144 || hidden != 1536 || groupSize != 64 {
-		t.Fatalf("loaded Gemma4 q4 dimensions vocab=%d hidden=%d group=%d, want 262144/1536/64", vocab, hidden, groupSize)
+		t.Fatalf("loaded Gemma4 q%d dimensions vocab=%d hidden=%d group=%d, want 262144/1536/64", bits, vocab, hidden, groupSize)
 	}
 	if weight.info.TypeName != "U32" ||
 		len(weight.info.Dimensions) != 2 ||
 		weight.info.Dimensions[0] != uint64(vocab) ||
-		weight.info.Dimensions[1] != uint64(hidden/8) ||
-		weight.info.ByteSize != uint64(vocab*(hidden/8)*4) {
-		t.Fatalf("q4 embed_tokens weight tensor = %+v, want Gemma4 q4 [%d,%d]", weight.info, vocab, hidden/8)
+		weight.info.Dimensions[1] != uint64(packedPerRow) ||
+		weight.info.ByteSize != uint64(vocab*packedPerRow*4) {
+		t.Fatalf("q%d embed_tokens weight tensor = %+v, want Gemma4 q%d [%d,%d]", bits, weight.info, bits, vocab, packedPerRow)
 	}
 	for label, tensor := range map[string]hipTensor{"scales": scales, "biases": biases} {
 		if tensor.info.TypeName != "BF16" ||
@@ -175,7 +342,7 @@ func assertLoadedGemma4MLXQ4EmbeddingLookupSmoke(t *testing.T, model *hipLoadedM
 			tensor.info.Dimensions[0] != uint64(vocab) ||
 			tensor.info.Dimensions[1] != uint64(groups) ||
 			tensor.info.ByteSize != uint64(vocab*groups*2) {
-			t.Fatalf("q4 embed_tokens %s tensor = %+v, want Gemma4 q4 [%d,%d]", label, tensor.info, vocab, groups)
+			t.Fatalf("q%d embed_tokens %s tensor = %+v, want Gemma4 q%d [%d,%d]", bits, label, tensor.info, bits, vocab, groups)
 		}
 	}
 	tokenIDs := []int32{0, 1, 257}
@@ -190,12 +357,13 @@ func assertLoadedGemma4MLXQ4EmbeddingLookupSmoke(t *testing.T, model *hipLoadedM
 		BiasPointer:      biases.pointer,
 		ScaleBytes:       scales.info.ByteSize,
 		BiasBytes:        biases.info.ByteSize,
+		QuantBits:        bits,
 	})
 	core.RequireNoError(t, err)
-	wantWeights := readLoadedUint32EmbeddingRows(t, weight, tokenIDs, hidden/8)
+	wantWeights := readLoadedUint32EmbeddingRows(t, weight, tokenIDs, packedPerRow)
 	wantScales := readLoadedBF16TensorRowsByID(t, scales, tokenIDs, groups)
 	wantBiases := readLoadedBF16TensorRowsByID(t, biases, tokenIDs, groups)
-	want, err := hipReferenceMLXQ4EmbeddingLookup(wantWeights, wantScales, wantBiases, len(tokenIDs), hidden, groupSize, []int32{0, 1, 2})
+	want, err := hipReferenceMLXAffineEmbeddingLookup(wantWeights, wantScales, wantBiases, len(tokenIDs), hidden, groupSize, []int32{0, 1, 2}, bits)
 	core.RequireNoError(t, err)
 	assertFloat32SlicesNear(t, want, got, 0.01)
 	return got
@@ -205,7 +373,7 @@ func assertLoadedGemma4Q4PackagePrefillDecodeSmoke(t *testing.T, model *hipLoade
 	t.Helper()
 	if model == nil ||
 		!isROCmGemma4Architecture(model.modelInfo.Architecture) ||
-		model.modelInfo.QuantBits != 4 {
+		!hipMLXAffineSupportedBits(model.modelInfo.QuantBits) {
 		return
 	}
 	prefill, err := model.Prefill(context.Background(), hipPrefillRequest{
@@ -457,7 +625,7 @@ func assertLoadedGemma4MLXQ4Layer0Smoke(t *testing.T, model *hipLoadedModel, emb
 	t.Helper()
 	if model == nil ||
 		!isROCmGemma4Architecture(model.modelInfo.Architecture) ||
-		model.modelInfo.QuantBits != 4 {
+		!hipMLXAffineSupportedBits(model.modelInfo.QuantBits) {
 		return nil
 	}
 	hidden := model.modelInfo.HiddenSize
@@ -607,7 +775,7 @@ func assertLoadedGemma4Q4PublicGenerateSmoke(t *testing.T, textModel inference.T
 	if textModel == nil ||
 		loaded == nil ||
 		!isROCmGemma4Architecture(loaded.modelInfo.Architecture) ||
-		loaded.modelInfo.QuantBits != 4 {
+		!hipMLXAffineSupportedBits(loaded.modelInfo.QuantBits) {
 		return
 	}
 	prompt := strings.TrimSpace(os.Getenv("GO_ROCM_GEMMA4_Q4_GENERATE_PROMPT"))
@@ -667,7 +835,7 @@ func assertLoadedGemma4Q4PublicGenerateSmoke(t *testing.T, textModel inference.T
 		if !ok || classify.Status != inference.CapabilityStatusExperimental ||
 			classify.Labels["kernel_scope"] != "loaded_gemma4_q4_experimental_classify" ||
 			classify.Labels["classify_kernel"] != hipKernelStatusLinked ||
-			classify.Labels["classify_logits_source"] != "gemma4_q4_package_prefill" ||
+			classify.Labels["classify_logits_source"] != "gemma4_mlx_affine_package_prefill" ||
 			classify.Labels["attention_kv_mode"] != rocmKVCacheModeKQ8VQ4 ||
 			classify.Labels["production_prefill"] != hipKernelStatusNotLinked ||
 			classify.Labels["production_decode"] != hipKernelStatusNotLinked ||
@@ -676,6 +844,9 @@ func assertLoadedGemma4Q4PublicGenerateSmoke(t *testing.T, textModel inference.T
 		}
 		speculative, ok := report.Capability(inference.CapabilitySpeculativeDecode)
 		if !ok || speculative.Status != inference.CapabilityStatusExperimental ||
+			speculative.Labels["attached_drafter_helper"] != hipKernelStatusLinked ||
+			speculative.Labels["attached_drafter_native_attachment"] != hipKernelStatusNotLinked ||
+			speculative.Labels["attached_drafter_role"] != "gemma4_assistant" ||
 			speculative.Labels["kernel_scope"] != "loaded_gemma4_q4_experimental_speculative_decode" ||
 			speculative.Labels["speculative_decode_helper"] != hipKernelStatusLinked ||
 			speculative.Labels["speculative_decode_source"] != "gemma4_q4_generate" ||
@@ -729,7 +900,7 @@ func assertLoadedGemma4Q4PublicGenerateSmoke(t *testing.T, textModel inference.T
 	if metrics.GeneratedTokens != tokenCount {
 		t.Fatalf("Gemma4 q4 public Generate metrics generated=%d, want %d", metrics.GeneratedTokens, tokenCount)
 	}
-	if gemma4Q4ExperimentalTextGenerateEnv() && !strings.Contains(prompt, ":") && metrics.PromptTokens != len(promptTokens) {
+	if !strings.Contains(prompt, ":") && metrics.PromptTokens != len(promptTokens) {
 		t.Fatalf("Gemma4 q4 public Generate metrics prompt=%d, want tokenizer prompt length %d", metrics.PromptTokens, len(promptTokens))
 	}
 	batch, err := textModel.BatchGenerate(context.Background(), []string{prompt}, inference.WithMaxTokens(1))
@@ -842,7 +1013,6 @@ func assertLoadedGemma4Q4PublicGenerateSmoke(t *testing.T, textModel inference.T
 		t.Fatalf("Gemma4 q4 public PromptLookupDecode = %+v, want one accepted lookup token %d", promptLookup, generated[0].ID)
 	}
 	if benchable, ok := any(textModel).(inference.BenchableModel); ok {
-		t.Setenv("GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE", "")
 		bench, err := benchable.Benchmark(context.Background(), inference.BenchConfig{
 			Prompts:      []string{"Hi"},
 			MaxTokens:    1,
@@ -853,16 +1023,46 @@ func assertLoadedGemma4Q4PublicGenerateSmoke(t *testing.T, textModel inference.T
 		}
 		if bench.GeneratedTokens != 1 ||
 			bench.PromptTokens == 0 ||
+			bench.Labels["attached.drafter.decode"] != "experimental" ||
+			bench.Labels["attached.drafter.native_attachment"] != hipKernelStatusNotLinked ||
+			bench.Labels["attached.drafter.role"] != "gemma4_assistant" ||
 			bench.Labels["kernel_scope"] != "loaded_gemma4_q4_experimental_benchmark" ||
 			bench.Labels["benchmark_prompt_mode"] != "explicit_text" ||
+			bench.Labels["benchmark_retained_state_book"] != "BenchmarkInferenceGemma4Q4Book10Turn_RetainedState" ||
+			bench.Labels["benchmark_retained_state_required"] != "true" ||
+			bench.Labels["benchmark_prompt_replay_fallback"] != "forbidden" ||
+			bench.Labels["benchmark_state_source"] != "rocm_state_session_runtime_kv" ||
+			bench.Labels["production_book_policy"] != "retained_state_required" ||
+			bench.Labels["production_book_decision_source"] != "benchmark_metrics" ||
+			bench.Labels["production_book_gate_wall_seconds"] != strconv.Itoa(ProductionLaneBookWallSeconds) ||
+			bench.Labels["production_book_gate_turns"] != strconv.Itoa(ProductionLaneBookTurnCount) ||
+			bench.Labels["production_book_gate_raw_decode_tokens_per_sec"] != strconv.Itoa(DefaultProductionQuantizationPolicy().MinimumVisibleTokensPerSec) ||
+			bench.Labels["production_book_gate_metrics"] == "" ||
+			bench.Labels["production_book_gate_reason_codes"] != productionBookGateReasonCodesLabel ||
+			bench.Labels["production_book_retained_route_metrics"] == "" ||
+			bench.Labels["production_book_retained_artifact_labels"] == "" ||
+			bench.Labels["production_model_source"] != "model_identity_or_pack" ||
+			bench.Labels["production_mtp_required_metrics"] == "" ||
+			bench.Labels["production_quant_decision_source"] != "gemma4_family_matrix" ||
 			bench.Labels["speculative.decode"] != "experimental" ||
+			bench.Labels["speculative.decode.affine_source"] != "gemma4_mlx_affine_generate" ||
 			bench.Labels["speculative.decode.source"] != "gemma4_q4_generate" ||
 			bench.Labels["prompt.lookup.decode"] != "experimental" ||
+			bench.Labels["prompt.lookup.decode.affine_source"] != "gemma4_mlx_affine_generate" ||
 			bench.Labels["prompt.lookup.decode.source"] != "gemma4_q4_generate" ||
 			bench.Labels["decode_kernel"] != hipKernelStatusNotLinked ||
 			bench.Labels["prefill_kernel"] != hipKernelStatusNotLinked {
-			t.Fatalf("Gemma4 q4 benchmark = %+v labels=%+v, want q4 benchmark/helper labels plus not-linked production prefill/decode labels", bench, bench.Labels)
+			t.Fatalf("Gemma4 q4 benchmark = %+v labels=%+v, want MLX affine benchmark/helper labels plus not-linked production prefill/decode labels", bench, bench.Labels)
 		}
+		for _, metric := range DefaultProductionQuantizationPolicy().RequiredBenchmarkMetrics {
+			if !strings.Contains(bench.Labels["production_book_required_metrics"], metric) {
+				t.Fatalf("Gemma4 q4 benchmark required metrics = %q, missing %q", bench.Labels["production_book_required_metrics"], metric)
+			}
+		}
+		assertCSVLabelContainsAll(t, "production_book_gate_metrics", bench.Labels["production_book_gate_metrics"], productionBookGateMetrics)
+		assertCSVLabelContainsAll(t, "production_book_retained_route_metrics", bench.Labels["production_book_retained_route_metrics"], productionBookRetainedRouteMetrics)
+		assertCSVLabelContainsAll(t, "production_book_retained_artifact_labels", bench.Labels["production_book_retained_artifact_labels"], productionBookRetainedArtifactLabels)
+		assertCSVLabelContainsAll(t, "production_mtp_required_metrics", bench.Labels["production_mtp_required_metrics"], defaultProductionMTPRequiredMetrics)
 	}
 	if evaluator, ok := any(textModel).(inference.Evaluator); ok {
 		eval, err := evaluator.Evaluate(context.Background(), &singleInferenceSample{sample: inference.DatasetSample{
@@ -882,7 +1082,7 @@ func assertLoadedGemma4Q4PublicGenerateSmoke(t *testing.T, textModel inference.T
 			eval.Metrics.Tokens != len(loaded.Encode("Hi")) ||
 			eval.Labels["eval.tokens"] != core.Sprintf("%d", len(loaded.Encode("Hi"))) ||
 			eval.Labels["quality_probe_status"] != "passed" ||
-			eval.Labels["eval.loss_logits_source"] != "gemma4_q4_package_prefill" ||
+			eval.Labels["eval.loss_logits_source"] != "gemma4_mlx_affine_package_prefill" ||
 			eval.Labels["loss_backend"] != "hip" ||
 			eval.Labels["loss_status"] != "experimental" ||
 			eval.Labels["decode_kernel"] != hipKernelStatusNotLinked ||
@@ -891,11 +1091,6 @@ func assertLoadedGemma4Q4PublicGenerateSmoke(t *testing.T, textModel inference.T
 		}
 	}
 	t.Logf("Gemma4 q4 public Generate prompt=%q prompt_tokens=%v generated tokens=%v text=%q", prompt, promptTokens, ids, texts)
-}
-
-func gemma4Q4ExperimentalTextGenerateEnv() bool {
-	raw := strings.ToLower(strings.TrimSpace(os.Getenv("GO_ROCM_GEMMA4_Q4_EXPERIMENTAL_TEXT_GENERATE")))
-	return raw == "1" || raw == "true" || raw == "yes"
 }
 
 func gemma4Q4ForwardLayerCountFromEnv(t *testing.T, max int) (int, bool) {
@@ -978,7 +1173,7 @@ func assertLoadedGemma4MLXQ4AttentionProjectionSmoke(t *testing.T, model *hipLoa
 	t.Helper()
 	if model == nil ||
 		!isROCmGemma4Architecture(model.modelInfo.Architecture) ||
-		model.modelInfo.QuantBits != 4 {
+		!hipMLXAffineSupportedBits(model.modelInfo.QuantBits) {
 		return gemma4BF16AttentionProjectionOutputs{}
 	}
 	hidden := model.modelInfo.HiddenSize
@@ -1010,7 +1205,7 @@ func assertLoadedGemma4MLXQ4ProjectionSmoke(t *testing.T, model *hipLoadedModel)
 	t.Helper()
 	if model == nil ||
 		!isROCmGemma4Architecture(model.modelInfo.Architecture) ||
-		model.modelInfo.QuantBits != 4 {
+		!hipMLXAffineSupportedBits(model.modelInfo.QuantBits) {
 		return nil
 	}
 	hidden := model.modelInfo.HiddenSize
@@ -1038,29 +1233,32 @@ func assertLoadedGemma4MLXQ4ProjectionTensorSmoke(t *testing.T, model *hipLoaded
 	if len(input) != spec.cols {
 		t.Fatalf("%s q4 input length = %d, want cols %d", spec.label, len(input), spec.cols)
 	}
+	bits := hipMLXQ4ProjectionBitsOrDefault(model.modelInfo.QuantBits)
 	weight, ok := model.tensors[spec.tensorBase+".weight"]
 	if !ok {
-		t.Fatalf("loaded Gemma4 q4 model is missing %s packed weight tensor", spec.label)
+		t.Fatalf("loaded Gemma4 q%d model is missing %s packed weight tensor", bits, spec.label)
 	}
 	scales, ok := model.tensors[spec.tensorBase+".scales"]
 	if !ok {
-		t.Fatalf("loaded Gemma4 q4 model is missing %s scales tensor", spec.label)
+		t.Fatalf("loaded Gemma4 q%d model is missing %s scales tensor", bits, spec.label)
 	}
 	biases, ok := model.tensors[spec.tensorBase+".biases"]
 	if !ok {
-		t.Fatalf("loaded Gemma4 q4 model is missing %s biases tensor", spec.label)
+		t.Fatalf("loaded Gemma4 q%d model is missing %s biases tensor", bits, spec.label)
 	}
 	groupSize := model.modelInfo.QuantGroup
 	if groupSize == 0 {
 		groupSize = 64
 	}
+	packedPerRow, err := hipMLXAffinePackedCols(spec.cols, bits)
+	core.RequireNoError(t, err)
 	groups := spec.cols / groupSize
 	if weight.info.TypeName != "U32" ||
 		len(weight.info.Dimensions) != 2 ||
 		weight.info.Dimensions[0] != uint64(spec.rows) ||
-		weight.info.Dimensions[1] != uint64(spec.cols/8) ||
-		weight.info.ByteSize != uint64(spec.rows*(spec.cols/8)*4) {
-		t.Fatalf("q4 %s weight tensor = %+v, want Gemma4 q4 [%d,%d]", spec.label, weight.info, spec.rows, spec.cols/8)
+		weight.info.Dimensions[1] != uint64(packedPerRow) ||
+		weight.info.ByteSize != uint64(spec.rows*packedPerRow*4) {
+		t.Fatalf("q%d %s weight tensor = %+v, want Gemma4 q%d [%d,%d]", bits, spec.label, weight.info, bits, spec.rows, packedPerRow)
 	}
 	for label, tensor := range map[string]hipTensor{"scales": scales, "biases": biases} {
 		if tensor.info.TypeName != "BF16" ||
@@ -1068,7 +1266,7 @@ func assertLoadedGemma4MLXQ4ProjectionTensorSmoke(t *testing.T, model *hipLoaded
 			tensor.info.Dimensions[0] != uint64(spec.rows) ||
 			tensor.info.Dimensions[1] != uint64(groups) ||
 			tensor.info.ByteSize != uint64(spec.rows*groups*2) {
-			t.Fatalf("q4 %s %s tensor = %+v, want Gemma4 q4 [%d,%d]", spec.label, label, tensor.info, spec.rows, groups)
+			t.Fatalf("q%d %s %s tensor = %+v, want Gemma4 q%d [%d,%d]", bits, spec.label, label, tensor.info, bits, spec.rows, groups)
 		}
 	}
 	got, err := hipRunMLXQ4ProjectionKernelWithDeviceWeightConfig(context.Background(), model.driver, input, hipMLXQ4DeviceWeightConfig{
@@ -1081,16 +1279,17 @@ func assertLoadedGemma4MLXQ4ProjectionTensorSmoke(t *testing.T, model *hipLoaded
 		Rows:          spec.rows,
 		Cols:          spec.cols,
 		GroupSize:     groupSize,
+		Bits:          bits,
 	})
 	core.RequireNoError(t, err)
 	compareRows := 8
 	if spec.rows < compareRows {
 		compareRows = spec.rows
 	}
-	wantWeights := readLoadedUint32TensorRows(t, weight, compareRows, spec.cols/8)
+	wantWeights := readLoadedUint32TensorRows(t, weight, compareRows, packedPerRow)
 	wantScales := readLoadedBF16TensorRows(t, scales, compareRows, groups)
 	wantBiases := readLoadedBF16TensorRows(t, biases, compareRows, groups)
-	want, err := hipReferenceMLXQ4Projection(input, wantWeights, wantScales, wantBiases, compareRows, spec.cols, groupSize)
+	want, err := hipReferenceMLXAffineProjection(input, wantWeights, wantScales, wantBiases, compareRows, spec.cols, groupSize, bits)
 	core.RequireNoError(t, err)
 	assertFloat32SlicesNear(t, want, got[:compareRows], 0.05)
 	return got
@@ -1186,7 +1385,7 @@ func assertLoadedGemma4MLXQ4OutputProjectionSmoke(t *testing.T, model *hipLoaded
 	t.Helper()
 	if model == nil ||
 		!isROCmGemma4Architecture(model.modelInfo.Architecture) ||
-		model.modelInfo.QuantBits != 4 {
+		!hipMLXAffineSupportedBits(model.modelInfo.QuantBits) {
 		return nil
 	}
 	hidden := model.modelInfo.HiddenSize
@@ -1281,7 +1480,7 @@ func assertLoadedGemma4MLXQ4MLPSmoke(t *testing.T, model *hipLoadedModel, input 
 	t.Helper()
 	if model == nil ||
 		!isROCmGemma4Architecture(model.modelInfo.Architecture) ||
-		model.modelInfo.QuantBits != 4 {
+		!hipMLXAffineSupportedBits(model.modelInfo.QuantBits) {
 		return nil
 	}
 	hidden := model.modelInfo.HiddenSize
@@ -1314,7 +1513,7 @@ func assertLoadedGemma4MLXQ4LogitSmoke(t *testing.T, model *hipLoadedModel, inpu
 	t.Helper()
 	if model == nil ||
 		!isROCmGemma4Architecture(model.modelInfo.Architecture) ||
-		model.modelInfo.QuantBits != 4 {
+		!hipMLXAffineSupportedBits(model.modelInfo.QuantBits) {
 		return hipGreedySampleResult{}
 	}
 	hidden := model.modelInfo.HiddenSize
@@ -1528,13 +1727,13 @@ func TestNativeModelPackSmokeGemma4E2B_Good(t *testing.T) {
 	if os.Getenv("GO_ROCM_RUN_MODEL_TESTS") != "1" {
 		t.Skip("set GO_ROCM_RUN_MODEL_TESTS=1 to run ROCm model smoke tests")
 	}
-	modelPath := os.Getenv("GO_ROCM_MODEL_PATH")
+	modelPath := inferenceBenchmarkGemma4ProductionModelPath()
 	if modelPath == "" {
-		t.Skip("set GO_ROCM_MODEL_PATH to a local Gemma4-E2B safetensors model pack")
+		t.Skip("set GO_ROCM_PRODUCTION_MODEL_PATH or GO_ROCM_MODEL_PATH to a local Gemma4-E2B safetensors model pack")
 	}
 	lowerPath := strings.ToLower(modelPath)
 	if !strings.Contains(lowerPath, "gemma4") || !strings.Contains(lowerPath, "e2b") {
-		t.Skip("set GO_ROCM_MODEL_PATH to an explicit Gemma4-E2B model pack for this smoke")
+		t.Skip("set GO_ROCM_PRODUCTION_MODEL_PATH or GO_ROCM_MODEL_PATH to an explicit Gemma4-E2B model pack for this smoke")
 	}
 
 	runtime := newSystemNativeRuntime()
@@ -1556,8 +1755,8 @@ func TestNativeModelPackSmokeGemma4E2B_Good(t *testing.T) {
 		t.Fatalf("inspection = %+v labels=%+v notes=%+v, want supported Gemma4-E2B safetensors pack", inspection, inspection.Labels, inspection.Notes)
 	}
 	if inspection.Model.QuantBits > 0 {
-		if inspection.Model.QuantBits != 4 || inspection.Model.QuantGroup != 64 {
-			t.Fatalf("model = %+v, want Gemma4-E2B 4-bit/64-group quantization when quantized", inspection.Model)
+		if !hipMLXAffineSupportedBits(inspection.Model.QuantBits) || inspection.Model.QuantGroup != 64 {
+			t.Fatalf("model = %+v, want Gemma4-E2B MLX affine 4/6/8-bit 64-group quantization when quantized", inspection.Model)
 		}
 	} else if inspection.Model.QuantType != "bf16" {
 		t.Fatalf("model = %+v labels=%+v, want BF16 metadata for unquantized Gemma4-E2B safetensors pack", inspection.Model, inspection.Labels)
@@ -1962,6 +2161,84 @@ func TestHIPHardwareProjectionKernelSource_Good(t *testing.T) {
 		wantProjected := append(
 			expectedGELUTanhProjectionFromQ4(t, q4Req, []float32{2, 3}),
 			expectedGELUTanhProjectionFromQ4(t, secondReq, []float32{4, 5})...,
+		)
+		assertFloat32SlicesNear(t, wantProjected, batchProjectedOutput, 0.0001)
+	})
+
+	t.Run("mlx-q8-projection", func(t *testing.T) {
+		q8Req := hipMLXQ4ProjectionRequest{
+			Input: []float32{1, 1, 1, 1, 1, 1, 1, 1},
+			Weight: hipPackMLXAffineValuesForTest([]uint32{
+				0, 1, 2, 3, 4, 5, 6, 7,
+				8, 9, 10, 11, 12, 13, 14, 15,
+			}, 8, 8),
+			Scales:    []uint16{0x3f80, 0x3f00},
+			Biases:    []uint16{0x0000, 0xbf80},
+			Rows:      2,
+			Cols:      8,
+			GroupSize: 8,
+			Bits:      8,
+		}
+		q8Want, err := hipReferenceMLXAffineProjection(q8Req.Input, q8Req.Weight, q8Req.Scales, q8Req.Biases, q8Req.Rows, q8Req.Cols, q8Req.GroupSize, q8Req.Bits)
+		core.RequireNoError(t, err)
+		q8Output, err := hipRunMLXQ4ProjectionKernel(context.Background(), hipRuntime.driver, q8Req)
+		core.RequireNoError(t, err)
+		assertFloat32SlicesNear(t, q8Want, q8Output, 0.0001)
+
+		q8Buffers, err := q8Req.deviceBuffers(hipRuntime.driver)
+		core.RequireNoError(t, err)
+		defer q8Buffers.Close()
+		q8Config := hipMLXQ4DeviceWeightConfig{
+			WeightPointer: q8Buffers.Weight.Pointer(),
+			ScalePointer:  q8Buffers.Scales.Pointer(),
+			BiasPointer:   q8Buffers.Biases.Pointer(),
+			WeightBytes:   q8Buffers.Weight.SizeBytes(),
+			ScaleBytes:    q8Buffers.Scales.SizeBytes(),
+			BiasBytes:     q8Buffers.Biases.SizeBytes(),
+			Rows:          q8Req.Rows,
+			Cols:          q8Req.Cols,
+			GroupSize:     q8Req.GroupSize,
+			Bits:          q8Req.Bits,
+		}
+		batchInput := append(append([]float32(nil), q8Req.Input...), []float32{2, 2, 2, 2, 2, 2, 2, 2}...)
+		batchPayload, err := hipFloat32Payload(batchInput)
+		core.RequireNoError(t, err)
+		batchInputBuffer, err := hipUploadByteBuffer(hipRuntime.driver, "rocm.hip.MLXQ4ProjectionBatchLaunch", "MLX q8 projection batch input", batchPayload, len(batchInput))
+		core.RequireNoError(t, err)
+		defer batchInputBuffer.Close()
+		batchOutputBuffer, err := hipRunMLXQ4ProjectionBatchKernelWithDeviceInput(context.Background(), hipRuntime.driver, batchInputBuffer, q8Config, 2)
+		core.RequireNoError(t, err)
+		defer batchOutputBuffer.Close()
+		batchOutput, err := hipReadFloat32DeviceOutput(batchOutputBuffer, "rocm.hip.MLXQ4ProjectionBatchLaunch", "MLX q8 projection batch output", q8Req.Rows*2)
+		core.RequireNoError(t, err)
+		assertFloat32SlicesNear(t, []float32{q8Want[0], q8Want[1], q8Want[0] * 2, q8Want[1] * 2}, batchOutput, 0.0001)
+
+		batchActivated, err := hipRunMLXQ4GELUTanhMultiplyBatchKernelWithDeviceInput(context.Background(), hipRuntime.driver, batchInputBuffer, q8Config, q8Config, 2)
+		core.RequireNoError(t, err)
+		defer batchActivated.Close()
+		activatedOutput, err := hipReadFloat32DeviceOutput(batchActivated, "rocm.hip.MLXQ4GELUTanhMultiplyBatchLaunch", "MLX q8 GELU tanh multiply batch output", q8Req.Rows*2)
+		core.RequireNoError(t, err)
+		secondReq := q8Req
+		secondReq.Input = []float32{2, 2, 2, 2, 2, 2, 2, 2}
+		wantActivated := append(
+			expectedGELUTanhMultiplyFromMLXAffine(t, q8Req, q8Req, 8),
+			expectedGELUTanhMultiplyFromMLXAffine(t, secondReq, secondReq, 8)...,
+		)
+		assertFloat32SlicesNear(t, wantActivated, activatedOutput, 0.0001)
+
+		batchMultiplierPayload, err := hipFloat32Payload([]float32{2, 3, 4, 5})
+		core.RequireNoError(t, err)
+		batchMultiplier, err := hipUploadByteBuffer(hipRuntime.driver, "rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "MLX q8 GELU tanh projection batch multiplier", batchMultiplierPayload, q8Req.Rows*2)
+		core.RequireNoError(t, err)
+		defer batchMultiplier.Close()
+		batchProjected, err := hipRunMLXQ4GELUTanhProjectionBatchKernelWithDeviceMultiplier(context.Background(), hipRuntime.driver, batchInputBuffer, batchMultiplier, q8Config, 2)
+		core.RequireNoError(t, err)
+		defer batchProjected.Close()
+		batchProjectedOutput, err := hipReadFloat32DeviceOutput(batchProjected, "rocm.hip.MLXQ4GELUTanhProjectionBatchLaunch", "MLX q8 GELU tanh projection batch output", q8Req.Rows*2)
+		core.RequireNoError(t, err)
+		wantProjected := append(
+			expectedGELUTanhProjectionFromMLXAffine(t, q8Req, []float32{2, 3}, 8),
+			expectedGELUTanhProjectionFromMLXAffine(t, secondReq, []float32{4, 5}, 8)...,
 		)
 		assertFloat32SlicesNear(t, wantProjected, batchProjectedOutput, 0.0001)
 	})
@@ -2498,7 +2775,6 @@ func TestHIPHardwareTransformerKernelSource_Good(t *testing.T) {
 	})
 
 	t.Run("attention-heads-sliced-interleaved-window-kv-reference", func(t *testing.T) {
-		t.Setenv("GO_ROCM_GEMMA4_Q4_INTERLEAVED_ROW_PAGES", "1")
 		const (
 			dim         = 256
 			inputTokens = 529
@@ -2572,7 +2848,6 @@ func TestHIPHardwareTransformerKernelSource_Good(t *testing.T) {
 	})
 
 	t.Run("attention-heads-batch-causal-sliced-interleaved-window-kv-reference", func(t *testing.T) {
-		t.Setenv("GO_ROCM_GEMMA4_Q4_INTERLEAVED_ROW_PAGES", "1")
 		const (
 			dim          = 256
 			priorTokens  = 529

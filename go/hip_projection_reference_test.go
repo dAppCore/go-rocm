@@ -84,6 +84,50 @@ func TestHIPProjectionReferenceMLXQ4_Good(t *testing.T) {
 	assertFloat32Near(t, 38, got[1])
 }
 
+func TestHIPProjectionReferenceMLXAffineQ6Q8_Good(t *testing.T) {
+	input := []float32{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
+	q6Weights := hipPackMLXAffineValuesForTest([]uint32{
+		0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+		16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
+	}, 16, 6)
+	q6, err := hipReferenceMLXAffineProjection(input, q6Weights, []uint16{0x3f80, 0x3f80}, []uint16{0, 0}, 2, 16, 16, 6)
+	core.AssertNoError(t, err)
+	assertFloat32Near(t, 120, q6[0])
+	assertFloat32Near(t, 136, q6[1])
+
+	q8Weights := hipPackMLXAffineValuesForTest([]uint32{
+		1, 2, 3, 4,
+		5, 6, 7, 8,
+	}, 4, 8)
+	q8, err := hipReferenceMLXAffineProjection([]float32{1, 1, 1, 1}, q8Weights, []uint16{0x3f80, 0x3f80}, []uint16{0, 0}, 2, 4, 4, 8)
+	core.AssertNoError(t, err)
+	assertFloat32Near(t, 10, q8[0])
+	assertFloat32Near(t, 26, q8[1])
+}
+
+func hipPackMLXAffineValuesForTest(values []uint32, cols, bits int) []uint32 {
+	packedPerRow, err := hipMLXAffinePackedCols(cols, bits)
+	if err != nil {
+		panic(err)
+	}
+	rows := (len(values) + cols - 1) / cols
+	out := make([]uint32, rows*packedPerRow)
+	mask := uint32(1<<uint(bits)) - 1
+	for index, value := range values {
+		row := index / cols
+		col := index % cols
+		bitOffset := uint64(col) * uint64(bits)
+		wordIndex := row*packedPerRow + int(bitOffset/32)
+		shift := uint(bitOffset % 32)
+		value &= mask
+		out[wordIndex] |= value << shift
+		if shift+uint(bits) > 32 {
+			out[wordIndex+1] |= value >> (32 - shift)
+		}
+	}
+	return out
+}
+
 func TestHIPProjectionReferenceBadShape_Bad(t *testing.T) {
 	_, err := hipReferenceFP16Projection([]float32{1}, []uint16{0x3c00, 0x3c00}, 1, 2, nil)
 
@@ -104,7 +148,7 @@ func TestHIPProjectionReferenceBadShape_Bad(t *testing.T) {
 
 	_, err = hipReferenceMLXQ4Projection([]float32{1}, []uint32{0}, []uint16{0x3f80}, []uint16{0}, 1, 7, 7)
 	core.AssertError(t, err)
-	core.AssertContains(t, err.Error(), "divisible by 8")
+	core.AssertContains(t, err.Error(), "cols*bits")
 
 	_, err = hipReferenceMLXQ4Projection([]float32{1, 1, 1, 1, 1, 1, 1, 1}, []uint32{0}, []uint16{0x3f80}, []uint16{0}, 1, 8, 3)
 	core.AssertError(t, err)

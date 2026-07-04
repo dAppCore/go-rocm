@@ -13,23 +13,26 @@ import (
 
 	core "dappco.re/go"
 	"dappco.re/go/inference"
+	rocmmodel "dappco.re/go/rocm/model"
 )
 
 func TestScheduler_Good_StreamsQueuedRequest(t *testing.T) {
 	var _ inference.SchedulerModel = (*ScheduledModel)(nil)
 	var _ inference.CancellableModel = (*ScheduledModel)(nil)
 	var _ inference.ProbeableModel = (*ScheduledModel)(nil)
+	var _ inference.CapabilityReporter = (*ScheduledModel)(nil)
 
 	fake := &schedulerFakeTextModel{tokens: []inference.Token{{Text: "a"}, {Text: "b"}}}
 	model, err := NewScheduledModel(fake, SchedulerConfig{QueueSize: 1})
 	core.RequireNoError(t, err)
 	defer model.Close()
 
-	handle, stream, err := model.Schedule(context.Background(), inference.ScheduledRequest{ID: "req-1", Prompt: "hello", Sampler: inference.SamplerConfig{MaxTokens: 2, StopTokens: []int32{2}}})
+	handle, stream, err := model.Schedule(context.Background(), inference.ScheduledRequest{ID: "req-1", Prompt: "hello", Sampler: inference.SamplerConfig{MaxTokens: 2, MinP: 0.05, StopTokens: []int32{2}}})
 
 	core.RequireNoError(t, err)
 	core.AssertEqual(t, "req-1", handle.ID)
 	core.AssertEqual(t, []string{"a", "b"}, collectScheduledTokenText(stream))
+	core.AssertEqual(t, float32(0.05), fake.lastConfig.MinP)
 	core.AssertEqual(t, []int32{2}, fake.lastConfig.StopTokens)
 }
 
@@ -134,6 +137,395 @@ func TestScheduler_Good_ChatUsesSchedulerQueue(t *testing.T) {
 
 	core.AssertEqual(t, "hello", <-fake.started)
 	core.AssertEqual(t, []string{"reply"}, tokens)
+}
+
+func TestScheduler_Good_Gemma4SamplerPreservesUnsetMaxTokens(t *testing.T) {
+	model, err := NewScheduledModel(&schedulerFakeTextModel{architecture: "gemma4_text"}, SchedulerConfig{QueueSize: 1})
+	core.RequireNoError(t, err)
+	defer model.Close()
+
+	unset := model.samplerConfigFromGenerateOptions(nil)
+	temperatureOnly := model.samplerConfigFromGenerateOptions([]inference.GenerateOption{inference.WithTemperature(0.7)})
+	explicit := model.samplerConfigFromGenerateOptions([]inference.GenerateOption{inference.WithMaxTokens(7)})
+	negative := model.samplerConfigFromGenerateOptions([]inference.GenerateOption{inference.WithMaxTokens(-1)})
+
+	core.AssertEqual(t, 0, unset.MaxTokens)
+	core.AssertEqual(t, 0, temperatureOnly.MaxTokens)
+	core.AssertEqual(t, float32(0.7), temperatureOnly.Temperature)
+	core.AssertEqual(t, 7, explicit.MaxTokens)
+	core.AssertEqual(t, -1, negative.MaxTokens)
+}
+
+func TestScheduler_Good_Gemma4ReporterIdentityPreservesUnsetMaxTokens(t *testing.T) {
+	model, err := NewScheduledModel(&schedulerFakeTextModel{
+		architecture: "qwen3",
+		identity: inference.ModelIdentity{
+			Architecture:  "gemma4_text",
+			ContextLength: 8,
+		},
+	}, SchedulerConfig{QueueSize: 1})
+	core.RequireNoError(t, err)
+	defer model.Close()
+
+	unset := model.samplerConfigFromGenerateOptions(nil)
+	temperatureOnly := model.samplerConfigFromGenerateOptions([]inference.GenerateOption{inference.WithTemperature(0.7)})
+
+	core.AssertEqual(t, 0, unset.MaxTokens)
+	core.AssertEqual(t, 0, temperatureOnly.MaxTokens)
+	core.AssertEqual(t, float32(0.7), temperatureOnly.Temperature)
+}
+
+func TestScheduler_Good_Gemma4ScheduleAllowsUnsetMaxTokensWithinContext(t *testing.T) {
+	fake := &schedulerFakeTextModel{
+		architecture:      "gemma4_text",
+		contextLength:     8,
+		encodeTokenCount:  3,
+		tokens:            []inference.Token{{Text: "ok"}},
+		started:           make(chan string, 1),
+		recordEncodeInput: true,
+	}
+	model, err := NewScheduledModel(fake, SchedulerConfig{QueueSize: 1})
+	core.RequireNoError(t, err)
+	defer model.Close()
+
+	handle, stream, err := model.Schedule(context.Background(), inference.ScheduledRequest{ID: "within-window", Prompt: "prompt", Sampler: inference.SamplerConfig{MaxTokens: 0}})
+
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, "within-window", handle.ID)
+	core.AssertEqual(t, []string{"ok"}, collectScheduledTokenText(stream))
+	core.AssertEqual(t, "prompt", <-fake.started)
+	core.AssertEqual(t, "prompt", fake.lastEncodeInput())
+	core.AssertEqual(t, 5, fake.lastConfig.MaxTokens)
+}
+
+func TestScheduler_Good_Gemma4ReporterIdentityScheduleUsesRemainingContext(t *testing.T) {
+	fake := &schedulerFakeTextModel{
+		architecture: "qwen3",
+		identity: inference.ModelIdentity{
+			Architecture:  "gemma4_text",
+			ContextLength: 8,
+		},
+		encodeTokenCount:  3,
+		tokens:            []inference.Token{{Text: "ok"}},
+		started:           make(chan string, 1),
+		recordEncodeInput: true,
+	}
+	model, err := NewScheduledModel(fake, SchedulerConfig{QueueSize: 1})
+	core.RequireNoError(t, err)
+	defer model.Close()
+
+	handle, stream, err := model.Schedule(context.Background(), inference.ScheduledRequest{ID: "reporter-window", Prompt: "prompt", Sampler: inference.SamplerConfig{MaxTokens: 0}})
+
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, "reporter-window", handle.ID)
+	core.AssertEqual(t, []string{"ok"}, collectScheduledTokenText(stream))
+	core.AssertEqual(t, "prompt", <-fake.started)
+	core.AssertEqual(t, "prompt", fake.lastEncodeInput())
+	core.AssertEqual(t, 5, fake.lastConfig.MaxTokens)
+}
+
+func TestScheduler_Good_ReportsReactiveModelIdentityAndProfile(t *testing.T) {
+	var _ ROCmModelRoutePlanReporter = (*ScheduledModel)(nil)
+
+	fake := &schedulerFakeTextModel{
+		architecture: "qwen3",
+		identity: inference.ModelIdentity{
+			Path:          "/models/lmstudio-community-gemma-4-e4b-it-6bit",
+			Architecture:  "gemma4_text",
+			QuantBits:     6,
+			NumLayers:     26,
+			HiddenSize:    2304,
+			ContextLength: 8192,
+			Labels: map[string]string{
+				"gemma4_size":       "E4B",
+				"gemma4_quant_mode": "q6",
+				"sliding_window":    "1024",
+			},
+		},
+		cacheProfile: rocmmodel.CacheProfile{
+			Contract:        rocmmodel.CacheProfileContract,
+			Architecture:    "gemma4_text",
+			TotalCaches:     1,
+			QuantizedCaches: 1,
+			MaxCacheTokens:  7,
+		},
+	}
+	model, err := NewScheduledModel(fake, SchedulerConfig{QueueSize: 1})
+	core.RequireNoError(t, err)
+	defer model.Close()
+
+	identity := model.ModelIdentity()
+	if identity.Architecture != "gemma4_text" ||
+		identity.ContextLength != 8192 ||
+		identity.QuantType != "q6" ||
+		identity.Labels["gemma4_size"] != "E4B" ||
+		identity.Labels["gemma4_quant_mode"] != "q6" {
+		t.Fatalf("ModelIdentity = %+v, want wrapped Gemma4 reporter identity", identity)
+	}
+	identity.Labels["gemma4_size"] = "mutated"
+	if next := model.ModelIdentity(); next.Labels["gemma4_size"] == "mutated" {
+		t.Fatalf("ModelIdentity returned aliased labels: %+v", next.Labels)
+	}
+
+	profile := model.ModelProfile()
+	if !profile.Matched() ||
+		profile.Model.ContextLength != 8192 ||
+		profile.Model.Labels["gemma4_size"] != "E4B" ||
+		!profile.Gemma4EngineFeatures.GenerateLinked() ||
+		profile.EngineFeatures.ChatTemplateID != "gemma4_hf_turn" {
+		t.Fatalf("ModelProfile = %+v, want scheduled wrapper to preserve reactive Gemma4 profile", profile)
+	}
+	profile.Model.Labels["gemma4_size"] = "mutated"
+	profile.Labels["engine_profile"] = "mutated"
+	nextProfile := model.ModelProfile()
+	if nextProfile.Model.Labels["gemma4_size"] == "mutated" ||
+		nextProfile.Labels["engine_profile"] == "mutated" {
+		t.Fatalf("ModelProfile returned aliased data: %+v", nextProfile)
+	}
+
+	plan := model.ModelRoutePlan()
+	if !plan.Matched() ||
+		plan.Contract != ROCmModelRoutePlanContract ||
+		plan.Architecture != "gemma4_text" ||
+		plan.Model.ContextLength != 8192 ||
+		plan.Model.Labels["gemma4_size"] != "E4B" ||
+		plan.Labels["engine_route_plan_contract"] != ROCmModelRoutePlanContract ||
+		plan.Labels["engine_route_plan_cache_profile"] != "true" ||
+		plan.Labels["engine_route_plan_cache_profile_contract"] != rocmmodel.CacheProfileContract ||
+		plan.Labels["engine_route_plan_cache_profile_max_cache_tokens"] != "7" ||
+		plan.CacheProfile.MaxCacheTokens != 7 ||
+		plan.Labels["engine_route_plan_tokenizer"] != "true" {
+		t.Fatalf("ModelRoutePlan = %+v, want scheduled wrapper to preserve Gemma4 route plan with live cache profile", plan)
+	}
+	plan.Model.Labels["gemma4_size"] = "mutated"
+	plan.FeatureRoute.Labels["engine_feature_route_contract"] = "mutated"
+	nextPlan := model.ModelRoutePlan()
+	if nextPlan.Model.Labels["gemma4_size"] == "mutated" ||
+		nextPlan.FeatureRoute.Labels["engine_feature_route_contract"] == "mutated" {
+		t.Fatalf("ModelRoutePlan returned aliased data: %+v", nextPlan)
+	}
+	resolvedPlan, ok := ROCmModelRoutePlanForModel(model)
+	if !ok || !resolvedPlan.Matched() || resolvedPlan.Architecture != "gemma4_text" {
+		t.Fatalf("ROCmModelRoutePlanForModel(scheduled) = %+v ok=%v, want wrapped route plan", resolvedPlan, ok)
+	}
+
+	report := model.Capabilities()
+	if !report.Supports(inference.CapabilityScheduler) ||
+		!report.Supports(inference.CapabilityRequestCancel) ||
+		!report.Supports(inference.CapabilityGenerate) ||
+		!report.Supports(inference.CapabilityChatTemplate) ||
+		!report.Supports(inference.CapabilityReasoningParse) ||
+		!report.Supports(inference.CapabilityToolParse) ||
+		report.Model.ContextLength != 8192 ||
+		report.Model.QuantType != "q6" ||
+		report.Model.Labels["gemma4_size"] != "E4B" ||
+		report.Labels["engine_profile"] != "gemma4" ||
+		report.Labels["engine_feature_chat_template_id"] != "gemma4_hf_turn" ||
+		report.Labels["engine_feature_capabilities"] != "generate,chat.template,reasoning.parse,tool.parse" ||
+		report.Labels["engine_route_plan_contract"] != ROCmModelRoutePlanContract ||
+		report.Labels["engine_route_plan_cache_profile"] != "true" ||
+		report.Labels["engine_route_plan_cache_profile_max_cache_tokens"] != "7" ||
+		report.Labels["engine_route_plan_tokenizer"] != "true" ||
+		report.Labels["scheduler_wrapper"] != "rocm" ||
+		report.Labels["scheduler_queue_size"] != "1" {
+		t.Fatalf("Capabilities = %+v, want scheduled wrapper plus wrapped Gemma4 identity/report", report)
+	}
+	generateCapability, ok := report.Capability(inference.CapabilityGenerate)
+	if !ok ||
+		generateCapability.Labels["engine_profile"] != "gemma4" ||
+		generateCapability.Labels["engine_feature_chat_template_id"] != "gemma4_hf_turn" {
+		t.Fatalf("generate capability = %+v ok=%v, want reactive registry labels", generateCapability, ok)
+	}
+	chatTemplateCapability, ok := report.Capability(inference.CapabilityChatTemplate)
+	if !ok ||
+		chatTemplateCapability.Labels["engine_profile"] != "gemma4" ||
+		chatTemplateCapability.Labels["engine_feature_chat_template_id"] != "gemma4_hf_turn" ||
+		chatTemplateCapability.Labels["engine_feature_capabilities"] != "generate,chat.template,reasoning.parse,tool.parse" {
+		t.Fatalf("chat template capability = %+v ok=%v, want registry-declared capability labels", chatTemplateCapability, ok)
+	}
+	schedulerCapability, ok := report.Capability(inference.CapabilityScheduler)
+	if !ok ||
+		schedulerCapability.Labels["scheduler_wrapper"] != "rocm" ||
+		schedulerCapability.Labels["scheduler_queue_size"] != "1" {
+		t.Fatalf("scheduler capability = %+v ok=%v, want wrapper labels", schedulerCapability, ok)
+	}
+	report.Model.Labels["gemma4_size"] = "mutated"
+	report.Labels["scheduler_wrapper"] = "mutated"
+	for index := range report.Capabilities {
+		if report.Capabilities[index].ID == inference.CapabilityScheduler {
+			report.Capabilities[index].Labels["scheduler_wrapper"] = "mutated"
+		}
+		if report.Capabilities[index].ID == inference.CapabilityChatTemplate {
+			report.Capabilities[index].Labels["engine_profile"] = "mutated"
+		}
+	}
+	nextReport := model.Capabilities()
+	nextSchedulerCapability, ok := nextReport.Capability(inference.CapabilityScheduler)
+	nextChatTemplateCapability, chatTemplateOK := nextReport.Capability(inference.CapabilityChatTemplate)
+	if !ok ||
+		!chatTemplateOK ||
+		nextReport.Model.Labels["gemma4_size"] == "mutated" ||
+		nextReport.Labels["scheduler_wrapper"] == "mutated" ||
+		nextSchedulerCapability.Labels["scheduler_wrapper"] == "mutated" ||
+		nextChatTemplateCapability.Labels["engine_profile"] == "mutated" {
+		t.Fatalf("Capabilities returned aliased data: %+v scheduler=%+v chat_template=%+v ok=%v/%v", nextReport, nextSchedulerCapability, nextChatTemplateCapability, ok, chatTemplateOK)
+	}
+}
+
+func TestScheduler_Good_Gemma4ScheduleAllowsNegativeMaxTokensWithinContext(t *testing.T) {
+	fake := &schedulerFakeTextModel{
+		architecture:      "gemma4_text",
+		contextLength:     8,
+		encodeTokenCount:  3,
+		tokens:            []inference.Token{{Text: "ok"}},
+		started:           make(chan string, 1),
+		recordEncodeInput: true,
+	}
+	model, err := NewScheduledModel(fake, SchedulerConfig{QueueSize: 1})
+	core.RequireNoError(t, err)
+	defer model.Close()
+
+	handle, stream, err := model.Schedule(context.Background(), inference.ScheduledRequest{ID: "negative-window", Prompt: "prompt", Sampler: inference.SamplerConfig{MaxTokens: -1}})
+
+	core.RequireNoError(t, err)
+	core.AssertEqual(t, "negative-window", handle.ID)
+	core.AssertEqual(t, []string{"ok"}, collectScheduledTokenText(stream))
+	core.AssertEqual(t, "prompt", <-fake.started)
+	core.AssertEqual(t, "prompt", fake.lastEncodeInput())
+	core.AssertEqual(t, 5, fake.lastConfig.MaxTokens)
+}
+
+func TestScheduler_Good_Gemma4GenerateNegativeMaxTokensUsesRemainingContext(t *testing.T) {
+	fake := &schedulerFakeTextModel{
+		architecture:     "gemma4_text",
+		contextLength:    8,
+		encodeTokenCount: 3,
+		tokens:           []inference.Token{{Text: "ok"}},
+		started:          make(chan string, 1),
+	}
+	model, err := NewScheduledModel(fake, SchedulerConfig{QueueSize: 1})
+	core.RequireNoError(t, err)
+	defer model.Close()
+
+	tokens := collectTokenText(model.Generate(context.Background(), "prompt", inference.WithMaxTokens(-1)))
+
+	core.AssertEqual(t, []string{"ok"}, tokens)
+	core.AssertEqual(t, "prompt", <-fake.started)
+	core.AssertEqual(t, 5, fake.lastConfig.MaxTokens)
+}
+
+func TestScheduler_Bad_Gemma4ScheduleRejectsExplicitMaxTokensPastContext(t *testing.T) {
+	fake := &schedulerFakeTextModel{
+		architecture:     "gemma4_text",
+		contextLength:    8,
+		encodeTokenCount: 3,
+		tokens:           []inference.Token{{Text: "nope"}},
+		started:          make(chan string, 1),
+	}
+	model, err := NewScheduledModel(fake, SchedulerConfig{QueueSize: 1})
+	core.RequireNoError(t, err)
+	defer model.Close()
+
+	handle, stream, err := model.Schedule(context.Background(), inference.ScheduledRequest{ID: "too-long", Prompt: "prompt", Sampler: inference.SamplerConfig{MaxTokens: 6}})
+
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "max tokens exceed remaining model context window")
+	core.AssertContains(t, model.Err().Error(), "max tokens exceed remaining model context window")
+	core.AssertEqual(t, "", handle.ID)
+	if stream != nil {
+		t.Fatalf("stream = %v, want nil", stream)
+	}
+	select {
+	case started := <-fake.started:
+		t.Fatalf("started request %q, want enqueue rejected", started)
+	default:
+	}
+}
+
+func TestScheduler_Bad_Gemma4ReporterIdentityRejectsMaxTokensPastContext(t *testing.T) {
+	fake := &schedulerFakeTextModel{
+		architecture: "qwen3",
+		identity: inference.ModelIdentity{
+			Architecture:  "gemma4_text",
+			ContextLength: 8,
+		},
+		encodeTokenCount: 3,
+		tokens:           []inference.Token{{Text: "nope"}},
+		started:          make(chan string, 1),
+	}
+	model, err := NewScheduledModel(fake, SchedulerConfig{QueueSize: 1})
+	core.RequireNoError(t, err)
+	defer model.Close()
+
+	handle, stream, err := model.Schedule(context.Background(), inference.ScheduledRequest{ID: "reporter-too-long", Prompt: "prompt", Sampler: inference.SamplerConfig{MaxTokens: 6}})
+
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "max tokens exceed remaining model context window")
+	core.AssertContains(t, model.Err().Error(), "max tokens exceed remaining model context window")
+	core.AssertEqual(t, "", handle.ID)
+	if stream != nil {
+		t.Fatalf("stream = %v, want nil", stream)
+	}
+	select {
+	case started := <-fake.started:
+		t.Fatalf("started request %q, want enqueue rejected", started)
+	default:
+	}
+}
+
+func TestScheduler_Bad_Gemma4ScheduleRejectsPromptAtContextWindow(t *testing.T) {
+	model, err := NewScheduledModel(&schedulerFakeTextModel{architecture: "gemma4_text", contextLength: 4, encodeTokenCount: 4}, SchedulerConfig{QueueSize: 1})
+	core.RequireNoError(t, err)
+	defer model.Close()
+
+	_, stream, err := model.Schedule(context.Background(), inference.ScheduledRequest{ID: "full-prompt", Prompt: "prompt"})
+
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "prompt reaches model context window")
+	if stream != nil {
+		t.Fatalf("stream = %v, want nil", stream)
+	}
+}
+
+func TestScheduler_Bad_Gemma4ScheduleRejectsChatMaxTokensPastContext(t *testing.T) {
+	fake := &schedulerFakeTextModel{
+		architecture:      "gemma4_text",
+		contextLength:     8,
+		encodeTokenCount:  3,
+		started:           make(chan string, 1),
+		recordEncodeInput: true,
+	}
+	model, err := NewScheduledModel(fake, SchedulerConfig{QueueSize: 1})
+	core.RequireNoError(t, err)
+	defer model.Close()
+
+	_, stream, err := model.Schedule(context.Background(), inference.ScheduledRequest{
+		ID:       "chat-too-long",
+		Messages: []inference.Message{{Role: "user", Content: "hello"}},
+		Sampler:  inference.SamplerConfig{MaxTokens: 6},
+	})
+
+	core.AssertError(t, err)
+	core.AssertContains(t, err.Error(), "max tokens exceed remaining model context window")
+	core.AssertContains(t, fake.lastEncodeInput(), "<|turn>user\nhello<turn|>")
+	if stream != nil {
+		t.Fatalf("stream = %v, want nil", stream)
+	}
+	select {
+	case started := <-fake.started:
+		t.Fatalf("started request %q, want enqueue rejected", started)
+	default:
+	}
+}
+
+func TestScheduler_Good_NonGemmaSamplerKeepsDefaultMaxTokens(t *testing.T) {
+	model, err := NewScheduledModel(&schedulerFakeTextModel{architecture: "qwen3"}, SchedulerConfig{QueueSize: 1})
+	core.RequireNoError(t, err)
+	defer model.Close()
+
+	cfg := model.samplerConfigFromGenerateOptions(nil)
+
+	core.AssertEqual(t, inference.DefaultGenerateConfig().MaxTokens, cfg.MaxTokens)
 }
 
 func TestScheduler_Bad_GenerateClosedSchedulerSetsErr(t *testing.T) {
@@ -549,6 +941,13 @@ func TestScheduler_Good_EmitsProbeEvents(t *testing.T) {
 }
 
 type schedulerFakeTextModel struct {
+	architecture       string
+	identity           inference.ModelIdentity
+	profile            ROCmModelProfile
+	cacheProfile       rocmmodel.CacheProfile
+	contextLength      int
+	encodeTokenCount   int
+	recordEncodeInput  bool
 	tokens             []inference.Token
 	wait               <-chan struct{}
 	started            chan string
@@ -558,6 +957,7 @@ type schedulerFakeTextModel struct {
 	lastMetrics        inference.GenerateMetrics
 	lastError          error
 	lastConfig         inference.GenerateConfig
+	encodeInputs       []string
 	cancelledID        string
 	cancelErr          error
 	closeCalls         int
@@ -639,9 +1039,39 @@ func (m *schedulerFakeTextModel) BatchGenerate(_ context.Context, prompts []stri
 	}
 	return m.batchResults, m.batchErr
 }
-func (m *schedulerFakeTextModel) ModelType() string { return "fake" }
+func (m *schedulerFakeTextModel) Encode(prompt string) []int32 {
+	m.mu.Lock()
+	if m.recordEncodeInput {
+		m.encodeInputs = append(m.encodeInputs, prompt)
+	}
+	count := m.encodeTokenCount
+	m.mu.Unlock()
+	if count <= 0 {
+		return approximateTokenIDs(prompt)
+	}
+	ids := make([]int32, count)
+	for index := range ids {
+		ids[index] = int32(index + 1)
+	}
+	return ids
+}
+func (m *schedulerFakeTextModel) ContextLength() int {
+	return m.contextLength
+}
+func (m *schedulerFakeTextModel) ModelType() string {
+	return firstNonEmptyString(m.architecture, "fake")
+}
 func (m *schedulerFakeTextModel) Info() inference.ModelInfo {
-	return inference.ModelInfo{Architecture: "fake"}
+	return inference.ModelInfo{Architecture: firstNonEmptyString(m.architecture, "fake")}
+}
+func (m *schedulerFakeTextModel) ModelIdentity() inference.ModelIdentity {
+	return m.identity
+}
+func (m *schedulerFakeTextModel) ModelProfile() ROCmModelProfile {
+	return m.profile
+}
+func (m *schedulerFakeTextModel) CacheProfile(context.Context) (rocmmodel.CacheProfile, error) {
+	return m.cacheProfile.Clone(), nil
 }
 func (m *schedulerFakeTextModel) Metrics() inference.GenerateMetrics {
 	m.mu.Lock()
@@ -671,6 +1101,15 @@ func (m *schedulerFakeTextModel) setErr(err error) {
 	m.mu.Lock()
 	m.lastError = err
 	m.mu.Unlock()
+}
+
+func (m *schedulerFakeTextModel) lastEncodeInput() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.encodeInputs) == 0 {
+		return ""
+	}
+	return m.encodeInputs[len(m.encodeInputs)-1]
 }
 
 func collectScheduledTokenText(stream <-chan inference.ScheduledToken) []string {

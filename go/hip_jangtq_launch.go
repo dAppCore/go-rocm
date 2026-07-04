@@ -164,9 +164,18 @@ func (req hipJANGTQProjectionRequest) launchArgs(buffers *hipJANGTQDeviceBuffers
 }
 
 func (args hipJANGTQLaunchArgs) Binary() ([]byte, error) {
+	payload := make([]byte, hipJANGTQLaunchArgsBytes)
+	return args.BinaryInto(payload)
+}
+
+func (args hipJANGTQLaunchArgs) BinaryInto(payload []byte) ([]byte, error) {
 	if args.InputPointer == 0 || args.PackedPointer == 0 || args.OutputPointer == 0 {
 		return nil, core.E("rocm.hip.JANGTQLaunch", "input, packed weight, and output pointers are required", nil)
 	}
+	if len(payload) < hipJANGTQLaunchArgsBytes {
+		return nil, core.E("rocm.hip.JANGTQLaunch", "launch arg payload buffer is too small", nil)
+	}
+	payload = payload[:hipJANGTQLaunchArgsBytes]
 	if err := validateROCmJANGTQDescriptor(rocmJANGTQDescriptor{WeightFormat: "mxtq", Bits: args.Bits, GroupSize: args.GroupSize}); err != nil {
 		return nil, err
 	}
@@ -217,7 +226,6 @@ func (args hipJANGTQLaunchArgs) Binary() ([]byte, error) {
 	}
 	bits := uint32(args.Bits)
 	groupSize := uint32(args.GroupSize)
-	payload := make([]byte, hipJANGTQLaunchArgsBytes)
 	binary.LittleEndian.PutUint32(payload[0:], hipJANGTQLaunchArgsVersion)
 	binary.LittleEndian.PutUint32(payload[4:], uint32(len(payload)))
 	binary.LittleEndian.PutUint64(payload[8:], uint64(args.InputPointer))
@@ -252,17 +260,29 @@ func (buffers *hipJANGTQDeviceBuffers) Close() error {
 }
 
 func (buffers *hipJANGTQDeviceBuffers) ReadOutput() ([]float32, error) {
+	if buffers == nil {
+		return nil, core.E("rocm.hip.JANGTQLaunch", "JANGTQ output buffer is required", nil)
+	}
+	payload := make([]byte, buffers.Rows*4)
+	values := make([]float32, buffers.Rows)
+	return buffers.ReadOutputInto(values, payload)
+}
+
+func (buffers *hipJANGTQDeviceBuffers) ReadOutputInto(values []float32, payload []byte) ([]float32, error) {
 	if buffers == nil || buffers.Output == nil || buffers.Output.Pointer() == 0 {
 		return nil, core.E("rocm.hip.JANGTQLaunch", "JANGTQ output buffer is required", nil)
 	}
 	if buffers.Rows <= 0 || buffers.Output.Count() != buffers.Rows || buffers.Output.SizeBytes() != uint64(buffers.Rows*4) {
 		return nil, core.E("rocm.hip.JANGTQLaunch", "JANGTQ output byte count mismatch", nil)
 	}
-	payload := make([]byte, buffers.Output.SizeBytes())
+	if len(payload) < int(buffers.Output.SizeBytes()) {
+		return nil, core.E("rocm.hip.JANGTQLaunch", "JANGTQ output payload buffer is too small", nil)
+	}
+	payload = payload[:buffers.Output.SizeBytes()]
 	if err := buffers.Output.driver.CopyDeviceToHost(buffers.Output.Pointer(), payload); err != nil {
 		return nil, core.E("rocm.hip.JANGTQLaunch", "copy JANGTQ output", err)
 	}
-	values, err := hipFloat32PayloadValues(payload)
+	values, err := hipFloat32PayloadValuesInto(values, payload)
 	if err != nil {
 		return nil, err
 	}

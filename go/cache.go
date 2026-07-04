@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"slices"
 	"strconv"
 	"sync"
 
@@ -254,6 +255,35 @@ func (service *BlockCacheService) ClearCache(ctx context.Context, labels map[str
 	return stats, nil
 }
 
+func (service *BlockCacheService) CacheEntries(ctx context.Context, labels map[string]string) ([]inference.CacheBlockRef, error) {
+	if service == nil {
+		return nil, core.E("rocm.CacheEntries", "cache service is nil", nil)
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	refs := make([]inference.CacheBlockRef, 0, len(service.blocks))
+	for _, block := range service.blocks {
+		if labelsMatch(block.labels, labels) {
+			refs = append(refs, cloneCacheBlockRef(block.ref))
+		}
+	}
+	slices.SortFunc(refs, func(a, b inference.CacheBlockRef) int {
+		if a.ID < b.ID {
+			return -1
+		}
+		if a.ID > b.ID {
+			return 1
+		}
+		return 0
+	})
+	return refs, nil
+}
+
 func (service *BlockCacheService) Close() error {
 	if service == nil {
 		return nil
@@ -308,6 +338,8 @@ func (service *BlockCacheService) cacheBlockPayload(tokens []int32, mode string,
 		labels["kv_backing"] = "package_local"
 		labels["kv_cache_block_size"] = core.Sprintf("%d", blockSize)
 		labels["kv_device_backing"] = "planned"
+		labels["kv_pages"] = core.Sprintf("%d", cache.PageCount())
+		labels["kv_tokens"] = core.Sprintf("%d", cache.TokenCount())
 		labels["kv_cache_constructible"] = "true"
 		labels["kv_cache_snapshot"] = "portable"
 		labels["kv_key_width"] = core.Sprintf("%d", keyWidth)
@@ -354,6 +386,11 @@ func positiveIntLabel(labels map[string]string, key string, fallback int) (int, 
 func cacheWarmKVTensors(tokens []int32, keyWidth, valueWidth int) ([]float32, []float32) {
 	keys := make([]float32, len(tokens)*keyWidth)
 	values := make([]float32, len(tokens)*valueWidth)
+	cacheWarmKVTensorsInto(tokens, keyWidth, valueWidth, keys, values)
+	return keys, values
+}
+
+func cacheWarmKVTensorsInto(tokens []int32, keyWidth, valueWidth int, keys, values []float32) {
 	for i, token := range tokens {
 		for j := 0; j < keyWidth; j++ {
 			keys[i*keyWidth+j] = float32(token) + float32(j)/1000
@@ -362,7 +399,6 @@ func cacheWarmKVTensors(tokens []int32, keyWidth, valueWidth int) ([]float32, []
 			values[i*valueWidth+j] = float32(token) - float32(j)/1000
 		}
 	}
-	return keys, values
 }
 
 func isROCmKVCacheMode(mode string) bool {
@@ -407,11 +443,12 @@ func (service *BlockCacheService) statsLocked() inference.CacheStats {
 	if largestBlock.ref.Encoding != "" {
 		cacheMode = largestBlock.ref.Encoding
 	}
-	for _, key := range []string{"kv_backing", "kv_cache_block_size", "kv_cache_constructible", "kv_cache_snapshot", "kv_device_backing", "kv_device_bytes", "kv_device_error", "kv_device_pages", "kv_device_restore", "kv_device_tokens", "kv_key_width", "kv_value_width", "disk_cache_restore", "disk_uri", "disk_codec", "disk_chunk_id", "disk_encoding", "disk_kind"} {
+	for _, key := range []string{"kv_backing", "kv_cache_block_size", "kv_cache_constructible", "kv_cache_snapshot", "kv_device_backing", "kv_device_bytes", "kv_device_error", "kv_device_pages", "kv_device_restore", "kv_device_tokens", "kv_key_width", "kv_value_width", "kv_pages", "kv_tokens", "disk_cache_restore", "disk_uri", "disk_codec", "disk_chunk_id", "disk_encoding", "disk_kind"} {
 		if largestBlock.labels[key] != "" {
 			labels[key] = largestBlock.labels[key]
 		}
 	}
+	labels = rocmApplyCacheProfileLabels(labels, service.cacheProfileLocked(""))
 	return inference.CacheStats{
 		Blocks:        len(service.blocks),
 		MemoryBytes:   memoryBytes,
@@ -627,22 +664,57 @@ func validateCacheKVSnapshotTokens(cache *rocmKVCache, tokens []int32) error {
 	if err != nil {
 		return err
 	}
-	keys, values := cacheWarmKVTensors(tokens, keyWidth, valueWidth)
-	if err := expected.AppendVectors(0, keyWidth, valueWidth, keys, values); err != nil {
-		return err
+	maxBlockTokens := cache.blockSize
+	if maxBlockTokens <= 0 || maxBlockTokens > len(tokens) {
+		maxBlockTokens = len(tokens)
 	}
-	actualKeys, actualValues, err := cache.Restore(0, len(tokens))
-	if err != nil {
-		return core.E("rocm.CacheWarm", "restore disk KV cache token range", err)
+	keys := make([]float32, maxBlockTokens*keyWidth)
+	values := make([]float32, maxBlockTokens*valueWidth)
+	for tokenStart := 0; tokenStart < len(tokens); tokenStart += maxBlockTokens {
+		tokenEnd := tokenStart + maxBlockTokens
+		if tokenEnd > len(tokens) {
+			tokenEnd = len(tokens)
+		}
+		blockTokens := tokens[tokenStart:tokenEnd]
+		keyCount := len(blockTokens) * keyWidth
+		valueCount := len(blockTokens) * valueWidth
+		cacheWarmKVTensorsInto(blockTokens, keyWidth, valueWidth, keys[:keyCount], values[:valueCount])
+		if err := expected.AppendVectors(tokenStart, keyWidth, valueWidth, keys[:keyCount], values[:valueCount]); err != nil {
+			return err
+		}
 	}
-	expectedKeys, expectedValues, err := expected.Restore(0, len(tokens))
-	if err != nil {
-		return err
-	}
-	if !float32SlicesEqual(actualKeys, expectedKeys) || !float32SlicesEqual(actualValues, expectedValues) {
+	if !rocmKVCacheBlocksEqual(cache.blocks, expected.blocks) {
 		return core.E("rocm.CacheWarm", "disk KV cache ref does not match warm request", nil)
 	}
 	return nil
+}
+
+func rocmKVCacheBlocksEqual(left, right []rocmKVCacheBlock) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index].tokenStart != right[index].tokenStart ||
+			left[index].tokenCount != right[index].tokenCount ||
+			left[index].keyWidth != right[index].keyWidth ||
+			left[index].valueWidth != right[index].valueWidth ||
+			!rocmKVEncodedTensorEqual(left[index].key, right[index].key) ||
+			!rocmKVEncodedTensorEqual(left[index].value, right[index].value) {
+			return false
+		}
+	}
+	return true
+}
+
+func rocmKVEncodedTensorEqual(left, right rocmKVEncodedTensor) bool {
+	return left.encoding == right.encoding &&
+		left.length == right.length &&
+		left.scale == right.scale &&
+		left.sizeBytes == right.sizeBytes &&
+		slices.Equal(left.scales, right.scales) &&
+		slices.Equal(left.f16, right.f16) &&
+		slices.Equal(left.q8, right.q8) &&
+		slices.Equal(left.packedQ4, right.packedQ4)
 }
 
 func float32SlicesEqual(left, right []float32) bool {
@@ -884,6 +956,16 @@ func (m *rocmModel) ClearCache(ctx context.Context, labels map[string]string) (s
 	return m.blockCacheService().ClearCache(ctx, labels)
 }
 
+func (m *rocmModel) CacheEntries(ctx context.Context, labels map[string]string) (entries []inference.CacheBlockRef, err error) {
+	m.clearLastError()
+	defer func() {
+		if err != nil {
+			m.setLastFailure(err)
+		}
+	}()
+	return m.blockCacheService().CacheEntries(ctx, labels)
+}
+
 func (m *rocmModel) blockCacheService() *BlockCacheService {
 	if m == nil {
 		return NewBlockCacheService(BlockCacheConfig{CacheMode: "block-prefix"})
@@ -911,28 +993,6 @@ func (m *rocmModel) blockCacheDeviceDriver() nativeHIPDriver {
 		return nil
 	}
 	return loaded.driver
-}
-
-func cloneStringMap(in map[string]string) map[string]string {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(in))
-	for key, value := range in {
-		out[key] = value
-	}
-	return out
-}
-
-func mergeStringMaps(left, right map[string]string) map[string]string {
-	out := cloneStringMap(left)
-	if out == nil {
-		out = map[string]string{}
-	}
-	for key, value := range right {
-		out[key] = value
-	}
-	return out
 }
 
 func labelsMatch(labels, filter map[string]string) bool {

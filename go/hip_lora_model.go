@@ -226,7 +226,7 @@ func (model *hipLoadedModel) loadSmallLoRAAdapter(path string, cfg hipLoadedSmal
 			"decode_architecture": cfg.Architecture,
 			"lora_kernel":         hipKernelStatusLinked,
 			"lora_kernel_name":    hipKernelNameLoRA,
-			"lora_model_status":   "experimental_qwen_gemma_small_decode",
+			"lora_model_status":   hipSmallDecodeLoRAModelStatus(cfg.Architecture),
 			"target":              firstNonEmptyString(file.Target, "output.weight"),
 			"target_hidden_size":  core.Sprintf("%d", cfg.HiddenSize),
 			"target_vocab_size":   core.Sprintf("%d", cfg.VocabSize),
@@ -645,5 +645,5 @@ func (model *hipLoadedModel) addSmallLoRALabels(labels map[string]string) {
 	labels["adapter_runtime"] = "hip_small_lm_head"
 	labels["lora_kernel"] = hipKernelStatusLinked
 	labels["lora_kernel_name"] = hipKernelNameLoRA
-	labels["lora_model_status"] = "experimental_qwen_gemma_small_decode"
+	labels["lora_model_status"] = hipSmallDecodeLoRAModelStatus(model.modelInfo.Architecture)
 }

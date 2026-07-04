@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"iter"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -16,6 +17,7 @@ import (
 
 	core "dappco.re/go"
 	"dappco.re/go/inference"
+	rocmmodel "dappco.re/go/rocm/model"
 )
 
 func TestNativeContract_RocmBackendImplementsSharedPlanner_Good(t *testing.T) {
@@ -33,6 +35,126 @@ func TestNativeContract_RocmModelImplementsSharedContracts_Good(t *testing.T) {
 	var _ inference.BenchableModel = (*rocmModel)(nil)
 	var _ inference.Evaluator = (*rocmModel)(nil)
 	var _ inference.CapabilityReporter = (*rocmModel)(nil)
+	var _ ROCmModelIdentityReporter = (*rocmModel)(nil)
+	var _ ROCmModelProfileReporter = (*rocmModel)(nil)
+	var _ ROCmModelRoutePlanReporter = (*rocmModel)(nil)
+}
+
+func TestNativeContract_RocmModelReactiveRegistryReporters_Good(t *testing.T) {
+	model := &rocmModel{
+		native: &hipLoadedModel{
+			contextSize: 8192,
+			modelLabels: map[string]string{
+				"runtime_label": "loaded",
+			},
+		},
+		modelPath: "/models/lmstudio-community-gemma-4-e4b-it-6bit",
+		modelType: "gemma4_text",
+		modelInfo: inference.ModelInfo{
+			Architecture: "gemma4_text",
+			VocabSize:    262144,
+			NumLayers:    26,
+			HiddenSize:   2304,
+			QuantBits:    6,
+			QuantGroup:   64,
+		},
+		modelLabels: map[string]string{
+			"gemma4_size":       "E4B",
+			"gemma4_quant_mode": "q6",
+			"model_label":       "base",
+		},
+		engineProfile: ROCmModelProfile{
+			Name:     "gemma4",
+			Family:   "gemma4",
+			Registry: rocmModelRegistryName,
+			EngineFeatures: ROCmEngineFeatures{
+				Contract:     rocmEngineFeaturesContract,
+				Capabilities: []inference.CapabilityID{inference.CapabilityGenerate},
+				Labels:       map[string]string{"engine_feature_text_generate": "true"},
+			},
+			Gemma4EngineFeatures: Gemma4EngineFeatures{
+				ModelContextWindow: true,
+				TextGenerate:       true,
+				MLXAffineDecode:    true,
+				DeviceKVState:      true,
+			},
+			Labels: map[string]string{"engine_profile": "gemma4"},
+		},
+	}
+
+	_, err := model.WarmCache(context.Background(), inference.CacheWarmRequest{
+		Mode:   rocmKVCacheModeQ8,
+		Tokens: []int32{1, 2, 3},
+	})
+	core.RequireNoError(t, err)
+
+	identity := model.ModelIdentity()
+	if identity.Path != model.modelPath ||
+		identity.Architecture != "gemma4_text" ||
+		identity.ContextLength != 8192 ||
+		identity.QuantType != "q6" ||
+		identity.Labels["model_label"] != "base" ||
+		identity.Labels["runtime_label"] != "loaded" {
+		t.Fatalf("ModelIdentity = %+v, want loaded context and merged model labels", identity)
+	}
+	identity.Labels["model_label"] = "mutated"
+	if next := model.ModelIdentity(); next.Labels["model_label"] == "mutated" {
+		t.Fatalf("ModelIdentity returned aliased labels: %+v", next.Labels)
+	}
+
+	profile := model.ModelProfile()
+	if !profile.Matched() ||
+		profile.Model.ContextLength != 8192 ||
+		profile.Model.Labels["runtime_label"] != "loaded" ||
+		!profile.Gemma4EngineFeatures.GenerateLinked() ||
+		!slices.Contains(profile.EngineFeatures.Capabilities, inference.CapabilityGenerate) {
+		t.Fatalf("ModelProfile = %+v, want loaded reactive registry profile", profile)
+	}
+	profile.Model.Labels["runtime_label"] = "mutated"
+	profile.EngineFeatures.Capabilities[0] = inference.CapabilityChat
+	profile.EngineFeatures.Labels["engine_feature_text_generate"] = "mutated"
+	profile.Labels["engine_profile"] = "mutated"
+	nextProfile := model.ModelProfile()
+	if nextProfile.Model.Labels["runtime_label"] == "mutated" ||
+		nextProfile.EngineFeatures.Capabilities[0] == inference.CapabilityChat ||
+		nextProfile.EngineFeatures.Labels["engine_feature_text_generate"] == "mutated" ||
+		nextProfile.Labels["engine_profile"] == "mutated" {
+		t.Fatalf("ModelProfile returned aliased profile data: %+v", nextProfile)
+	}
+
+	plan := model.ModelRoutePlan()
+	if !plan.Matched() ||
+		plan.Contract != ROCmModelRoutePlanContract ||
+		plan.Architecture != "gemma4_text" ||
+		plan.Model.ContextLength != 8192 ||
+		plan.Model.Labels["runtime_label"] != "loaded" ||
+		!plan.FeatureRoute.Matched() ||
+		plan.Labels["engine_route_plan_contract"] != ROCmModelRoutePlanContract ||
+		plan.Labels["engine_route_plan_cache_profile"] != "true" ||
+		plan.Labels["engine_route_plan_cache_profile_contract"] != rocmmodel.CacheProfileContract ||
+		plan.Labels["engine_route_plan_cache_profile_max_cache_tokens"] != "3" ||
+		plan.CacheProfile.MaxCacheTokens != 3 ||
+		plan.Labels["engine_route_plan_feature"] != "true" {
+		t.Fatalf("ModelRoutePlan = %+v, want loaded model-owned route plan with live cache profile", plan)
+	}
+	plan.Model.Labels["runtime_label"] = "mutated"
+	plan.FeatureRoute.Labels["engine_feature_route_contract"] = "mutated"
+	nextPlan := model.ModelRoutePlan()
+	if nextPlan.Model.Labels["runtime_label"] == "mutated" ||
+		nextPlan.FeatureRoute.Labels["engine_feature_route_contract"] == "mutated" {
+		t.Fatalf("ModelRoutePlan returned aliased route data: %+v", nextPlan)
+	}
+	resolvedPlan, ok := ROCmModelRoutePlanForModel(model)
+	if !ok || !resolvedPlan.Matched() || resolvedPlan.Architecture != "gemma4_text" {
+		t.Fatalf("ROCmModelRoutePlanForModel = %+v ok=%v, want loaded model route plan", resolvedPlan, ok)
+	}
+	report := model.Capabilities()
+	if report.Labels["engine_route_plan_contract"] != ROCmModelRoutePlanContract ||
+		report.Labels["engine_route_plan_cache_profile"] != "true" ||
+		report.Labels["engine_route_plan_cache_profile_max_cache_tokens"] != "3" ||
+		report.Labels["engine_route_plan_feature"] != "true" {
+		t.Fatalf("Capabilities labels = %+v, want live route-plan labels", report.Labels)
+	}
 }
 
 func TestNativeContract_RocmBackendCapabilities_Good(t *testing.T) {
@@ -68,20 +190,63 @@ func TestNativeContract_RocmBackendCapabilities_Good(t *testing.T) {
 	if !report.Supports(inference.CapabilityTokenizer) || !report.Supports(inference.CapabilityProbeEvents) {
 		t.Fatalf("capabilities = %+v, want fallback tokenizer and probe stream", report.CapabilityIDs())
 	}
-	metadataFixtures := nativeContractMetadataFixtureKernels()
-	if cap, ok := report.Capability(inference.CapabilityJANGTQ); !ok || cap.Status != inference.CapabilityStatusExperimental ||
-		cap.Labels["runtime_status"] != string(inference.FeatureRuntimeMetadataOnly) ||
-		cap.Labels["fixture_kernel_name"] != metadataFixtures[inference.CapabilityJANGTQ] ||
-		cap.Labels["production_integration"] != "pending" {
-		t.Fatalf("JANGTQ capability = %+v ok=%v, want metadata-only experimental groundwork", cap, ok)
+	if cap, ok := report.Capability(inference.CapabilityQuantization); !ok || cap.Status != inference.CapabilityStatusExperimental ||
+		cap.Labels["kv_compression"] != rocmTurboQuantKVMode ||
+		cap.Labels["kv_compression_bits"] != "3.5" ||
+		cap.Labels["kv_compression_default"] != "true" ||
+		cap.Labels["kv_compression_group_size"] != rocmTurboQuantKVDefaultGroupLabel ||
+		cap.Labels["kv_compression_runtime"] != "cpu_reference" ||
+		cap.Labels["autoround_algorithms"] != productionAutoRoundAlgorithmsLabel ||
+		cap.Labels["autoround_formats"] != productionAutoRoundFormatsLabel ||
+		cap.Labels["autoround_weight_schemes"] != productionAutoRoundSchemesLabel ||
+		cap.Labels["autoround_float_formats"] != productionAutoRoundFloatFormatsLabel ||
+		cap.Labels["autoround_group_sizes"] != productionAutoRoundGroupSizesLabel ||
+		cap.Labels["autoround_profiles"] != productionAutoRoundProfilesLabel ||
+		cap.Labels["autoround_calibration_evidence_helper"] != "ApplyProductionAutoRoundCalibrationLabelEvidence" ||
+		cap.Labels["autoround_calibration_decision_helper"] != "EvaluateProductionAutoRoundCalibrationEvidence" ||
+		cap.Labels["autoround_calibration_decision_labels"] != productionAutoRoundCalibrationDecisionLabelsLabel ||
+		cap.Labels["autoround_calibration_decision_label_evidence_helper"] != "ApplyProductionAutoRoundCalibrationDecisionLabelEvidence" ||
+		cap.Labels["autoround_calibration_decision_label_evaluator"] != "EvaluateProductionAutoRoundCalibrationDecisionLabels" ||
+		cap.Labels["autoround_calibration_decision_validator"] != "ValidateProductionAutoRoundCalibrationDecisionLabels" ||
+		cap.Labels["autoround_calibration_evidence_decision_label_helper"] != "ApplyProductionAutoRoundCalibrationEvidenceDecisionLabels" ||
+		cap.Labels["autoround_calibration_evidence_decision_validator"] != "ValidateProductionAutoRoundCalibrationEvidenceDecisionLabels" ||
+		cap.Labels["autoround_calibration_labels"] != productionAutoRoundCalibrationLabelsLabel ||
+		cap.Labels["autoround_calibration_knobs"] != "nsamples,seqlen,iters" ||
+		cap.Labels["autoround_calibration_validator"] != "ValidateProductionAutoRoundCalibrationLabels" ||
+		cap.Labels["autoround_runtime"] != "planned_hip" ||
+		cap.Labels["autoround_hip_kernel"] != hipKernelStatusNotLinked ||
+		cap.Labels["production_candidate_gate"] != "linked" ||
+		cap.Labels["production_explicit_opt_in_required"] != "false" ||
+		cap.Labels["production_fast_lane_default"] != "true" ||
+		cap.Labels["production_requires_cli_flag"] != "false" ||
+		cap.Labels["production_requires_env_gate"] != "false" ||
+		cap.Labels["production_hip_integration"] != hipKernelStatusNotLinked {
+		t.Fatalf("quantization capability = %+v ok=%v, want production TurboQuant KV fast-lane labels", cap, ok)
 	}
-	for _, id := range []inference.CapabilityID{inference.CapabilityMoERouting, inference.CapabilityMoELazyExperts, inference.CapabilityCodebookVQ} {
+	cap, ok := report.Capability(inference.CapabilityQuantization)
+	if !ok ||
+		cap.Labels["production_required_layout_version"] != ProductionTurboQuantKVLayoutVersion ||
+		cap.Labels["production_required_key_algorithm"] != ProductionTurboQuantKeyAlgorithm ||
+		cap.Labels["production_required_value_algorithm"] != ProductionTurboQuantValueAlgorithm ||
+		cap.Labels["production_required_outlier_policy"] != ProductionTurboQuantOutlierPolicy ||
+		cap.Labels["production_combined_gate"] != ProductionCombinedMTPAndTurboQuantMode ||
+		!strings.Contains(cap.Labels["production_compare_cache_modes"], rocmKVCacheModeKQ8VQ4) {
+		t.Fatalf("quantization capability = %+v ok=%v, want TurboQuant production gate evidence labels", cap, ok)
+	}
+	assertCSVLabelContainsAll(t, "production_required_metrics", cap.Labels["production_required_metrics"], defaultProductionTurboQuantRequiredMetrics)
+	assertCSVLabelContainsAll(t, "production_combined_required_metrics", cap.Labels["production_combined_required_metrics"], defaultProductionCombinedMTPAndTurboQuantRequiredMetrics)
+	if !stringSliceContains(report.CacheModes, rocmTurboQuantKVMode) {
+		t.Fatalf("cache modes = %+v, want research TurboQuant KV mode advertised", report.CacheModes)
+	}
+	metadataFixtures := nativeContractMetadataFixtureKernels()
+	for _, id := range []inference.CapabilityID{inference.CapabilityMoERouting, inference.CapabilityMoELazyExperts, inference.CapabilityJANGTQ, inference.CapabilityCodebookVQ} {
 		if cap, ok := report.Capability(id); !ok || cap.Status != inference.CapabilityStatusExperimental ||
-			cap.Labels["runtime_status"] != string(inference.FeatureRuntimeMetadataOnly) ||
+			cap.Labels["runtime_status"] != string(inference.FeatureRuntimeExperimental) ||
+			cap.Labels["fixture_kernel"] != hipKernelStatusLinked ||
 			cap.Labels["fixture_kernel_name"] != metadataFixtures[id] ||
 			cap.Labels["required_integration"] == "" ||
 			cap.Labels["production_integration"] != "pending" {
-			t.Fatalf("metadata capability %s = %+v ok=%v, want metadata-only experimental", id, cap, ok)
+			t.Fatalf("fixture capability %s = %+v ok=%v, want linked fixture kernel with production pending", id, cap, ok)
 		}
 	}
 	if cap, ok := report.Capability(inference.CapabilityScheduler); !ok || cap.Status != inference.CapabilityStatusSupported {
@@ -142,16 +307,49 @@ func TestNativeContract_RocmBackendCapabilities_Good(t *testing.T) {
 			t.Fatalf("state capability %s = %+v ok=%v, want experimental state lifecycle groundwork", id, cap, ok)
 		}
 	}
+	if cap, ok := report.Capability(inference.CapabilityAgentMemory); !ok ||
+		cap.Labels["hierarchical_memory_pretraining"] != "experimental" ||
+		cap.Labels["memory_pretraining_package"] != "dappco.re/go/rocm/memorypretrain" ||
+		cap.Labels["memory_bank_builder"] != "hierarchical_kmeans" ||
+		cap.Labels["memory_pretraining_retrieval"] != "leaf_cluster_topk" ||
+		cap.Labels["memory_pretraining_injection"] != "additive" ||
+		cap.Labels["memory_pretraining_runtime"] != "cpu_native" ||
+		cap.Labels["memory_pretraining_hip_injection"] != "pending" ||
+		cap.Labels["memory_pretraining_training_bridge"] != "RunModelNativeSimpleSelfDistillationMemoryPretraining" ||
+		cap.Labels["memory_pretraining_optimizer_track"] != "append_only_adamw" ||
+		cap.Labels["memory_pretraining_optimizer_track_containers"] != "kv,mp4,binary" ||
+		cap.Labels["memory_pretraining_optimizer_track_frames"] != "propagated" ||
+		cap.Labels["memory_pretraining_optimizer_track_finder"] != "FindNativeAdamWStateTrackStep" ||
+		cap.Labels["memory_pretraining_optimizer_track_lister"] != "ListNativeAdamWStateTrack" ||
+		cap.Labels["memory_pretraining_optimizer_track_loader"] != "LoadNativeAdamWStateTrackStep" ||
+		cap.Labels["memory_pretraining_hot_path_benchmarks"] != "present" {
+		t.Fatalf("agent memory capability = %+v ok=%v, want hierarchical-memory pretraining labels", cap, ok)
+	}
 	if cap, ok := report.Capability(inference.CapabilityBenchmark); !ok || cap.Status != inference.CapabilityStatusExperimental {
 		t.Fatalf("benchmark capability = %+v ok=%v, want experimental benchmark wrapper", cap, ok)
 	}
 	if cap, ok := report.Capability(inference.CapabilityResponsesAPI); !ok || cap.Status != inference.CapabilityStatusExperimental {
-		t.Fatalf("responses capability = %+v ok=%v, want experimental non-streaming handler", cap, ok)
+		t.Fatalf("responses capability = %+v ok=%v, want experimental streaming handler", cap, ok)
+	} else if !strings.Contains(cap.Detail, "SSE streaming") || strings.Contains(cap.Detail, "streaming is pending") {
+		t.Fatalf("responses capability = %+v, want streaming advertised", cap)
 	}
 	for _, id := range []inference.CapabilityID{inference.CapabilityAnthropicMessages, inference.CapabilityOllamaCompat} {
 		if cap, ok := report.Capability(id); !ok || cap.Status != inference.CapabilityStatusExperimental {
-			t.Fatalf("wire capability %s = %+v ok=%v, want experimental non-streaming handler", id, cap, ok)
+			t.Fatalf("wire capability %s = %+v ok=%v, want experimental handler", id, cap, ok)
 		}
+	}
+	if cap, ok := report.Capability(inference.CapabilityAnthropicMessages); !ok ||
+		!strings.Contains(cap.Detail, "SSE streaming") ||
+		strings.Contains(cap.Detail, "streaming is pending") {
+		t.Fatalf("Anthropic capability = %+v ok=%v, want streaming advertised", cap, ok)
+	}
+	if cap, ok := report.Capability(inference.CapabilityOllamaCompat); !ok ||
+		!strings.Contains(cap.Detail, "streaming") ||
+		!strings.Contains(cap.Detail, "/api/tags") ||
+		!strings.Contains(cap.Detail, "/api/show") ||
+		strings.Contains(cap.Detail, "streaming remains pending") ||
+		strings.Contains(cap.Detail, "model registry endpoints are pending") {
+		t.Fatalf("Ollama capability = %+v ok=%v, want streaming registry tags/show advertised", cap, ok)
 	}
 	requiredTrainingKernels := map[inference.CapabilityID]string{
 		inference.CapabilityLoRATraining: "lora_backward",
@@ -168,13 +366,55 @@ func TestNativeContract_RocmBackendCapabilities_Good(t *testing.T) {
 			cap.Labels["runtime_status"] != string(inference.FeatureRuntimePlanned) ||
 			cap.Labels["training_kernel"] != hipKernelStatusNotLinked ||
 			cap.Labels["training_interface"] != "not_implemented" ||
-			cap.Labels["required_kernel"] != requiredTrainingKernels[id] {
+			cap.Labels["required_kernel"] != requiredTrainingKernels[id] ||
+			cap.Labels["optimizer_status"] != "update_only" ||
+			cap.Labels["optimizer_backend"] != "reference" ||
+			cap.Labels["optimizer_kernel"] != hipKernelStatusNotLinked ||
+			cap.Labels["optimizer_direct_helper"] != "RunNativeAdamWUpdate" ||
+			cap.Labels["optimizer_helper"] != "RunNativeAdamWUpdatePass" ||
+			cap.Labels["optimizer_launch_args"] != "hipAdamWUpdateLaunchArgs" ||
+			cap.Labels["optimizer_launch_args_bytes"] != "128" ||
+			cap.Labels["optimizer_layout"] != "packed_contiguous_parameters_m_v" ||
+			cap.Labels["optimizer_track"] != "append_only" ||
+			cap.Labels["optimizer_track_containers"] != "kv,mp4,binary" ||
+			cap.Labels["optimizer_track_helper"] != "AppendNativeAdamWStateTrack" ||
+			cap.Labels["optimizer_track_list_helper"] != "ListNativeAdamWStateTrack" ||
+			cap.Labels["optimizer_track_find_helper"] != "FindNativeAdamWStateTrackStep" ||
+			cap.Labels["optimizer_track_load_step_helper"] != "LoadNativeAdamWStateTrackStep" {
 			t.Fatalf("training capability %s = %+v ok=%v, want planned/not-linked training labels", id, cap, ok)
 		}
 		if fixture := trainingFixtureKernels[id]; fixture != "" {
 			if cap.Labels["fixture_kernel"] != hipKernelStatusNotLinked || cap.Labels["fixture_kernel_name"] != fixture {
 				t.Fatalf("training capability %s labels = %+v, want not-linked toy fixture kernel %s without native kernels", id, cap.Labels, fixture)
 			}
+		}
+		if id == inference.CapabilityLoRATraining &&
+			(cap.Labels["lora_update_helper"] != "RunNativeLoRAAdamWUpdatePass" ||
+				cap.Labels["lora_backward_backend"] != "reference" ||
+				cap.Labels["lora_adapter_snapshot_helper"] != "SaveNativeLoRAAdapterSnapshot" ||
+				cap.Labels["lora_adapter_track_latest_snapshot_helper"] != "SaveNativeLoRAAdapterSnapshotTrackLast" ||
+				cap.Labels["lora_adapter_track_snapshot_helper"] != "SaveNativeLoRAAdapterSnapshotTrackStep") {
+			t.Fatalf("LoRA training capability labels = %+v, want reference LoRA update helper", cap.Labels)
+		}
+		if id == inference.CapabilityDistillation &&
+			(cap.Labels["distillation_update_helper"] != "RunNativeDistillationAdamWUpdatePass" ||
+				cap.Labels["distillation_track_helper"] != "RunNativeDistillationAdamWUpdateTrackPass") {
+			t.Fatalf("distillation training capability labels = %+v, want distillation update and track helpers", cap.Labels)
+		}
+		if id == inference.CapabilityGRPO &&
+			(cap.Labels["advantage_update_helper"] != "RunNativeGRPOAdamWUpdatePass" ||
+				cap.Labels["advantage_track_helper"] != "RunNativeGRPOAdamWUpdateTrackPass" ||
+				cap.Labels["policy_loss_helper"] != "RunNativeGRPOPolicyLossPass" ||
+				cap.Labels["policy_update_helper"] != "RunNativeGRPOPolicyAdamWUpdatePass" ||
+				cap.Labels["policy_track_helper"] != "RunNativeGRPOPolicyAdamWUpdateTrackPass" ||
+				cap.Labels["policy_rollout_group_label"] != "group_id" ||
+				cap.Labels["policy_rollout_group_result_labels"] != "grpo_rollout_group_source,grpo_rollout_groups" ||
+				cap.Labels["policy_rollout_identity_labels"] != "rollout_id,sample_id,trajectory_id,turn_id,completion_id,episode_id" ||
+				cap.Labels["policy_rollout_identity_result_labels"] != "grpo_rollouts,grpo_rollout_samples,grpo_rollout_trajectories,grpo_rollout_turns,grpo_rollout_completions,grpo_rollout_episodes" ||
+				cap.Labels["policy_rollout_prompt_labels"] != "prompt_id,query_id" ||
+				cap.Labels["policy_rollout_prompt_result_labels"] != "grpo_rollout_prompt_source,grpo_rollout_prompts" ||
+				cap.Labels["policy_loss_backend"] != "reference") {
+			t.Fatalf("GRPO training capability labels = %+v, want reference advantage and policy helpers", cap.Labels)
 		}
 	}
 	for _, id := range nativeContractSharedCapabilityIDs() {
@@ -193,6 +433,7 @@ func TestNativeContract_RocmBackendCapabilitiesUseRuntimeKernelStatus_Good(t *te
 		device:    nativeDeviceInfo{Name: "gfx1100", MemoryBytes: 16 * memoryGiB, FreeBytes: 8 * memoryGiB, Driver: "hip-test"},
 		kernelStatus: hipKernelStatus{
 			Decode:     hipKernelStatusNotLinked,
+			Optimizer:  hipKernelStatusLinked,
 			Prefill:    hipKernelStatusNotLinked,
 			Projection: hipKernelStatusLinked,
 			KVCache:    hipKernelStatusPlanned,
@@ -204,9 +445,13 @@ func TestNativeContract_RocmBackendCapabilitiesUseRuntimeKernelStatus_Good(t *te
 	if report.Labels["kernel_status"] != hipKernelStatusLinked ||
 		report.Labels["cross_entropy_kernel"] != hipKernelStatusNotLinked ||
 		report.Labels["decode_kernel"] != hipKernelStatusNotLinked ||
+		report.Labels["optimizer_kernel"] != hipKernelStatusLinked ||
 		report.Labels["prefill_kernel"] != hipKernelStatusNotLinked ||
 		report.Labels["projection_kernel"] != hipKernelStatusLinked {
 		t.Fatalf("labels = %+v, want runtime kernel status", report.Labels)
+	}
+	if capability, ok := report.Capability(inference.CapabilityLoRATraining); !ok || capability.Labels["optimizer_kernel"] != hipKernelStatusLinked {
+		t.Fatalf("LoRA training capability = %+v ok=%v, want linked optimizer kernel status", capability, ok)
 	}
 	if capability, ok := report.Capability(inference.CapabilityEvaluation); !ok || capability.Labels["loss_kernel"] != hipKernelStatusNotLinked {
 		t.Fatalf("evaluation capability = %+v ok=%v, want loss fixture not linked for projection-only status", capability, ok)
@@ -255,6 +500,56 @@ func TestNativeContract_RocmModelCapabilities_Ugly(t *testing.T) {
 	}
 	if !report.Supports(inference.CapabilityEvaluation) {
 		t.Fatalf("evaluation should be experimentally available: %+v", report.CapabilityIDs())
+	}
+}
+
+func TestNativeContract_CapabilityReportGenericReactiveRegistryLabels_Good(t *testing.T) {
+	report := rocmCapabilityReport(nativeDeviceInfo{}, inference.ModelIdentity{
+		Path:         "/models/qwen",
+		Architecture: "Qwen3_5MoeForConditionalGeneration",
+		QuantBits:    4,
+	}, inference.AdapterIdentity{}, true, defaultHIPKernelStatus())
+
+	if report.Labels["engine_feature_architecture"] != "qwen3_6_moe" ||
+		report.Labels["engine_feature_family"] != "qwen" ||
+		report.Labels["engine_feature_chat_template_id"] != "qwen" ||
+		report.Labels["engine_feature_reasoning_parser"] != "qwen" ||
+		report.Labels["engine_feature_tool_parser"] != "qwen" ||
+		report.Labels["engine_feature_text_generate"] != "false" ||
+		report.Labels["engine_feature_capabilities"] != "chat.template,reasoning.parse,tool.parse" ||
+		report.Labels["engine_load_status"] != string(ROCmModelLoadStagedNative) ||
+		report.Labels["engine_load_target"] != "standalone" ||
+		report.Labels["engine_load_staged"] != "true" ||
+		report.Labels["engine_load_text_generate"] != "false" {
+		t.Fatalf("report labels = %+v, want generic registry-derived Qwen engine feature labels", report.Labels)
+	}
+	modelLoad, ok := report.Capability(inference.CapabilityModelLoad)
+	if !ok ||
+		modelLoad.Labels["engine_load_status"] != string(ROCmModelLoadStagedNative) ||
+		modelLoad.Labels["engine_load_target"] != "standalone" ||
+		modelLoad.Labels["engine_load_staged"] != "true" ||
+		modelLoad.Labels["engine_load_text_generate"] != "false" {
+		t.Fatalf("model-load capability = %+v ok=%v, want staged Qwen load-status labels", modelLoad, ok)
+	}
+	if cap, ok := report.Capability(inference.CapabilityGenerate); !ok || cap.Status != inference.CapabilityStatusPlanned {
+		t.Fatalf("generate capability = %+v ok=%v, staged Qwen must not claim linked generation", cap, ok)
+	}
+	chatTemplate, ok := report.Capability(inference.CapabilityChatTemplate)
+	if !ok ||
+		chatTemplate.Labels["chat_template"] != "qwen" ||
+		chatTemplate.Labels["engine_feature_chat_template_id"] != "qwen" ||
+		chatTemplate.Labels["engine_feature_reasoning_parser"] != "qwen" ||
+		chatTemplate.Labels["engine_feature_tool_parser"] != "qwen" {
+		t.Fatalf("chat template capability = %+v ok=%v, want Qwen registry template labels", chatTemplate, ok)
+	}
+	for _, id := range []inference.CapabilityID{inference.CapabilityReasoningParse, inference.CapabilityToolParse} {
+		capability, ok := report.Capability(id)
+		if !ok || capability.Status != inference.CapabilityStatusSupported ||
+			capability.Labels["engine_feature_architecture"] != "qwen3_6_moe" ||
+			capability.Labels["engine_feature_reasoning_parser"] != "qwen" ||
+			capability.Labels["engine_feature_tool_parser"] != "qwen" {
+			t.Fatalf("parser capability %s = %+v ok=%v, want registry parser labels", id, capability, ok)
+		}
 	}
 }
 
@@ -321,13 +616,55 @@ func TestNativeContract_RocmModelDoesNotImplementTrainingSurfaces_Ugly(t *testin
 			capability.Labels["runtime_status"] != string(inference.FeatureRuntimePlanned) ||
 			capability.Labels["training_kernel"] != hipKernelStatusNotLinked ||
 			capability.Labels["training_interface"] != "not_implemented" ||
-			capability.Labels["required_kernel"] != requiredTrainingKernels[id] {
+			capability.Labels["required_kernel"] != requiredTrainingKernels[id] ||
+			capability.Labels["optimizer_status"] != "update_only" ||
+			capability.Labels["optimizer_backend"] != "reference" ||
+			capability.Labels["optimizer_kernel"] != hipKernelStatusNotLinked ||
+			capability.Labels["optimizer_direct_helper"] != "RunNativeAdamWUpdate" ||
+			capability.Labels["optimizer_helper"] != "RunNativeAdamWUpdatePass" ||
+			capability.Labels["optimizer_launch_args"] != "hipAdamWUpdateLaunchArgs" ||
+			capability.Labels["optimizer_launch_args_bytes"] != "128" ||
+			capability.Labels["optimizer_layout"] != "packed_contiguous_parameters_m_v" ||
+			capability.Labels["optimizer_track"] != "append_only" ||
+			capability.Labels["optimizer_track_containers"] != "kv,mp4,binary" ||
+			capability.Labels["optimizer_track_helper"] != "AppendNativeAdamWStateTrack" ||
+			capability.Labels["optimizer_track_list_helper"] != "ListNativeAdamWStateTrack" ||
+			capability.Labels["optimizer_track_find_helper"] != "FindNativeAdamWStateTrackStep" ||
+			capability.Labels["optimizer_track_load_step_helper"] != "LoadNativeAdamWStateTrackStep" {
 			t.Fatalf("training capability %s = %+v ok=%v, want planned/not-linked model report", id, capability, ok)
 		}
 		if fixture := trainingFixtureKernels[id]; fixture != "" {
 			if capability.Labels["fixture_kernel"] != hipKernelStatusNotLinked || capability.Labels["fixture_kernel_name"] != fixture {
 				t.Fatalf("training capability %s labels = %+v, want not-linked toy fixture kernel %s without native kernels", id, capability.Labels, fixture)
 			}
+		}
+		if id == inference.CapabilityLoRATraining &&
+			(capability.Labels["lora_update_helper"] != "RunNativeLoRAAdamWUpdatePass" ||
+				capability.Labels["lora_backward_backend"] != "reference" ||
+				capability.Labels["lora_adapter_snapshot_helper"] != "SaveNativeLoRAAdapterSnapshot" ||
+				capability.Labels["lora_adapter_track_latest_snapshot_helper"] != "SaveNativeLoRAAdapterSnapshotTrackLast" ||
+				capability.Labels["lora_adapter_track_snapshot_helper"] != "SaveNativeLoRAAdapterSnapshotTrackStep") {
+			t.Fatalf("LoRA training capability labels = %+v, want reference LoRA update helper", capability.Labels)
+		}
+		if id == inference.CapabilityDistillation &&
+			(capability.Labels["distillation_update_helper"] != "RunNativeDistillationAdamWUpdatePass" ||
+				capability.Labels["distillation_track_helper"] != "RunNativeDistillationAdamWUpdateTrackPass") {
+			t.Fatalf("distillation training capability labels = %+v, want distillation update and track helpers", capability.Labels)
+		}
+		if id == inference.CapabilityGRPO &&
+			(capability.Labels["advantage_update_helper"] != "RunNativeGRPOAdamWUpdatePass" ||
+				capability.Labels["advantage_track_helper"] != "RunNativeGRPOAdamWUpdateTrackPass" ||
+				capability.Labels["policy_loss_helper"] != "RunNativeGRPOPolicyLossPass" ||
+				capability.Labels["policy_update_helper"] != "RunNativeGRPOPolicyAdamWUpdatePass" ||
+				capability.Labels["policy_track_helper"] != "RunNativeGRPOPolicyAdamWUpdateTrackPass" ||
+				capability.Labels["policy_rollout_group_label"] != "group_id" ||
+				capability.Labels["policy_rollout_group_result_labels"] != "grpo_rollout_group_source,grpo_rollout_groups" ||
+				capability.Labels["policy_rollout_identity_labels"] != "rollout_id,sample_id,trajectory_id,turn_id,completion_id,episode_id" ||
+				capability.Labels["policy_rollout_identity_result_labels"] != "grpo_rollouts,grpo_rollout_samples,grpo_rollout_trajectories,grpo_rollout_turns,grpo_rollout_completions,grpo_rollout_episodes" ||
+				capability.Labels["policy_rollout_prompt_labels"] != "prompt_id,query_id" ||
+				capability.Labels["policy_rollout_prompt_result_labels"] != "grpo_rollout_prompt_source,grpo_rollout_prompts" ||
+				capability.Labels["policy_loss_backend"] != "reference") {
+			t.Fatalf("GRPO training capability labels = %+v, want reference advantage and policy helpers", capability.Labels)
 		}
 	}
 }
@@ -387,8 +724,11 @@ func TestNativeContract_RocmModelCapabilitiesUseNativeKernelStatus_Good(t *testi
 	}
 	for _, id := range []inference.CapabilityID{inference.CapabilityDistillation, inference.CapabilityGRPO} {
 		capability, ok := report.Capability(id)
-		if !ok || capability.Labels["fixture_kernel"] != hipKernelStatusLinked {
-			t.Fatalf("training capability %s = %+v ok=%v, want linked toy fixture label when native kernels are configured", id, capability, ok)
+		if !ok ||
+			capability.Labels["fixture_kernel"] != hipKernelStatusLinked ||
+			capability.Labels["optimizer_status"] != "update_only" ||
+			capability.Labels["optimizer_kernel"] != hipKernelStatusNotLinked {
+			t.Fatalf("training capability %s = %+v ok=%v, want linked toy fixture label and update-only optimizer metadata when native kernels are configured", id, capability, ok)
 		}
 	}
 	for _, id := range []inference.CapabilityID{inference.CapabilitySpeculativeDecode, inference.CapabilityPromptLookupDecode} {
@@ -443,12 +783,14 @@ func TestNativeContract_RocmTinyFixtureCapabilitiesLabelProductionPending_Good(t
 
 func TestNativeContract_RocmGemma4Q4ExperimentalGenerateCapability_Good(t *testing.T) {
 	report := rocmCapabilityReport(nativeDeviceInfo{}, inference.ModelIdentity{
-		Architecture: "gemma4",
-		VocabSize:    262144,
-		NumLayers:    35,
-		HiddenSize:   1536,
-		QuantBits:    4,
-		QuantGroup:   64,
+		Path:          "/models/lmstudio-community-gemma-4-e2b-it-4bit",
+		Architecture:  "gemma4",
+		VocabSize:     262144,
+		NumLayers:     35,
+		HiddenSize:    1536,
+		QuantBits:     4,
+		QuantGroup:    64,
+		ContextLength: 131072,
 	}, inference.AdapterIdentity{}, true, defaultHIPKernelStatus(), rocmCapabilityReportOption{Gemma4Q4GenerateLinked: true})
 
 	generate, ok := report.Capability(inference.CapabilityGenerate)
@@ -461,6 +803,27 @@ func TestNativeContract_RocmGemma4Q4ExperimentalGenerateCapability_Good(t *testi
 		generate.Labels["gemma4_q4_device_kv_state"] != "forward_returned_device_state" ||
 		generate.Labels["decode_architecture"] != "gemma4" ||
 		generate.Labels["decode_quant"] != "mlx_q4" ||
+		generate.Labels["gemma4_mlx_affine_bits"] != "4" ||
+		generate.Labels["gemma4_mlx_affine_decode"] != hipKernelStatusLinked ||
+		generate.Labels["gemma4_mlx_affine_kv_state"] != "forward_returned_device_state" ||
+		generate.Labels["gemma4_size"] != "E2B" ||
+		generate.Labels["gemma4_quant_mode"] != "q4" ||
+		generate.Labels["gemma4_pack_supported"] != "true" ||
+		generate.Labels["gemma4_runtime"] != Gemma4RuntimeMLXAffine ||
+		generate.Labels["gemma4_generate_status"] != Gemma4GenerateLinked ||
+		generate.Labels["gemma4_runnable_on_card"] != "true" ||
+		generate.Labels["quant_default_tier"] != "q6" ||
+		generate.Labels["quant_family"] != "mlx_affine" ||
+		generate.Labels["quant_ladder"] != "bf16,q8,q6,q4" ||
+		generate.Labels["production_quant_policy"] != "gemma4_mlx_affine" ||
+		generate.Labels["production_quant_tier"] != "constrained" ||
+		generate.Labels["production_quant_pack_count"] != "20" ||
+		generate.Labels["production_quant_pack_sizes"] != "E2B,E4B,12B,26B-A4B,31B" ||
+		!strings.Contains(generate.Labels["production_quant_linked_generate_packs"], "E4B:q6") ||
+		!strings.Contains(generate.Labels["production_quant_linked_generate_packs"], "12B:q6") ||
+		!strings.Contains(generate.Labels["production_quant_load_only_packs"], "E2B:bf16") ||
+		!strings.Contains(generate.Labels["production_quant_planned_packs"], "E4B:mxfp4") ||
+		generate.Labels["production_quant_active_weight_read_bytes_per_token"] == "" ||
 		generate.Labels["decode_layers"] != "35" ||
 		generate.Labels["decode_vocab_size"] != "262144" ||
 		generate.Labels["decode_hidden_size"] != "1536" ||
@@ -474,6 +837,15 @@ func TestNativeContract_RocmGemma4Q4ExperimentalGenerateCapability_Good(t *testi
 	}
 	if !strings.Contains(generate.Detail, "production native prefill/decode remain pending") {
 		t.Fatalf("generate detail = %q, want production prefill/decode caveat", generate.Detail)
+	}
+	if generate.Labels["engine_state_context_route_contract"] != ROCmStateContextRegistryContract ||
+		generate.Labels["engine_state_context_window"] != "131072" ||
+		generate.Labels["engine_state_context_prompt_replay_refused"] != "true" ||
+		generate.Labels["engine_state_context_remaining_context_default"] != "true" ||
+		generate.Labels["engine_state_context_runtime_owned_kv"] != "true" ||
+		generate.Labels["engine_state_context_gemma4_size"] != "E2B" ||
+		generate.Labels["engine_state_context_gemma4_quant_mode"] != "q4" {
+		t.Fatalf("generate state/context labels = %+v, want Gemma4 route labels with model context window", generate.Labels)
 	}
 	batch, ok := report.Capability(inference.CapabilityBatchGenerate)
 	if !ok || batch.Status != inference.CapabilityStatusExperimental ||
@@ -496,7 +868,7 @@ func TestNativeContract_RocmGemma4Q4ExperimentalGenerateCapability_Good(t *testi
 		chat.Labels["kernel_scope"] != "loaded_gemma4_q4_experimental_chat" ||
 		chat.Labels["chat_kernel"] != hipKernelStatusLinked ||
 		chat.Labels["chat_name"] != "rocm_gemma4_q4_chat_generate_experimental" ||
-		chat.Labels["chat_template"] != "fallback" ||
+		chat.Labels["chat_template"] != "gemma4_hf_turn" ||
 		chat.Labels["gemma4_q4_decode_kernel"] != hipKernelStatusLinked ||
 		chat.Labels["attention_kv_mode"] != rocmKVCacheModeKQ8VQ4 ||
 		chat.Labels["production_prefill"] != hipKernelStatusNotLinked ||
@@ -508,10 +880,26 @@ func TestNativeContract_RocmGemma4Q4ExperimentalGenerateCapability_Good(t *testi
 	if !strings.Contains(chat.Detail, "production native prefill/decode remain pending") {
 		t.Fatalf("chat detail = %q, want production prefill/decode caveat", chat.Detail)
 	}
+	chatTemplate, ok := report.Capability(inference.CapabilityChatTemplate)
+	if !ok || chatTemplate.Status != inference.CapabilityStatusExperimental ||
+		chatTemplate.Labels["chat_template"] != "gemma4_hf_turn" ||
+		chatTemplate.Labels["turn_start"] != "<|turn>" ||
+		chatTemplate.Labels["turn_end"] != "<turn|>" ||
+		chatTemplate.Labels["generation_role"] != "model" ||
+		chatTemplate.Labels["runtime_status"] != string(inference.FeatureRuntimeExperimental) {
+		t.Fatalf("chat template capability = %+v ok=%v, want Gemma4 HF turn template labels", chatTemplate, ok)
+	}
+	if chatTemplate.Labels["engine_tokenizer_route_contract"] != ROCmModelTokenizerRegistryContract ||
+		chatTemplate.Labels["engine_tokenizer_kind"] != "GemmaTokenizer" ||
+		chatTemplate.Labels["engine_tokenizer_chat_template_id"] != "gemma4_hf_turn" ||
+		chatTemplate.Labels["engine_tokenizer_generation_role"] != "model" ||
+		chatTemplate.Labels["engine_tokenizer_model_owned_template"] != "true" {
+		t.Fatalf("chat template tokenizer route labels = %+v, want Gemma4 tokenizer route labels", chatTemplate.Labels)
+	}
 	evaluation, ok := report.Capability(inference.CapabilityEvaluation)
 	if !ok || evaluation.Status != inference.CapabilityStatusExperimental ||
 		evaluation.Labels["kernel_scope"] != "loaded_gemma4_q4_experimental_eval" ||
-		evaluation.Labels["eval_loss_logits_source"] != "gemma4_q4_package_prefill" ||
+		evaluation.Labels["eval_loss_logits_source"] != "gemma4_mlx_affine_package_prefill" ||
 		evaluation.Labels["eval_prefill_kernel"] != hipKernelStatusLinked ||
 		evaluation.Labels["eval_prefill_name"] != "rocm_gemma4_q4_package_prefill_experimental" ||
 		evaluation.Labels["attention_kv_mode"] != rocmKVCacheModeKQ8VQ4 ||
@@ -524,12 +912,36 @@ func TestNativeContract_RocmGemma4Q4ExperimentalGenerateCapability_Good(t *testi
 	if !strings.Contains(evaluation.Detail, "production native prefill/decode remain pending") {
 		t.Fatalf("evaluation detail = %q, want production prefill/decode caveat", evaluation.Detail)
 	}
+	if !strings.Contains(evaluation.Detail, "MLX affine 4/6/8-bit") {
+		t.Fatalf("evaluation detail = %q, want bit-aware MLX affine detail", evaluation.Detail)
+	}
 	benchmark, ok := report.Capability(inference.CapabilityBenchmark)
 	if !ok || benchmark.Status != inference.CapabilityStatusExperimental ||
+		benchmark.Labels["attached_drafter_helper"] != hipKernelStatusLinked ||
+		benchmark.Labels["attached_drafter_native_attachment"] != hipKernelStatusNotLinked ||
+		benchmark.Labels["attached_drafter_role"] != "gemma4_assistant" ||
 		benchmark.Labels["kernel_scope"] != "loaded_gemma4_q4_experimental_benchmark" ||
 		benchmark.Labels["benchmark_kernel"] != hipKernelStatusLinked ||
 		benchmark.Labels["benchmark_name"] != "rocm_gemma4_q4_benchmark_experimental" ||
 		benchmark.Labels["benchmark_prompt_mode"] != "explicit_text" ||
+		benchmark.Labels["benchmark_retained_state_book"] != "BenchmarkInferenceGemma4Q4Book10Turn_RetainedState" ||
+		benchmark.Labels["benchmark_replay_baseline"] != "BenchmarkInferenceGemma4Q4Book10Turn_ReplayBaseline" ||
+		benchmark.Labels["benchmark_retained_state_required"] != "true" ||
+		benchmark.Labels["benchmark_prompt_replay_fallback"] != "forbidden" ||
+		benchmark.Labels["benchmark_state_source"] != "rocm_state_session_runtime_kv" ||
+		benchmark.Labels["production_book_policy"] != "retained_state_required" ||
+		benchmark.Labels["production_book_decision_source"] != "benchmark_metrics" ||
+		benchmark.Labels["production_book_gate_wall_seconds"] != strconv.Itoa(ProductionLaneBookWallSeconds) ||
+		benchmark.Labels["production_book_gate_turns"] != strconv.Itoa(ProductionLaneBookTurnCount) ||
+		benchmark.Labels["production_book_gate_raw_decode_tokens_per_sec"] != strconv.Itoa(DefaultProductionQuantizationPolicy().MinimumVisibleTokensPerSec) ||
+		benchmark.Labels["production_book_gate_metrics"] == "" ||
+		benchmark.Labels["production_book_gate_reason_codes"] != productionBookGateReasonCodesLabel ||
+		benchmark.Labels["production_book_retained_route_metrics"] == "" ||
+		benchmark.Labels["production_book_retained_artifact_labels"] == "" ||
+		benchmark.Labels["production_book_long_output_quality_flags"] != "0" ||
+		benchmark.Labels["production_model_source"] != "model_identity_or_pack" ||
+		benchmark.Labels["production_mtp_required_metrics"] == "" ||
+		benchmark.Labels["production_quant_decision_source"] != "gemma4_family_matrix" ||
 		benchmark.Labels["attention_kv_mode"] != rocmKVCacheModeKQ8VQ4 ||
 		benchmark.Labels["production_prefill"] != hipKernelStatusNotLinked ||
 		benchmark.Labels["production_decode"] != hipKernelStatusNotLinked ||
@@ -540,12 +952,40 @@ func TestNativeContract_RocmGemma4Q4ExperimentalGenerateCapability_Good(t *testi
 	if !strings.Contains(benchmark.Detail, "production native prefill/decode remain pending") {
 		t.Fatalf("benchmark detail = %q, want production prefill/decode caveat", benchmark.Detail)
 	}
+	if !strings.Contains(benchmark.Detail, "retained-state 10-turn book gate") ||
+		!strings.Contains(benchmark.Detail, "prompt replay forbidden") {
+		t.Fatalf("benchmark detail = %q, want retained-state book gate with prompt replay forbidden", benchmark.Detail)
+	}
+	if !strings.Contains(benchmark.Detail, "MLX affine 4/6/8-bit") {
+		t.Fatalf("benchmark detail = %q, want bit-aware MLX affine detail", benchmark.Detail)
+	}
+	if benchmark.Labels["engine_state_context_route_contract"] != ROCmStateContextRegistryContract ||
+		benchmark.Labels["engine_state_context_prompt_replay_refused"] != "true" ||
+		benchmark.Labels["engine_state_context_runtime_owned_kv"] != "true" ||
+		benchmark.Labels["engine_lora_route_contract"] != ROCmLoRAAdapterRegistryContract ||
+		benchmark.Labels["engine_lora_target_policy"] != "gemma4" ||
+		benchmark.Labels["engine_attached_drafter_route_contract"] != ROCmAttachedDrafterRegistryContract ||
+		benchmark.Labels["engine_attached_drafter_role"] != "target" ||
+		benchmark.Labels["engine_attached_drafter_native_attachment"] != hipKernelStatusNotLinked ||
+		benchmark.Labels["engine_attached_drafter_retained_state_required"] != "true" ||
+		benchmark.Labels["engine_attached_drafter_prompt_replay_fallback"] != "forbidden" {
+		t.Fatalf("benchmark route labels = %+v, want Gemma4 registry route labels", benchmark.Labels)
+	}
+	assertCSVLabelContainsAll(t, "production_book_gate_metrics", benchmark.Labels["production_book_gate_metrics"], productionBookGateMetrics)
+	assertCSVLabelContainsAll(t, "production_book_retained_route_metrics", benchmark.Labels["production_book_retained_route_metrics"], productionBookRetainedRouteMetrics)
+	assertCSVLabelContainsAll(t, "production_book_retained_artifact_labels", benchmark.Labels["production_book_retained_artifact_labels"], productionBookRetainedArtifactLabels)
+	for _, metric := range DefaultProductionQuantizationPolicy().RequiredBenchmarkMetrics {
+		if !strings.Contains(benchmark.Labels["production_book_required_metrics"], metric) {
+			t.Fatalf("benchmark required metrics = %q, missing %q", benchmark.Labels["production_book_required_metrics"], metric)
+		}
+	}
+	assertCSVLabelContainsAll(t, "production_mtp_required_metrics", benchmark.Labels["production_mtp_required_metrics"], defaultProductionMTPRequiredMetrics)
 	classify, ok := report.Capability(inference.CapabilityClassify)
 	if !ok || classify.Status != inference.CapabilityStatusExperimental ||
 		classify.Labels["kernel_scope"] != "loaded_gemma4_q4_experimental_classify" ||
 		classify.Labels["classify_kernel"] != hipKernelStatusLinked ||
 		classify.Labels["classify_name"] != "rocm_gemma4_q4_classify_experimental" ||
-		classify.Labels["classify_logits_source"] != "gemma4_q4_package_prefill" ||
+		classify.Labels["classify_logits_source"] != "gemma4_mlx_affine_package_prefill" ||
 		classify.Labels["attention_kv_mode"] != rocmKVCacheModeKQ8VQ4 ||
 		classify.Labels["production_prefill"] != hipKernelStatusNotLinked ||
 		classify.Labels["production_decode"] != hipKernelStatusNotLinked ||
@@ -560,8 +1000,9 @@ func TestNativeContract_RocmGemma4Q4ExperimentalGenerateCapability_Good(t *testi
 	if !ok || logitProbe.Status != inference.CapabilityStatusExperimental ||
 		logitProbe.Labels["kernel_scope"] != "loaded_gemma4_q4_experimental_logit_probe" ||
 		logitProbe.Labels["logit_probe_kernel"] != hipKernelStatusLinked ||
+		logitProbe.Labels["logit_probe_affine_source"] != "gemma4_mlx_affine_classify_logits" ||
 		logitProbe.Labels["logit_probe_source"] != "gemma4_q4_classify_logits" ||
-		logitProbe.Labels["classify_logits_source"] != "gemma4_q4_package_prefill" ||
+		logitProbe.Labels["classify_logits_source"] != "gemma4_mlx_affine_package_prefill" ||
 		logitProbe.Labels["attention_kv_mode"] != rocmKVCacheModeKQ8VQ4 ||
 		logitProbe.Labels["production_prefill"] != hipKernelStatusNotLinked ||
 		logitProbe.Labels["production_decode"] != hipKernelStatusNotLinked ||
@@ -569,13 +1010,27 @@ func TestNativeContract_RocmGemma4Q4ExperimentalGenerateCapability_Good(t *testi
 		logitProbe.Labels["runtime_status"] != string(inference.FeatureRuntimeExperimental) {
 		t.Fatalf("logit probe capability = %+v ok=%v, want experimental Gemma4 q4 classify-logit probe labels with production prefill pending", logitProbe, ok)
 	}
-	if !strings.Contains(logitProbe.Detail, "Gemma4 MLX-q4 classification logits") {
-		t.Fatalf("logit probe detail = %q, want q4 classify-logit source", logitProbe.Detail)
+	if !strings.Contains(logitProbe.Detail, "Gemma4 MLX affine 4/6/8-bit classification logits") {
+		t.Fatalf("logit probe detail = %q, want MLX affine classify-logit source", logitProbe.Detail)
 	}
 	speculative, ok := report.Capability(inference.CapabilitySpeculativeDecode)
 	if !ok || speculative.Status != inference.CapabilityStatusExperimental ||
+		speculative.Labels["attached_drafter_helper"] != hipKernelStatusLinked ||
+		speculative.Labels["attached_drafter_native_attachment"] != hipKernelStatusNotLinked ||
+		speculative.Labels["attached_drafter_role"] != "gemma4_assistant" ||
+		speculative.Labels["attached_drafter_retained_state_entrypoint"] != hipKernelStatusLinked ||
+		speculative.Labels["attached_drafter_retained_state_required"] != "true" ||
+		speculative.Labels["attached_drafter_state_source"] != "rocm_state_session_runtime_kv" ||
+		speculative.Labels["attached_drafter_prompt_replay_fallback"] != "forbidden" ||
+		speculative.Labels["engine_attached_drafter_route_contract"] != ROCmAttachedDrafterRegistryContract ||
+		speculative.Labels["engine_attached_drafter_native_attachment"] != hipKernelStatusNotLinked ||
+		speculative.Labels["engine_attached_drafter_retained_state_required"] != "true" ||
+		speculative.Labels["engine_attached_drafter_state_source"] != "rocm_state_session_runtime_kv" ||
+		speculative.Labels["engine_attached_drafter_prompt_replay_fallback"] != "forbidden" ||
+		speculative.Labels["engine_attached_drafter_assistant_architecture"] != officialGemma4E2BAssistantArchitecture ||
 		speculative.Labels["kernel_scope"] != "loaded_gemma4_q4_experimental_speculative_decode" ||
 		speculative.Labels["speculative_decode_helper"] != hipKernelStatusLinked ||
+		speculative.Labels["speculative_decode_affine_source"] != "gemma4_mlx_affine_generate" ||
 		speculative.Labels["speculative_decode_source"] != "gemma4_q4_generate" ||
 		speculative.Labels["gemma4_q4_decode_kernel"] != hipKernelStatusLinked ||
 		speculative.Labels["production_prefill"] != hipKernelStatusNotLinked ||
@@ -584,13 +1039,55 @@ func TestNativeContract_RocmGemma4Q4ExperimentalGenerateCapability_Good(t *testi
 		speculative.Labels["runtime_status"] != string(inference.FeatureRuntimeExperimental) {
 		t.Fatalf("speculative capability = %+v ok=%v, want experimental Gemma4 q4 helper labels with production prefill/decode pending", speculative, ok)
 	}
-	if !strings.Contains(speculative.Detail, "production native prefill/decode remain pending") {
-		t.Fatalf("speculative detail = %q, want production prefill/decode caveat", speculative.Detail)
+	if !strings.Contains(speculative.Detail, "native HIP drafter attachment") ||
+		!strings.Contains(speculative.Detail, "production native prefill/decode remain pending") {
+		t.Fatalf("speculative detail = %q, want attached-drafter and production prefill/decode caveats", speculative.Detail)
+	}
+	if !strings.Contains(speculative.Detail, "MLX affine 4/6/8-bit") {
+		t.Fatalf("speculative detail = %q, want bit-aware MLX affine source", speculative.Detail)
+	}
+	for _, id := range []inference.CapabilityID{inference.CapabilityStateBundle, inference.CapabilityStateWake, inference.CapabilityStateSleep, inference.CapabilityStateFork} {
+		stateCapability, ok := report.Capability(id)
+		if !ok ||
+			stateCapability.Labels["engine_state_context_route_contract"] != ROCmStateContextRegistryContract ||
+			stateCapability.Labels["engine_state_context_window"] != "131072" ||
+			stateCapability.Labels["engine_state_context_prompt_replay_refused"] != "true" ||
+			stateCapability.Labels["engine_state_context_remaining_context_default"] != "true" ||
+			stateCapability.Labels["engine_state_context_runtime_owned_kv"] != "true" ||
+			stateCapability.Labels["engine_state_context_gemma4_size"] != "E2B" ||
+			stateCapability.Labels["engine_state_context_gemma4_quant_mode"] != "q4" {
+			t.Fatalf("state capability %s = %+v ok=%v, want Gemma4 state/context route labels", id, stateCapability, ok)
+		}
+	}
+	tokenizerRouteCapability, ok := report.Capability(inference.CapabilityTokenizer)
+	if !ok ||
+		tokenizerRouteCapability.Labels["engine_tokenizer_route_contract"] != ROCmModelTokenizerRegistryContract ||
+		tokenizerRouteCapability.Labels["engine_tokenizer_kind"] != "GemmaTokenizer" ||
+		tokenizerRouteCapability.Labels["engine_tokenizer_chat_template_id"] != "gemma4_hf_turn" ||
+		tokenizerRouteCapability.Labels["engine_tokenizer_generation_role"] != "model" {
+		t.Fatalf("tokenizer capability = %+v ok=%v, want Gemma4 tokenizer route labels", tokenizerRouteCapability, ok)
+	}
+	for _, id := range []inference.CapabilityID{inference.CapabilityLoRAInference, inference.CapabilityLoRATraining, inference.CapabilityModelMerge} {
+		loraRouteCapability, ok := report.Capability(id)
+		if !ok ||
+			loraRouteCapability.Labels["engine_lora_route_contract"] != ROCmLoRAAdapterRegistryContract ||
+			loraRouteCapability.Labels["engine_lora_target_policy"] != "gemma4" ||
+			loraRouteCapability.Labels["engine_lora_default_targets"] != "q_proj,v_proj,o_proj" ||
+			loraRouteCapability.Labels["engine_lora_safe_targets"] != "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" ||
+			loraRouteCapability.Labels["engine_lora_extended_targets"] != "router.proj,per_layer_input_gate,per_layer_projection" ||
+			loraRouteCapability.Labels["engine_lora_extended_targets_require_opt"] != "true" ||
+			loraRouteCapability.Labels["engine_lora_apply_supported"] != "true" ||
+			loraRouteCapability.Labels["engine_lora_training_supported"] != "true" ||
+			!strings.Contains(loraRouteCapability.Labels["engine_lora_capabilities"], string(inference.CapabilityModelMerge)) ||
+			!strings.Contains(loraRouteCapability.Labels["engine_lora_target_paths"], "q_proj=self_attn.q_proj") {
+			t.Fatalf("LoRA route capability %s = %+v ok=%v, want Gemma4 adapter route labels", id, loraRouteCapability, ok)
+		}
 	}
 	promptLookup, ok := report.Capability(inference.CapabilityPromptLookupDecode)
 	if !ok || promptLookup.Status != inference.CapabilityStatusExperimental ||
 		promptLookup.Labels["kernel_scope"] != "loaded_gemma4_q4_experimental_prompt_lookup_decode" ||
 		promptLookup.Labels["prompt_lookup_decode_helper"] != hipKernelStatusLinked ||
+		promptLookup.Labels["prompt_lookup_decode_affine_source"] != "gemma4_mlx_affine_generate" ||
 		promptLookup.Labels["prompt_lookup_decode_source"] != "gemma4_q4_generate" ||
 		promptLookup.Labels["gemma4_q4_decode_kernel"] != hipKernelStatusLinked ||
 		promptLookup.Labels["production_prefill"] != hipKernelStatusNotLinked ||
@@ -601,6 +1098,320 @@ func TestNativeContract_RocmGemma4Q4ExperimentalGenerateCapability_Good(t *testi
 	}
 	if !strings.Contains(promptLookup.Detail, "production native prefill/decode remain pending") {
 		t.Fatalf("prompt lookup detail = %q, want production prefill/decode caveat", promptLookup.Detail)
+	}
+	if !strings.Contains(promptLookup.Detail, "MLX affine 4/6/8-bit") {
+		t.Fatalf("prompt lookup detail = %q, want bit-aware MLX affine source", promptLookup.Detail)
+	}
+}
+
+func TestNativeContract_RocmGemma4Q6CapabilityLabels_Good(t *testing.T) {
+	report := rocmCapabilityReport(nativeDeviceInfo{}, inference.ModelIdentity{
+		Path:         "/models/lmstudio-community-gemma-4-e2b-it-6bit",
+		Architecture: "gemma4_text",
+		VocabSize:    262144,
+		NumLayers:    35,
+		HiddenSize:   1536,
+		QuantBits:    6,
+		QuantGroup:   64,
+	}, inference.AdapterIdentity{}, true, defaultHIPKernelStatus(), rocmCapabilityReportOption{Gemma4Q4GenerateLinked: true})
+
+	generate, ok := report.Capability(inference.CapabilityGenerate)
+	if !ok || generate.Labels["decode_quant"] != "mlx_q6" ||
+		generate.Labels["gemma4_mlx_affine_bits"] != "6" ||
+		generate.Labels["gemma4_size"] != "E2B" ||
+		generate.Labels["gemma4_quant_mode"] != "q6" ||
+		generate.Labels["gemma4_runtime"] != Gemma4RuntimeMLXAffine ||
+		generate.Labels["gemma4_generate_status"] != Gemma4GenerateLinked ||
+		generate.Labels["quant_default_tier"] != "q6" ||
+		generate.Labels["quant_family"] != "mlx_affine" ||
+		generate.Labels["quant_ladder"] != "bf16,q8,q6,q4" ||
+		generate.Labels["production_quant_tier"] != "default" ||
+		generate.Labels["production_quant_product_default"] != "true" ||
+		generate.Labels["production_quant_model"] != ProductionLaneCurrentModelID ||
+		generate.Labels["production_quant_min_visible_tokens_per_sec"] != "100" ||
+		generate.Labels["production_quant_runnable_pack_count"] != "14" ||
+		!strings.Contains(generate.Labels["production_quant_load_only_packs"], "E4B:bf16") ||
+		!strings.Contains(generate.Labels["production_quant_planned_packs"], "E2B:mxfp8") ||
+		!strings.Contains(generate.Labels["production_quant_planned_packs"], "E4B:mxfp8") {
+		t.Fatalf("generate capability = %+v ok=%v, want Gemma4 q6 MLX affine labels", generate, ok)
+	}
+	if !strings.Contains(generate.Detail, "MLX affine 4/6/8-bit") {
+		t.Fatalf("generate detail = %q, want bit-aware MLX affine detail", generate.Detail)
+	}
+	chat, ok := report.Capability(inference.CapabilityChat)
+	if !ok || chat.Labels["decode_quant"] != "mlx_q6" || chat.Labels["chat_template"] != "gemma4_hf_turn" {
+		t.Fatalf("chat capability = %+v ok=%v, want q6 Gemma4 template labels", chat, ok)
+	}
+	benchmark, ok := report.Capability(inference.CapabilityBenchmark)
+	if !ok ||
+		benchmark.Labels["decode_quant"] != "mlx_q6" ||
+		benchmark.Labels["benchmark_retained_state_book"] != "BenchmarkInferenceGemma4Q4Book10Turn_RetainedState" ||
+		benchmark.Labels["benchmark_prompt_replay_fallback"] != "forbidden" ||
+		benchmark.Labels["production_book_policy"] != "retained_state_required" ||
+		benchmark.Labels["production_book_decision_source"] != "benchmark_metrics" ||
+		benchmark.Labels["production_book_gate_raw_decode_tokens_per_sec"] != "100" ||
+		benchmark.Labels["production_book_gate_wall_seconds"] != strconv.Itoa(ProductionLaneBookWallSeconds) ||
+		benchmark.Labels["production_book_gate_metrics"] == "" ||
+		benchmark.Labels["production_book_gate_reason_codes"] != productionBookGateReasonCodesLabel ||
+		benchmark.Labels["production_book_retained_route_metrics"] == "" ||
+		benchmark.Labels["production_book_retained_artifact_labels"] == "" ||
+		benchmark.Labels["production_book_required_metrics"] == "" ||
+		benchmark.Labels["production_model_source"] != "model_identity_or_pack" ||
+		benchmark.Labels["production_quant_decision_source"] != "gemma4_family_matrix" {
+		t.Fatalf("benchmark capability = %+v ok=%v, want q6 retained-state production book labels", benchmark, ok)
+	}
+	if benchmark.Labels["engine_state_context_route_contract"] != ROCmStateContextRegistryContract ||
+		benchmark.Labels["engine_lora_route_contract"] != ROCmLoRAAdapterRegistryContract ||
+		benchmark.Labels["engine_attached_drafter_route_contract"] != ROCmAttachedDrafterRegistryContract ||
+		benchmark.Labels["engine_attached_drafter_role"] != "target" {
+		t.Fatalf("benchmark route labels = %+v, want q6 Gemma4 registry route labels", benchmark.Labels)
+	}
+	assertCSVLabelContainsAll(t, "production_book_gate_metrics", benchmark.Labels["production_book_gate_metrics"], productionBookGateMetrics)
+	assertCSVLabelContainsAll(t, "production_book_retained_route_metrics", benchmark.Labels["production_book_retained_route_metrics"], productionBookRetainedRouteMetrics)
+	assertCSVLabelContainsAll(t, "production_book_retained_artifact_labels", benchmark.Labels["production_book_retained_artifact_labels"], productionBookRetainedArtifactLabels)
+}
+
+func TestNativeContract_RocmGemma4E4BQ6CapabilityLabels_Good(t *testing.T) {
+	report := rocmCapabilityReport(nativeDeviceInfo{}, inference.ModelIdentity{
+		Path:         "/models/lmstudio-community-gemma-4-e4b-it-6bit",
+		Architecture: "gemma4_text",
+		VocabSize:    262144,
+		NumLayers:    26,
+		HiddenSize:   2304,
+		QuantBits:    6,
+		QuantGroup:   64,
+	}, inference.AdapterIdentity{}, true, defaultHIPKernelStatus(), rocmCapabilityReportOption{Gemma4Q4GenerateLinked: true})
+
+	generate, ok := report.Capability(inference.CapabilityGenerate)
+	if !ok ||
+		generate.Labels["decode_quant"] != "mlx_q6" ||
+		generate.Labels["gemma4_size"] != "E4B" ||
+		generate.Labels["gemma4_quant_mode"] != "q6" ||
+		generate.Labels["gemma4_pack_supported"] != "true" ||
+		generate.Labels["gemma4_runtime"] != Gemma4RuntimeMLXAffine ||
+		generate.Labels["gemma4_generate_status"] != Gemma4GenerateLinked ||
+		generate.Labels["gemma4_runnable_on_card"] != "true" ||
+		generate.Labels["decode_layers"] != "26" ||
+		generate.Labels["decode_hidden_size"] != "2304" {
+		t.Fatalf("generate capability = %+v ok=%v, want Gemma4 E4B q6 size/quant labels from path metadata", generate, ok)
+	}
+}
+
+func TestNativeContract_RocmGemma4CapabilityLabelsInferPathQuant_Good(t *testing.T) {
+	report := rocmCapabilityReport(nativeDeviceInfo{}, inference.ModelIdentity{
+		Path:         "/models/lmstudio-community-gemma-4-e4b-it-6bit",
+		Architecture: "gemma4_text",
+		VocabSize:    262144,
+		NumLayers:    26,
+		HiddenSize:   2304,
+	}, inference.AdapterIdentity{}, true, defaultHIPKernelStatus(), rocmCapabilityReportOption{Gemma4Q4GenerateLinked: true})
+
+	if report.Model.QuantType != "q6" || report.Model.QuantBits != 6 {
+		t.Fatalf("report model = %+v, want path-inferred q6 identity", report.Model)
+	}
+	generate, ok := report.Capability(inference.CapabilityGenerate)
+	if !ok ||
+		generate.Labels["decode_quant"] != "mlx_q6" ||
+		generate.Labels["gemma4_mlx_affine_bits"] != "6" ||
+		generate.Labels["gemma4_size"] != "E4B" ||
+		generate.Labels["gemma4_quant_mode"] != "q6" ||
+		generate.Labels["gemma4_generate_status"] != Gemma4GenerateLinked {
+		t.Fatalf("generate capability = %+v ok=%v, want path-inferred E4B q6 labels", generate, ok)
+	}
+}
+
+func TestNativeContract_RocmGemma4TwelveBQ6CapabilityLabels_Good(t *testing.T) {
+	report := rocmCapabilityReport(nativeDeviceInfo{}, inference.ModelIdentity{
+		Path:         "/models/lmstudio-community-gemma-4-12b-it-6bit",
+		Architecture: "gemma4_text",
+		VocabSize:    262144,
+		NumLayers:    48,
+		HiddenSize:   3840,
+		QuantBits:    6,
+		QuantGroup:   64,
+	}, inference.AdapterIdentity{}, true, defaultHIPKernelStatus(), rocmCapabilityReportOption{Gemma4Q4GenerateLinked: true})
+
+	generate, ok := report.Capability(inference.CapabilityGenerate)
+	if !ok ||
+		generate.Labels["decode_quant"] != "mlx_q6" ||
+		generate.Labels["gemma4_size"] != "12B" ||
+		generate.Labels["gemma4_quant_mode"] != "q6" ||
+		generate.Labels["gemma4_pack_supported"] != "true" ||
+		generate.Labels["gemma4_runtime"] != Gemma4RuntimeMLXAffine ||
+		generate.Labels["gemma4_generate_status"] != Gemma4GenerateLinked ||
+		generate.Labels["gemma4_runnable_on_card"] != "true" ||
+		generate.Labels["decode_layers"] != "48" ||
+		generate.Labels["decode_hidden_size"] != "3840" {
+		t.Fatalf("generate capability = %+v ok=%v, want Gemma4 12B q6 size/quant labels", generate, ok)
+	}
+	benchmark, ok := report.Capability(inference.CapabilityBenchmark)
+	if !ok ||
+		benchmark.Labels["attached_drafter_target_gemma4_size"] != "12B" ||
+		benchmark.Labels["attached_drafter_target_gemma4_quant_mode"] != "q6" ||
+		benchmark.Labels["attached_drafter_target_gemma4_quant_group"] != "64" ||
+		benchmark.Labels["attached_drafter_assistant_gemma4_size"] != "12B" ||
+		benchmark.Labels["attached_drafter_assistant_gemma4_quant_mode"] != "bf16" ||
+		benchmark.Labels["attached_drafter_official_pair_verified"] != "false" {
+		t.Fatalf("benchmark capability = %+v ok=%v, want non-official 12B MTP pair labels", benchmark, ok)
+	}
+}
+
+func TestNativeContract_RocmGemma4Unified12BQ4ExposesLinkedCapability_Good(t *testing.T) {
+	report := rocmCapabilityReport(nativeDeviceInfo{}, inference.ModelIdentity{
+		Path:         "/models/lmstudio-community-gemma-4-12b-it-4bit",
+		Architecture: "gemma4_text",
+		VocabSize:    262144,
+		NumLayers:    48,
+		HiddenSize:   3840,
+		QuantBits:    4,
+		QuantGroup:   64,
+	}, inference.AdapterIdentity{}, true, defaultHIPKernelStatus(), rocmCapabilityReportOption{Gemma4Q4GenerateLinked: true})
+
+	generate, ok := report.Capability(inference.CapabilityGenerate)
+	if !ok || generate.Status != inference.CapabilityStatusExperimental ||
+		generate.Labels["gemma4_size"] != "12B" ||
+		generate.Labels["gemma4_quant_mode"] != "q4" ||
+		generate.Labels["gemma4_pack_supported"] != "true" ||
+		generate.Labels["gemma4_runtime"] != Gemma4RuntimeMLXAffine ||
+		generate.Labels["gemma4_generate_status"] != Gemma4GenerateLinked ||
+		generate.Labels["gemma4_runnable_on_card"] != "true" ||
+		generate.Labels["kernel_scope"] != "loaded_gemma4_q4_experimental_generate" {
+		t.Fatalf("generate capability = %+v ok=%v, want linked Gemma4 12B q4 generation", generate, ok)
+	}
+	chat, ok := report.Capability(inference.CapabilityChat)
+	if !ok || chat.Status != inference.CapabilityStatusExperimental ||
+		chat.Labels["gemma4_size"] != "12B" ||
+		chat.Labels["gemma4_quant_mode"] != "q4" ||
+		chat.Labels["gemma4_pack_supported"] != "true" ||
+		chat.Labels["kernel_scope"] != "loaded_gemma4_q4_experimental_chat" {
+		t.Fatalf("chat capability = %+v ok=%v, want linked Gemma4 12B q4 chat", chat, ok)
+	}
+	modelLoad, ok := report.Capability(inference.CapabilityModelLoad)
+	if !ok ||
+		modelLoad.Labels["gemma4_size"] != "12B" ||
+		modelLoad.Labels["gemma4_quant_mode"] != "q4" ||
+		modelLoad.Labels["gemma4_pack_supported"] != "true" {
+		t.Fatalf("model-load capability = %+v ok=%v, want supported Gemma4 12B q4 labels", modelLoad, ok)
+	}
+	chatTemplate, ok := report.Capability(inference.CapabilityChatTemplate)
+	if !ok ||
+		chatTemplate.Labels["chat_template"] != "gemma4_hf_turn" ||
+		chatTemplate.Labels["gemma4_size"] != "12B" ||
+		chatTemplate.Labels["gemma4_quant_mode"] != "q4" ||
+		chatTemplate.Labels["gemma4_pack_supported"] != "true" ||
+		chatTemplate.Labels["engine_tokenizer_route_contract"] != ROCmModelTokenizerRegistryContract ||
+		chatTemplate.Labels["engine_tokenizer_chat_template_id"] != "gemma4_hf_turn" {
+		t.Fatalf("chat-template capability = %+v ok=%v, want Gemma4 12B q4 template labels", chatTemplate, ok)
+	}
+	for _, id := range []inference.CapabilityID{
+		inference.CapabilityModelFit,
+		inference.CapabilityMemoryPlanning,
+		inference.CapabilityKVCachePlanning,
+		inference.CapabilityTokenizer,
+		inference.CapabilityClassify,
+		inference.CapabilityBenchmark,
+		inference.CapabilityEvaluation,
+		inference.CapabilitySpeculativeDecode,
+		inference.CapabilityPromptLookupDecode,
+	} {
+		capability, ok := report.Capability(id)
+		if !ok ||
+			capability.Labels["gemma4_size"] != "12B" ||
+			capability.Labels["gemma4_quant_mode"] != "q4" ||
+			capability.Labels["gemma4_pack_supported"] != "true" {
+			t.Fatalf("capability %s = %+v ok=%v, want supported Gemma4 12B q4 labels", id, capability, ok)
+		}
+	}
+}
+
+func TestNativeContract_RocmGemma4LargestPacksStatusOnly_Bad(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		size   string
+		path   string
+		labels map[string]string
+	}{
+		{name: "26b-a4b", size: "26B-A4B", path: "gemma-4-26b-a4b-it-6bit"},
+		{name: "31b", size: "31B", path: "gemma-4-31b-it-6bit"},
+		{name: "31b-carried-labels", size: "31B", path: "generic-local-pack", labels: map[string]string{
+			"gemma4_size":       "31b",
+			"gemma4_quant_mode": "Q6",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			report := rocmCapabilityReport(nativeDeviceInfo{}, inference.ModelIdentity{
+				Architecture: "gemma4_text",
+				Path:         tc.path,
+				Labels:       tc.labels,
+				VocabSize:    262144,
+				NumLayers:    64,
+				HiddenSize:   4096,
+				QuantBits:    6,
+				QuantGroup:   64,
+			}, inference.AdapterIdentity{}, true, defaultHIPKernelStatus(), rocmCapabilityReportOption{Gemma4Q4GenerateLinked: true})
+
+			generate, ok := report.Capability(inference.CapabilityGenerate)
+			if !ok ||
+				generate.Status == inference.CapabilityStatusExperimental ||
+				generate.Labels["gemma4_size"] != tc.size ||
+				generate.Labels["gemma4_quant_mode"] != "q6-status" ||
+				generate.Labels["gemma4_pack_supported"] != "true" ||
+				generate.Labels["gemma4_runtime"] != Gemma4RuntimePlanned ||
+				generate.Labels["gemma4_generate_status"] != Gemma4GeneratePlannedOnly ||
+				generate.Labels["gemma4_runnable_on_card"] != "false" ||
+				generate.Labels["kernel_scope"] == "loaded_gemma4_q4_experimental_generate" {
+				t.Fatalf("generate capability = %+v ok=%v, want %s q6 status-only planned labels", generate, ok, tc.size)
+			}
+			if chat, ok := report.Capability(inference.CapabilityChat); !ok ||
+				chat.Status == inference.CapabilityStatusExperimental ||
+				chat.Labels["gemma4_size"] != tc.size ||
+				chat.Labels["gemma4_quant_mode"] != "q6-status" ||
+				chat.Labels["gemma4_generate_status"] != Gemma4GeneratePlannedOnly ||
+				chat.Labels["kernel_scope"] == "loaded_gemma4_q4_experimental_chat" {
+				t.Fatalf("chat capability = %+v ok=%v, want %s q6 status-only planned labels", chat, ok, tc.size)
+			}
+		})
+	}
+}
+
+var nativeContractGemma4BenchmarkCapabilityLabelsSink map[string]string
+var nativeContractQuantizationCapabilityLabelsSink map[string]string
+
+func BenchmarkNativeContract_RocmGemma4Q6BenchmarkCapabilityLabels(b *testing.B) {
+	model := inference.ModelIdentity{
+		Architecture: "gemma4_text",
+		VocabSize:    262144,
+		NumLayers:    35,
+		HiddenSize:   1536,
+		QuantBits:    6,
+		QuantGroup:   64,
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		nativeContractGemma4BenchmarkCapabilityLabelsSink = rocmGemma4Q4BenchmarkCapabilityLabels(model)
+	}
+}
+
+func BenchmarkNativeContract_RocmQuantizationCapabilityLabels(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		nativeContractQuantizationCapabilityLabelsSink = rocmQuantizationCapabilityLabels()
+	}
+}
+
+func BenchmarkNativeContract_RocmQuantizationCapabilityLabelsApply(b *testing.B) {
+	labels := make(map[string]string, 32)
+	b.ReportAllocs()
+	for b.Loop() {
+		clear(labels)
+		rocmApplyQuantizationCapabilityLabels(labels)
+	}
+	if labels["autoround_calibration_evidence_helper"] != "ApplyProductionAutoRoundCalibrationLabelEvidence" ||
+		labels["autoround_calibration_validator"] != "ValidateProductionAutoRoundCalibrationLabels" ||
+		labels["autoround_calibration_decision_validator"] != "ValidateProductionAutoRoundCalibrationDecisionLabels" ||
+		labels["autoround_calibration_evidence_decision_validator"] != "ValidateProductionAutoRoundCalibrationEvidenceDecisionLabels" ||
+		labels["production_required_metrics"] != defaultProductionTurboQuantRequiredMetricsLabel {
+		b.Fatalf("labels = %+v, want quantization capability labels", labels)
 	}
 }
 
@@ -671,7 +1482,7 @@ func TestNativeContract_RocmModelCapabilitiesUseLoRAKernelStatus_Good(t *testing
 		capability.Labels["kernel_name"] != hipKernelNameLoRA ||
 		capability.Labels["lora_kernel"] != hipKernelStatusLinked ||
 		capability.Labels["kernel_scope"] != "loaded_adapter_fixtures" ||
-		capability.Labels["supported_adapter_scopes"] != "tiny_output_head,qwen_gemma_small_lm_head,bert_sequence_classifier" ||
+		capability.Labels["supported_adapter_scopes"] != "tiny_output_head,qwen_gemma_dense_small_lm_head,bert_sequence_classifier" ||
 		capability.Labels["production_adapter_application"] != hipKernelStatusNotLinked {
 		t.Fatalf("LoRA capability = %+v ok=%v, want experimental tiny LoRA kernel fixture", capability, ok)
 	}
@@ -799,7 +1610,7 @@ func TestNativeContract_LoadModelSafetensorsGemma4UsesNativeRuntime_Good(t *test
 		"architectures":["Gemma4ForConditionalGeneration"],
 		"model_type":"gemma4",
 		"tie_word_embeddings":true,
-		"quantization_config":{"bits":4,"group_size":64,"mode":"affine"},
+		"quantization_config":{"bits":6,"group_size":64,"mode":"affine"},
 		"text_config":{
 			"model_type":"gemma4_text",
 			"hidden_size":16,
@@ -829,7 +1640,7 @@ func TestNativeContract_LoadModelSafetensorsGemma4UsesNativeRuntime_Good(t *test
 		runtime.loadConfig.ModelInfo.HiddenSize != 16 ||
 		runtime.loadConfig.ModelInfo.VocabSize != 8 ||
 		runtime.loadConfig.ModelInfo.NumLayers != 1 ||
-		runtime.loadConfig.ModelInfo.QuantBits != 4 ||
+		runtime.loadConfig.ModelInfo.QuantBits != 6 ||
 		runtime.loadConfig.ModelInfo.QuantGroup != 64 {
 		t.Fatalf("load config model = %+v, want Gemma4 text_config identity", runtime.loadConfig.ModelInfo)
 	}
@@ -852,7 +1663,7 @@ func TestNativeContract_LoadModelSafetensorsGemma4PropagatesTextRuntimeConfig_Go
 		"architectures":["Gemma4ForConditionalGeneration"],
 		"model_type":"gemma4",
 		"tie_word_embeddings":true,
-		"quantization_config":{"bits":4,"group_size":64,"mode":"affine"},
+		"quantization_config":{"bits":6,"group_size":64,"mode":"affine"},
 		"text_config":{
 			"model_type":"gemma4_text",
 			"hidden_size":16,
@@ -874,6 +1685,7 @@ func TestNativeContract_LoadModelSafetensorsGemma4PropagatesTextRuntimeConfig_Go
 			"moe_intermediate_size":32,
 			"max_position_embeddings":131072,
 			"sliding_window":1024,
+			"sliding_window_pattern":5,
 			"layer_types":["sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention","sliding_attention"],
 			"rope_parameters":{
 				"sliding_attention":{"rope_theta":10000.0,"rope_type":"default"},
@@ -896,10 +1708,12 @@ func TestNativeContract_LoadModelSafetensorsGemma4PropagatesTextRuntimeConfig_Go
 	defer model.Close()
 
 	cfg := runtime.loadConfig.Gemma4TextConfig
+	core.AssertEqual(t, 6, cfg.NumLayers)
 	core.AssertEqual(t, []string{"sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention", "full_attention"}, cfg.LayerTypes)
 	core.AssertEqual(t, true, cfg.KVSharedLayersSet)
 	core.AssertEqual(t, 2, cfg.KVSharedLayers)
 	core.AssertEqual(t, 1024, cfg.SlidingWindow)
+	core.AssertEqual(t, 5, cfg.SlidingWindowPattern)
 	core.AssertEqual(t, 512, cfg.HeadDim)
 	core.AssertEqual(t, 1024, cfg.GlobalHeadDim)
 	core.AssertEqual(t, 4, cfg.HiddenSizePerLayerInput)
@@ -916,7 +1730,23 @@ func TestNativeContract_LoadModelSafetensorsGemma4PropagatesTextRuntimeConfig_Go
 	core.AssertEqual(t, float64(0.25), cfg.RoPEParameters["full_attention"].PartialRotaryFactor)
 	core.AssertEqual(t, float64(1), cfg.RoPEParameters["full_attention"].Factor)
 	if runtime.loadConfig.ModelLabels["attention_layer_types"] == "" ||
+		runtime.loadConfig.ModelLabels["sliding_window"] != "1024" ||
+		runtime.loadConfig.ModelLabels["gemma4_sliding_window"] != "1024" ||
+		runtime.loadConfig.ModelLabels["sliding_window_pattern"] != "5" ||
+		runtime.loadConfig.ModelLabels["gemma4_sliding_window_pattern"] != "5" ||
 		runtime.loadConfig.ModelLabels["attention_kv_shared_layers"] != "2" ||
+		runtime.loadConfig.ModelLabels["gemma4_attention_kv_shared_layers"] != "2" ||
+		runtime.loadConfig.ModelLabels["attention_layer_count"] != "6" ||
+		runtime.loadConfig.ModelLabels["gemma4_attention_layer_count"] != "6" ||
+		runtime.loadConfig.ModelLabels["attention_cache_owner_by_layer"] != "0,1,2,3,4,4" ||
+		runtime.loadConfig.ModelLabels["attention_cache_index_by_layer"] != "0,1,2,3,4,-1" ||
+		runtime.loadConfig.ModelLabels["attention_cache_owner_count"] != "5" ||
+		runtime.loadConfig.ModelLabels["attention_cache_shared_layers"] != "1" ||
+		runtime.loadConfig.ModelLabels["gemma4_fixed_sliding_prefill_chunk_limit"] != "1024" ||
+		runtime.loadConfig.ModelLabels["attention_window_policy"] != "sliding_causal" ||
+		runtime.loadConfig.ModelLabels["attention_mask_cached_offset_causal"] != "true" ||
+		runtime.loadConfig.ModelLabels["attention_mask_fixed_single_token"] != "true" ||
+		runtime.loadConfig.ModelLabels["gemma4_speculative_verify_proposal_window_limit"] != "1023" ||
 		runtime.loadConfig.ModelLabels["gemma4_hidden_size_per_layer_input"] != "4" ||
 		runtime.loadConfig.ModelLabels["gemma4_vocab_size_per_layer_input"] != "8" ||
 		runtime.loadConfig.ModelLabels["gemma4_use_double_wide_mlp"] != "true" ||
@@ -929,6 +1759,16 @@ func TestNativeContract_LoadModelSafetensorsGemma4PropagatesTextRuntimeConfig_Go
 		runtime.loadConfig.ModelLabels["attention_rope_full_theta"] != "1e+06" ||
 		runtime.loadConfig.ModelLabels["attention_rope_full_factor"] != "1" {
 		t.Fatalf("model labels = %+v, want Gemma4 attention metadata propagated", runtime.loadConfig.ModelLabels)
+	}
+	if !runtime.loadConfig.EngineProfile.Matched() ||
+		runtime.loadConfig.EngineProfile.Name != "gemma4" ||
+		!runtime.loadConfig.EngineProfile.Gemma4EngineFeatures.FixedSlidingCache ||
+		!runtime.loadConfig.EngineProfile.Gemma4EngineFeatures.FixedSlidingCacheBound ||
+		runtime.loadConfig.EngineProfile.Gemma4DeclaredFeatures.Attention.SlidingWindow != 1024 ||
+		runtime.loadConfig.EngineProfile.Gemma4DeclaredFeatures.Attention.SlidingPattern != 5 ||
+		runtime.loadConfig.ModelLabels["engine_profile"] != "gemma4" ||
+		runtime.loadConfig.ModelLabels["engine_fixed_sliding_cache"] != "true" {
+		t.Fatalf("engine profile = %+v labels=%+v, want config-owned Gemma4 registry profile", runtime.loadConfig.EngineProfile, runtime.loadConfig.ModelLabels)
 	}
 }
 
@@ -972,6 +1812,40 @@ func TestNativeContract_Gemma4TieWordEmbeddingsDefaultsTrue_Good(t *testing.T) {
 	explicitTrue := true
 	cfg.TieWordEmbeddings = &explicitTrue
 	core.AssertEqual(t, true, rocmConfigTiedWordEmbeddings(cfg))
+}
+
+func TestNativeContract_Gemma4NativeConfigDeclaresMultimodalTowers_Good(t *testing.T) {
+	cfg := rocmNativeGemma4TextConfigFromProbe(rocmModelPackConfigProbe{
+		ModelType:                "gemma4",
+		ImageTokenID:             258880,
+		AudioTokenID:             258881,
+		VisionSoftTokensPerImage: 280,
+		VisionConfig: rocmModelPackVisionConfigProbe{
+			ModelType:       "gemma4_vision",
+			HiddenSize:      1152,
+			NumHiddenLayers: 27,
+		},
+		AudioConfig: rocmModelPackAudioConfigProbe{
+			ModelType:       "gemma4_audio",
+			HiddenSize:      1024,
+			NumHiddenLayers: 24,
+			AudioEmbedDim:   768,
+		},
+	})
+
+	core.AssertEqual(t, true, cfg.Vision)
+	core.AssertEqual(t, true, cfg.Audio)
+	features := Gemma4DeclaredFeaturesOfNativeConfig(cfg)
+	core.AssertEqual(t, true, features.Vision)
+	core.AssertEqual(t, true, features.Audio)
+	labels := rocmApplyGemma4NativeConfigFeatureLabels(nil, cfg)
+	core.AssertEqual(t, "true", labels["gemma4_multimodal"])
+	core.AssertEqual(t, "true", labels["gemma4_vision"])
+	core.AssertEqual(t, "true", labels["gemma4_audio"])
+
+	textOnly := rocmNativeGemma4TextConfigFromProbe(rocmModelPackConfigProbe{ModelType: "gemma4"})
+	core.AssertEqual(t, false, textOnly.Vision)
+	core.AssertEqual(t, false, textOnly.Audio)
 }
 
 func TestNativeContract_Gemma4LayerTypesDefaultPatternForcesFinalFull_Good(t *testing.T) {
@@ -1120,6 +1994,107 @@ func TestNativeContract_PlanModelFit_Good(t *testing.T) {
 	}
 }
 
+func TestNativeContract_PlanModelFit_Q6QuantTypeOnly_Good(t *testing.T) {
+	runtime := &fakeNativeRuntime{device: nativeDeviceInfo{MemoryBytes: 16 * memoryGiB, Name: "gfx1100"}}
+	report, err := newROCmBackendWithRuntime(runtime).PlanModelFit(context.Background(), inference.ModelIdentity{
+		Architecture:  "gemma4_text",
+		Path:          "/models/lmstudio-community-gemma-4-e2b-it-6bit",
+		QuantType:     "q6",
+		ContextLength: 32768,
+		NumLayers:     35,
+		HiddenSize:    1536,
+	}, 0)
+	if err != nil {
+		t.Fatalf("PlanModelFit: %v", err)
+	}
+	if report == nil || !report.Fits || !report.ArchitectureOK || !report.QuantizationOK {
+		t.Fatalf("fit report = %+v, want string-only q6 quantization accepted", report)
+	}
+	if report.Model.QuantType != "q6" {
+		t.Fatalf("model quant type = %q, want q6", report.Model.QuantType)
+	}
+	if report.MemoryPlan.Labels["production_quant_policy"] != "gemma4_mlx_affine" ||
+		report.MemoryPlan.Labels["production_quant_tier"] != "default" ||
+		report.MemoryPlan.Labels["production_quant_active_weight_read_bytes_per_token"] == "" ||
+		report.MemoryPlan.Labels["production_quant_min_visible_tokens_per_sec"] != "100" ||
+		report.MemoryPlan.Labels["production_quant_pack_sizes"] != "E2B,E4B,12B,26B-A4B,31B" {
+		t.Fatalf("memory plan labels = %+v, want q6 production quant policy labels", report.MemoryPlan.Labels)
+	}
+	if report.MemoryPlan.Labels["engine_state_context_route_contract"] != ROCmStateContextRegistryContract ||
+		report.MemoryPlan.Labels["engine_state_context_window"] != "32768" ||
+		report.MemoryPlan.Labels["engine_state_context_prompt_replay_refused"] != "true" ||
+		report.MemoryPlan.Labels["engine_state_context_remaining_context_default"] != "true" ||
+		report.MemoryPlan.Labels["engine_state_context_runtime_owned_kv"] != "true" ||
+		report.MemoryPlan.Labels["engine_lora_route_contract"] != ROCmLoRAAdapterRegistryContract ||
+		report.MemoryPlan.Labels["engine_lora_target_policy"] != "gemma4" ||
+		report.MemoryPlan.Labels["engine_lora_default_targets"] != "q_proj,v_proj,o_proj" ||
+		report.MemoryPlan.Labels["engine_lora_extended_targets_require_opt"] != "true" ||
+		report.MemoryPlan.Labels["engine_attached_drafter_route_contract"] != ROCmAttachedDrafterRegistryContract ||
+		report.MemoryPlan.Labels["engine_attached_drafter_role"] != "target" ||
+		report.MemoryPlan.Labels["engine_attached_drafter_native_attachment"] != hipKernelStatusNotLinked ||
+		report.MemoryPlan.Labels["engine_attached_drafter_retained_state_required"] != "true" ||
+		report.MemoryPlan.Labels["engine_attached_drafter_prompt_replay_fallback"] != "forbidden" {
+		t.Fatalf("memory plan labels = %+v, want registry route labels", report.MemoryPlan.Labels)
+	}
+}
+
+func TestNativeContract_PlanModelFit_DenseAndMTPRouteLabels_Good(t *testing.T) {
+	runtime := &fakeNativeRuntime{device: nativeDeviceInfo{MemoryBytes: 16 * memoryGiB, Name: "gfx1100"}}
+	for _, architecture := range []string{"gemma3", "qwen3", "qwen3_6", "mistral"} {
+		t.Run("dense_"+architecture, func(t *testing.T) {
+			dense, err := newROCmBackendWithRuntime(runtime).PlanModelFit(context.Background(), inference.ModelIdentity{
+				Architecture:  architecture,
+				QuantBits:     6,
+				ContextLength: 32768,
+				NumLayers:     32,
+				HiddenSize:    4096,
+			}, 0)
+			if err != nil {
+				t.Fatalf("PlanModelFit dense: %v", err)
+			}
+			if dense == nil || dense.MemoryPlan.Labels["dense_route_candidate"] != "true" ||
+				dense.MemoryPlan.Labels["dense_route_status"] != "experimental" ||
+				dense.MemoryPlan.Labels["dense_route_family"] != "loader_neutral" ||
+				dense.MemoryPlan.Labels["dense_route_backend"] != "hip_small_decode" ||
+				dense.MemoryPlan.Labels["dense_route_reference"] != "gemma4_mlx_affine_matvec" {
+				t.Fatalf("dense fit report = %+v, want dense route candidate labels", dense)
+			}
+		})
+	}
+
+	assistant, err := newROCmBackendWithRuntime(runtime).PlanModelFit(context.Background(), inference.ModelIdentity{
+		Architecture:  "gemma4_assistant",
+		QuantBits:     6,
+		ContextLength: 32768,
+		NumLayers:     35,
+		HiddenSize:    1536,
+	}, 0)
+	if err != nil {
+		t.Fatalf("PlanModelFit assistant: %v", err)
+	}
+	if assistant == nil || assistant.MemoryPlan.Labels["attached_drafter"] != "experimental_retained_plan" ||
+		assistant.MemoryPlan.Labels["attached_drafter_native_attachment"] != hipKernelStatusNotLinked ||
+		assistant.MemoryPlan.Labels["attached_drafter_retained_state_entrypoint"] != hipKernelStatusLinked ||
+		assistant.MemoryPlan.Labels["attached_drafter_retained_state_required"] != "true" ||
+		assistant.MemoryPlan.Labels["attached_drafter_state_source"] != "rocm_state_session_runtime_kv" ||
+		assistant.MemoryPlan.Labels["attached_drafter_prompt_replay_fallback"] != "forbidden" ||
+		assistant.MemoryPlan.Labels["mtp_role"] != "drafter" ||
+		assistant.MemoryPlan.Labels["mtp_target_family"] != "gemma4" {
+		t.Fatalf("assistant fit report = %+v, want MTP drafter labels", assistant)
+	}
+	if assistant.MemoryPlan.Labels["engine_state_context_route_contract"] != ROCmStateContextRegistryContract ||
+		assistant.MemoryPlan.Labels["engine_state_context_attached_only"] != "true" ||
+		assistant.MemoryPlan.Labels["engine_state_context_attached_drafter_state"] != "true" ||
+		assistant.MemoryPlan.Labels["engine_state_context_runtime_owned_kv"] != "true" ||
+		assistant.MemoryPlan.Labels["engine_attached_drafter_route_contract"] != ROCmAttachedDrafterRegistryContract ||
+		assistant.MemoryPlan.Labels["engine_attached_drafter_role"] != "assistant" ||
+		assistant.MemoryPlan.Labels["engine_attached_drafter_attached_only"] != "true" ||
+		assistant.MemoryPlan.Labels["engine_attached_drafter_assistant"] != "true" ||
+		assistant.MemoryPlan.Labels["engine_attached_drafter_prompt_replay_fallback"] != "forbidden" {
+		t.Fatalf("assistant fit report labels = %+v, want registry route labels", assistant.MemoryPlan.Labels)
+	}
+}
+
 func TestNativeContract_PlanModelFit_Rocm16GBMoELazyExperts_Good(t *testing.T) {
 	runtime := &fakeNativeRuntime{device: nativeDeviceInfo{MemoryBytes: 16 * memoryGiB, Name: "gfx1100"}}
 	report, err := newROCmBackendWithRuntime(runtime).PlanModelFit(context.Background(), inference.ModelIdentity{
@@ -1234,7 +2209,11 @@ func TestNativeContract_PlanModelFit_Gemma4SlidingAttentionWeightBytes_Good(t *t
 		report.MemoryPlan.Labels["attention_sliding_layers"] != "28" ||
 		report.MemoryPlan.Labels["attention_kv_width"] != "256" ||
 		report.MemoryPlan.Labels["attention_global_kv_width"] != "512" ||
-		report.MemoryPlan.Labels["sliding_window"] != "512" {
+		report.MemoryPlan.Labels["sliding_window"] != "512" ||
+		report.MemoryPlan.Labels["production_quant_policy"] != "gemma4_mlx_affine" ||
+		report.MemoryPlan.Labels["production_quant_default_bits"] != "6" ||
+		report.MemoryPlan.Labels["production_quant_quality_bits"] != "8" ||
+		report.MemoryPlan.Labels["production_quant_constrained_bits"] != "4" {
 		t.Fatalf("memory plan labels = %+v, want known weights and sliding-attention metadata", report.MemoryPlan.Labels)
 	}
 	if nativeContractHasNoteContaining(report.Notes, "weight and KV cache estimate leaves too little memory") {
@@ -2341,8 +3320,9 @@ func TestNativeContract_BenchmarkWarmupRunsAllPromptsWithoutMeasuredCounters_Goo
 func TestNativeContract_GeneratedPromptUsesExplicitGemma4Q4TextMode_Good(t *testing.T) {
 	model := &rocmModel{
 		native: &hipLoadedModel{
-			modelInfo: inference.ModelInfo{Architecture: "gemma4_text", QuantBits: 4},
-			tokenText: &hipTokenTextDecoder{},
+			modelInfo:   inference.ModelInfo{Architecture: "gemma4_text", QuantBits: 4},
+			modelLabels: linkedGemma4TestLabels("E2B", "q4"),
+			tokenText:   &hipTokenTextDecoder{},
 		},
 	}
 
@@ -2386,6 +3366,214 @@ func TestNativeContract_BenchmarkDecodeHelperStatusUsesQ4Generate_Good(t *testin
 	core.AssertEqual(t, "planned", rocmDecodeHelperStatusLabel(defaultHIPKernelStatus(), false))
 	core.AssertEqual(t, "experimental", rocmDecodeHelperStatusLabel(defaultHIPKernelStatus(), true))
 	core.AssertEqual(t, "experimental", rocmDecodeHelperStatusLabel(hipKernelStatus{Decode: hipKernelStatusLinked}, false))
+}
+
+func TestNativeContract_BenchmarkLabelsAttachedDrafterHelperForGemma4Affine_Good(t *testing.T) {
+	labels := map[string]string{}
+
+	rocmAddGemma4AttachedDrafterBenchmarkLabels(labels)
+
+	core.AssertEqual(t, "experimental", labels["attached.drafter.decode"])
+	core.AssertEqual(t, hipKernelStatusNotLinked, labels["attached.drafter.native_attachment"])
+	core.AssertEqual(t, "gemma4_assistant", labels["attached.drafter.role"])
+	core.AssertEqual(t, "gemma4_mlx_affine_generate", labels["attached.drafter.source"])
+	core.AssertEqual(t, hipKernelStatusLinked, labels["attached.drafter.retained_state_entrypoint"])
+	core.AssertEqual(t, "true", labels["attached.drafter.retained_state_required"])
+	core.AssertEqual(t, "rocm_state_session_runtime_kv", labels["attached.drafter.state_source"])
+	core.AssertEqual(t, "forbidden", labels["attached.drafter.prompt_replay_fallback"])
+	core.AssertEqual(t, hipKernelStatusLinked, labels["attached.drafter.target_retained_decode"])
+	core.AssertEqual(t, hipKernelStatusLinked, labels["attached.drafter.target_retained_state_decode"])
+	core.AssertEqual(t, hipKernelStatusNotLinked, labels["attached.drafter.assistant_verify"])
+	core.AssertEqual(t, hipKernelStatusNotLinked, labels["attached.drafter.assistant_state_verify"])
+	core.AssertEqual(t, attachedDrafterNativeHandoffTargetDecodeOnly, labels["attached.drafter.native_handoff"])
+	core.AssertEqual(t, officialGemma4E2BAssistantArchitecture, labels["attached.drafter.assistant_architecture"])
+	core.AssertEqual(t, "true", labels["attached.drafter.assistant_ordered_embeddings"])
+	core.AssertEqual(t, "true", labels["attached.drafter.assistant_four_layer_drafter"])
+	core.AssertEqual(t, "2048", labels["attached.drafter.assistant_centroids"])
+	core.AssertEqual(t, "32", labels["attached.drafter.assistant_centroid_intermediate_top_k"])
+	core.AssertEqual(t, "int64", labels["attached.drafter.assistant_token_ordering_dtype"])
+	core.AssertEqual(t, "2048x128", labels["attached.drafter.assistant_token_ordering_shape"])
+	core.AssertEqual(t, officialGemma4E2BAssistantModelID, labels["attached.drafter.official_assistant_model_id"])
+	core.AssertEqual(t, officialGemma4E2BAssistantRevision, labels["attached.drafter.official_assistant_revision"])
+	core.AssertEqual(t, officialGemma4E2BTargetModelID, labels["attached.drafter.official_target_model_id"])
+	core.AssertEqual(t, officialGemma4E2BTargetRevision, labels["attached.drafter.official_target_revision"])
+	core.AssertEqual(t, "true", labels["attached.drafter.official_pair_verified"])
+	core.AssertEqual(t, "true", labels["attached.drafter.gemma4_family_pair_verified"])
+	core.AssertEqual(t, ProductionLaneCurrentModelID, labels["attached.drafter.target.production_quant_model"])
+	core.AssertEqual(t, ProductionLaneModelID, labels["attached.drafter.target.production_quant_locked_model"])
+	core.AssertEqual(t, "gemma4", labels["attached.drafter.target.engine_profile"])
+	core.AssertEqual(t, "gemma4_text", labels["attached.drafter.target.engine_architecture_profile"])
+	core.AssertEqual(t, string(inference.FeatureRuntimeNative), labels["attached.drafter.target.engine_architecture_runtime_status"])
+	core.AssertEqual(t, "gemma", labels["attached.drafter.target.engine_architecture_reasoning_parser"])
+	core.AssertEqual(t, "q8,paged,k-q8-v-q4,retained-state", labels["attached.drafter.target.engine_architecture_cache_hints"])
+	core.AssertEqual(t, "gemma4_hf_turn", labels["attached.drafter.target.engine_chat_template"])
+	core.AssertEqual(t, "q_proj,v_proj,o_proj", labels["attached.drafter.target.gemma4_lora_default_targets"])
+	core.AssertEqual(t, "model_registry", labels["attached.drafter.target.gemma4_weight_policy"])
+	core.AssertEqual(t, officialGemma4E2BAssistantModelID, labels["attached.drafter.assistant.production_quant_model"])
+	core.AssertEqual(t, officialGemma4E2BAssistantModelID, labels["attached.drafter.assistant.production_quant_assistant_model"])
+	core.AssertEqual(t, "E2B:assistant-bf16", labels["attached.drafter.assistant.production_quant_pack"])
+	core.AssertEqual(t, "mtp-assistant", labels["attached.drafter.assistant.production_quant_tier"])
+	core.AssertEqual(t, "true", labels["attached.drafter.assistant.production_quant_mtp_assistant"])
+	core.AssertEqual(t, "gemma4", labels["attached.drafter.assistant.production_quant_target_family"])
+	core.AssertEqual(t, "gemma4", labels["attached.drafter.assistant.engine_profile"])
+	core.AssertEqual(t, "gemma4_assistant", labels["attached.drafter.assistant.engine_architecture_profile"])
+	core.AssertEqual(t, string(inference.FeatureRuntimeNative), labels["attached.drafter.assistant.engine_architecture_runtime_status"])
+	core.AssertEqual(t, "retained-state,attached-drafter", labels["attached.drafter.assistant.engine_architecture_cache_hints"])
+	core.AssertEqual(t, "true", labels["attached.drafter.assistant.engine_architecture_attached_only"])
+	core.AssertEqual(t, "false", labels["attached.drafter.assistant.engine_architecture_generation"])
+	core.AssertEqual(t, "", labels["attached.drafter.assistant.gemma4_lora_default_targets"])
+	core.AssertEqual(t, "", labels["attached.drafter.assistant.gemma4_weight_policy"])
+	core.AssertEqual(t, productionMTPDefaultDraftTokensLabel, labels["attached.drafter.speculative_draft_tokens"])
+}
+
+func TestNativeContract_BenchmarkLabelsAttachedDrafterRejectsNonOfficialPair_Bad(t *testing.T) {
+	labels := map[string]string{}
+
+	rocmAddGemma4AttachedDrafterBenchmarkLabels(labels, inference.ModelIdentity{
+		Path:         "/models/lmstudio-community-gemma-4-12b-it-6bit",
+		Architecture: "gemma4_text",
+		NumLayers:    48,
+		HiddenSize:   3840,
+		VocabSize:    262144,
+		QuantBits:    6,
+	}, officialGemma4E2BBF16AssistantIdentity())
+
+	core.AssertEqual(t, "12B", labels["attached.drafter.target.gemma4_size"])
+	core.AssertEqual(t, "q6", labels["attached.drafter.target.gemma4_quant_mode"])
+	core.AssertEqual(t, "64", labels["attached.drafter.target.gemma4_quant_group"])
+	core.AssertEqual(t, "mlx-community/gemma-4-12b-it-6bit", labels["attached.drafter.target.production_quant_model"])
+	core.AssertEqual(t, "", labels["attached.drafter.target.production_quant_locked_model"])
+	core.AssertEqual(t, "E2B", labels["attached.drafter.assistant.gemma4_size"])
+	core.AssertEqual(t, "bf16", labels["attached.drafter.assistant.gemma4_quant_mode"])
+	core.AssertEqual(t, officialGemma4E2BAssistantModelID, labels["attached.drafter.assistant.production_quant_model"])
+	core.AssertEqual(t, "E2B:assistant-bf16", labels["attached.drafter.assistant.production_quant_pack"])
+	core.AssertEqual(t, "true", labels["attached.drafter.assistant.production_quant_mtp_assistant"])
+	core.AssertEqual(t, "false", labels["attached.drafter.official_pair_verified"])
+	core.AssertEqual(t, "false", labels["attached.drafter.gemma4_family_pair_verified"])
+}
+
+func TestNativeContract_BenchmarkLabelsAttachedDrafterInfersAssistantFromTarget_Good(t *testing.T) {
+	labels := map[string]string{}
+
+	rocmAddGemma4AttachedDrafterBenchmarkLabels(labels, inference.ModelIdentity{
+		Path:         "/models/lmstudio-community-gemma-4-12b-it-6bit",
+		Architecture: "gemma4_text",
+		NumLayers:    48,
+		HiddenSize:   3840,
+		VocabSize:    262144,
+		QuantBits:    6,
+	})
+
+	core.AssertEqual(t, "12B", labels["attached.drafter.target.gemma4_size"])
+	core.AssertEqual(t, "q6", labels["attached.drafter.target.gemma4_quant_mode"])
+	core.AssertEqual(t, "64", labels["attached.drafter.target.gemma4_quant_group"])
+	core.AssertEqual(t, "mlx-community/gemma-4-12b-it-6bit", labels["attached.drafter.target.production_quant_model"])
+	core.AssertEqual(t, "", labels["attached.drafter.target.production_quant_locked_model"])
+	core.AssertEqual(t, "12B", labels["attached.drafter.assistant.gemma4_size"])
+	core.AssertEqual(t, "bf16", labels["attached.drafter.assistant.gemma4_quant_mode"])
+	core.AssertEqual(t, rocmGemma4MTPAssistantPath("12B", "bf16"), labels["attached.drafter.assistant.production_quant_model"])
+	core.AssertEqual(t, "12B:assistant-bf16", labels["attached.drafter.assistant.production_quant_pack"])
+	core.AssertEqual(t, "true", labels["attached.drafter.assistant.production_quant_mtp_assistant"])
+	core.AssertEqual(t, "false", labels["attached.drafter.official_pair_verified"])
+	core.AssertEqual(t, "true", labels["attached.drafter.gemma4_family_pair_verified"])
+}
+
+func TestNativeContract_CapabilityLabelsAttachedDrafterEvidence_Good(t *testing.T) {
+	labels := map[string]string{}
+
+	rocmAddGemma4AttachedDrafterCapabilityLabels(labels)
+
+	core.AssertEqual(t, hipKernelStatusLinked, labels["attached_drafter_helper"])
+	core.AssertEqual(t, hipKernelStatusNotLinked, labels["attached_drafter_native_attachment"])
+	core.AssertEqual(t, "gemma4_assistant", labels["attached_drafter_role"])
+	core.AssertEqual(t, "gemma4_mlx_affine_generate", labels["attached_drafter_source"])
+	core.AssertEqual(t, hipKernelStatusLinked, labels["attached_drafter_retained_state_entrypoint"])
+	core.AssertEqual(t, "true", labels["attached_drafter_retained_state_required"])
+	core.AssertEqual(t, "rocm_state_session_runtime_kv", labels["attached_drafter_state_source"])
+	core.AssertEqual(t, "forbidden", labels["attached_drafter_prompt_replay_fallback"])
+	core.AssertEqual(t, hipKernelStatusLinked, labels["attached_drafter_target_retained_decode"])
+	core.AssertEqual(t, hipKernelStatusLinked, labels["attached_drafter_target_retained_state_decode"])
+	core.AssertEqual(t, hipKernelStatusNotLinked, labels["attached_drafter_assistant_verify"])
+	core.AssertEqual(t, hipKernelStatusNotLinked, labels["attached_drafter_assistant_state_verify"])
+	core.AssertEqual(t, attachedDrafterNativeHandoffTargetDecodeOnly, labels["attached_drafter_native_handoff"])
+	core.AssertEqual(t, officialGemma4E2BAssistantArchitecture, labels["attached_drafter_assistant_architecture"])
+	core.AssertEqual(t, "true", labels["attached_drafter_assistant_ordered_embeddings"])
+	core.AssertEqual(t, "true", labels["attached_drafter_assistant_four_layer_drafter"])
+	core.AssertEqual(t, "2048", labels["attached_drafter_assistant_centroids"])
+	core.AssertEqual(t, "32", labels["attached_drafter_assistant_centroid_intermediate_top_k"])
+	core.AssertEqual(t, "int64", labels["attached_drafter_assistant_token_ordering_dtype"])
+	core.AssertEqual(t, "2048x128", labels["attached_drafter_assistant_token_ordering_shape"])
+	core.AssertEqual(t, officialGemma4E2BAssistantModelID, labels["attached_drafter_official_assistant_model_id"])
+	core.AssertEqual(t, officialGemma4E2BAssistantRevision, labels["attached_drafter_official_assistant_revision"])
+	core.AssertEqual(t, officialGemma4E2BTargetModelID, labels["attached_drafter_official_target_model_id"])
+	core.AssertEqual(t, officialGemma4E2BTargetRevision, labels["attached_drafter_official_target_revision"])
+	core.AssertEqual(t, "true", labels["attached_drafter_official_pair_verified"])
+	core.AssertEqual(t, "true", labels["attached_drafter_gemma4_family_pair_verified"])
+	core.AssertEqual(t, ProductionLaneCurrentModelID, labels["attached_drafter_target_production_quant_model"])
+	core.AssertEqual(t, ProductionLaneModelID, labels["attached_drafter_target_production_quant_locked_model"])
+	core.AssertEqual(t, officialGemma4E2BAssistantModelID, labels["attached_drafter_assistant_production_quant_model"])
+	core.AssertEqual(t, officialGemma4E2BAssistantModelID, labels["attached_drafter_assistant_production_quant_assistant_model"])
+	core.AssertEqual(t, "E2B:assistant-bf16", labels["attached_drafter_assistant_production_quant_pack"])
+	core.AssertEqual(t, "mtp-assistant", labels["attached_drafter_assistant_production_quant_tier"])
+	core.AssertEqual(t, "true", labels["attached_drafter_assistant_production_quant_mtp_assistant"])
+	core.AssertEqual(t, "gemma4", labels["attached_drafter_assistant_production_quant_target_family"])
+	core.AssertEqual(t, "gemma4", labels["attached_drafter_target_engine_profile"])
+	core.AssertEqual(t, "gemma4_text", labels["attached_drafter_target_engine_architecture_profile"])
+	core.AssertEqual(t, string(inference.FeatureRuntimeNative), labels["attached_drafter_target_engine_architecture_runtime_status"])
+	core.AssertEqual(t, "gemma", labels["attached_drafter_target_engine_architecture_reasoning_parser"])
+	core.AssertEqual(t, "q8,paged,k-q8-v-q4,retained-state", labels["attached_drafter_target_engine_architecture_cache_hints"])
+	core.AssertEqual(t, "gemma4_hf_turn", labels["attached_drafter_target_engine_chat_template"])
+	core.AssertEqual(t, "q_proj,v_proj,o_proj", labels["attached_drafter_target_gemma4_lora_default_targets"])
+	core.AssertEqual(t, "model_registry", labels["attached_drafter_target_gemma4_weight_policy"])
+	core.AssertEqual(t, "gemma4", labels["attached_drafter_assistant_engine_profile"])
+	core.AssertEqual(t, "gemma4_assistant", labels["attached_drafter_assistant_engine_architecture_profile"])
+	core.AssertEqual(t, string(inference.FeatureRuntimeNative), labels["attached_drafter_assistant_engine_architecture_runtime_status"])
+	core.AssertEqual(t, "retained-state,attached-drafter", labels["attached_drafter_assistant_engine_architecture_cache_hints"])
+	core.AssertEqual(t, "true", labels["attached_drafter_assistant_engine_architecture_attached_only"])
+	core.AssertEqual(t, "false", labels["attached_drafter_assistant_engine_architecture_generation"])
+	core.AssertEqual(t, "", labels["attached_drafter_assistant_gemma4_lora_default_targets"])
+	core.AssertEqual(t, "", labels["attached_drafter_assistant_gemma4_weight_policy"])
+	core.AssertEqual(t, productionMTPDefaultDraftTokensLabel, labels["attached_drafter_speculative_draft_tokens"])
+
+	speculative := rocmGemma4Q4SpeculativeDecodeCapabilityLabels(productionMTPE2BQ6TargetModel().modelIdentity())
+	core.AssertEqual(t, ROCmAttachedDrafterRegistryContract, speculative["engine_attached_drafter_route_contract"])
+	core.AssertEqual(t, hipKernelStatusNotLinked, speculative["engine_attached_drafter_native_attachment"])
+	core.AssertEqual(t, "true", speculative["engine_attached_drafter_retained_state_required"])
+	core.AssertEqual(t, "rocm_state_session_runtime_kv", speculative["engine_attached_drafter_state_source"])
+	core.AssertEqual(t, "forbidden", speculative["engine_attached_drafter_prompt_replay_fallback"])
+	core.AssertEqual(t, officialGemma4E2BAssistantArchitecture, speculative["engine_attached_drafter_assistant_architecture"])
+	core.AssertEqual(t, productionMTPAssistantTokenOrderingShapeLabel, speculative["engine_attached_drafter_assistant_token_ordering_shape"])
+}
+
+func TestNativeContract_CapabilityLabelsAttachedDrafterInfersAssistantFromTarget_Good(t *testing.T) {
+	labels := map[string]string{}
+
+	rocmAddGemma4AttachedDrafterCapabilityLabels(labels, inference.ModelIdentity{
+		Path:         "/models/lmstudio-community-gemma-4-e4b-it-8bit",
+		Architecture: "gemma4_text",
+		NumLayers:    26,
+		HiddenSize:   2304,
+		VocabSize:    262144,
+		QuantBits:    8,
+	})
+
+	core.AssertEqual(t, "E4B", labels["attached_drafter_target_gemma4_size"])
+	core.AssertEqual(t, "q8", labels["attached_drafter_target_gemma4_quant_mode"])
+	core.AssertEqual(t, "64", labels["attached_drafter_target_gemma4_quant_group"])
+	core.AssertEqual(t, "lmstudio-community/gemma-4-E4B-it-MLX-8bit", labels["attached_drafter_target_production_quant_model"])
+	core.AssertEqual(t, "", labels["attached_drafter_target_production_quant_locked_model"])
+	core.AssertEqual(t, "E4B", labels["attached_drafter_assistant_gemma4_size"])
+	core.AssertEqual(t, "bf16", labels["attached_drafter_assistant_gemma4_quant_mode"])
+	core.AssertEqual(t, rocmGemma4MTPAssistantPath("E4B", "bf16"), labels["attached_drafter_assistant_production_quant_model"])
+	core.AssertEqual(t, "E4B:assistant-bf16", labels["attached_drafter_assistant_production_quant_pack"])
+	core.AssertEqual(t, "true", labels["attached_drafter_assistant_production_quant_mtp_assistant"])
+	core.AssertEqual(t, "gemma4_text", labels["attached_drafter_target_engine_architecture_profile"])
+	core.AssertEqual(t, "gemma4_assistant", labels["attached_drafter_assistant_engine_architecture_profile"])
+	core.AssertEqual(t, string(inference.FeatureRuntimeNative), labels["attached_drafter_assistant_engine_architecture_runtime_status"])
+	core.AssertEqual(t, "retained-state,attached-drafter", labels["attached_drafter_assistant_engine_architecture_cache_hints"])
+	core.AssertEqual(t, "true", labels["attached_drafter_assistant_engine_architecture_attached_only"])
+	core.AssertEqual(t, "false", labels["attached_drafter_official_pair_verified"])
+	core.AssertEqual(t, "true", labels["attached_drafter_gemma4_family_pair_verified"])
 }
 
 func TestNativeContract_BenchmarkAndEvaluateTinyFixtureLabelsProductionPending_Good(t *testing.T) {
@@ -2971,61 +4159,6 @@ func TestNativeContract_BenchmarkMirrorsDeviceCacheLabels_Good(t *testing.T) {
 	core.AssertNotEmpty(t, cacheEvent.Labels["kv_device_bytes"])
 }
 
-func TestNativeContract_ModelPackInspectorReadsSidecars_Good(t *testing.T) {
-	dir := t.TempDir()
-	writeNativeContractFile(t, core.PathJoin(dir, "config.json"), `{
-		"model_type":"MiniMaxM2ForCausalLM",
-		"hidden_size":2048,
-		"num_hidden_layers":24,
-		"vocab_size":32000,
-		"max_position_embeddings":32768,
-		"num_local_experts":32,
-		"num_experts_per_tok":2,
-		"quantization_config":{"quant_method":"jangtq","bits":2,"group_size":64,"weight_format":"mxtq"}
-	}`)
-	writeNativeContractSafetensors(t, core.PathJoin(dir, "model.safetensors"))
-	writeNativeContractFile(t, core.PathJoin(dir, "jang_config.json"), `{
-		"version":1,
-		"weight_format":"mxtq",
-		"profile":"JANGTQ",
-		"source_model":{"name":"MiniMax-M2.7","org":"dealignai","architecture":"MiniMaxM2ForCausalLM"},
-		"mxtq_bits":{"attention":8,"shared_expert":4,"routed_expert":2,"embed_tokens":8,"lm_head":8},
-		"quantization":{"method":"affine+mxtq","group_size":64,"bits_default":2},
-		"capabilities":{"reasoning_parser":"minimax","tool_parser":"json","supports_tools":true,"supports_thinking":true,"cache_type":"block-prefix"}
-	}`)
-	writeNativeContractFile(t, core.PathJoin(dir, "codebook_config.json"), `{
-		"type":"codebook",
-		"format":"vq",
-		"codebook_size":16,
-		"code_dim":2,
-		"index_bits":8,
-		"tensors":[{"name":"model.layers.0.mlp.down_proj.weight","shape":[2,4],"codes":"codes","codebook":"table"}]
-	}`)
-
-	backend := newROCmBackendWithRuntime(&fakeNativeRuntime{device: nativeDeviceInfo{MemoryBytes: 16 * memoryGiB, Name: "gfx1100"}})
-	inspection, err := backend.InspectModelPack(context.Background(), dir)
-	if err != nil {
-		t.Fatalf("InspectModelPack: %v", err)
-	}
-	if !inspection.Supported || inspection.Format != "safetensors" || inspection.Model.Architecture != "minimax_m2" || inspection.Model.QuantType != "jangtq" {
-		t.Fatalf("inspection = %+v, want supported MiniMax/JANGTQ safetensors pack", inspection)
-	}
-	if inspection.Labels["memory_plan_machine_class"] != "rocm-16gb" || inspection.Labels["memory_plan_moe_lazy_experts"] != "true" || inspection.Labels["codebook_format"] != "vq" {
-		t.Fatalf("inspection labels = %+v, want memory fit and codebook metadata", inspection.Labels)
-	}
-	metadataFixtures := nativeContractMetadataFixtureKernels()
-	for _, id := range []inference.CapabilityID{inference.CapabilityJANGTQ, inference.CapabilityCodebookVQ, inference.CapabilityMoERouting, inference.CapabilityMoELazyExperts} {
-		capability, ok := nativeInspectionCapability(inspection, id)
-		if !ok || capability.Status != inference.CapabilityStatusExperimental ||
-			capability.Labels["runtime_status"] != string(inference.FeatureRuntimeMetadataOnly) ||
-			capability.Labels["fixture_kernel_name"] != metadataFixtures[id] ||
-			capability.Labels["required_integration"] == "" ||
-			capability.Labels["production_integration"] != "pending" {
-			t.Fatalf("inspection capability %s = %+v ok=%v, want metadata-only experimental", id, capability, ok)
-		}
-	}
-}
-
 func TestNativeContract_ModelPackInspectorRejectsMalformedCodebook_Bad(t *testing.T) {
 	dir := nativeContractSafetensorsPack(t, `{"model_type":"Qwen3ForCausalLM"}`)
 	writeNativeContractFile(t, core.PathJoin(dir, "codebook_config.json"), `{
@@ -3148,7 +4281,7 @@ func TestNativeContract_ModelPackInspectorRerankTaskParamsAllowNonStrings_Good(t
 	if err != nil {
 		t.Fatalf("InspectModelPack: %v", err)
 	}
-	if inspection.Model.Architecture != "bert" || inspection.Labels["rerank_model"] != "true" || inspection.Labels["classifier_model"] != "true" {
+	if inspection.Model.Architecture != "bert_rerank" || inspection.Labels["rerank_model"] != "true" || inspection.Labels["classifier_model"] != "true" {
 		t.Fatalf("inspection = %+v labels=%+v, want BERT classifier/rerank metadata", inspection, inspection.Labels)
 	}
 	if !nativeInspectionHasCapability(inspection, inference.CapabilityRerank) {
@@ -3195,7 +4328,7 @@ func TestNativeContract_ModelPackInspectorSequenceClassificationWithoutRerankIsC
 	if err != nil {
 		t.Fatalf("InspectModelPack: %v", err)
 	}
-	if inspection.Model.Architecture != "bert" || inspection.Labels["classifier_model"] != "true" {
+	if inspection.Model.Architecture != "bert_rerank" || inspection.Labels["classifier_model"] != "true" {
 		t.Fatalf("inspection = %+v labels=%+v, want BERT classifier metadata", inspection, inspection.Labels)
 	}
 	if _, ok := inspection.Labels["rerank_model"]; ok {
@@ -3256,27 +4389,33 @@ func TestNativeContract_ModelPackInspectorArchitectureFixtures_Good(t *testing.T
 		architecture string
 		quantType    string
 		capability   inference.CapabilityID
+		dense        bool
+		mtpDrafter   bool
 	}{
-		{name: "Qwen3", architecture: "qwen3", config: `{"model_type":"Qwen3ForCausalLM","max_position_embeddings":32768}`},
+		{name: "Qwen3", architecture: "qwen3", dense: true, config: `{"model_type":"Qwen3ForCausalLM","max_position_embeddings":32768}`},
 		{name: "Qwen3MoE", architecture: "qwen3_moe", capability: inference.CapabilityMoERouting, config: `{"model_type":"Qwen3MoeForCausalLM","num_local_experts":128,"num_experts_per_tok":8}`},
 		{name: "Qwen3Next", architecture: "qwen3_next", config: `{"architectures":["Qwen3NextForCausalLM"],"max_position_embeddings":262144}`},
+		{name: "Qwen3.6", architecture: "qwen3_6", dense: true, config: `{"architectures":["Qwen3_5ForConditionalGeneration"],"max_position_embeddings":262144}`},
+		{name: "Qwen3.6MoE", architecture: "qwen3_6_moe", capability: inference.CapabilityMoERouting, config: `{"architectures":["Qwen3_5MoeForConditionalGeneration"],"num_local_experts":128,"num_experts_per_tok":8}`},
 		{name: "Gemma", architecture: "gemma", config: `{"model_type":"GemmaForCausalLM","max_position_embeddings":8192}`},
-		{name: "Mistral", architecture: "mistral", config: `{"model_type":"MistralForCausalLM","sliding_window":4096}`},
+		{name: "Gemma3", architecture: "gemma3", dense: true, config: `{"model_type":"Gemma3ForCausalLM","max_position_embeddings":131072}`},
+		{name: "Mistral", architecture: "mistral", dense: true, config: `{"model_type":"MistralForCausalLM","sliding_window":4096}`},
 		{name: "Mixtral", architecture: "mixtral", config: `{"model_type":"MixtralForCausalLM","num_local_experts":8,"num_experts_per_tok":2}`},
-		{name: "Phi", architecture: "phi3", config: `{"model_type":"Phi3ForCausalLM","max_position_embeddings":4096}`},
+		{name: "Phi", architecture: "phi", dense: true, config: `{"model_type":"Phi3ForCausalLM","max_position_embeddings":4096}`},
 		{name: "DeepSeek", architecture: "deepseek", config: `{"model_type":"DeepseekV3ForCausalLM","num_hidden_layers":61}`},
 		{name: "DeepSeekR1", architecture: "deepseek_r1", config: `{"architectures":["DeepSeekR1ForCausalLM"],"num_hidden_layers":61}`},
 		{name: "GPTOSS", architecture: "gpt-oss", quantType: "mxfp4", config: `{"architectures":["GptOssForCausalLM"],"max_position_embeddings":131072,"quantization_config":{"quant_method":"mxfp4"}}`},
 		{name: "Kimi", architecture: "kimi", quantType: "nvfp4", config: `{"architectures":["KimiK2ForCausalLM"],"max_position_embeddings":131072,"quantization_config":{"format":"nvfp4"}}`},
 		{name: "Gemma4Text", architecture: "gemma4_text", config: `{"model_type":"gemma4_text","max_position_embeddings":131072}`},
 		{name: "Gemma4CausalLM", architecture: "gemma4_text", config: `{"architectures":["Gemma4ForCausalLM"],"max_position_embeddings":131072}`},
+		{name: "Gemma4Assistant", architecture: "gemma4_assistant", mtpDrafter: true, config: `{"architectures":["Gemma4AssistantForCausalLM"],"max_position_embeddings":131072}`},
 		{name: "MiniMax", architecture: "minimax", config: `{"model_type":"MiniMaxForCausalLM","max_position_embeddings":32768}`},
 		{name: "Llama", architecture: "llama", config: `{"model_type":"LlamaForCausalLM","max_position_embeddings":8192}`},
-		{name: "GLM4", architecture: "glm4", config: `{"model_type":"ChatGLM4ForCausalLM","max_position_embeddings":32768}`},
-		{name: "Hermes", architecture: "hermes", config: `{"architectures":["NousHermesForCausalLM"],"max_position_embeddings":32768}`},
-		{name: "Granite", architecture: "granite", config: `{"model_type":"GraniteForCausalLM","max_position_embeddings":8192}`},
+		{name: "GLM4", architecture: "glm4", dense: true, config: `{"model_type":"ChatGLM4ForCausalLM","max_position_embeddings":32768}`},
+		{name: "Hermes", architecture: "hermes", dense: true, config: `{"architectures":["NousHermesForCausalLM"],"max_position_embeddings":32768}`},
+		{name: "Granite", architecture: "granite", dense: true, config: `{"model_type":"GraniteForCausalLM","max_position_embeddings":8192}`},
 		{name: "BERTEmbeddings", architecture: "bert", capability: inference.CapabilityEmbeddings, config: `{"model_type":"BertModel","max_position_embeddings":512}`},
-		{name: "BERTReranker", architecture: "bert", capability: inference.CapabilityRerank, config: `{"architectures":["BertForSequenceClassification"],"task_specific_params":{"rerank":{"task":"rerank"}}}`},
+		{name: "BERTReranker", architecture: "bert_rerank", capability: inference.CapabilityRerank, config: `{"architectures":["BertForSequenceClassification"],"task_specific_params":{"rerank":{"task":"rerank"}}}`},
 	}
 
 	for _, tc := range cases {
@@ -3294,7 +4433,180 @@ func TestNativeContract_ModelPackInspectorArchitectureFixtures_Good(t *testing.T
 			if tc.capability != "" && !nativeInspectionHasCapability(inspection, tc.capability) {
 				t.Fatalf("capabilities = %+v, want %s", inspection.Capabilities, tc.capability)
 			}
+			if tc.dense {
+				if inspection.Labels["dense_route_candidate"] != "true" ||
+					inspection.Labels["dense_route_status"] != "experimental" ||
+					inspection.Labels["dense_route_family"] != "loader_neutral" ||
+					inspection.Labels["dense_route_backend"] != "hip_small_decode" ||
+					inspection.Labels["dense_route_reference"] != "gemma4_mlx_affine_matvec" {
+					t.Fatalf("labels = %+v, want dense quick-win route candidate labels", inspection.Labels)
+				}
+			} else if inspection.Labels["dense_route_candidate"] == "true" {
+				t.Fatalf("labels = %+v, non-dense fixture should not be labelled as dense route candidate", inspection.Labels)
+			}
+			if tc.mtpDrafter {
+				if inspection.Labels["attached_drafter"] != "experimental_retained_plan" ||
+					inspection.Labels["attached_drafter_native_attachment"] != hipKernelStatusNotLinked ||
+					inspection.Labels["attached_drafter_retained_state_entrypoint"] != hipKernelStatusLinked ||
+					inspection.Labels["attached_drafter_retained_state_required"] != "true" ||
+					inspection.Labels["attached_drafter_state_source"] != "rocm_state_session_runtime_kv" ||
+					inspection.Labels["attached_drafter_prompt_replay_fallback"] != "forbidden" ||
+					inspection.Labels["attached_drafter_assistant_architecture"] != officialGemma4E2BAssistantArchitecture ||
+					inspection.Labels["attached_drafter_assistant_ordered_embeddings"] != "true" ||
+					inspection.Labels["attached_drafter_assistant_centroids"] != productionMTPAssistantOrderedEmbeddingCentroidsLabel ||
+					inspection.Labels["attached_drafter_assistant_centroid_intermediate_top_k"] != productionMTPAssistantCentroidIntermediateTopKLabel ||
+					inspection.Labels["attached_drafter_assistant_four_layer_drafter"] != "true" ||
+					inspection.Labels["attached_drafter_assistant_token_ordering_dtype"] != "int64" ||
+					inspection.Labels["attached_drafter_assistant_token_ordering_shape"] != productionMTPAssistantTokenOrderingShapeLabel ||
+					inspection.Labels["attached_drafter_official_pair_verified"] != "false" ||
+					inspection.Labels["attached_drafter_speculative_draft_tokens"] != productionMTPDefaultDraftTokensLabel ||
+					inspection.Labels["mtp_role"] != "drafter" ||
+					inspection.Labels["mtp_target_family"] != "gemma4" ||
+					!nativeContractHasNoteContaining(inspection.Notes, "attached MTP drafter") {
+					t.Fatalf("inspection = %+v labels=%+v notes=%+v, want Gemma4 assistant MTP drafter metadata", inspection, inspection.Labels, inspection.Notes)
+				}
+			} else if inspection.Labels["mtp_role"] != "" {
+				t.Fatalf("labels = %+v, non-assistant fixture should not be labelled as MTP drafter", inspection.Labels)
+			}
 		})
+	}
+}
+
+func TestNativeContract_ModelPackInspectorAutoRoundQuantization_Good(t *testing.T) {
+	inspection, err := newROCmBackendWithRuntime(&fakeNativeRuntime{}).InspectModelPack(context.Background(), nativeContractSafetensorsPack(t, `{
+		"architectures":["Qwen3ForCausalLM"],
+		"max_position_embeddings":32768,
+		"quantization_config":{
+			"quant_method":"auto-round-light",
+			"format":"native",
+			"weight_format":"mxfp4",
+			"scheme":"W4A16",
+			"bits":4,
+			"group_size":128,
+			"iters":200,
+			"nsamples":512,
+			"seqlen":2048,
+			"sym":true,
+			"asym":false
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("InspectModelPack: %v", err)
+	}
+	if inspection.Model.QuantType != "auto_round_light" || inspection.Model.QuantBits != 4 || inspection.Model.QuantGroup != 128 {
+		t.Fatalf("model quantization = %+v, want AutoRound q4 group-128 identity", inspection.Model)
+	}
+	if inspection.Labels["autoround_quantization"] != "true" ||
+		inspection.Labels["autoround_algorithm"] != "auto_round_light" ||
+		inspection.Labels["autoround_format"] != "native" ||
+		inspection.Labels["autoround_weight_format"] != "mxfp4" ||
+		inspection.Labels["autoround_scheme"] != "W4A16" ||
+		inspection.Labels["autoround_bits"] != "4" ||
+		inspection.Labels["autoround_group_size"] != "128" ||
+		inspection.Labels["autoround_iters"] != "200" ||
+		inspection.Labels["autoround_nsamples"] != "512" ||
+		inspection.Labels["autoround_seqlen"] != "2048" ||
+		inspection.Labels["autoround_sym"] != "true" ||
+		inspection.Labels["autoround_asym"] != "false" ||
+		inspection.Labels["autoround_profile"] != "w4a16-mxfp4-g128" ||
+		inspection.Labels["autoround_profile_role"] != "rocm-fp4-planning" ||
+		inspection.Labels["autoround_profile_matched"] != "true" ||
+		inspection.Labels["autoround_profile_requires_bench"] != "true" ||
+		inspection.Labels["autoround_profile_requires_calibration"] != "true" ||
+		inspection.Labels["autoround_calibration_profile"] != "w4a16-mxfp4-g128" ||
+		inspection.Labels["autoround_calibration_format"] != "native" ||
+		inspection.Labels["autoround_calibration_weight_scheme"] != "W4A16" ||
+		inspection.Labels["autoround_calibration_float_format"] != "mxfp4" ||
+		inspection.Labels["autoround_calibration_bits"] != "4" ||
+		inspection.Labels["autoround_calibration_group_size"] != "128" ||
+		inspection.Labels["autoround_calibration_nsamples"] != "512" ||
+		inspection.Labels["autoround_calibration_seqlen"] != "2048" ||
+		inspection.Labels["autoround_calibration_iters"] != "200" ||
+		inspection.Labels["autoround_calibration_runtime"] != "planned_hip" ||
+		inspection.Labels["autoround_calibration_hip_kernel"] != hipKernelStatusNotLinked ||
+		inspection.Labels["autoround_calibration_requires_bench"] != "true" ||
+		inspection.Labels["autoround_calibration_required"] != "true" ||
+		inspection.Labels["autoround_runtime"] != "planned_hip" ||
+		inspection.Labels["autoround_hip_kernel"] != hipKernelStatusNotLinked {
+		t.Fatalf("labels = %+v, want AutoRound metadata labels", inspection.Labels)
+	}
+
+	mxfp8Inspection, err := newROCmBackendWithRuntime(&fakeNativeRuntime{}).InspectModelPack(context.Background(), nativeContractSafetensorsPack(t, `{
+		"architectures":["Qwen3ForCausalLM"],
+		"max_position_embeddings":32768,
+		"quantization_config":{
+			"quant_method":"auto-round",
+			"format":"native",
+			"weight_format":"mxfp8",
+			"scheme":"W8A16",
+			"bits":8,
+			"group_size":64,
+			"iters":220,
+			"nsamples":640,
+			"seqlen":3072
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("InspectModelPack MXFP8: %v", err)
+	}
+	if mxfp8Inspection.Model.QuantType != "auto_round" || mxfp8Inspection.Model.QuantBits != 8 || mxfp8Inspection.Model.QuantGroup != 64 {
+		t.Fatalf("MXFP8 model quantization = %+v, want AutoRound q8 group-64 identity", mxfp8Inspection.Model)
+	}
+	if mxfp8Inspection.Labels["autoround_weight_format"] != "mxfp8" ||
+		mxfp8Inspection.Labels["autoround_scheme"] != "W8A16" ||
+		mxfp8Inspection.Labels["autoround_profile"] != "w8a16-mxfp8-g64" ||
+		mxfp8Inspection.Labels["autoround_profile_role"] != "rocm-fp8-planning" ||
+		mxfp8Inspection.Labels["autoround_profile_matched"] != "true" ||
+		mxfp8Inspection.Labels["autoround_calibration_profile"] != "w8a16-mxfp8-g64" ||
+		mxfp8Inspection.Labels["autoround_calibration_weight_scheme"] != "W8A16" ||
+		mxfp8Inspection.Labels["autoround_calibration_float_format"] != "mxfp8" ||
+		mxfp8Inspection.Labels["autoround_calibration_bits"] != "8" ||
+		mxfp8Inspection.Labels["autoround_calibration_group_size"] != "64" ||
+		mxfp8Inspection.Labels["autoround_calibration_nsamples"] != "640" ||
+		mxfp8Inspection.Labels["autoround_calibration_seqlen"] != "3072" ||
+		mxfp8Inspection.Labels["autoround_calibration_iters"] != "220" ||
+		mxfp8Inspection.Labels["autoround_calibration_runtime"] != "planned_hip" ||
+		mxfp8Inspection.Labels["autoround_calibration_hip_kernel"] != hipKernelStatusNotLinked {
+		t.Fatalf("MXFP8 labels = %+v, want AutoRound MXFP8 calibration labels", mxfp8Inspection.Labels)
+	}
+
+	int2Inspection, err := newROCmBackendWithRuntime(&fakeNativeRuntime{}).InspectModelPack(context.Background(), nativeContractSafetensorsPack(t, `{
+		"architectures":["Qwen3ForCausalLM"],
+		"max_position_embeddings":32768,
+		"quantization_config":{
+			"quant_method":"auto-round",
+			"format":"native",
+			"weight_format":"int2",
+			"scheme":"W2A16",
+			"bits":2,
+			"group_size":128,
+			"iters":240,
+			"nsamples":768,
+			"seqlen":4096
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("InspectModelPack INT2: %v", err)
+	}
+	if int2Inspection.Model.QuantType != "auto_round" || int2Inspection.Model.QuantBits != 2 || int2Inspection.Model.QuantGroup != 128 {
+		t.Fatalf("INT2 model quantization = %+v, want AutoRound q2 group-128 identity", int2Inspection.Model)
+	}
+	if int2Inspection.Labels["autoround_weight_format"] != "int2" ||
+		int2Inspection.Labels["autoround_scheme"] != "W2A16" ||
+		int2Inspection.Labels["autoround_profile"] != "w2a16-int2-g128" ||
+		int2Inspection.Labels["autoround_profile_role"] != "rocm-int2-planning" ||
+		int2Inspection.Labels["autoround_profile_matched"] != "true" ||
+		int2Inspection.Labels["autoround_calibration_profile"] != "w2a16-int2-g128" ||
+		int2Inspection.Labels["autoround_calibration_weight_scheme"] != "W2A16" ||
+		int2Inspection.Labels["autoround_calibration_float_format"] != "int2" ||
+		int2Inspection.Labels["autoround_calibration_bits"] != "2" ||
+		int2Inspection.Labels["autoround_calibration_group_size"] != "128" ||
+		int2Inspection.Labels["autoround_calibration_nsamples"] != "768" ||
+		int2Inspection.Labels["autoround_calibration_seqlen"] != "4096" ||
+		int2Inspection.Labels["autoround_calibration_iters"] != "240" ||
+		int2Inspection.Labels["autoround_calibration_runtime"] != "planned_hip" ||
+		int2Inspection.Labels["autoround_calibration_hip_kernel"] != hipKernelStatusNotLinked {
+		t.Fatalf("INT2 labels = %+v, want AutoRound W2A16 INT2 calibration labels", int2Inspection.Labels)
 	}
 }
 
@@ -3304,7 +4616,7 @@ func TestNativeContract_ModelPackInspectorGemma4NestedTextConfig_Good(t *testing
 		"architectures":["Gemma4ForConditionalGeneration"],
 		"model_type":"gemma4",
 		"tie_word_embeddings":true,
-		"quantization_config":{"bits":4,"group_size":64,"mode":"affine"},
+		"quantization_config":{"bits":6,"group_size":64,"mode":"affine"},
 		"text_config":{
 			"model_type":"gemma4_text",
 			"hidden_size":1536,
@@ -3345,7 +4657,7 @@ func TestNativeContract_ModelPackInspectorGemma4NestedTextConfig_Good(t *testing
 		inspection.Model.NumLayers != 35 ||
 		inspection.Model.HiddenSize != 1536 ||
 		inspection.Model.VocabSize != 262144 ||
-		inspection.Model.QuantBits != 4 ||
+		inspection.Model.QuantBits != 6 ||
 		inspection.Model.QuantGroup != 64 {
 		t.Fatalf("model = %+v, want Gemma4 text_config dimensions and quantization", inspection.Model)
 	}
@@ -3418,7 +4730,7 @@ func TestNativeContract_ModelPackInspectorGemma4BF16DType_Good(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InspectModelPack: %v", err)
 	}
-	if !inspection.Supported || inspection.Model.Architecture != "gemma4" || inspection.Model.QuantType != "bf16" || inspection.Model.QuantBits != 0 {
+	if !inspection.Supported || inspection.Model.Architecture != "gemma4" || inspection.Model.QuantType != "bf16" || inspection.Model.QuantBits != 16 {
 		t.Fatalf("inspection = %+v labels=%+v, want supported BF16 Gemma4 safetensors pack", inspection, inspection.Labels)
 	}
 	if inspection.Labels["weight_files"] != "2" || inspection.Labels["safetensors_dtypes"] != "BF16" || inspection.Labels["tied_word_embeddings"] != "true" {
@@ -3812,7 +5124,9 @@ type fakeNativeRuntime struct {
 	device       nativeDeviceInfo
 	model        nativeModel
 	loadPath     string
+	loadPaths    []string
 	loadConfig   nativeLoadConfig
+	loadConfigs  []nativeLoadConfig
 	kernelStatus hipKernelStatus
 }
 
@@ -3828,7 +5142,9 @@ func (runtime *fakeNativeRuntime) KernelStatus() hipKernelStatus {
 }
 func (runtime *fakeNativeRuntime) LoadModel(path string, cfg nativeLoadConfig) (nativeModel, error) {
 	runtime.loadPath = path
+	runtime.loadPaths = append(runtime.loadPaths, path)
 	runtime.loadConfig = cfg
+	runtime.loadConfigs = append(runtime.loadConfigs, cfg)
 	if runtime.model == nil {
 		runtime.model = &fakeNativeModel{}
 	}
@@ -3857,6 +5173,14 @@ type fakeNativeModel struct {
 	evalLossKernelOut        hipCrossEntropyLossResult
 	evalLossKernelErr        error
 	evalLossKernelCalls      int
+	distillKernelOK          bool
+	distillKernelOut         hipDistillationKLLossResult
+	distillKernelErr         error
+	distillKernelCalls       int
+	grpoKernelOK             bool
+	grpoKernelOut            []float64
+	grpoKernelErr            error
+	grpoKernelCalls          int
 	classifyResults          []inference.ClassifyResult
 	classifyPrompts          [][]string
 	generatePrompts          []string
@@ -4050,6 +5374,20 @@ func (model *fakeNativeModel) RunEvalCrossEntropyLoss(_ context.Context, _ [][]f
 		return hipCrossEntropyLossResult{}, false, nil
 	}
 	return model.evalLossKernelOut, true, model.evalLossKernelErr
+}
+func (model *fakeNativeModel) RunDistillationKLLoss(_ context.Context, _, _ [][]float32, _ float64) (hipDistillationKLLossResult, bool, error) {
+	model.distillKernelCalls++
+	if !model.distillKernelOK {
+		return hipDistillationKLLossResult{}, false, nil
+	}
+	return model.distillKernelOut, true, model.distillKernelErr
+}
+func (model *fakeNativeModel) RunGRPOAdvantage(_ context.Context, _ []float64) ([]float64, bool, error) {
+	model.grpoKernelCalls++
+	if !model.grpoKernelOK {
+		return nil, false, nil
+	}
+	return append([]float64(nil), model.grpoKernelOut...), true, model.grpoKernelErr
 }
 func (model *fakeNativeModel) Metrics() inference.GenerateMetrics {
 	if model.metrics != (inference.GenerateMetrics{}) {
@@ -4264,6 +5602,16 @@ func nativeContractMetadataFixtureKernels() map[inference.CapabilityID]string {
 		inference.CapabilityMoELazyExperts: hipKernelNameMoELazy,
 		inference.CapabilityJANGTQ:         hipKernelNameJANGTQ,
 		inference.CapabilityCodebookVQ:     hipKernelNameCodebook,
+	}
+}
+
+func assertCSVLabelContainsAll(t *testing.T, label string, value string, required []string) {
+	t.Helper()
+	values := splitProductionCSVLabel(value)
+	for _, metric := range required {
+		if !stringSliceContains(values, metric) {
+			t.Fatalf("%s = %q, missing %q", label, value, metric)
+		}
 	}
 }
 

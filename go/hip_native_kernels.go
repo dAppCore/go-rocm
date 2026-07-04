@@ -6,13 +6,13 @@ package rocm
 
 import (
 	"context"
-	"os"
 
 	core "dappco.re/go"
 )
 
 type hipNativeProjectionKernelSet struct {
 	hipKernelStub
+	moduleSource string
 }
 
 func newHIPRuntimeKernelSet(driver nativeHIPDriver) hipKernelSet {
@@ -22,13 +22,14 @@ func newHIPRuntimeKernelSet(driver nativeHIPDriver) hipKernelSet {
 	if _, ok := driver.(nativeHIPKernelLauncher); !ok {
 		return newDefaultHIPKernelSet()
 	}
-	if core.Trim(os.Getenv("GO_ROCM_KERNEL_HSACO")) == "" {
+	resolution := resolveHIPKernelModule()
+	if core.Trim(resolution.Path) == "" {
 		return newDefaultHIPKernelSet()
 	}
-	return hipNativeProjectionKernelSet{}
+	return hipNativeProjectionKernelSet{moduleSource: resolution.Source}
 }
 
-func (hipNativeProjectionKernelSet) Status() hipKernelStatus {
+func (kernels hipNativeProjectionKernelSet) Status() hipKernelStatus {
 	return hipKernelStatus{
 		CrossEntropy: hipKernelStatusLinked,
 		Decode:       hipKernelStatusNotLinked,
@@ -39,7 +40,7 @@ func (hipNativeProjectionKernelSet) Status() hipKernelStatus {
 		Projection:   hipKernelStatusLinked,
 		Rerank:       hipKernelStatusLinked,
 		KVCache:      hipKernelStatusPlanned,
-		Reason:       "native projection, embedding, rerank, and toy loss kernels configured by GO_ROCM_KERNEL_HSACO; prefill/decode kernels are not linked yet",
+		Reason:       "native projection, embedding, rerank, and toy loss kernels configured by " + hipKernelModuleSourceLabel(kernels.moduleSource) + "; prefill/decode kernels are not linked yet",
 	}
 }
 

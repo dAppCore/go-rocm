@@ -177,3 +177,82 @@ func TestHIPCodebookLookupReadOutputValidation_Bad(t *testing.T) {
 	core.AssertError(t, err)
 	core.AssertContains(t, err.Error(), "copy codebook output")
 }
+
+func BenchmarkHIPCodebookLookupLaunch_Codes512Dim64(b *testing.B) {
+	req := hipCodebookLookupRequest{
+		Codes:    codebookBenchmarkCodes(512, 128),
+		Codebook: codebookBenchmarkTable(128, 64),
+		CodeDim:  64,
+	}
+	driver := &fakeHIPDriver{available: true}
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		got, err := hipRunCodebookLookupKernel(context.Background(), driver, req)
+		if err != nil {
+			b.Fatalf("run codebook fixture: %v", err)
+		}
+		if len(got) != len(req.Codes)*req.CodeDim {
+			b.Fatalf("output length = %d, want %d", len(got), len(req.Codes)*req.CodeDim)
+		}
+	}
+}
+
+func BenchmarkHIPCodebookLookupLaunchPrepared_Codes512Dim64(b *testing.B) {
+	req := hipCodebookLookupRequest{
+		Codes:    codebookBenchmarkCodes(512, 128),
+		Codebook: codebookBenchmarkTable(128, 64),
+		CodeDim:  64,
+	}
+	driver := &fakeHIPDriver{available: true, skipLaunchRecording: true, copies: make([]uint64, 0, 8)}
+	buffers, err := req.deviceBuffers(driver)
+	if err != nil {
+		b.Fatalf("prepare codebook fixture buffers: %v", err)
+	}
+	defer buffers.Close()
+	launch, err := req.launchArgs(buffers)
+	if err != nil {
+		b.Fatalf("prepare codebook fixture launch args: %v", err)
+	}
+	launchBytes, err := launch.BinaryInto(make([]byte, hipCodebookLaunchArgsBytes))
+	if err != nil {
+		b.Fatalf("encode codebook fixture launch args: %v", err)
+	}
+	config, err := hipOneDimensionalLaunchConfig(hipKernelNameCodebook, launchBytes, len(req.Codes)*req.CodeDim)
+	if err != nil {
+		b.Fatalf("prepare codebook fixture launch config: %v", err)
+	}
+	outputPayload := make([]byte, len(req.Codes)*req.CodeDim*4)
+	outputValues := make([]float32, len(req.Codes)*req.CodeDim)
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := hipLaunchKernel(driver, config); err != nil {
+			b.Fatalf("launch codebook fixture: %v", err)
+		}
+		got, err := buffers.ReadOutputInto(outputValues, outputPayload)
+		if err != nil {
+			b.Fatalf("read codebook fixture: %v", err)
+		}
+		if len(got) != len(req.Codes)*req.CodeDim {
+			b.Fatalf("output length = %d, want %d", len(got), len(req.Codes)*req.CodeDim)
+		}
+		driver.copies = driver.copies[:0]
+	}
+}
+
+func codebookBenchmarkCodes(count, codebookSize int) []uint8 {
+	codes := make([]uint8, count)
+	for i := range codes {
+		codes[i] = uint8((i * 17) % codebookSize)
+	}
+	return codes
+}
+
+func codebookBenchmarkTable(codebookSize, codeDim int) []float32 {
+	values := make([]float32, codebookSize*codeDim)
+	for i := range values {
+		values[i] = float32(i%codeDim) / float32(codeDim)
+	}
+	return values
+}

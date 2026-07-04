@@ -12,15 +12,21 @@ import (
 // ParserRegistry provides architecture-aware reasoning and tool parsing.
 type ParserRegistry struct {
 	architecture string
+	parserID     string
 	parser       outputparser.OutputParser
 }
 
 // NewParserRegistry creates a parser registry for one model family.
 func NewParserRegistry(architecture string) ParserRegistry {
-	architecture = normalizeROCmArchitecture(architecture)
+	architecture = ROCmArchitectureID(architecture)
+	parserID, _ := ROCmReasoningParserID(architecture)
+	if parserID == "" {
+		parserID = architecture
+	}
 	return ParserRegistry{
 		architecture: architecture,
-		parser:       outputparser.ForHint(outputparser.Hint{Architecture: architecture}),
+		parserID:     parserID,
+		parser:       outputparser.ForHint(outputparser.Hint{Architecture: parserID}),
 	}
 }
 
@@ -36,7 +42,11 @@ func (registry ParserRegistry) outputParser() outputparser.OutputParser {
 	if registry.parser != nil {
 		return registry.parser
 	}
-	return outputparser.ForHint(outputparser.Hint{Architecture: registry.architecture})
+	parserID := registry.parserID
+	if parserID == "" {
+		parserID = registry.architecture
+	}
+	return outputparser.ForHint(outputparser.Hint{Architecture: parserID})
 }
 
 func (m *rocmModel) ParseReasoning(tokens []inference.Token, text string) (result inference.ReasoningParseResult, err error) {

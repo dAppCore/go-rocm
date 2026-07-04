@@ -29,9 +29,8 @@ func (b *rocmBackend) Available() bool {
 
 // LoadModel loads a GGUF model onto the AMD GPU via llama-server.
 // Model architecture is read from GGUF metadata (replacing filename-based guessing).
-// If no context length is specified, defaults to min(model_context_length,
-// 4096). When metadata omits the native context, it falls back to 4096 to
-// keep the load path on the safe side of VRAM usage.
+// If no context length is specified, use the model native context window. When
+// metadata omits the native context, fall back to 4096.
 func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (
 	inference.TextModel,
 	error,
@@ -62,9 +61,11 @@ func (b *rocmBackend) LoadModel(path string, opts ...inference.LoadOption) (
 	}
 
 	return &rocmModel{
-		server:    modelServer,
-		modelType: metadata.Architecture,
-		modelInfo: modelInfoFromMetadata(metadata),
+		server:        modelServer,
+		modelPath:     path,
+		modelType:     metadata.Architecture,
+		modelInfo:     modelInfoFromMetadata(metadata),
+		contextLength: contextLength,
 	}, nil
 }
 
@@ -75,7 +76,7 @@ func resolveContextLength(requestedContextLength int, metadata gguf.Metadata) in
 	if metadata.ContextLength == 0 {
 		return defaultContextLengthCap
 	}
-	return min(int(metadata.ContextLength), defaultContextLengthCap)
+	return int(metadata.ContextLength)
 }
 
 func modelInfoFromMetadata(metadata gguf.Metadata) inference.ModelInfo {

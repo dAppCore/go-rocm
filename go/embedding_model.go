@@ -918,12 +918,37 @@ func hipLoadedModelIdentity(model *hipLoadedModel) inference.ModelIdentity {
 		return inference.ModelIdentity{}
 	}
 	info := model.modelInfo
-	return inference.ModelIdentity{
-		Architecture: info.Architecture,
-		VocabSize:    info.VocabSize,
-		NumLayers:    info.NumLayers,
-		HiddenSize:   info.HiddenSize,
-		QuantBits:    info.QuantBits,
-		QuantGroup:   info.QuantGroup,
+	identity := model.engineProfile.Model
+	if rocmModelIdentityIsZero(identity) {
+		identity = inference.ModelIdentity{}
 	}
+	if identity.Architecture == "" {
+		identity.Architecture = info.Architecture
+	}
+	if identity.VocabSize == 0 {
+		identity.VocabSize = info.VocabSize
+	}
+	if identity.NumLayers == 0 {
+		identity.NumLayers = info.NumLayers
+	}
+	if identity.HiddenSize == 0 {
+		identity.HiddenSize = info.HiddenSize
+	}
+	if identity.QuantBits == 0 {
+		identity.QuantBits = info.QuantBits
+	}
+	if identity.QuantGroup == 0 {
+		identity.QuantGroup = info.QuantGroup
+	}
+	if identity.ContextLength == 0 {
+		identity.ContextLength = model.contextSize
+	}
+	identity.Labels = mergeStringMaps(identity.Labels, model.modelLabels)
+	if identity.QuantType == "" {
+		identity.QuantType = identity.Labels["quant_type"]
+	}
+	if identity.QuantType == "" && rocmIsGemma4SizeQuantIdentity(identity.Architecture) {
+		identity.QuantType = identity.Labels["gemma4_quant_mode"]
+	}
+	return rocmGemma4ModelWithInferredPathQuant(identity)
 }

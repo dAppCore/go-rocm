@@ -5,6 +5,7 @@
 package rocm
 
 import (
+	"bytes"
 	"encoding/binary"
 
 	core "dappco.re/go"
@@ -70,6 +71,10 @@ func rocmKVCacheBlockFromRawPayload(payload []byte) (rocmKVCacheBlock, error) {
 	if err != nil {
 		return rocmKVCacheBlock{}, err
 	}
+	return rocmKVCacheBlockFromRawParts(meta, keyPayload, valuePayload)
+}
+
+func rocmKVCacheBlockFromRawParts(meta rocmKVBlockRawMeta, keyPayload, valuePayload []byte) (rocmKVCacheBlock, error) {
 	key, err := rocmKVTensorFromDeviceBytesRows(meta.keyEncoding, meta.keyLength, meta.tokenCount, keyPayload)
 	if err != nil {
 		return rocmKVCacheBlock{}, core.E("rocm.KVCache.RawBlock", "decode key tensor", err)
@@ -81,6 +86,39 @@ func rocmKVCacheBlockFromRawPayload(payload []byte) (rocmKVCacheBlock, error) {
 	return rocmKVCacheBlock{
 		tokenStart: meta.tokenStart,
 		tokenCount: meta.tokenCount,
+		keyWidth:   meta.keyWidth,
+		valueWidth: meta.valueWidth,
+		key:        key,
+		value:      value,
+	}, nil
+}
+
+func rocmKVCacheBlockPrefixFromRawPayload(payload []byte, prefixTokens int) (rocmKVCacheBlock, error) {
+	meta, keyPayload, valuePayload, err := rocmKVBlockRawPayloadParts(payload)
+	if err != nil {
+		return rocmKVCacheBlock{}, err
+	}
+	return rocmKVCacheBlockPrefixFromRawParts(meta, keyPayload, valuePayload, prefixTokens)
+}
+
+func rocmKVCacheBlockPrefixFromRawParts(meta rocmKVBlockRawMeta, keyPayload, valuePayload []byte, prefixTokens int) (rocmKVCacheBlock, error) {
+	if prefixTokens <= 0 || prefixTokens > meta.tokenCount {
+		return rocmKVCacheBlock{}, core.E("rocm.KVCache.RawBlock", "prefix token count mismatch", nil)
+	}
+	if prefixTokens == meta.tokenCount {
+		return rocmKVCacheBlockFromRawParts(meta, keyPayload, valuePayload)
+	}
+	key, err := rocmKVTensorPrefixFromDeviceBytesRows(meta.keyEncoding, meta.keyLength, meta.tokenCount, keyPayload, prefixTokens)
+	if err != nil {
+		return rocmKVCacheBlock{}, core.E("rocm.KVCache.RawBlock", "decode prefix key tensor", err)
+	}
+	value, err := rocmKVTensorPrefixFromDeviceBytesRows(meta.valueEncoding, meta.valueLength, meta.tokenCount, valuePayload, prefixTokens)
+	if err != nil {
+		return rocmKVCacheBlock{}, core.E("rocm.KVCache.RawBlock", "decode prefix value tensor", err)
+	}
+	return rocmKVCacheBlock{
+		tokenStart: meta.tokenStart,
+		tokenCount: prefixTokens,
 		keyWidth:   meta.keyWidth,
 		valueWidth: meta.valueWidth,
 		key:        key,
@@ -105,7 +143,7 @@ func rocmKVBlockRawPayloadParts(payload []byte) (rocmKVBlockRawMeta, []byte, []b
 	if len(payload) < rocmKVBlockRawHeaderBytes {
 		return rocmKVBlockRawMeta{}, nil, nil, core.E("rocm.KVCache.RawBlock", "raw block payload is too small", nil)
 	}
-	if string(payload[0:8]) != string(rocmKVBlockRawMagic[:]) {
+	if !bytes.Equal(payload[0:8], rocmKVBlockRawMagic[:]) {
 		return rocmKVBlockRawMeta{}, nil, nil, core.E("rocm.KVCache.RawBlock", "invalid raw block magic", nil)
 	}
 	if version := binary.LittleEndian.Uint32(payload[8:]); version != rocmKVBlockRawVersion {
@@ -197,6 +235,10 @@ func rocmKVEncodingCode(encoding string) (uint32, bool) {
 		return 4, true
 	case rocmKVEncodingQ4Rows:
 		return 5, true
+	case rocmKVEncodingQ8RowsI:
+		return 6, true
+	case rocmKVEncodingQ4RowsI:
+		return 7, true
 	default:
 		return 0, false
 	}
@@ -214,6 +256,10 @@ func rocmKVEncodingFromCode(code uint32) (string, bool) {
 		return rocmKVEncodingQ8Rows, true
 	case 5:
 		return rocmKVEncodingQ4Rows, true
+	case 6:
+		return rocmKVEncodingQ8RowsI, true
+	case 7:
+		return rocmKVEncodingQ4RowsI, true
 	default:
 		return "", false
 	}
@@ -236,11 +282,23 @@ func rocmKVEncodedTensorPayloadBytesRows(encoding string, length, rows int) int 
 			return -1
 		}
 		return length + rows*4
+	case rocmKVEncodingQ8RowsI:
+		if rows <= 0 || length%rows != 0 {
+			return -1
+		}
+		rowWidth := length / rows
+		return rows * (4 + rowWidth)
 	case rocmKVEncodingQ4Rows:
 		if rows <= 0 {
 			return -1
 		}
 		return (length+1)/2 + rows*4
+	case rocmKVEncodingQ4RowsI:
+		if rows <= 0 || length%rows != 0 {
+			return -1
+		}
+		rowWidth := length / rows
+		return rows * (4 + (rowWidth+1)/2)
 	default:
 		return -1
 	}
