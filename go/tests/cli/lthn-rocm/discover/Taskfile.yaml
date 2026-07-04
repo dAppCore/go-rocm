@@ -1,0 +1,20 @@
+version: "3"
+
+# CLI artifact test: discover -json exposes runtime, compile, fast-lane, and
+# registry contracts without loading a model.
+tasks:
+  test:
+    cmds:
+      - |
+        bash <<'EOF'
+        set -euo pipefail
+        command -v jq >/dev/null || { echo "SKIP: jq is required"; exit 0; }
+        source ../_lib/run.sh
+        root="$(go_root .)"
+        bin="$(build_lthn_rocm "$root")"
+        out="$(mktemp)"
+        run_capture_stdout 0 "$out" "$bin" discover -json
+        assert_jq '.runtime.backend == "rocm" and .compile.current.name and .fast_lane.enabled_by_default == true and .workloads and .capability_count > 0 and .model_registry.name == "rocm-model-registry-v1"' "$out" || {
+          echo "FAIL: discover -json missing production contract fields" >&2; cat "$out" >&2; exit 1; }
+        echo "PASS: discover -json reports runtime, compile targets, fast lane, registry, workloads, and capabilities"
+        EOF

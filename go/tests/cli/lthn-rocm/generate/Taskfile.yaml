@@ -1,0 +1,21 @@
+version: "3"
+
+# CLI artifact test: generate runs the real binary against a cached model and
+# retained state. Skips cleanly without model weights or a compiled HSACO.
+tasks:
+  test:
+    cmds:
+      - |
+        bash <<'EOF'
+        set -euo pipefail
+        source ../_lib/run.sh
+        root="$(go_root .)"
+        model="$(gemma4_qat_target_path)" || { echo "SKIP: Gemma-4 target model not cached"; exit 0; }
+        hsaco="$(kernel_hsaco .)" || { echo "SKIP: ROCm HSACO not built"; exit 0; }
+        bin="$(build_lthn_rocm "$root")"
+        out="$(mktemp)"
+        export GO_ROCM_KERNEL_HSACO="$hsaco"
+        run_capture_all 0 "$out" "$bin" generate -backend rocm -state cli-artifact -state-store "$(mktemp -d)/state.kv" -draft "" -max-tokens 12 -prompt "Write one short sentence about ROCm." "$model"
+        assert_contains "tok/s" "$out" || { echo "FAIL: generate output missing throughput" >&2; cat "$out" >&2; exit 1; }
+        echo "PASS: generate loaded cached Gemma-4 target with retained state - $(grep -oE 'decode [0-9.]+ tok/s' "$out" | head -1)"
+        EOF

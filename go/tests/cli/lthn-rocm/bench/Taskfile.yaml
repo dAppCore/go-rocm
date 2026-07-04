@@ -1,0 +1,35 @@
+version: "3"
+
+# CLI artifact test: bench -json emits the Gemma-4 QAT/MTP release evidence
+# contract without running hardware measurement.
+tasks:
+  test:
+    cmds:
+      - |
+        bash <<'EOF'
+        set -euo pipefail
+        command -v jq >/dev/null || { echo "SKIP: jq is required"; exit 0; }
+        source ../_lib/run.sh
+        root="$(go_root .)"
+        bin="$(build_lthn_rocm "$root")"
+        out="$(mktemp)"
+        run_capture_stdout 0 "$out" "$bin" bench -json -max-tokens 128 mlx-community/gemma-4-12B-it-qat-4bit
+        assert_jq '.kind == "gemma4-qat-production-bench-plan" and .target.floor_tok_s == 180 and .target.goal_tok_s == 200 and .readiness.done == false' "$out" || {
+          echo "FAIL: bench -json missing QAT release gate contract" >&2; cat "$out" >&2; exit 1; }
+        assert_jq 'any(.commands[]; .name == "rocm-stateful-generate") and any(.commands[]; .name == "openai-server-state") and any(.commands[]; .name == "openai-chat-retained-state") and any(.comparisons[]; .name == "vllm") and any(.comparisons[]; .name == "llama.cpp")' "$out" || {
+          echo "FAIL: bench -json missing retained-state/OpenAI/comparison commands" >&2; cat "$out" >&2; exit 1; }
+        echo "PASS: bench -json pins Gemma-4 QAT release evidence contract"
+
+        local_model="${GO_ROCM_CLI_GEMMA4_TARGET:-/data/ai/models/mlx-community/gemma-4-e2b-it-6bit}"
+        if [[ -d "$local_model" && "$local_model" == *"gemma-4-e2b-it-6bit"* ]]; then
+          out_local="$(mktemp)"
+          run_capture_stdout 0 "$out_local" "$bin" bench -json -max-tokens 64 "$local_model"
+          assert_jq '.model.qat.collection_id == "mlx-community/gemma-4-qat" and .model.qat.quant_mode == "q6" and .model.assistant_qat.collection_id == "mlx-community/gemma-4-mtp-qat" and .model.assistant == "mlx-community/gemma-4-E2B-it-qat-assistant-6bit"' "$out_local" || {
+            echo "FAIL: local cached Gemma-4 QAT target did not resolve matching MTP-QAT assistant" >&2; cat "$out_local" >&2; exit 1; }
+          assert_jq 'any(.commands[]; .name == "rocm-stateful-generate" and (.command | contains("-draft mlx-community/gemma-4-E2B-it-qat-assistant-6bit"))) and any(.commands[]; .name == "openai-server-state" and (.command | contains("-draft mlx-community/gemma-4-E2B-it-qat-assistant-6bit")))' "$out_local" || {
+            echo "FAIL: local cached Gemma-4 QAT commands did not pin the MTP-QAT assistant" >&2; cat "$out_local" >&2; exit 1; }
+          echo "PASS: bench -json pins cached Gemma-4 E2B q6 target to MTP-QAT assistant"
+        else
+          echo "SKIP: local Gemma-4 E2B q6 target model not cached"
+        fi
+        EOF

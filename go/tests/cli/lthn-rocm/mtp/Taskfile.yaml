@@ -1,0 +1,28 @@
+version: "3"
+
+# CLI artifact test: generate runs a cached Gemma-4 QAT target beside its MTP-QAT
+# assistant in one isolated binary process. This is the go-mlx AX-10 pattern in
+# ROCm form: real pair engagement when weights/HSACO are present, clean skip
+# otherwise, and exact parity assertions stay in smaller Go tests.
+tasks:
+  test:
+    cmds:
+      - |
+        bash <<'EOF'
+        set -euo pipefail
+        source ../_lib/run.sh
+        root="$(go_root .)"
+        model="$(gemma4_qat_target_path)" || { echo "SKIP: Gemma-4 target model not cached"; exit 0; }
+        draft="$(gemma4_qat_draft_path)" || { echo "SKIP: Gemma-4 assistant drafter not cached"; exit 0; }
+        hsaco="$(kernel_hsaco .)" || { echo "SKIP: ROCm HSACO not built"; exit 0; }
+        bin="$(build_lthn_rocm "$root")"
+        out="$(mktemp)"
+        export GO_ROCM_KERNEL_HSACO="$hsaco"
+        run_capture_all 0 "$out" "$bin" generate -backend rocm -state "" -draft "$draft" -draft-block 4 -temp 0 -max-tokens 24 \
+          -prompt "List the first twelve positive integers in order, one per line." "$model"
+        assert_contains "native MTP status attachment=linked" "$out" || {
+          echo "FAIL: native attached drafter did not report linked status" >&2; cat "$out" >&2; exit 1; }
+        assert_contains "mtp:" "$out" || {
+          echo "FAIL: MTP lane did not report acceptance metrics" >&2; cat "$out" >&2; exit 1; }
+        echo "PASS: MTP pair engaged - $(grep -oiE 'mtp: [0-9]+% acceptance[^)]*\\)' "$out" | head -1)"
+        EOF

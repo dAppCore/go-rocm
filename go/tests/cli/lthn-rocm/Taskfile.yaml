@@ -1,0 +1,36 @@
+version: "3"
+
+tasks:
+  build:
+    dir: ../../..
+    cmds:
+      - CGO_ENABLED="${CGO_ENABLED:-1}" go build ./...
+
+  test:
+    dir: ../../..
+    cmds:
+      - go test -count=1 ./...
+
+  vet:
+    dir: ../../..
+    cmds:
+      - go vet ./...
+
+  cli:
+    desc: "CLI artifact tests for lthn-rocm: isolated binary processes, jq/grep assertions, cached-model tests skip cleanly."
+    cmds:
+      - task -d help test
+      - task -d discover test
+      - task -d bench test
+      - task -d tune test
+      - task -d generate test
+      - task -d mtp test
+      - task -d serve test
+      - task -d serve-mtp test
+      - task -d ebook test
+
+  default:
+    deps:
+      - build
+      - test
+      - vet

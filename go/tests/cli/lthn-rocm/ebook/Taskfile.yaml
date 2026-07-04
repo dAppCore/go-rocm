@@ -1,0 +1,21 @@
+version: "3"
+
+# CLI artifact test: ebook renders model metadata as EPUB without loading the
+# runtime. -weights=false keeps the artifact small and fast.
+tasks:
+  test:
+    cmds:
+      - |
+        bash <<'EOF'
+        set -euo pipefail
+        source ../_lib/run.sh
+        root="$(go_root .)"
+        model="$(gemma4_qat_target_path)" || { echo "SKIP: Gemma-4 target model not cached"; exit 0; }
+        bin="$(build_lthn_rocm "$root")"
+        epub="$(mktemp -d)/model.epub"
+        out="$(mktemp)"
+        run_capture_all 0 "$out" "$bin" ebook --model "$model" --out "$epub" -weights=false
+        assert_contains "wrote" "$out" || { echo "FAIL: ebook did not report a write" >&2; cat "$out" >&2; exit 1; }
+        [ -s "$epub" ] || { echo "FAIL: epub missing or empty at $epub" >&2; cat "$out" >&2; exit 1; }
+        echo "PASS: ebook produced $(wc -c <"$epub") bytes"
+        EOF

@@ -1,0 +1,61 @@
+version: "3"
+
+# CLI artifact test: serve runs the OpenAI-compatible chat path with a cached
+# Gemma-4 QAT target plus MTP-QAT assistant, then proves the second turn wakes
+# the conversation prefix from the state store. Skips without weights or HSACO.
+tasks:
+  test:
+    cmds:
+      - |
+        bash <<'EOF'
+        set -euo pipefail
+        command -v jq >/dev/null || { echo "SKIP: jq is required"; exit 0; }
+        command -v curl >/dev/null || { echo "SKIP: curl is required"; exit 0; }
+        source ../_lib/run.sh
+        root="$(go_root .)"
+        model="$(gemma4_qat_target_path)" || { echo "SKIP: Gemma-4 target model not cached"; exit 0; }
+        draft="$(gemma4_qat_draft_path)" || { echo "SKIP: Gemma-4 assistant drafter not cached"; exit 0; }
+        hsaco="$(kernel_hsaco .)" || { echo "SKIP: ROCm HSACO not built"; exit 0; }
+        bin="$(build_lthn_rocm "$root")"
+        addr="127.0.0.1:38913"
+        log="$(mktemp)"; first="$(mktemp)"; second="$(mktemp)"; status="$(mktemp)"
+        export GO_ROCM_KERNEL_HSACO="$hsaco"
+        "$bin" serve --model "$model" --draft "$draft" --draft-block 4 --addr "$addr" --state-store "$(mktemp -d)/conv.kv" >"$log" 2>&1 &
+        srv=$!
+        trap 'kill "$srv" 2>/dev/null || true; wait "$srv" 2>/dev/null || true' EXIT
+
+        code="$(curl -s -o "$first" -w '%{http_code}' --retry-connrefused --retry 60 --retry-delay 1 --max-time 300 \
+          "http://$addr/v1/chat/completions" -H 'content-type: application/json' \
+          -d '{"model":"x","max_tokens":12,"temperature":0,"messages":[{"role":"user","content":"List three ROCm words."}]}' || echo 000)"
+        if [ "$code" != "200" ]; then
+          echo "FAIL: first chat returned HTTP $code" >&2; cat "$first" >&2; echo "--- serve log ---" >&2; cat "$log" >&2; exit 1
+        fi
+        assert_jq '.choices[0].message.content | length > 0' "$first" || {
+          echo "FAIL: first chat returned empty content" >&2; cat "$first" >&2; exit 1; }
+        reply_json="$(jq -c '.choices[0].message.content' "$first")"
+
+        code="$(curl -s -o "$second" -w '%{http_code}' --max-time 300 \
+          "http://$addr/v1/chat/completions" -H 'content-type: application/json' \
+          --data-binary @- <<JSON
+        {"model":"x","max_tokens":12,"temperature":0,"messages":[{"role":"user","content":"List three ROCm words."},{"role":"assistant","content":$reply_json},{"role":"user","content":"Now add one more."}]}
+        JSON
+        )"
+        if [ "$code" != "200" ]; then
+          echo "FAIL: second retained chat returned HTTP $code" >&2; cat "$second" >&2; echo "--- serve log ---" >&2; cat "$log" >&2; exit 1
+        fi
+        assert_jq '.choices[0].message.content | length > 0' "$second" || {
+          echo "FAIL: second chat returned empty content" >&2; cat "$second" >&2; exit 1; }
+
+        token="$(tr -d '\n' < "$HOME/Lethean/data/admin.token")"
+        code="$(curl -s -o "$status" -w '%{http_code}' --max-time 60 \
+          "http://$addr/v1/admin/serve/status" -H "authorization: Bearer $token" || echo 000)"
+        if [ "$code" != "200" ]; then
+          echo "FAIL: admin status returned HTTP $code" >&2; cat "$status" >&2; echo "--- serve log ---" >&2; cat "$log" >&2; exit 1
+        fi
+        assert_jq '.labels.reactive_state_continuity == "conversation_store" and .labels.openai_chat_retained_state_mtp == "linked" and .labels.native_mtp_attachment == "linked" and .resolver.native_mtp_attachment == "linked" and .resolver.state_stats.store_wakes >= 1 and .resolver.state_stats.sleeps >= 2' "$status" || {
+          echo "FAIL: status missing MTP retained-state continuity evidence" >&2
+          jq '{labels: {reactive_state_continuity: .labels.reactive_state_continuity, openai_chat_retained_state_mtp: .labels.openai_chat_retained_state_mtp, native_mtp_attachment: .labels.native_mtp_attachment}, resolver: {native_mtp_attachment: .resolver.native_mtp_attachment}, stats: .resolver.state_stats}' "$status" >&2
+          echo "--- serve log ---" >&2; cat "$log" >&2; exit 1
+        }
+        echo "PASS: serve MTP OpenAI continuity - $(jq -r '.resolver.state_stats | "wakes=\(.store_wakes) sleeps=\(.sleeps)"' "$status")"
+        EOF

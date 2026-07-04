@@ -1,0 +1,22 @@
+version: "3"
+
+# CLI artifact test: tune -json emits the reactive MTP sweep contract. This is
+# plan-only and does not require native attached-drafter execution.
+tasks:
+  test:
+    cmds:
+      - |
+        bash <<'EOF'
+        set -euo pipefail
+        command -v jq >/dev/null || { echo "SKIP: jq is required"; exit 0; }
+        source ../_lib/run.sh
+        root="$(go_root .)"
+        model="$(gemma4_qat_target_path)" || { echo "SKIP: Gemma-4 target model not cached"; exit 0; }
+        draft="$(gemma4_qat_draft_path)" || { echo "SKIP: Gemma-4 assistant drafter not cached"; exit 0; }
+        bin="$(build_lthn_rocm "$root")"
+        out="$(mktemp)"
+        run_capture_stdout 0 "$out" "$bin" tune -json --model "$model" -draft "$draft" -depths 4 -max-tokens 24 -profile-dir "$(mktemp -d)"
+        assert_jq '.kind == "reactive-mtp-tuning-plan" and .labels.production_requires_env_gate == "false" and .labels.production_requires_cli_flag == "false" and .sweep[0].draft_block == 4 and .sweep[0].draft_tokens == 3' "$out" || {
+          echo "FAIL: tune -json missing reactive MTP plan contract" >&2; cat "$out" >&2; exit 1; }
+        echo "PASS: tune -json reports reactive MTP sweep plan for cached Gemma-4 target + assistant"
+        EOF

@@ -1,0 +1,19 @@
+version: "3"
+
+# CLI artifact test: top-level help advertises the production command surface.
+tasks:
+  test:
+    cmds:
+      - |
+        bash <<'EOF'
+        set -euo pipefail
+        source ../_lib/run.sh
+        root="$(go_root .)"
+        bin="$(build_lthn_rocm "$root")"
+        out="$(mktemp)"
+        run_capture_all 0 "$out" "$bin" help
+        for cmd in serve generate discover bench tune vision audio sft ssd ebook fuse slice state-pack; do
+          assert_contains "$cmd" "$out" || { echo "FAIL: help omits subcommand '$cmd'" >&2; cat "$out" >&2; exit 1; }
+        done
+        echo "PASS: help advertises lthn-rocm command surface"
+        EOF

@@ -1,0 +1,34 @@
+version: "3"
+
+# CLI artifact test: serve starts the OpenAI-compatible HTTP path in its own
+# process and performs one chat request. Skips without cached weights or HSACO.
+tasks:
+  test:
+    cmds:
+      - |
+        bash <<'EOF'
+        set -euo pipefail
+        command -v jq >/dev/null || { echo "SKIP: jq is required"; exit 0; }
+        command -v curl >/dev/null || { echo "SKIP: curl is required"; exit 0; }
+        source ../_lib/run.sh
+        root="$(go_root .)"
+        model="$(gemma4_qat_target_path)" || { echo "SKIP: Gemma-4 target model not cached"; exit 0; }
+        hsaco="$(kernel_hsaco .)" || { echo "SKIP: ROCm HSACO not built"; exit 0; }
+        bin="$(build_lthn_rocm "$root")"
+        addr="127.0.0.1:38912"
+        log="$(mktemp)"; out="$(mktemp)"
+        export GO_ROCM_KERNEL_HSACO="$hsaco"
+        "$bin" serve --model "$model" --draft "" --addr "$addr" --state-store "$(mktemp -d)/conv.kv" >"$log" 2>&1 &
+        srv=$!
+        trap 'kill "$srv" 2>/dev/null || true; wait "$srv" 2>/dev/null || true' EXIT
+        code="$(curl -s -o "$out" -w '%{http_code}' --retry-connrefused --retry 60 --retry-delay 1 --max-time 300 \
+          "http://$addr/v1/chat/completions" -H 'content-type: application/json' \
+          -d '{"model":"x","max_tokens":12,"temperature":0,"messages":[{"role":"user","content":"Say hello to ROCm in one short sentence."}]}' || echo 000)"
+        if [ "$code" != "200" ]; then
+          echo "FAIL: serve /v1/chat/completions returned HTTP $code" >&2; cat "$out" >&2
+          echo "--- serve log ---" >&2; cat "$log" >&2; exit 1
+        fi
+        assert_jq '.choices[0].message.content | length > 0' "$out" || {
+          echo "FAIL: empty assistant content" >&2; cat "$out" >&2; exit 1; }
+        echo "PASS: serve answered /v1/chat/completions with cached Gemma-4 target"
+        EOF
